@@ -1,0 +1,6 @@
+[submodule "vendor/qemu"]
+	path = vendor/qemu
+	url = https://github.com/qemu/qemu.git
+[submodule "vendor/riscv-isa-manual"]
+	path = vendor/riscv-isa-manual
+	url = https://github.com/riscv/riscv-isa-manual.git
