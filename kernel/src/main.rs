@@ -131,6 +131,7 @@ pub extern "C" fn kmain() -> ! {
         if check_demo_done() {
             break;
         }
+        console::fb_flush();
         unsafe { core::arch::asm!("wfi"); }
     }
 
@@ -143,6 +144,9 @@ pub extern "C" fn kmain() -> ! {
     println!("========================================");
     println!();
     println!("[shutdown] rvOS shutting down. Goodbye!");
+
+    // Final flush so all output is visible on the GPU framebuffer
+    console::fb_flush();
 
     arch::sbi::sbi_shutdown();
 }

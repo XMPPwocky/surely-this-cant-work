@@ -1,12 +1,13 @@
 /// VirtIO MMIO transport layer for QEMU virt machine.
 ///
 /// 8 VirtIO MMIO slots at 0x1000_1000 .. 0x1000_8000, each 0x1000 apart.
+/// QEMU virt machine exposes legacy (v1) devices, so we support both v1 and v2.
 
 const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
 const VIRTIO_MMIO_STRIDE: usize = 0x1000;
 const VIRTIO_MMIO_SLOTS: usize = 8;
 
-// Register offsets
+// Register offsets (common to both v1 and v2)
 pub const REG_MAGIC: usize = 0x000;
 pub const REG_VERSION: usize = 0x004;
 pub const REG_DEVICE_ID: usize = 0x008;
@@ -18,11 +19,18 @@ pub const REG_DRIVER_FEATURES_SEL: usize = 0x024;
 pub const REG_QUEUE_SEL: usize = 0x030;
 pub const REG_QUEUE_NUM_MAX: usize = 0x034;
 pub const REG_QUEUE_NUM: usize = 0x038;
-pub const REG_QUEUE_READY: usize = 0x044;
 pub const REG_QUEUE_NOTIFY: usize = 0x050;
 pub const REG_INTERRUPT_STATUS: usize = 0x060;
 pub const REG_INTERRUPT_ACK: usize = 0x064;
 pub const REG_STATUS: usize = 0x070;
+
+// Legacy (v1) only registers
+pub const REG_GUEST_PAGE_SIZE: usize = 0x028;
+pub const REG_QUEUE_ALIGN: usize = 0x03C;
+pub const REG_QUEUE_PFN: usize = 0x040;
+
+// Modern (v2) only registers
+pub const REG_QUEUE_READY: usize = 0x044;
 pub const REG_QUEUE_DESC_LOW: usize = 0x080;
 pub const REG_QUEUE_DESC_HIGH: usize = 0x084;
 pub const REG_QUEUE_AVAIL_LOW: usize = 0x090;
@@ -31,7 +39,6 @@ pub const REG_QUEUE_USED_LOW: usize = 0x0A0;
 pub const REG_QUEUE_USED_HIGH: usize = 0x0A4;
 
 const VIRTIO_MAGIC: u32 = 0x74726976;
-const VIRTIO_VERSION_2: u32 = 2;
 
 // Device status bits
 pub const STATUS_ACKNOWLEDGE: u32 = 1;
@@ -52,6 +59,11 @@ pub fn write_reg(base: usize, offset: usize, val: u32) {
     unsafe { ((base + offset) as *mut u32).write_volatile(val) }
 }
 
+/// Return the MMIO version for a device at `base`.
+pub fn device_version(base: usize) -> u32 {
+    read_reg(base, REG_VERSION)
+}
+
 /// Probe all 8 VirtIO MMIO slots and return the base address
 /// of the first device matching `device_id`, or None.
 pub fn probe(device_id: u32) -> Option<usize> {
@@ -62,11 +74,12 @@ pub fn probe(device_id: u32) -> Option<usize> {
             continue;
         }
         let version = read_reg(base, REG_VERSION);
-        if version != VIRTIO_VERSION_2 {
-            continue;
-        }
         let id = read_reg(base, REG_DEVICE_ID);
-        if id == device_id {
+        if id == 0 {
+            continue; // empty slot
+        }
+        crate::println!("[virtio] slot {} @ {:#x}: version={} device_id={}", i, base, version, id);
+        if id == device_id && (version == 1 || version == 2) {
             return Some(base);
         }
     }
@@ -74,8 +87,10 @@ pub fn probe(device_id: u32) -> Option<usize> {
 }
 
 /// Initialise a VirtIO MMIO device through the standard handshake.
-/// Returns the base address on success.
+/// Detects v1 (legacy) vs v2 (modern) and uses the appropriate sequence.
 pub fn init_device(base: usize) -> bool {
+    let version = read_reg(base, REG_VERSION);
+
     // 1. Reset
     write_reg(base, REG_STATUS, 0);
 
@@ -83,35 +98,45 @@ pub fn init_device(base: usize) -> bool {
     write_reg(base, REG_STATUS, STATUS_ACKNOWLEDGE);
 
     // 3. DRIVER
-    write_reg(
-        base,
-        REG_STATUS,
-        STATUS_ACKNOWLEDGE | STATUS_DRIVER,
-    );
+    write_reg(base, REG_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
-    // 4. Negotiate features: accept none (we don't need any special features)
-    write_reg(base, REG_DEVICE_FEATURES_SEL, 0);
-    let _features_lo = read_reg(base, REG_DEVICE_FEATURES);
-    write_reg(base, REG_DRIVER_FEATURES_SEL, 0);
-    write_reg(base, REG_DRIVER_FEATURES, 0);
-    write_reg(base, REG_DEVICE_FEATURES_SEL, 1);
-    let _features_hi = read_reg(base, REG_DEVICE_FEATURES);
-    write_reg(base, REG_DRIVER_FEATURES_SEL, 1);
-    write_reg(base, REG_DRIVER_FEATURES, 0);
+    if version == 1 {
+        // Legacy: set GuestPageSize before doing anything with queues
+        write_reg(base, REG_GUEST_PAGE_SIZE, 4096);
 
-    // 5. FEATURES_OK
-    write_reg(
-        base,
-        REG_STATUS,
-        STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
-    );
+        // Negotiate features: accept none for legacy (write features word 0 only)
+        write_reg(base, REG_DEVICE_FEATURES_SEL, 0);
+        let _features = read_reg(base, REG_DEVICE_FEATURES);
+        write_reg(base, REG_DRIVER_FEATURES_SEL, 0);
+        write_reg(base, REG_DRIVER_FEATURES, 0);
 
-    let status = read_reg(base, REG_STATUS);
-    if status & STATUS_FEATURES_OK == 0 {
-        return false;
+        // Legacy has NO FEATURES_OK step, go straight to DRIVER_OK later
+        true
+    } else {
+        // Modern (v2) handshake
+        write_reg(base, REG_DEVICE_FEATURES_SEL, 0);
+        let _features_lo = read_reg(base, REG_DEVICE_FEATURES);
+        write_reg(base, REG_DRIVER_FEATURES_SEL, 0);
+        write_reg(base, REG_DRIVER_FEATURES, 0);
+        write_reg(base, REG_DEVICE_FEATURES_SEL, 1);
+        let _features_hi = read_reg(base, REG_DEVICE_FEATURES);
+        write_reg(base, REG_DRIVER_FEATURES_SEL, 1);
+        write_reg(base, REG_DRIVER_FEATURES, 0);
+
+        // FEATURES_OK
+        write_reg(
+            base,
+            REG_STATUS,
+            STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK,
+        );
+
+        let status = read_reg(base, REG_STATUS);
+        if status & STATUS_FEATURES_OK == 0 {
+            return false;
+        }
+
+        true
     }
-
-    true
 }
 
 /// After queue setup, set DRIVER_OK.

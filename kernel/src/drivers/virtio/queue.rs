@@ -56,7 +56,10 @@ pub struct Virtqueue {
 
 impl Virtqueue {
     /// Allocate and initialise a virtqueue. Registers it on the device.
+    /// Detects v1 (legacy) vs v2 (modern) MMIO and uses the appropriate setup.
     pub fn new(base: usize, queue_idx: u32) -> Self {
+        let version = mmio::device_version(base);
+
         // Select queue
         mmio::write_reg(base, mmio::REG_QUEUE_SEL, queue_idx);
 
@@ -66,17 +69,50 @@ impl Virtqueue {
         // Set queue size
         mmio::write_reg(base, mmio::REG_QUEUE_NUM, QUEUE_SIZE as u32);
 
-        // Allocate one page for descriptors (16 * 16 = 256 bytes fits in a page)
-        let desc_frame = frame::frame_alloc().expect("virtqueue desc alloc");
-        let desc_phys = desc_frame.0 << 12;
+        let (desc_phys, avail_phys, used_phys);
 
-        // Allocate one page for avail ring
-        let avail_frame = frame::frame_alloc().expect("virtqueue avail alloc");
-        let avail_phys = avail_frame.0 << 12;
+        if version == 1 {
+            // Legacy (v1): desc, avail, and used must be in a contiguous region.
+            // Layout:
+            //   offset 0:    descriptor table  (QUEUE_SIZE * 16 = 256 bytes)
+            //   offset 256:  available ring     (4 + 2 * QUEUE_SIZE = 36 bytes)
+            //   offset 4096: used ring          (aligned to QueueAlign = 4096)
+            // Total: 2 pages
+            let region = frame::frame_alloc_contiguous(2).expect("virtqueue v1 alloc");
+            let region_phys = region.0 << 12;
 
-        // Allocate one page for used ring
-        let used_frame = frame::frame_alloc().expect("virtqueue used alloc");
-        let used_phys = used_frame.0 << 12;
+            // Zero the entire 2-page region
+            unsafe {
+                core::ptr::write_bytes(region_phys as *mut u8, 0, PAGE_SIZE * 2);
+            }
+
+            desc_phys = region_phys;
+            avail_phys = region_phys + QUEUE_SIZE * 16; // offset 256
+            used_phys = region_phys + PAGE_SIZE;        // offset 4096
+
+            // Tell device: alignment and page frame number
+            mmio::write_reg(base, mmio::REG_QUEUE_ALIGN, PAGE_SIZE as u32);
+            mmio::write_reg(base, mmio::REG_QUEUE_PFN, (region_phys >> 12) as u32);
+        } else {
+            // Modern (v2): separate pages for each component
+            let desc_frame = frame::frame_alloc().expect("virtqueue desc alloc");
+            desc_phys = desc_frame.0 << 12;
+            let avail_frame = frame::frame_alloc().expect("virtqueue avail alloc");
+            avail_phys = avail_frame.0 << 12;
+            let used_frame = frame::frame_alloc().expect("virtqueue used alloc");
+            used_phys = used_frame.0 << 12;
+
+            // Tell device about the queue addresses (v2 registers)
+            mmio::write_reg(base, mmio::REG_QUEUE_DESC_LOW, desc_phys as u32);
+            mmio::write_reg(base, mmio::REG_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32);
+            mmio::write_reg(base, mmio::REG_QUEUE_AVAIL_LOW, avail_phys as u32);
+            mmio::write_reg(base, mmio::REG_QUEUE_AVAIL_HIGH, (avail_phys >> 32) as u32);
+            mmio::write_reg(base, mmio::REG_QUEUE_USED_LOW, used_phys as u32);
+            mmio::write_reg(base, mmio::REG_QUEUE_USED_HIGH, (used_phys >> 32) as u32);
+
+            // Mark queue ready (v2 only)
+            mmio::write_reg(base, mmio::REG_QUEUE_READY, 1);
+        }
 
         let desc = desc_phys as *mut VirtqDesc;
         let avail = avail_phys as *mut VirtqAvail;
@@ -109,17 +145,6 @@ impl Virtqueue {
             u.flags = 0;
             u.idx = 0;
         }
-
-        // Tell device about the queue addresses
-        mmio::write_reg(base, mmio::REG_QUEUE_DESC_LOW, desc_phys as u32);
-        mmio::write_reg(base, mmio::REG_QUEUE_DESC_HIGH, (desc_phys >> 32) as u32);
-        mmio::write_reg(base, mmio::REG_QUEUE_AVAIL_LOW, avail_phys as u32);
-        mmio::write_reg(base, mmio::REG_QUEUE_AVAIL_HIGH, (avail_phys >> 32) as u32);
-        mmio::write_reg(base, mmio::REG_QUEUE_USED_LOW, used_phys as u32);
-        mmio::write_reg(base, mmio::REG_QUEUE_USED_HIGH, (used_phys >> 32) as u32);
-
-        // Mark queue ready
-        mmio::write_reg(base, mmio::REG_QUEUE_READY, 1);
 
         Virtqueue {
             desc,

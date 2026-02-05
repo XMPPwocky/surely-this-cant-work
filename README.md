@@ -18,6 +18,12 @@ A from-scratch RISC-V 64-bit microkernel operating system written in Rust. Targe
 - **Kernel heap** — linked-list free-list allocator (`#[global_allocator]`), enabling `Vec`, `Box`, `String`
 - **SpinLock** — atomic spinlock with RAII guard and interrupt disable/restore
 
+## Screenshot
+
+VirtIO GPU framebuffer console showing the full demo (boot, kernel tasks, IPC, user mode, shutdown):
+
+![rvOS boot screenshot](screenshots/boot.png)
+
 ## Quick Start
 
 ### Prerequisites
