@@ -19,14 +19,17 @@ run-gui: build
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-display gtk \
+		-no-shutdown -no-reboot \
 		-kernel $(KERNEL_BIN)
 
 # VNC mode: connect with a VNC client to :5900, serial on stdio
+# QEMU stays alive after kernel shutdown so you can actually see the display
 run-vnc: build
 	qemu-system-riscv64 -machine virt -serial stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-display vnc=:0 \
+		-no-shutdown -no-reboot \
 		-kernel $(KERNEL_BIN)
 
 # Headless GPU with screenshot: runs QEMU with virtio-gpu, takes PPM screenshot via monitor
