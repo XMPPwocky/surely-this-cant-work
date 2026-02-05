@@ -1,6 +1,7 @@
 /// Framebuffer console: renders text on the VirtIO GPU framebuffer.
 ///
-/// Uses an 8x16 bitmap font.
+/// Uses an 8x16 bitmap font. Supports a Y offset so a logo banner
+/// at the top is preserved when the text area scrolls.
 
 use core::fmt;
 use super::font::{FONT, FONT_WIDTH, FONT_HEIGHT};
@@ -14,6 +15,8 @@ pub struct FbConsole {
     row: u32,
     cols: u32,
     rows: u32,
+    /// Pixel Y offset where the text area starts (below the logo).
+    y_offset: u32,
     fg: u32,
     bg: u32,
 }
@@ -31,7 +34,8 @@ impl FbConsole {
             row: 0,
             cols: 0,
             rows: 0,
-            fg: 0x00FFFFFF,   // white (BGRA: B=FF, G=FF, R=FF, A=00)
+            y_offset: 0,
+            fg: 0x00FFFFFF,   // white
             bg: 0x00000000,   // black
         }
     }
@@ -47,6 +51,7 @@ impl FbConsole {
         self.stride = width;
         self.col = 0;
         self.row = 0;
+        self.y_offset = 0;
         self.cols = width / FONT_WIDTH;
         self.rows = height / FONT_HEIGHT;
         true
@@ -56,12 +61,22 @@ impl FbConsole {
         !self.fb.is_null()
     }
 
-    /// Render a character glyph at character cell (cx, cy).
+    /// Set a pixel Y offset for the text area (e.g. below a logo banner).
+    /// Text rows and scrolling are confined to the area below this offset.
+    pub fn set_row(&mut self, text_row: u32) {
+        let pixel_offset = text_row * FONT_HEIGHT;
+        self.y_offset = pixel_offset.min(self.height);
+        self.rows = (self.height - self.y_offset) / FONT_HEIGHT;
+        self.row = 0;
+        self.col = 0;
+    }
+
+    /// Render a character glyph at character cell (cx, cy) within the text area.
     fn put_char(&self, cx: u32, cy: u32, ch: u8) {
         let glyph_idx = if (ch as usize) < 128 { ch as usize } else { 0 };
         let glyph = &FONT[glyph_idx];
         let px = cx * FONT_WIDTH;
-        let py = cy * FONT_HEIGHT;
+        let py = self.y_offset + cy * FONT_HEIGHT;
 
         for row in 0..FONT_HEIGHT {
             let bits = glyph[row as usize];
@@ -87,24 +102,6 @@ impl FbConsole {
         }
     }
 
-    /// Clear a character cell to background color.
-    fn clear_cell(&self, cx: u32, cy: u32) {
-        let px = cx * FONT_WIDTH;
-        let py = cy * FONT_HEIGHT;
-        for row in 0..FONT_HEIGHT {
-            let y = py + row;
-            if y >= self.height { break; }
-            for col in 0..FONT_WIDTH {
-                let x = px + col;
-                if x >= self.width { break; }
-                let offset = (y * self.stride + x) as isize;
-                unsafe {
-                    self.fb.offset(offset).write_volatile(self.bg);
-                }
-            }
-        }
-    }
-
     /// Write one character at the cursor position and advance.
     pub fn write_char(&mut self, ch: u8) {
         match ch {
@@ -120,7 +117,6 @@ impl FbConsole {
                 self.col = 0;
             }
             b'\t' => {
-                // Tab to next 8-column boundary
                 let next = (self.col + 8) & !7;
                 while self.col < next && self.col < self.cols {
                     self.put_char(self.col, self.row, b' ');
@@ -150,22 +146,26 @@ impl FbConsole {
         }
     }
 
-    /// Scroll the framebuffer up by one text row (FONT_HEIGHT pixels).
+    /// Scroll the text area up by one text row, preserving the logo above y_offset.
     fn scroll_up(&self) {
-        let row_bytes = self.stride * FONT_HEIGHT;
-        let total_pixels = self.stride * self.height;
-        let copy_pixels = total_pixels - row_bytes;
+        let font_row_pixels = (self.stride * FONT_HEIGHT) as usize;
+        let text_start = (self.y_offset * self.stride) as usize;
+        let text_area_pixels = (self.stride * (self.height - self.y_offset)) as usize;
+        let copy_pixels = text_area_pixels - font_row_pixels;
 
         unsafe {
-            // Move everything up by FONT_HEIGHT rows
+            // Move text area up by FONT_HEIGHT pixel rows
             core::ptr::copy(
-                self.fb.add(row_bytes as usize),
-                self.fb,
-                copy_pixels as usize,
+                self.fb.add(text_start + font_row_pixels),
+                self.fb.add(text_start),
+                copy_pixels,
             );
-            // Clear the bottom row
-            let bottom_start = self.fb.add(copy_pixels as usize);
-            core::ptr::write_bytes(bottom_start, 0, row_bytes as usize);
+            // Clear the bottom text row
+            core::ptr::write_bytes(
+                self.fb.add(text_start + copy_pixels),
+                0,
+                font_row_pixels,
+            );
         }
     }
 }

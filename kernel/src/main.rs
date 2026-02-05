@@ -90,6 +90,8 @@ pub extern "C" fn kmain() -> ! {
         if let Some((fb, w, h)) = drivers::virtio::gpu::framebuffer() {
             console::init_fb(fb, w, h);
             println!("[boot] Framebuffer console active ({}x{})", w, h);
+            // Draw animated color logo and offset text below it
+            console::draw_boot_logo();
         }
     }
 

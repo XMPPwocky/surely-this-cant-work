@@ -1,5 +1,6 @@
 pub mod font;
 pub mod framebuffer;
+pub mod logo;
 
 use crate::sync::SpinLock;
 use framebuffer::FbConsole;
@@ -37,4 +38,13 @@ pub fn init_fb(fb: *mut u32, width: u32, height: u32) {
 /// Flush the framebuffer to the GPU display.
 pub fn fb_flush() {
     crate::drivers::virtio::gpu::flush();
+}
+
+/// Draw the animated boot logo and offset the text console below it.
+pub fn draw_boot_logo() {
+    if let Some((fb, w, h)) = crate::drivers::virtio::gpu::framebuffer() {
+        let rows_used = logo::draw_boot_logo(fb, w, h);
+        let mut con = FB_CONSOLE.lock();
+        con.set_row(rows_used);
+    }
 }
