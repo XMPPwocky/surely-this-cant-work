@@ -8,6 +8,7 @@ const MAX_CHANNELS: usize = 16;
 
 /// A fixed-size message
 #[derive(Clone)]
+#[repr(C)]
 pub struct Message {
     pub data: [u8; MAX_MSG_SIZE],
     pub len: usize,
@@ -33,7 +34,6 @@ impl Message {
     }
 }
 
-/// A uni-directional message channel (bounded queue)
 struct Channel {
     queue: VecDeque<Message>,
     active: bool,
@@ -85,7 +85,7 @@ pub fn channel_create() -> usize {
     panic!("No free channels");
 }
 
-/// Send a message on a channel (non-blocking).
+/// Send a message on a channel. Used by kernel tasks directly (owned msg).
 pub fn channel_send(ch: usize, msg: Message) {
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch) {
@@ -95,8 +95,19 @@ pub fn channel_send(ch: usize, msg: Message) {
     }
 }
 
-/// Try to receive a message from a channel (non-blocking).
-/// Returns None if the queue is empty.
+/// Send a message on a channel (by reference, for syscall path). Returns Ok(()) or Err(()).
+pub fn channel_send_ref(ch: usize, msg: &Message) -> Result<(), ()> {
+    let mut mgr = CHANNELS.lock();
+    if let Some(Some(channel)) = mgr.channels.get_mut(ch) {
+        if channel.active {
+            channel.queue.push_back(msg.clone());
+            return Ok(());
+        }
+    }
+    Err(())
+}
+
+/// Try to receive a message (non-blocking). Returns None if empty.
 pub fn channel_recv(ch: usize) -> Option<Message> {
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch) {
@@ -104,6 +115,11 @@ pub fn channel_recv(ch: usize) -> Option<Message> {
     } else {
         None
     }
+}
+
+/// Alias for channel_recv (used by syscall path).
+pub fn channel_try_recv(ch: usize) -> Option<Message> {
+    channel_recv(ch)
 }
 
 /// Close a channel.

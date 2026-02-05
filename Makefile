@@ -3,7 +3,7 @@ KERNEL_BIN = target/riscv64gc-unknown-none-elf/release/kernel.bin
 RUST_TOOLCHAIN_BIN = $(shell . $$HOME/.cargo/env && rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin
 OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 
-.PHONY: build run run-gui debug clean
+.PHONY: build run run-gui run-vnc run-gpu-screenshot debug clean
 
 build:
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml
@@ -20,6 +20,34 @@ run-gui: build
 		-device virtio-gpu-device \
 		-display gtk \
 		-kernel $(KERNEL_BIN)
+
+# VNC mode: connect with a VNC client to :5900, serial on stdio
+run-vnc: build
+	qemu-system-riscv64 -machine virt -serial stdio \
+		-bios default -m 128M \
+		-device virtio-gpu-device \
+		-display vnc=:0 \
+		-kernel $(KERNEL_BIN)
+
+# Headless GPU with screenshot: runs QEMU with virtio-gpu, takes PPM screenshot via monitor
+# Usage: make run-gpu-screenshot DELAY=5
+DELAY ?= 5
+SCREENSHOT ?= /tmp/rvos-screenshot.ppm
+run-gpu-screenshot: build
+	@echo "Starting QEMU with virtio-gpu (headless)..."
+	qemu-system-riscv64 -machine virt -nographic \
+		-serial mon:stdio \
+		-bios default -m 128M \
+		-device virtio-gpu-device \
+		-display vnc=:0 \
+		-kernel $(KERNEL_BIN) \
+		-monitor unix:/tmp/qemu-monitor.sock,server,nowait &
+	@sleep $(DELAY)
+	@echo "Taking screenshot to $(SCREENSHOT)..."
+	@echo "screendump $(SCREENSHOT)" | socat - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>/dev/null || true
+	@sleep 1
+	@kill %1 2>/dev/null || true
+	@[ -f $(SCREENSHOT) ] && echo "Screenshot saved: $(SCREENSHOT)" || echo "Screenshot failed (install socat?)"
 
 debug: build
 	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \

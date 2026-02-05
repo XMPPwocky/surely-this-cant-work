@@ -1,9 +1,8 @@
     .section .text
     .globl _trap_entry
-    .globl _user_trap_return
     .align 2
 _trap_entry:
-    # Check if we came from U-mode by reading sstatus.SPP
+    # Check if we came from U-mode or S-mode.
     # sscratch holds kernel sp when in U-mode, 0 when in S-mode
     csrrw   sp, sscratch, sp
     # If sp (now old sscratch) is zero, we came from S-mode
@@ -15,7 +14,7 @@ _from_kernel:
     # Allocate TrapFrame on kernel stack: 32 regs + sstatus + sepc = 34 * 8 = 272 bytes
     addi    sp, sp, -272
 
-    # Save x1-x31 (x0 is always zero, skip saving it)
+    # Save x1-x31
     sd      x1,   8(sp)
     sd      x3,  24(sp)
     sd      x4,  32(sp)
@@ -60,17 +59,17 @@ _from_kernel:
     csrr    t0, sepc
     sd      t0, 264(sp)
 
-    # Call Rust trap handler with pointer to TrapFrame
+    # Call Rust trap handler
     mv      a0, sp
     call    trap_handler
 
-    # Restore sstatus and sepc (may have been modified by handler)
+    # Restore sstatus and sepc
     ld      t0, 256(sp)
     csrw    sstatus, t0
     ld      t0, 264(sp)
     csrw    sepc, t0
 
-    # Restore x1, x3-x31 (skip x0 and x2/sp)
+    # Restore x1, x3-x31
     ld      x1,   8(sp)
     ld      x3,  24(sp)
     ld      x4,  32(sp)
@@ -102,7 +101,7 @@ _from_kernel:
     ld      x30,240(sp)
     ld      x31,248(sp)
 
-    # Restore sp
+    # Restore sp and return to S-mode
     addi    sp, sp, 272
     sret
 
@@ -157,22 +156,30 @@ _from_user:
     csrr    t0, sepc
     sd      t0, 264(sp)
 
-    # Call Rust trap handler with pointer to TrapFrame
+    # Switch to kernel page table before calling trap handler
+    # This ensures the kernel runs with its own page table
+    call    restore_kernel_satp_asm
+
+    # Call Rust trap handler
     mv      a0, sp
     call    trap_handler
 
-    # Fall through to _user_trap_return
+    # Before returning to user mode, restore the user's page table
+    # Call Rust function to get the current process's user satp
+    call    get_current_user_satp
+    # a0 = user satp (0 if not a user process)
+    beqz    a0, _user_trap_return_no_satp_switch
+    csrw    satp, a0
+    sfence.vma
+_user_trap_return_no_satp_switch:
 
-_user_trap_return:
-    # a0 = pointer to TrapFrame (either from above or from sret-to-user path)
-    # If we get here from trap_handler, sp still points to the frame
     # Restore sstatus and sepc
     ld      t0, 256(sp)
     csrw    sstatus, t0
     ld      t0, 264(sp)
     csrw    sepc, t0
 
-    # Restore user sp into sscratch
+    # Restore user sp into sscratch (so next trap can swap)
     ld      t0, 16(sp)
     csrw    sscratch, t0
 

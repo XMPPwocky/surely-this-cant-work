@@ -19,11 +19,39 @@ mod task;
 global_asm!(include_str!("arch/boot.S"));
 global_asm!(include_str!("arch/trap.S"));
 global_asm!(include_str!("arch/switch.S"));
+global_asm!(include_str!("arch/user_programs.S"));
 
 // Shared state for the IPC ping-pong demo
 static PING_CHANNEL: AtomicUsize = AtomicUsize::new(0);
 static PONG_CHANNEL: AtomicUsize = AtomicUsize::new(0);
 static DEMO_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Get user program bytes from embedded assembly symbols
+fn user_hello_code() -> &'static [u8] {
+    extern "C" {
+        static _user_hello_start: u8;
+        static _user_hello_end: u8;
+    }
+    unsafe {
+        let start = &_user_hello_start as *const u8;
+        let end = &_user_hello_end as *const u8;
+        let len = end as usize - start as usize;
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
+fn user_getpid_code() -> &'static [u8] {
+    extern "C" {
+        static _user_getpid_start: u8;
+        static _user_getpid_end: u8;
+    }
+    unsafe {
+        let start = &_user_getpid_start as *const u8;
+        let end = &_user_getpid_end as *const u8;
+        let len = end as usize - start as usize;
+        core::slice::from_raw_parts(start, len)
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
@@ -50,16 +78,19 @@ pub extern "C" fn kmain() -> ! {
     println!("[boot] {} page frames allocated for page tables", mm::frame::frames_allocated());
     println!();
 
+    // Save kernel satp for restoring when returning from user mode
+    task::save_kernel_satp();
+
     // ---- Phase 3: Traps and interrupts ----
     arch::trap::init();
     drivers::plic::init();
 
-    // ---- Phase 4: Scheduler ----
+    // ---- Phase 4: Scheduler and IPC ----
     task::init();
     ipc::init();
 
     // ---- Phase 5: Spawn demo tasks ----
-    println!("[demo] Spawning integration demo tasks...");
+    println!("[demo] Spawning kernel demo tasks...");
     let ch_ping = ipc::channel_create();
     let ch_pong = ipc::channel_create();
     PING_CHANNEL.store(ch_ping, Ordering::SeqCst);
@@ -69,6 +100,13 @@ pub extern "C" fn kmain() -> ! {
     task::spawn_named(task_counter_b, "counter-B");
     task::spawn_named(task_ping, "ping");
     task::spawn_named(task_pong, "pong");
+
+    // ---- Phase 5b: Spawn user-mode tasks ----
+    println!("[demo] Spawning user-mode tasks...");
+    task::spawn_user(user_hello_code(), "user-hello");
+    task::spawn_user(user_getpid_code(), "user-getpid");
+
+    // Spawn monitor last (it waits for everyone)
     task::spawn_named(task_monitor, "monitor");
     println!();
 
@@ -77,13 +115,13 @@ pub extern "C" fn kmain() -> ! {
     println!("[boot] System ready. Entering idle loop.");
     println!();
 
-    // Idle loop (PID 0): scheduler will preempt into spawned tasks
+    // Idle loop (PID 0): yield to spawned tasks cooperatively
     loop {
-        unsafe { core::arch::asm!("wfi"); }
-        // Check if the demo is done
+        task::schedule();
         if DEMO_DONE.load(Ordering::SeqCst) {
             break;
         }
+        unsafe { core::arch::asm!("wfi"); }
     }
 
     // ---- Phase 7: Clean shutdown ----
@@ -138,13 +176,13 @@ fn task_ping() {
         ipc::channel_send(ch_ping, msg);
         println!("[ping] sent ping #{}", i);
 
-        // Wait for pong reply (busy-poll)
+        // Wait for pong reply (busy-poll with yield)
         loop {
             if let Some(reply) = ipc::channel_recv(ch_pong) {
                 println!("[ping] received: \"{}\" from PID {}", reply.as_str(), reply.sender_pid);
                 break;
             }
-            busy_delay(10_000);
+            task::schedule();
         }
         busy_delay(50_000);
     }
@@ -161,7 +199,7 @@ fn task_pong() {
     let ch_pong = PONG_CHANNEL.load(Ordering::SeqCst);
 
     for _i in 0..5 {
-        // Wait for ping message
+        // Wait for ping message (busy-poll with yield)
         loop {
             if let Some(msg) = ipc::channel_recv(ch_ping) {
                 println!("[pong] received: \"{}\" from PID {}", msg.as_str(), msg.sender_pid);
@@ -171,7 +209,7 @@ fn task_pong() {
                 println!("[pong] sent pong reply");
                 break;
             }
-            busy_delay(10_000);
+            task::schedule();
         }
     }
     println!("[pong] done");
@@ -191,16 +229,18 @@ fn task_monitor() {
     println!("----------------------------------");
     println!();
 
-    // Wait for counter and IPC tasks to finish (PIDs 1-4)
+    // Wait for counter tasks (PIDs 1-4) and user tasks (PIDs 5-6) to finish
     loop {
         let still_running = task::is_alive(1)
             || task::is_alive(2)
             || task::is_alive(3)
-            || task::is_alive(4);
+            || task::is_alive(4)
+            || task::is_alive(5)
+            || task::is_alive(6);
         if !still_running {
             break;
         }
-        busy_delay(50_000);
+        task::schedule();
     }
 
     println!();
@@ -221,9 +261,16 @@ fn task_monitor() {
     task::exit_current();
 }
 
-/// Busy-wait delay (spin loop)
+/// Busy-wait delay with cooperative yielding
 fn busy_delay(iters: usize) {
-    for _ in 0..iters {
-        core::hint::spin_loop();
+    let mut x: usize = 0;
+    for i in 0..iters {
+        unsafe {
+            core::ptr::write_volatile(&mut x as *mut usize, x.wrapping_add(1));
+        }
+        // Yield periodically to allow other tasks to run
+        if i % 20_000 == 0 && i > 0 {
+            task::schedule();
+        }
     }
 }
