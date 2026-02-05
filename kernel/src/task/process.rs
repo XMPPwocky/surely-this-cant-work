@@ -1,5 +1,5 @@
 use crate::task::context::TaskContext;
-use crate::mm::address::{PhysPageNum, PAGE_SIZE};
+use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
 use crate::mm::frame;
 use crate::mm::page_table::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U};
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -9,12 +9,6 @@ const KERNEL_STACK_SIZE: usize = KERNEL_STACK_PAGES * PAGE_SIZE;
 
 const USER_STACK_PAGES: usize = 4; // 16 KiB
 const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
-
-// User code is placed at this address
-pub const USER_CODE_BASE: usize = 0x8040_0000;
-// User stack top (grows downward from here)
-pub const USER_STACK_TOP: usize = 0x8060_0000;
-pub const USER_STACK_BASE: usize = USER_STACK_TOP - USER_STACK_SIZE;
 
 pub const MAX_PROCS: usize = 64;
 const NAME_LEN: usize = 16;
@@ -40,7 +34,9 @@ pub struct Process {
     pub kernel_stack_base: usize,
     pub kernel_stack_top: usize,
     pub is_user: bool,
-    pub user_satp: usize, // satp value for user page table (0 = kernel task)
+    pub user_satp: usize,      // satp value for user page table (0 = kernel task)
+    pub user_entry: usize,     // virtual (= physical) address of user code
+    pub user_stack_top: usize, // virtual (= physical) address of user stack top
     name: [u8; NAME_LEN],
     name_len: usize,
 }
@@ -65,6 +61,8 @@ impl Process {
             kernel_stack_top: stack_top,
             is_user: false,
             user_satp: 0,
+            user_entry: 0,
+            user_stack_top: 0,
             name: [0u8; NAME_LEN],
             name_len: 0,
         }
@@ -72,7 +70,8 @@ impl Process {
 
     /// Create a user process.
     /// `user_code` is the machine code bytes to run in U-mode.
-    /// We create a new page table, copy code to user pages, set up user stack.
+    /// User code and stack are identity-mapped (VA=PA) in a per-process
+    /// page table, so addresses work under both kernel and user page tables.
     pub fn new_user(user_code: &[u8]) -> Self {
         let pid = alloc_pid();
 
@@ -82,16 +81,35 @@ impl Process {
         let kstack_base = kstack_ppn.0 * PAGE_SIZE;
         let kstack_top = kstack_base + KERNEL_STACK_SIZE;
 
-        // Create a new page table for this user process
-        let mut pt = create_user_page_table(user_code);
-        let satp = pt.satp();
+        // Allocate user code pages
+        let code_pages = (user_code.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+        let code_pages = if code_pages == 0 { 1 } else { code_pages };
+        let code_ppn = frame::frame_alloc_contiguous(code_pages)
+            .expect("Failed to allocate user code pages");
+        let code_phys = code_ppn.0 * PAGE_SIZE;
 
-        // Leak the page table (it needs to live as long as the process)
+        // Copy user code into the allocated pages
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                user_code.as_ptr(),
+                code_phys as *mut u8,
+                user_code.len(),
+            );
+        }
+
+        // Allocate user stack pages
+        let stack_ppn = frame::frame_alloc_contiguous(USER_STACK_PAGES)
+            .expect("Failed to allocate user stack pages");
+        let stack_phys_base = stack_ppn.0 * PAGE_SIZE;
+        let stack_phys_top = stack_phys_base + USER_STACK_SIZE;
+
+        // Create user page table with identity-mapped user pages
+        let pt = create_user_page_table_identity(
+            code_ppn, code_pages, stack_ppn, USER_STACK_PAGES,
+        );
+        let satp = pt.satp();
         core::mem::forget(pt);
 
-        // Set up context: the "ra" will point to a trampoline that
-        // sets up sscratch and sret's to user mode
-        // We use a special entry that will jump to user mode
         let context = TaskContext::new_user_entry(kstack_top);
 
         Process {
@@ -102,6 +120,8 @@ impl Process {
             kernel_stack_top: kstack_top,
             is_user: true,
             user_satp: satp,
+            user_entry: code_phys,
+            user_stack_top: stack_phys_top,
             name: [0u8; NAME_LEN],
             name_len: 0,
         }
@@ -117,6 +137,8 @@ impl Process {
             kernel_stack_top: 0,
             is_user: false,
             user_satp: 0,
+            user_entry: 0,
+            user_stack_top: 0,
             name: [0u8; NAME_LEN],
             name_len: 0,
         };
@@ -136,11 +158,17 @@ impl Process {
     }
 }
 
-/// Create a user page table:
-/// - Identity-map all kernel memory (without U bit)
-/// - Map user code pages at USER_CODE_BASE (with U bit)
-/// - Map user stack pages at USER_STACK_BASE (with U bit)
-fn create_user_page_table(user_code: &[u8]) -> PageTable {
+/// Create a user page table with identity-mapped user pages.
+/// All kernel memory is identity-mapped without U bit.
+/// User code and stack pages are identity-mapped WITH U bit at their
+/// physical addresses, so the same addresses work under both kernel
+/// and user page tables (critical for syscall buffer access).
+fn create_user_page_table_identity(
+    code_ppn: PhysPageNum,
+    code_pages: usize,
+    stack_ppn: PhysPageNum,
+    stack_pages: usize,
+) -> PageTable {
     extern "C" {
         static _text_start: u8;
         static _text_end: u8;
@@ -159,10 +187,6 @@ fn create_user_page_table(user_code: &[u8]) -> PageTable {
 
     let mut pt = PageTable::new();
 
-    crate::println!("[user-pt] free_start={:#x} user_region={:#x}..{:#x}",
-        (stack_top + PAGE_SIZE - 1) & !(PAGE_SIZE - 1),
-        USER_CODE_BASE, USER_STACK_TOP);
-
     // Identity-map SBI region
     pt.map_range(0x8000_0000, 0x8000_0000, text_start - 0x8000_0000, PTE_R | PTE_X);
 
@@ -175,18 +199,37 @@ fn create_user_page_table(user_code: &[u8]) -> PageTable {
     // Identity-map data + bss + stack as R+W (no U bit)
     pt.map_range(data_start, data_start, stack_top - data_start, PTE_R | PTE_W);
 
-    // Identity-map free memory region as R+W (no U bit)
-    // Skip the user code and stack regions to avoid double-mapping
+    // Identity-map ALL free memory as R+W (no U bit).
+    // The user code/stack pages are allocated from this pool and will be
+    // re-mapped below with the U bit (the second map call will override).
+    // Actually, we need to skip the user pages to avoid double-mapping.
     let free_start = (stack_top + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let user_region_start = USER_CODE_BASE;
-    let user_region_end = USER_STACK_TOP;
-    // Map free memory before the user region
-    if free_start < user_region_start {
-        pt.map_range(free_start, free_start, user_region_start - free_start, PTE_R | PTE_W);
+
+    // Compute ranges to skip (user code and stack physical pages)
+    let code_start = code_ppn.0 * PAGE_SIZE;
+    let code_end = code_start + code_pages * PAGE_SIZE;
+    let ustack_start = stack_ppn.0 * PAGE_SIZE;
+    let ustack_end = ustack_start + stack_pages * PAGE_SIZE;
+
+    // Build a list of (start, end) ranges to exclude, sorted
+    let mut excludes: [(usize, usize); 2] = [(code_start, code_end), (ustack_start, ustack_end)];
+    if excludes[0].0 > excludes[1].0 {
+        excludes.swap(0, 1);
     }
-    // Map free memory after the user region
-    if user_region_end < 0x8800_0000 {
-        pt.map_range(user_region_end, user_region_end, 0x8800_0000 - user_region_end, PTE_R | PTE_W);
+
+    // Map free memory, skipping excluded ranges
+    let mut cursor = free_start;
+    let ram_end: usize = 0x8800_0000;
+    for &(ex_start, ex_end) in &excludes {
+        if cursor < ex_start {
+            pt.map_range(cursor, cursor, ex_start - cursor, PTE_R | PTE_W);
+        }
+        if ex_end > cursor {
+            cursor = ex_end;
+        }
+    }
+    if cursor < ram_end {
+        pt.map_range(cursor, cursor, ram_end - cursor, PTE_R | PTE_W);
     }
 
     // Identity-map UART
@@ -201,34 +244,16 @@ fn create_user_page_table(user_code: &[u8]) -> PageTable {
     // Identity-map VirtIO
     pt.map_range(0x1000_1000, 0x1000_1000, 0x0000_8000, PTE_R | PTE_W);
 
-    // Now allocate and map user code pages with U bit
-    let code_pages = (user_code.len() + PAGE_SIZE - 1) / PAGE_SIZE;
-    let code_pages = if code_pages == 0 { 1 } else { code_pages };
-    let code_ppn = frame::frame_alloc_contiguous(code_pages)
-        .expect("Failed to allocate user code pages");
-    // Copy user code into these pages
-    let code_dst = code_ppn.0 * PAGE_SIZE;
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            user_code.as_ptr(),
-            code_dst as *mut u8,
-            user_code.len(),
-        );
-    }
-    // Map code pages at USER_CODE_BASE with U+R+X
+    // Identity-map user code pages with U+R+X at their physical address
     for i in 0..code_pages {
-        let vpn = crate::mm::address::VirtPageNum((USER_CODE_BASE + i * PAGE_SIZE) / PAGE_SIZE);
-        let ppn = PhysPageNum(code_ppn.0 + i);
-        pt.map(vpn, ppn, PTE_R | PTE_X | PTE_U);
+        let addr = code_ppn.0 + i;
+        pt.map(VirtPageNum(addr), PhysPageNum(addr), PTE_R | PTE_X | PTE_U);
     }
 
-    // Allocate and map user stack pages with U bit
-    let stack_ppn = frame::frame_alloc_contiguous(USER_STACK_PAGES)
-        .expect("Failed to allocate user stack pages");
-    for i in 0..USER_STACK_PAGES {
-        let vpn = crate::mm::address::VirtPageNum((USER_STACK_BASE + i * PAGE_SIZE) / PAGE_SIZE);
-        let ppn = PhysPageNum(stack_ppn.0 + i);
-        pt.map(vpn, ppn, PTE_R | PTE_W | PTE_U);
+    // Identity-map user stack pages with U+R+W at their physical address
+    for i in 0..stack_pages {
+        let addr = stack_ppn.0 + i;
+        pt.map(VirtPageNum(addr), PhysPageNum(addr), PTE_R | PTE_W | PTE_U);
     }
 
     pt

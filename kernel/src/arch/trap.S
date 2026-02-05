@@ -108,14 +108,27 @@ _from_kernel:
 _from_user:
     # sp = kernel stack pointer (from sscratch)
     # sscratch = user sp (we swapped)
+    #
+    # IMPORTANT: Switch to kernel page table FIRST, before using kernel stack.
+    # The kernel stack physical address may fall in a range (e.g., 0x80400000-0x80600000)
+    # that is not identity-mapped in the user page table but is identity-mapped in
+    # the kernel page table. We must switch satp before any stack access.
+    # We use t0 as a temporary (user t0 will be saved later).
+    # Load kernel satp from the global variable KERNEL_SATP_RAW.
+1:  auipc   t0, %pcrel_hi(KERNEL_SATP_RAW)
+    ld      t0, %pcrel_lo(1b)(t0)
+    csrw    satp, t0
+    sfence.vma
+
+    # Now kernel page table is active, kernel stack is accessible.
     # Allocate TrapFrame on kernel stack
     addi    sp, sp, -272
 
-    # Save x1-x31
+    # Save x1-x31 (t0/x5 was clobbered above, save 0 as placeholder)
     sd      x1,   8(sp)
     sd      x3,  24(sp)
     sd      x4,  32(sp)
-    sd      x5,  40(sp)
+    sd      zero, 40(sp)    # x5/t0 was clobbered (save 0)
     sd      x6,  48(sp)
     sd      x7,  56(sp)
     sd      x8,  64(sp)
@@ -147,6 +160,12 @@ _from_user:
     csrr    t0, sscratch
     sd      t0,  16(sp)
 
+    # Set sscratch = 0 to indicate we are in S-mode now.
+    # This is critical: if the trap handler calls schedule() and switches
+    # to a kernel task, that kernel task's future traps must see sscratch=0
+    # to take the _from_kernel path.
+    csrw    sscratch, zero
+
     # Store zero into regs[0]
     sd      zero, 0(sp)
 
@@ -156,24 +175,15 @@ _from_user:
     csrr    t0, sepc
     sd      t0, 264(sp)
 
-    # Switch to kernel page table before calling trap handler
-    # This ensures the kernel runs with its own page table
-    call    restore_kernel_satp_asm
-
     # Call Rust trap handler
     mv      a0, sp
     call    trap_handler
 
-    # Before returning to user mode, restore the user's page table
-    # Call Rust function to get the current process's user satp
+    # Get the user satp for later (store in s1 temporarily, will be restored below)
     call    get_current_user_satp
-    # a0 = user satp (0 if not a user process)
-    beqz    a0, _user_trap_return_no_satp_switch
-    csrw    satp, a0
-    sfence.vma
-_user_trap_return_no_satp_switch:
+    mv      s1, a0      # Save user satp in s1 (will be restored from trap frame below)
 
-    # Restore sstatus and sepc
+    # Restore sstatus and sepc (still under kernel page table)
     ld      t0, 256(sp)
     csrw    sstatus, t0
     ld      t0, 264(sp)
@@ -183,7 +193,7 @@ _user_trap_return_no_satp_switch:
     ld      t0, 16(sp)
     csrw    sscratch, t0
 
-    # Restore x1, x3-x31
+    # Restore x1, x3-x31 (all loaded from kernel stack under kernel page table)
     ld      x1,   8(sp)
     ld      x3,  24(sp)
     ld      x4,  32(sp)
@@ -191,7 +201,7 @@ _user_trap_return_no_satp_switch:
     ld      x6,  48(sp)
     ld      x7,  56(sp)
     ld      x8,  64(sp)
-    ld      x9,  72(sp)
+    # x9/s1 loaded below after satp switch
     ld      x10, 80(sp)
     ld      x11, 88(sp)
     ld      x12, 96(sp)
@@ -215,7 +225,19 @@ _user_trap_return_no_satp_switch:
     ld      x30,240(sp)
     ld      x31,248(sp)
 
-    # Restore sp from sscratch (user sp), put kernel sp into sscratch
+    # Deallocate trap frame and swap sp/sscratch
     addi    sp, sp, 272
     csrrw   sp, sscratch, sp
+
+    # Now switch to user page table (s1 still holds user satp)
+    # Do this AFTER all kernel stack accesses are complete
+    beqz    s1, _user_trap_skip_satp
+    csrw    satp, s1
+    sfence.vma
+_user_trap_skip_satp:
+    # Restore s1 to its original value (which was 0 for user processes
+    # since we zeroed all regs before sret; for returning from syscall
+    # we clobbered s1 but user code shouldn't depend on callee-saved
+    # registers across syscalls)
+    li      s1, 0
     sret

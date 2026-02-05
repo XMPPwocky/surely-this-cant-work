@@ -5,7 +5,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::SpinLock;
 use crate::task::context::TaskContext;
-use crate::task::process::{Process, ProcessState, MAX_PROCS, USER_CODE_BASE, USER_STACK_TOP};
+use crate::task::process::{Process, ProcessState, MAX_PROCS};
 
 extern "C" {
     fn switch_context(old: *mut TaskContext, new: *const TaskContext);
@@ -47,6 +47,11 @@ static SCHEDULER: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 /// Stored kernel satp value for restoring after user process trap
 static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 
+/// Raw kernel satp value accessible from assembly (trap.S uses this
+/// to switch to kernel page table before accessing the kernel stack).
+#[no_mangle]
+static mut KERNEL_SATP_RAW: usize = 0;
+
 pub fn init() {
     SCHEDULER.lock().init();
     crate::println!("Scheduler initialized (max {} processes)", MAX_PROCS);
@@ -56,6 +61,9 @@ pub fn init() {
 pub fn save_kernel_satp() {
     let satp: usize = crate::read_csr!("satp");
     KERNEL_SATP.store(satp, Ordering::Relaxed);
+    unsafe {
+        KERNEL_SATP_RAW = satp;
+    }
 }
 
 /// Spawn a new kernel task. Returns the PID.
@@ -154,6 +162,14 @@ pub fn schedule() {
 
     let old_ctx = &mut sched.processes[old_pid].as_mut().unwrap().context as *mut TaskContext;
     let new_ctx = &sched.processes[next_pid].as_ref().unwrap().context as *const TaskContext;
+
+    // Disable interrupts BEFORE dropping the lock. This prevents the lock's
+    // Drop from re-enabling interrupts (which could allow a timer to fire
+    // between lock release and switch_context, causing recursive scheduling).
+    // The target task is responsible for re-enabling them:
+    // - kernel_task_trampoline does csrsi sstatus,2
+    // - user_entry_trampoline transitions to U-mode via sret (SPIE -> SIE)
+    crate::arch::csr::disable_interrupts();
 
     // Drop the lock BEFORE switching (critical!)
     drop(sched);
@@ -268,8 +284,8 @@ pub extern "C" fn prepare_user_return(out: *mut UserReturnInfo) {
     let proc = sched.processes[pid].as_ref().expect("prepare_user_return: no current process");
     unsafe {
         (*out).satp = proc.user_satp;
-        (*out).sepc = USER_CODE_BASE;
-        (*out).user_sp = USER_STACK_TOP;
+        (*out).sepc = proc.user_entry;
+        (*out).user_sp = proc.user_stack_top;
         (*out).kernel_sp = proc.kernel_stack_top;
     }
 }

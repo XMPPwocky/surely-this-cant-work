@@ -85,6 +85,14 @@ pub extern "C" fn kmain() -> ! {
     arch::trap::init();
     drivers::plic::init();
 
+    // ---- Phase 3b: VirtIO GPU (optional, nographic mode has no device) ----
+    if drivers::virtio::gpu::init() {
+        if let Some((fb, w, h)) = drivers::virtio::gpu::framebuffer() {
+            console::init_fb(fb, w, h);
+            println!("[boot] Framebuffer console active ({}x{})", w, h);
+        }
+    }
+
     // ---- Phase 4: Scheduler and IPC ----
     task::init();
     ipc::init();
@@ -115,10 +123,12 @@ pub extern "C" fn kmain() -> ! {
     println!("[boot] System ready. Entering idle loop.");
     println!();
 
-    // Idle loop (PID 0): yield to spawned tasks cooperatively
+    // Idle loop (PID 0): yield to spawned tasks cooperatively.
+    // Use a function call to check DEMO_DONE to prevent the compiler
+    // from caching the address in a callee-saved register across schedule().
     loop {
         task::schedule();
-        if DEMO_DONE.load(Ordering::SeqCst) {
+        if check_demo_done() {
             break;
         }
         unsafe { core::arch::asm!("wfi"); }
@@ -259,6 +269,13 @@ fn task_monitor() {
     println!("[monitor] signaled shutdown");
 
     task::exit_current();
+}
+
+/// Check if the demo is done (separate function to prevent the compiler
+/// from caching the DEMO_DONE address in a callee-saved register across schedule()).
+#[inline(never)]
+fn check_demo_done() -> bool {
+    DEMO_DONE.load(Ordering::SeqCst)
 }
 
 /// Busy-wait delay with cooperative yielding

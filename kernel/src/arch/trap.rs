@@ -59,10 +59,18 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     15 => "store/AMO",
                     _ => "unknown",
                 };
+                let sstatus_val = tf.sstatus;
+                let spp = (sstatus_val >> 8) & 1;
                 crate::println!(
-                    "Page fault ({}): sepc={:#x}, stval={:#x}",
-                    fault_type, tf.sepc, stval
+                    "Page fault ({}): sepc={:#x}, stval={:#x}, SPP={} ({})",
+                    fault_type, tf.sepc, stval, spp,
+                    if spp == 1 { "S-mode" } else { "U-mode" }
                 );
+                crate::println!("  sstatus={:#x} ra={:#x} sp={:#x}",
+                    sstatus_val, tf.regs[1], tf.regs[2]);
+                crate::println!("  s0={:#x} s1={:#x} s2={:#x}",
+                    tf.regs[8], tf.regs[9], tf.regs[10]);
+                crate::println!("  current_pid={}", crate::task::current_pid());
                 panic!("Unhandled page fault");
             }
             _ => {
