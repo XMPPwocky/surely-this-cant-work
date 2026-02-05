@@ -48,3 +48,13 @@ pub fn draw_boot_logo() {
         con.set_row(rows_used);
     }
 }
+
+/// Keep the logo triangle spinning forever (call at shutdown).
+/// Only does anything if GPU is active. Never returns.
+pub fn animate_logo_forever() -> ! {
+    if let Some((fb, w, h)) = crate::drivers::virtio::gpu::framebuffer() {
+        logo::animate_forever(fb, w, h);
+    }
+    // No GPU — just halt
+    loop { unsafe { core::arch::asm!("wfi"); } }
+}

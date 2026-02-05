@@ -150,6 +150,13 @@ pub extern "C" fn kmain() -> ! {
     // Final flush so all output is visible on the GPU framebuffer
     console::fb_flush();
 
+    // If GPU is active, keep the logo triangle spinning so VNC/GUI users
+    // can actually see it. Ctrl+C in the terminal to quit QEMU.
+    // If no GPU (serial-only), shut down cleanly via SBI.
+    if drivers::virtio::gpu::framebuffer().is_some() {
+        console::animate_logo_forever();
+    }
+
     arch::sbi::sbi_shutdown();
 }
 

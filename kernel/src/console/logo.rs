@@ -267,7 +267,34 @@ pub fn draw_boot_logo(fb: *mut u32, width: u32, height: u32) -> u32 {
         c.fill_rect(bar_margin + i as u32 * seg_w, bar_y, seg_w, bar_h, color);
     }
 
-    // 7. Animate spinning triangles
+    // 7. Animate spinning triangles (one cycle)
+    animate_triangles(&c, cx, cy, 24, 0);
+
+    // Redraw ring on top (animation may have clipped edges)
+    c.draw_ring(cx, cy, 82, 78, RING_COLOR);
+    crate::drivers::virtio::gpu::flush();
+
+    // Return number of text rows the banner occupies
+    // (BANNER_HEIGHT / 16 rounded up)
+    (BANNER_HEIGHT + 15) / 16
+}
+
+/// Keep the triangle animation spinning forever (call after demo completes).
+/// This never returns — the user kills QEMU with Ctrl+C.
+pub fn animate_forever(fb: *mut u32, width: u32, height: u32) -> ! {
+    let c = Canvas { fb, stride: width, width, height };
+    let cx = 120i32;
+    let cy = 105i32;
+
+    let mut global_frame = 0u32;
+    loop {
+        animate_triangles(&c, cx, cy, 64, global_frame);
+        global_frame = global_frame.wrapping_add(64);
+    }
+}
+
+/// Run `num_frames` of the spinning triangle animation starting at `start_frame`.
+fn animate_triangles(c: &Canvas, cx: i32, cy: i32, num_frames: u32, start_frame: u32) {
     let outer_r = 72i32;
     let inner_r = 36i32;
     let clear_margin = 77u32;
@@ -275,8 +302,9 @@ pub fn draw_boot_logo(fb: *mut u32, width: u32, height: u32) -> u32 {
     let clear_y = (cy as u32).saturating_sub(clear_margin);
     let clear_size = clear_margin * 2;
 
-    let num_frames = 24u32;
-    for frame in 0..num_frames {
+    for i in 0..num_frames {
+        let frame = start_frame.wrapping_add(i);
+
         // Clear triangle area (preserve ring)
         c.fill_rect(clear_x, clear_y, clear_size, clear_size, BG_DARK);
 
@@ -286,8 +314,8 @@ pub fn draw_boot_logo(fb: *mut u32, width: u32, height: u32) -> u32 {
         let (x1, y1) = tri_vertex(cx, cy, outer_r, step + 21);
         let (x2, y2) = tri_vertex(cx, cy, outer_r, step + 42);
 
-        // Vertex colors cycle through hues
-        let hue_base = frame * 256 / num_frames;
+        // Vertex colors cycle through hues (full cycle every 64 frames)
+        let hue_base = frame.wrapping_mul(256) / 64;
         let c0 = hue_to_rgb(hue_base);
         let c1 = hue_to_rgb(hue_base + 85);
         let c2 = hue_to_rgb(hue_base + 170);
@@ -312,12 +340,4 @@ pub fn draw_boot_logo(fb: *mut u32, width: u32, height: u32) -> u32 {
         crate::drivers::virtio::gpu::flush();
         delay_ms(50);
     }
-
-    // Redraw ring on top (animation may have clipped edges)
-    c.draw_ring(cx, cy, 82, 78, RING_COLOR);
-    crate::drivers::virtio::gpu::flush();
-
-    // Return number of text rows the banner occupies
-    // (BANNER_HEIGHT / 16 rounded up)
-    (BANNER_HEIGHT + 15) / 16
 }
