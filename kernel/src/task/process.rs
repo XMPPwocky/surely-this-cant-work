@@ -7,10 +7,11 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 const KERNEL_STACK_PAGES: usize = 4; // 16 KiB
 const KERNEL_STACK_SIZE: usize = KERNEL_STACK_PAGES * PAGE_SIZE;
 
-const USER_STACK_PAGES: usize = 4; // 16 KiB
+const USER_STACK_PAGES: usize = 8; // 32 KiB
 const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
 
 pub const MAX_PROCS: usize = 64;
+pub const MAX_HANDLES: usize = 16;
 const NAME_LEN: usize = 16;
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
@@ -37,6 +38,7 @@ pub struct Process {
     pub user_satp: usize,      // satp value for user page table (0 = kernel task)
     pub user_entry: usize,     // virtual (= physical) address of user code
     pub user_stack_top: usize, // virtual (= physical) address of user stack top
+    pub handles: [Option<usize>; MAX_HANDLES], // local handle -> global endpoint ID
     name: [u8; NAME_LEN],
     name_len: usize,
 }
@@ -63,6 +65,7 @@ impl Process {
             user_satp: 0,
             user_entry: 0,
             user_stack_top: 0,
+            handles: [None; MAX_HANDLES],
             name: [0u8; NAME_LEN],
             name_len: 0,
         }
@@ -122,6 +125,7 @@ impl Process {
             user_satp: satp,
             user_entry: code_phys,
             user_stack_top: stack_phys_top,
+            handles: [None; MAX_HANDLES],
             name: [0u8; NAME_LEN],
             name_len: 0,
         }
@@ -139,6 +143,7 @@ impl Process {
             user_satp: 0,
             user_entry: 0,
             user_stack_top: 0,
+            handles: [None; MAX_HANDLES],
             name: [0u8; NAME_LEN],
             name_len: 0,
         };
@@ -155,6 +160,34 @@ impl Process {
 
     pub fn name(&self) -> &str {
         core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("???")
+    }
+
+    /// Allocate a handle in this process's table for the given global endpoint ID.
+    /// Returns the local handle index.
+    pub fn alloc_handle(&mut self, global_ep: usize) -> usize {
+        for (i, slot) in self.handles.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(global_ep);
+                return i;
+            }
+        }
+        panic!("Process {}: handle table full", self.pid);
+    }
+
+    /// Look up a local handle to get the global endpoint ID.
+    pub fn lookup_handle(&self, handle: usize) -> Option<usize> {
+        if handle < MAX_HANDLES {
+            self.handles[handle]
+        } else {
+            None
+        }
+    }
+
+    /// Free a local handle.
+    pub fn free_handle(&mut self, handle: usize) {
+        if handle < MAX_HANDLES {
+            self.handles[handle] = None;
+        }
     }
 }
 
