@@ -88,3 +88,13 @@ _user_getpid_start:
 
     j       .
 _user_getpid_end:
+
+    #---------------------------------------------------------------------------
+    # User program: "shell" - interactive command shell
+    #---------------------------------------------------------------------------
+    .globl _user_shell_start
+    .globl _user_shell_end
+    .align 4
+_user_shell_start:
+    .incbin "user/shell/target/riscv64gc-unknown-none-elf/release/shell.bin"
+_user_shell_end:

@@ -48,6 +48,7 @@ pub const STATUS_FEATURES_OK: u32 = 8;
 
 // Device IDs
 pub const DEVICE_ID_GPU: u32 = 16;
+pub const DEVICE_ID_INPUT: u32 = 18;
 
 #[inline]
 pub fn read_reg(base: usize, offset: usize) -> u32 {
@@ -81,6 +82,27 @@ pub fn probe(device_id: u32) -> Option<usize> {
         crate::println!("[virtio] slot {} @ {:#x}: version={} device_id={}", i, base, version, id);
         if id == device_id && (version == 1 || version == 2) {
             return Some(base);
+        }
+    }
+    None
+}
+
+/// Probe all 8 VirtIO MMIO slots and return the base address and slot index
+/// of the first device matching `device_id`, or None.
+pub fn probe_with_slot(device_id: u32) -> Option<(usize, usize)> {
+    for i in 0..VIRTIO_MMIO_SLOTS {
+        let base = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
+        let magic = read_reg(base, REG_MAGIC);
+        if magic != VIRTIO_MAGIC {
+            continue;
+        }
+        let version = read_reg(base, REG_VERSION);
+        let id = read_reg(base, REG_DEVICE_ID);
+        if id == 0 {
+            continue;
+        }
+        if id == device_id && (version == 1 || version == 2) {
+            return Some((base, i));
         }
     }
     None

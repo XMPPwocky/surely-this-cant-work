@@ -179,29 +179,34 @@ _from_user:
     mv      a0, sp
     call    trap_handler
 
-    # Get the user satp for later (store in s1 temporarily, will be restored below)
+    # Get the user satp for later (store in t0; t0 was already clobbered on
+    # trap entry for the kernel satp switch, so the trap frame has 0 for t0.
+    # We sacrifice restoring t0 to use it as a carrier for user_satp across
+    # the kernel->user stack swap.)
     call    get_current_user_satp
-    mv      s1, a0      # Save user satp in s1 (will be restored from trap frame below)
+    mv      t0, a0      # Save user satp in t0
 
     # Restore sstatus and sepc (still under kernel page table)
-    ld      t0, 256(sp)
-    csrw    sstatus, t0
-    ld      t0, 264(sp)
-    csrw    sepc, t0
+    ld      t1, 256(sp)
+    csrw    sstatus, t1
+    ld      t1, 264(sp)
+    csrw    sepc, t1
 
     # Restore user sp into sscratch (so next trap can swap)
-    ld      t0, 16(sp)
-    csrw    sscratch, t0
+    ld      t1, 16(sp)
+    csrw    sscratch, t1
 
     # Restore x1, x3-x31 (all loaded from kernel stack under kernel page table)
+    # Note: x5/t0 is NOT restored here -- it carries user_satp across the stack swap.
+    # This is safe because t0 was already destroyed on trap entry (used for kernel satp).
     ld      x1,   8(sp)
     ld      x3,  24(sp)
     ld      x4,  32(sp)
-    ld      x5,  40(sp)
+    # x5/t0 skipped: carries user_satp
     ld      x6,  48(sp)
     ld      x7,  56(sp)
     ld      x8,  64(sp)
-    # x9/s1 loaded below after satp switch
+    ld      x9,  72(sp)    # s1 restored properly from trap frame
     ld      x10, 80(sp)
     ld      x11, 88(sp)
     ld      x12, 96(sp)
@@ -229,15 +234,12 @@ _from_user:
     addi    sp, sp, 272
     csrrw   sp, sscratch, sp
 
-    # Now switch to user page table (s1 still holds user satp)
+    # Now switch to user page table (t0 holds user satp)
     # Do this AFTER all kernel stack accesses are complete
-    beqz    s1, _user_trap_skip_satp
-    csrw    satp, s1
+    beqz    t0, _user_trap_skip_satp
+    csrw    satp, t0
     sfence.vma
 _user_trap_skip_satp:
-    # Restore s1 to its original value (which was 0 for user processes
-    # since we zeroed all regs before sret; for returning from syscall
-    # we clobbered s1 but user code shouldn't depend on callee-saved
-    # registers across syscalls)
-    li      s1, 0
+    # t0 now has a stale user_satp value, but t0 is caller-saved and was
+    # already destroyed on trap entry, so user code cannot depend on it.
     sret

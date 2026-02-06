@@ -38,6 +38,18 @@ pub fn init() {
     crate::println!("PLIC initialized (UART IRQ {} enabled)", UART_IRQ);
 }
 
+/// Enable an additional IRQ (set priority and enable bit).
+pub fn enable_irq(irq: u32) {
+    // Set priority to 1
+    write_reg(PLIC_PRIORITY_BASE + 4 * irq as usize, 1);
+    // Enable the IRQ bit
+    let word_idx = irq / 32;
+    let bit_idx = irq % 32;
+    let addr = PLIC_ENABLE_BASE + (word_idx as usize) * 4;
+    let current = read_reg(addr);
+    write_reg(addr, current | (1 << bit_idx));
+}
+
 pub fn plic_claim() -> u32 {
     read_reg(PLIC_CLAIM)
 }

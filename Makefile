@@ -1,23 +1,31 @@
 KERNEL_ELF = target/riscv64gc-unknown-none-elf/release/kernel
 KERNEL_BIN = target/riscv64gc-unknown-none-elf/release/kernel.bin
+SHELL_ELF = user/shell/target/riscv64gc-unknown-none-elf/release/shell
+SHELL_BIN = user/shell/target/riscv64gc-unknown-none-elf/release/shell.bin
 RUST_TOOLCHAIN_BIN = $(shell . $$HOME/.cargo/env && rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin
 OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 
-.PHONY: build run run-gui run-vnc run-gpu-screenshot debug clean
+.PHONY: build build-shell run run-gui run-vnc run-gpu-screenshot debug clean
 
-build:
+build-shell:
+	. $$HOME/.cargo/env && cd user/shell && CARGO_ENCODED_RUSTFLAGS="" cargo build --release
+	$(OBJCOPY) --binary-architecture=riscv64 $(SHELL_ELF) --strip-all -O binary $(SHELL_BIN)
+
+build: build-shell
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
 run: build
 	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
+		-device virtio-keyboard-device \
 		-kernel $(KERNEL_BIN)
 
 run-gui: build
 	qemu-system-riscv64 -machine virt -serial stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
+		-device virtio-keyboard-device \
 		-display gtk \
 		-no-shutdown -no-reboot \
 		-kernel $(KERNEL_BIN)
@@ -28,6 +36,7 @@ run-vnc: build
 	qemu-system-riscv64 -machine virt -serial stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
+		-device virtio-keyboard-device \
 		-display vnc=:0 \
 		-no-shutdown -no-reboot \
 		-kernel $(KERNEL_BIN)
@@ -42,6 +51,7 @@ run-gpu-screenshot: build
 		-serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
+		-device virtio-keyboard-device \
 		-display vnc=:0 \
 		-kernel $(KERNEL_BIN) \
 		-monitor unix:/tmp/qemu-monitor.sock,server,nowait &
@@ -55,6 +65,7 @@ run-gpu-screenshot: build
 debug: build
 	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
+		-device virtio-keyboard-device \
 		-kernel $(KERNEL_BIN) \
 		-s -S &
 	gdb-multiarch -ex "target remote :1234" -ex "file $(KERNEL_ELF)"
@@ -62,3 +73,5 @@ debug: build
 clean:
 	. $$HOME/.cargo/env && cargo clean --manifest-path kernel/Cargo.toml
 	rm -f $(KERNEL_BIN)
+	cd user/shell && . $$HOME/.cargo/env && cargo clean 2>/dev/null || true
+	rm -f $(SHELL_BIN)
