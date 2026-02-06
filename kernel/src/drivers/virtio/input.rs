@@ -207,13 +207,13 @@ pub fn init() -> bool {
     crate::drivers::plic::enable_irq(irq);
 
     unsafe {
-        KEYBOARD = Some(Keyboard {
+        core::ptr::addr_of_mut!(KEYBOARD).write(Some(Keyboard {
             base,
             irq,
             eventq,
             event_bufs,
             shift_pressed: false,
-        });
+        }));
     }
 
     crate::println!("[keyboard] Initialized");
@@ -223,7 +223,7 @@ pub fn init() -> bool {
 /// Handle a keyboard IRQ. Called from the trap handler.
 pub fn handle_irq() {
     let kbd = unsafe {
-        match KEYBOARD.as_mut() {
+        match (*core::ptr::addr_of_mut!(KEYBOARD)).as_mut() {
             Some(k) => k,
             None => return,
         }
@@ -277,5 +277,5 @@ pub fn handle_irq() {
 
 /// Return the IRQ number if the keyboard is initialized.
 pub fn irq_number() -> Option<u32> {
-    unsafe { KEYBOARD.as_ref().map(|k| k.irq) }
+    unsafe { (*core::ptr::addr_of!(KEYBOARD)).as_ref().map(|k| k.irq) }
 }

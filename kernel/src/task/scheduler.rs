@@ -67,6 +67,7 @@ pub fn save_kernel_satp() {
 }
 
 /// Spawn a new kernel task. Returns the PID.
+#[allow(dead_code)]
 pub fn spawn(entry: fn()) -> usize {
     let mut sched = SCHEDULER.lock();
     let proc = Process::new_kernel(entry);
@@ -99,6 +100,7 @@ pub fn spawn_named(entry: fn(), name: &str) -> usize {
 }
 
 /// Spawn a user-mode process from machine code bytes. Returns the PID.
+#[allow(dead_code)]
 pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
     let mut sched = SCHEDULER.lock();
     let mut proc = Process::new_user(user_code);
@@ -122,6 +124,7 @@ pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
 }
 
 /// Spawn a user-mode process with handle 0 pre-set to boot_ep (boot channel).
+#[allow(dead_code)]
 pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize) -> usize {
     let mut sched = SCHEDULER.lock();
     let mut proc = Process::new_user(user_code);
@@ -146,6 +149,7 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
 }
 
 /// Spawn a user process from ELF data
+#[allow(dead_code)]
 pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
     let mut sched = SCHEDULER.lock();
     let mut proc = Process::new_user_elf(elf_data);
@@ -282,6 +286,7 @@ pub fn schedule() {
 }
 
 /// Mark the current task as dead and schedule away (for kernel tasks)
+#[allow(dead_code)]
 pub fn exit_current() -> ! {
     {
         let mut sched = SCHEDULER.lock();
@@ -346,6 +351,7 @@ pub fn process_list() -> String {
 }
 
 /// Count alive (non-Dead) processes
+#[allow(dead_code)]
 pub fn alive_count() -> usize {
     let sched = SCHEDULER.lock();
     sched.processes.iter().filter(|slot| {
@@ -354,6 +360,7 @@ pub fn alive_count() -> usize {
 }
 
 /// Check if a specific PID is alive
+#[allow(dead_code)]
 pub fn is_alive(pid: usize) -> bool {
     let sched = SCHEDULER.lock();
     matches!(

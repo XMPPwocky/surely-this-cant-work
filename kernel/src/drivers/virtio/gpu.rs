@@ -3,8 +3,6 @@
 /// Implements a minimal VirtIO GPU driver that sets up a 2D framebuffer
 /// and provides `flush()` to update the display.
 
-use core::sync::atomic::{fence, Ordering};
-use crate::mm::frame;
 use crate::mm::address::PAGE_SIZE;
 use super::mmio;
 use super::queue::{Virtqueue, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE, alloc_dma_buffer};
@@ -246,7 +244,7 @@ pub fn init() -> bool {
     crate::println!("[gpu] Framebuffer at {:#x} ({} pages)", fb_addr, fb_pages);
 
     unsafe {
-        GPU = Some(gpu);
+        core::ptr::addr_of_mut!(GPU).write(Some(gpu));
     }
 
     true
@@ -398,7 +396,8 @@ fn resource_flush(gpu: &mut Gpu, width: u32, height: u32) {
 /// Call this after writing pixels to the framebuffer.
 pub fn flush() {
     unsafe {
-        if let Some(ref mut gpu) = GPU {
+        let ptr = core::ptr::addr_of_mut!(GPU);
+        if let Some(ref mut gpu) = *ptr {
             transfer_to_host_2d(gpu, gpu.width, gpu.height);
             resource_flush(gpu, gpu.width, gpu.height);
         }
@@ -409,7 +408,8 @@ pub fn flush() {
 /// Returns None if GPU is not initialised.
 pub fn framebuffer() -> Option<(*mut u32, u32, u32)> {
     unsafe {
-        GPU.as_ref().map(|gpu| {
+        let ptr = core::ptr::addr_of!(GPU);
+        (*ptr).as_ref().map(|gpu| {
             (gpu.fb_addr as *mut u32, gpu.width, gpu.height)
         })
     }

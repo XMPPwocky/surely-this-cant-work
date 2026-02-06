@@ -109,12 +109,14 @@ _from_user:
     # sp = kernel stack pointer (from sscratch)
     # sscratch = user sp (we swapped)
     #
-    # IMPORTANT: Switch to kernel page table FIRST, before using kernel stack.
-    # The kernel stack physical address may fall in a range (e.g., 0x80400000-0x80600000)
-    # that is not identity-mapped in the user page table but is identity-mapped in
-    # the kernel page table. We must switch satp before any stack access.
-    # We use t0 as a temporary (user t0 will be saved later).
-    # Load kernel satp from the global variable KERNEL_SATP_RAW.
+    # IMPORTANT: The kernel stack is identity-mapped in the user page table
+    # (as part of free memory), so we can access it before switching satp.
+    # Save user t0 DIRECTLY into its trap frame slot before clobbering it.
+    # Trap frame will start at sp-272; regs[5] (x5/t0) is at offset 40.
+    # So save at sp - 272 + 40 = sp - 232.
+    sd      t0, -232(sp)
+
+    # Switch to kernel page table using t0 as temporary.
 1:  auipc   t0, %pcrel_hi(KERNEL_SATP_RAW)
     ld      t0, %pcrel_lo(1b)(t0)
     csrw    satp, t0
@@ -124,11 +126,11 @@ _from_user:
     # Allocate TrapFrame on kernel stack
     addi    sp, sp, -272
 
-    # Save x1-x31 (t0/x5 was clobbered above, save 0 as placeholder)
+    # Save x1-x31 (t0/x5 was pre-saved at 40(sp) above)
     sd      x1,   8(sp)
     sd      x3,  24(sp)
     sd      x4,  32(sp)
-    sd      zero, 40(sp)    # x5/t0 was clobbered (save 0)
+    # x5/t0 already at 40(sp) -- pre-saved before satp switch
     sd      x6,  48(sp)
     sd      x7,  56(sp)
     sd      x8,  64(sp)
@@ -179,12 +181,9 @@ _from_user:
     mv      a0, sp
     call    trap_handler
 
-    # Get the user satp for later (store in t0; t0 was already clobbered on
-    # trap entry for the kernel satp switch, so the trap frame has 0 for t0.
-    # We sacrifice restoring t0 to use it as a carrier for user_satp across
-    # the kernel->user stack swap.)
+    # Get user satp (returned in a0)
     call    get_current_user_satp
-    mv      t0, a0      # Save user satp in t0
+    mv      t0, a0
 
     # Restore sstatus and sepc (still under kernel page table)
     ld      t1, 256(sp)
@@ -196,17 +195,25 @@ _from_user:
     ld      t1, 16(sp)
     csrw    sscratch, t1
 
-    # Restore x1, x3-x31 (all loaded from kernel stack under kernel page table)
-    # Note: x5/t0 is NOT restored here -- it carries user_satp across the stack swap.
-    # This is safe because t0 was already destroyed on trap entry (used for kernel satp).
+    # Switch to user page table while we still have kernel sp.
+    # The kernel stack is identity-mapped in the user page table,
+    # so we can still access the trap frame after this switch.
+    beqz    t0, _user_skip_satp_switch
+    csrw    satp, t0
+    sfence.vma
+_user_skip_satp_switch:
+
+    # Now under user page table. Kernel stack is still accessible
+    # (identity-mapped in user page table as part of free memory).
+    # Restore ALL registers including t0 from the trap frame.
     ld      x1,   8(sp)
     ld      x3,  24(sp)
     ld      x4,  32(sp)
-    # x5/t0 skipped: carries user_satp
+    ld      x5,  40(sp)    # t0 fully restored!
     ld      x6,  48(sp)
     ld      x7,  56(sp)
     ld      x8,  64(sp)
-    ld      x9,  72(sp)    # s1 restored properly from trap frame
+    ld      x9,  72(sp)
     ld      x10, 80(sp)
     ld      x11, 88(sp)
     ld      x12, 96(sp)
@@ -234,12 +241,5 @@ _from_user:
     addi    sp, sp, 272
     csrrw   sp, sscratch, sp
 
-    # Now switch to user page table (t0 holds user satp)
-    # Do this AFTER all kernel stack accesses are complete
-    beqz    t0, _user_trap_skip_satp
-    csrw    satp, t0
-    sfence.vma
-_user_trap_skip_satp:
-    # t0 now has a stale user_satp value, but t0 is caller-saved and was
-    # already destroyed on trap entry, so user code cannot depend on it.
+    # User page table already active, all registers restored. Return to user.
     sret

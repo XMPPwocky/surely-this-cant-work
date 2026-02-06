@@ -44,8 +44,11 @@ pub struct Virtqueue {
     pub avail: *mut VirtqAvail,
     pub used: *mut VirtqUsed,
     /// Physical addresses for DMA registration
+    #[allow(dead_code)]
     pub desc_phys: usize,
+    #[allow(dead_code)]
     pub avail_phys: usize,
+    #[allow(dead_code)]
     pub used_phys: usize,
     /// Free descriptor tracking: free_head points to first free desc, each free desc's `next` chains
     free_head: u16,

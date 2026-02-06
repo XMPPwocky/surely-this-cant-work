@@ -5,12 +5,17 @@ SHELL_BIN = user/shell/target/riscv64gc-unknown-none-elf/release/shell.bin
 RUST_TOOLCHAIN_BIN = $(shell . $$HOME/.cargo/env && rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin
 OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 
-.PHONY: build build-shell run run-gui run-vnc run-gpu-screenshot debug clean
+.PHONY: build build-shell build-hello run run-gui run-vnc run-gpu-screenshot debug clean
 
 build-shell:
 	. $$HOME/.cargo/env && cd user/shell && CARGO_ENCODED_RUSTFLAGS="" cargo build --release
 
-build: build-shell
+build-hello:
+	. $$HOME/.cargo/env && mv .cargo/config.toml .cargo/config.toml.bak && \
+		cd user/hello && cargo +rvos build --release; \
+		cd /home/ubuntu/src/temp2/rvos && mv .cargo/config.toml.bak .cargo/config.toml
+
+build: build-shell build-hello
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 

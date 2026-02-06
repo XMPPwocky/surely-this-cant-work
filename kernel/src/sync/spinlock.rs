@@ -20,7 +20,7 @@ impl<T> SpinLock<T> {
         }
     }
 
-    pub fn lock(&self) -> SpinLockGuard<T> {
+    pub fn lock(&self) -> SpinLockGuard<'_, T> {
         // Save and disable interrupts
         let was_enabled = csr::interrupts_enabled();
         csr::disable_interrupts();

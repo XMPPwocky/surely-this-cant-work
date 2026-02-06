@@ -57,8 +57,11 @@ macro_rules! clear_csr {
 
 // SSTATUS bits
 pub const SSTATUS_SIE: usize = 1 << 1;
+#[allow(dead_code)]
 pub const SSTATUS_SPIE: usize = 1 << 5;
+#[allow(dead_code)]
 pub const SSTATUS_SPP: usize = 1 << 8;
+#[allow(dead_code)]
 pub const SSTATUS_SUM: usize = 1 << 18;
 
 #[inline(always)]
@@ -81,6 +84,7 @@ pub fn read_sepc() -> usize {
     read_csr!("sepc")
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn read_tp() -> usize {
     read_csr!("tp")
@@ -96,11 +100,13 @@ pub fn write_satp(val: usize) {
     write_csr!("satp", val);
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn write_sscratch(val: usize) {
     write_csr!("sscratch", val);
 }
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn write_sepc(val: usize) {
     write_csr!("sepc", val);

@@ -131,6 +131,7 @@ impl Canvas {
     }
 
     /// Draw a solid filled triangle.
+    #[allow(dead_code)]
     fn draw_filled_triangle(
         &self, x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32, color: u32,
     ) {
@@ -178,6 +179,7 @@ fn unpack(c: u32) -> (i32, i32, i32) {
     (((c >> 16) & 0xFF) as i32, ((c >> 8) & 0xFF) as i32, (c & 0xFF) as i32)
 }
 
+#[allow(dead_code)]
 fn pt_in_tri(
     px: i32, py: i32,
     x0: i32, y0: i32, x1: i32, y1: i32, x2: i32, y2: i32,
@@ -281,6 +283,7 @@ pub fn draw_boot_logo(fb: *mut u32, width: u32, height: u32) -> u32 {
 
 /// Keep the triangle animation spinning forever (call after demo completes).
 /// This never returns — the user kills QEMU with Ctrl+C.
+#[allow(dead_code)]
 pub fn animate_forever(fb: *mut u32, width: u32, height: u32) -> ! {
     let c = Canvas { fb, stride: width, width, height };
     let cx = 120i32;

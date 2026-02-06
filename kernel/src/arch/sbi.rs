@@ -16,6 +16,7 @@ fn sbi_call(eid: usize, fid: usize, arg0: usize, arg1: usize, arg2: usize) -> (u
 }
 
 /// Legacy console putchar (EID=0x01)
+#[allow(dead_code)]
 pub fn sbi_console_putchar(ch: u8) {
     sbi_call(0x01, 0, ch as usize, 0, 0);
 }
@@ -26,6 +27,7 @@ pub fn sbi_set_timer(stime: u64) {
 }
 
 /// Legacy shutdown (EID=0x08)
+#[allow(dead_code)]
 pub fn sbi_shutdown() -> ! {
     sbi_call(0x08, 0, 0, 0, 0);
     unreachable!()

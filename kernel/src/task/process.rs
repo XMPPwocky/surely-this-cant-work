@@ -39,6 +39,7 @@ pub struct Process {
     pub pid: usize,
     pub state: ProcessState,
     pub context: TaskContext,
+    #[allow(dead_code)]
     pub kernel_stack_base: usize,
     pub kernel_stack_top: usize,
     pub is_user: bool,
@@ -84,6 +85,7 @@ impl Process {
     /// `user_code` is the machine code bytes to run in U-mode.
     /// User code and stack are identity-mapped (VA=PA) in a per-process
     /// page table, so addresses work under both kernel and user page tables.
+    #[allow(dead_code)]
     pub fn new_user(user_code: &[u8]) -> Self {
         let pid = alloc_pid();
 
@@ -162,9 +164,9 @@ impl Process {
         let stack_phys_base = stack_ppn.0 * PAGE_SIZE;
         let stack_phys_top = stack_phys_base + USER_STACK_SIZE;
 
-        // Create page table
-        let pt = create_user_page_table_identity(
-            loaded.code_ppn, loaded.total_pages,
+        // Create page table: map code at its original VA, stack at identity
+        let pt = create_user_page_table_elf(
+            loaded.code_ppn, loaded.total_pages, loaded.base_va,
             stack_ppn, USER_STACK_PAGES,
         );
         let satp = pt.satp();
@@ -180,7 +182,7 @@ impl Process {
             kernel_stack_top: kstack_top,
             is_user: true,
             user_satp: satp,
-            user_entry: loaded.entry_pa,
+            user_entry: loaded.entry_va,
             user_stack_top: stack_phys_top,
             handles: [None; MAX_HANDLES],
             mmap_regions: [None; MAX_MMAP_REGIONS],
@@ -279,6 +281,99 @@ impl Process {
 /// User code and stack pages are identity-mapped WITH U bit at their
 /// physical addresses, so the same addresses work under both kernel
 /// and user page tables (critical for syscall buffer access).
+/// Create a user page table that maps code at its original ELF virtual addresses.
+/// Code pages are mapped at base_va, stack pages are identity-mapped at their PA.
+fn create_user_page_table_elf(
+    code_ppn: PhysPageNum,
+    code_pages: usize,
+    base_va: usize,
+    stack_ppn: PhysPageNum,
+    stack_pages: usize,
+) -> PageTable {
+    extern "C" {
+        static _text_start: u8;
+        static _text_end: u8;
+        static _rodata_start: u8;
+        static _rodata_end: u8;
+        static _data_start: u8;
+        fn _stack_top();
+    }
+
+    let text_start = unsafe { &_text_start as *const u8 as usize };
+    let text_end = unsafe { &_text_end as *const u8 as usize };
+    let rodata_start = unsafe { &_rodata_start as *const u8 as usize };
+    let rodata_end = unsafe { &_rodata_end as *const u8 as usize };
+    let data_start = unsafe { &_data_start as *const u8 as usize };
+    let stack_top = _stack_top as *const () as usize;
+
+    let mut pt = PageTable::new();
+
+    // Identity-map SBI region
+    pt.map_range(0x8000_0000, 0x8000_0000, text_start - 0x8000_0000, PTE_R | PTE_X);
+
+    // Identity-map kernel text as R+X (no U bit)
+    pt.map_range(text_start, text_start, text_end - text_start, PTE_R | PTE_X);
+
+    // Identity-map rodata as R (no U bit)
+    pt.map_range(rodata_start, rodata_start, rodata_end - rodata_start, PTE_R);
+
+    // Identity-map data + bss + stack as R+W (no U bit)
+    pt.map_range(data_start, data_start, stack_top - data_start, PTE_R | PTE_W);
+
+    // Identity-map free memory as R+W (no U bit), skipping user code+stack pages
+    let free_start = (stack_top + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let code_start = code_ppn.0 * PAGE_SIZE;
+    let code_end = code_start + code_pages * PAGE_SIZE;
+    let ustack_start = stack_ppn.0 * PAGE_SIZE;
+    let ustack_end = ustack_start + stack_pages * PAGE_SIZE;
+
+    let mut excludes: [(usize, usize); 2] = [(code_start, code_end), (ustack_start, ustack_end)];
+    if excludes[0].0 > excludes[1].0 {
+        excludes.swap(0, 1);
+    }
+
+    let mut cursor = free_start;
+    let ram_end: usize = 0x8800_0000;
+    for &(ex_start, ex_end) in &excludes {
+        if cursor < ex_start {
+            pt.map_range(cursor, cursor, ex_start - cursor, PTE_R | PTE_W);
+        }
+        if ex_end > cursor {
+            cursor = ex_end;
+        }
+    }
+    if cursor < ram_end {
+        pt.map_range(cursor, cursor, ram_end - cursor, PTE_R | PTE_W);
+    }
+
+    // Identity-map UART
+    pt.map_range(0x1000_0000, 0x1000_0000, PAGE_SIZE, PTE_R | PTE_W);
+
+    // Identity-map PLIC
+    pt.map_range(0x0C00_0000, 0x0C00_0000, 0x0400_0000, PTE_R | PTE_W);
+
+    // Identity-map CLINT
+    pt.map_range(0x0200_0000, 0x0200_0000, 0x0001_0000, PTE_R | PTE_W);
+
+    // Identity-map VirtIO
+    pt.map_range(0x1000_1000, 0x1000_1000, 0x0000_8000, PTE_R | PTE_W);
+
+    // Map user code pages at their original ELF VAs with U+R+W+X
+    let base_vpn = base_va / PAGE_SIZE;
+    for i in 0..code_pages {
+        pt.map(VirtPageNum(base_vpn + i), PhysPageNum(code_ppn.0 + i), PTE_R | PTE_W | PTE_X | PTE_U);
+    }
+
+    // Identity-map user stack pages with U+R+W at their physical address
+    for i in 0..stack_pages {
+        let addr = stack_ppn.0 + i;
+        pt.map(VirtPageNum(addr), PhysPageNum(addr), PTE_R | PTE_W | PTE_U);
+    }
+
+    pt
+}
+
+#[allow(dead_code)]
 fn create_user_page_table_identity(
     code_ppn: PhysPageNum,
     code_pages: usize,
@@ -360,10 +455,11 @@ fn create_user_page_table_identity(
     // Identity-map VirtIO
     pt.map_range(0x1000_1000, 0x1000_1000, 0x0000_8000, PTE_R | PTE_W);
 
-    // Identity-map user code pages with U+R+X at their physical address
+    // Identity-map user code pages with U+R+W+X at their physical address
+    // (includes .text, .rodata, .data, .bss — all in the same contiguous region)
     for i in 0..code_pages {
         let addr = code_ppn.0 + i;
-        pt.map(VirtPageNum(addr), PhysPageNum(addr), PTE_R | PTE_X | PTE_U);
+        pt.map(VirtPageNum(addr), PhysPageNum(addr), PTE_R | PTE_W | PTE_X | PTE_U);
     }
 
     // Identity-map user stack pages with U+R+W at their physical address

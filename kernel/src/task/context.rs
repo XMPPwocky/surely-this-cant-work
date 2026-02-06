@@ -44,7 +44,7 @@ impl TaskContext {
             fn kernel_task_trampoline();
         }
         TaskContext {
-            ra: kernel_task_trampoline as usize,
+            ra: kernel_task_trampoline as *const () as usize,
             sp: stack_top,
             s0: entry,
             s1: 0,
@@ -69,7 +69,7 @@ impl TaskContext {
             fn user_entry_trampoline();
         }
         TaskContext {
-            ra: user_entry_trampoline as usize,
+            ra: user_entry_trampoline as *const () as usize,
             sp: kernel_stack_top,
             s0: 0,
             s1: 0,

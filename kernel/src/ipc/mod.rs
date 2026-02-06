@@ -30,6 +30,7 @@ impl Message {
         }
     }
 
+    #[allow(dead_code)]
     pub fn from_str(s: &str, sender: usize) -> Self {
         let mut msg = Message::new();
         msg.sender_pid = sender;
@@ -40,6 +41,7 @@ impl Message {
         msg
     }
 
+    #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
         core::str::from_utf8(&self.data[..self.len]).unwrap_or("???")
     }

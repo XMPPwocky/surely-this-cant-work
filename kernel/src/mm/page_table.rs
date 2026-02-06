@@ -1,4 +1,4 @@
-use crate::mm::address::{PhysAddr, PhysPageNum, VirtPageNum, PAGE_SIZE};
+use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
 use crate::mm::frame;
 
 // PTE flag bits
@@ -7,6 +7,7 @@ pub const PTE_R: usize = 1 << 1; // Read
 pub const PTE_W: usize = 1 << 2; // Write
 pub const PTE_X: usize = 1 << 3; // Execute
 pub const PTE_U: usize = 1 << 4; // User
+#[allow(dead_code)]
 pub const PTE_G: usize = 1 << 5; // Global
 pub const PTE_A: usize = 1 << 6; // Accessed
 pub const PTE_D: usize = 1 << 7; // Dirty

@@ -34,6 +34,19 @@ fn user_shell_code() -> &'static [u8] {
     }
 }
 
+fn user_hello_std_code() -> &'static [u8] {
+    extern "C" {
+        static _user_hello_std_start: u8;
+        static _user_hello_std_end: u8;
+    }
+    unsafe {
+        let start = &_user_hello_std_start as *const u8;
+        let end = &_user_hello_std_end as *const u8;
+        let len = end as usize - start as usize;
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     // ---- Phase 1: Boot and hardware init ----
@@ -152,6 +165,11 @@ pub extern "C" fn kmain() -> ! {
     }
     task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo");
     task::spawn_named(services::math::math_service, "math");
+
+    // Spawn hello-std test program with its own boot channel
+    let (hello_boot_a, hello_boot_b) = ipc::channel_create_pair();
+    services::init::register_boot(hello_boot_b, services::init::ConsoleType::Serial);
+    task::spawn_user_elf_with_boot_channel(user_hello_std_code(), "hello-std", hello_boot_a);
 
     // Spawn shells with boot channels
     task::spawn_user_elf_with_boot_channel(user_shell_code(), "shell-serial", shell_serial_boot_a);

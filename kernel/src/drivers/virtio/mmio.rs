@@ -11,6 +11,7 @@ const VIRTIO_MMIO_SLOTS: usize = 8;
 pub const REG_MAGIC: usize = 0x000;
 pub const REG_VERSION: usize = 0x004;
 pub const REG_DEVICE_ID: usize = 0x008;
+#[allow(dead_code)]
 pub const REG_VENDOR_ID: usize = 0x00C;
 pub const REG_DEVICE_FEATURES: usize = 0x010;
 pub const REG_DEVICE_FEATURES_SEL: usize = 0x014;

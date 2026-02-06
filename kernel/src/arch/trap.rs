@@ -88,6 +88,12 @@ fn handle_syscall(tf: &mut TrapFrame) {
     let syscall_num = tf.regs[17]; // a7
     let a0 = tf.regs[10];
     let a1 = tf.regs[11];
+    let pid = crate::task::current_pid();
+
+    // Debug: trace syscalls from hello-std (PID 5)
+    if pid == 5 {
+        crate::println!("[trace] PID 5 syscall={} a0={:#x} a1={:#x}", syscall_num, a0, a1);
+    }
 
     match syscall_num {
         SYS_EXIT => {
@@ -142,9 +148,10 @@ fn sys_chan_create(tf: &mut TrapFrame) {
 /// SYS_CHAN_SEND: translate handle -> endpoint, copy message from user, send.
 /// If message has a cap, translate cap handle -> global endpoint too.
 fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
-    if !validate_user_ptr(msg_ptr, core::mem::size_of::<crate::ipc::Message>()) {
-        return usize::MAX;
-    }
+    let msg_pa = match validate_user_buffer(msg_ptr, core::mem::size_of::<crate::ipc::Message>()) {
+        Some(pa) => pa,
+        None => return usize::MAX,
+    };
 
     // Translate handle to global endpoint
     let endpoint = match crate::task::current_process_handle(handle) {
@@ -152,11 +159,8 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
         None => return usize::MAX,
     };
 
-    // Read message from user space
-    crate::set_csr!("sstatus", crate::arch::csr::SSTATUS_SUM);
-    let user_msg = unsafe { &*(msg_ptr as *const crate::ipc::Message) };
-    let mut msg = user_msg.clone();
-    crate::clear_csr!("sstatus", crate::arch::csr::SSTATUS_SUM);
+    // Read message from user space via translated PA (kernel identity-maps all RAM)
+    let mut msg = unsafe { core::ptr::read(msg_pa as *const crate::ipc::Message) };
 
     // Set sender PID
     msg.sender_pid = crate::task::current_pid();
@@ -182,9 +186,10 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
 
 /// SYS_CHAN_RECV (non-blocking): translate handle, try recv, translate cap in result.
 fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
-    if !validate_user_ptr(msg_buf_ptr, core::mem::size_of::<crate::ipc::Message>()) {
-        return usize::MAX;
-    }
+    let msg_pa = match validate_user_buffer(msg_buf_ptr, core::mem::size_of::<crate::ipc::Message>()) {
+        Some(pa) => pa,
+        None => return usize::MAX,
+    };
 
     let endpoint = match crate::task::current_process_handle(handle) {
         Some(ep) => ep,
@@ -198,11 +203,10 @@ fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
                 let local_handle = crate::task::current_process_alloc_handle(msg.cap);
                 msg.cap = local_handle;
             }
-            crate::set_csr!("sstatus", crate::arch::csr::SSTATUS_SUM);
+            // Write to user buffer via translated PA
             unsafe {
-                core::ptr::write(msg_buf_ptr as *mut crate::ipc::Message, msg);
+                core::ptr::write(msg_pa as *mut crate::ipc::Message, msg);
             }
-            crate::clear_csr!("sstatus", crate::arch::csr::SSTATUS_SUM);
             0
         }
         None => 1, // Nothing available
@@ -214,10 +218,13 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
     let handle = tf.regs[10];
     let msg_buf_ptr = tf.regs[11];
 
-    if !validate_user_ptr(msg_buf_ptr, core::mem::size_of::<crate::ipc::Message>()) {
-        tf.regs[10] = usize::MAX;
-        return;
-    }
+    let msg_pa = match validate_user_buffer(msg_buf_ptr, core::mem::size_of::<crate::ipc::Message>()) {
+        Some(pa) => pa,
+        None => {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
+    };
 
     let endpoint = match crate::task::current_process_handle(handle) {
         Some(ep) => ep,
@@ -235,11 +242,10 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
                     let local_handle = crate::task::current_process_alloc_handle(msg.cap);
                     msg.cap = local_handle;
                 }
-                crate::set_csr!("sstatus", crate::arch::csr::SSTATUS_SUM);
+                // Write to user buffer via translated PA
                 unsafe {
-                    core::ptr::write(msg_buf_ptr as *mut crate::ipc::Message, msg);
+                    core::ptr::write(msg_pa as *mut crate::ipc::Message, msg);
                 }
-                crate::clear_csr!("sstatus", crate::arch::csr::SSTATUS_SUM);
                 tf.regs[10] = 0;
                 return;
             }
@@ -280,6 +286,11 @@ fn sys_mmap(_hint: usize, length: usize) -> usize {
     };
 
     let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
+
+    // Zero the allocated pages (user code expects zeroed memory from mmap)
+    unsafe {
+        core::ptr::write_bytes(base_pa as *mut u8, 0, pages * crate::mm::address::PAGE_SIZE);
+    }
 
     // Get current process's user_satp and map pages into its page table
     let user_satp = crate::task::current_process_user_satp();
@@ -356,12 +367,61 @@ fn sys_munmap(addr: usize, length: usize) -> usize {
 }
 
 fn sys_exit() {
+    crate::println!("[syscall] PID {} called SYS_EXIT", crate::task::current_pid());
     crate::task::exit_current_from_syscall();
 }
 
-/// Validate that a user pointer is within RAM range.
-fn validate_user_ptr(ptr: usize, len: usize) -> bool {
-    ptr >= 0x8000_0000 && ptr.wrapping_add(len) <= 0x8800_0000
+/// Translate a user virtual address to a physical address by walking the
+/// current process's Sv39 page table. Returns None if unmapped.
+fn translate_user_va(va: usize) -> Option<usize> {
+    let user_satp = crate::task::current_process_user_satp();
+    if user_satp == 0 {
+        return None;
+    }
+    let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
+    let pt = crate::mm::page_table::PageTable::from_root(root_ppn);
+    let vpn = crate::mm::address::VirtPageNum(va / crate::mm::address::PAGE_SIZE);
+    let result = pt.translate(vpn).map(|ppn| {
+        ppn.0 * crate::mm::address::PAGE_SIZE + (va % crate::mm::address::PAGE_SIZE)
+    });
+    core::mem::forget(pt);
+    result
+}
+
+/// Validate a user buffer and return its physical address.
+/// Walks the user page table to translate VA→PA. Logs an error on failure.
+fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let pa = match translate_user_va(ptr) {
+        Some(pa) => pa,
+        None => {
+            crate::println!(
+                "[syscall] PID {}: invalid user pointer {:#x} (len={}), page not mapped",
+                crate::task::current_pid(), ptr, len
+            );
+            return None;
+        }
+    };
+
+    // For cross-page buffers, verify all pages are mapped and contiguous in PA
+    let start_page = ptr / crate::mm::address::PAGE_SIZE;
+    let end_page = (ptr + len - 1) / crate::mm::address::PAGE_SIZE;
+    let pa_base_page = pa / crate::mm::address::PAGE_SIZE;
+    for i in 1..=(end_page - start_page) {
+        match translate_user_va((start_page + i) * crate::mm::address::PAGE_SIZE) {
+            Some(next_pa) if next_pa / crate::mm::address::PAGE_SIZE == pa_base_page + i => {}
+            _ => {
+                crate::println!(
+                    "[syscall] PID {}: user buffer {:#x}+{} spans non-contiguous pages",
+                    crate::task::current_pid(), ptr, len
+                );
+                return None;
+            }
+        }
+    }
+    Some(pa)
 }
 
 fn timer_tick() {

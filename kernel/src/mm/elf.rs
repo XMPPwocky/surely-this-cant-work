@@ -45,7 +45,10 @@ struct Elf64Phdr {
 pub struct LoadedElf {
     pub code_ppn: PhysPageNum,  // first physical page of loaded program
     pub total_pages: usize,      // number of pages allocated
+    #[allow(dead_code)]
     pub entry_pa: usize,         // physical address of entry point
+    pub entry_va: usize,         // original virtual address of entry point
+    pub base_va: usize,          // base virtual address of first PT_LOAD segment
 }
 
 /// Load an ELF64 binary. Allocates contiguous physical pages, copies
@@ -147,6 +150,8 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, &'static str> {
         code_ppn,
         total_pages,
         entry_pa,
+        entry_va: ehdr.e_entry as usize,
+        base_va,
     })
 }
 

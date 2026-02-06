@@ -51,6 +51,7 @@ pub fn draw_boot_logo() {
 
 /// Keep the logo triangle spinning forever (call at shutdown).
 /// Only does anything if GPU is active. Never returns.
+#[allow(dead_code)]
 pub fn animate_logo_forever() -> ! {
     if let Some((fb, w, h)) = crate::drivers::virtio::gpu::framebuffer() {
         logo::animate_forever(fb, w, h);

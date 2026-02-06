@@ -98,3 +98,13 @@ _user_getpid_end:
 _user_shell_start:
     .incbin "user/shell/target/riscv64gc-unknown-none-elf/release/shell"
 _user_shell_end:
+
+    #---------------------------------------------------------------------------
+    # User program: "hello-std" - test program using Rust std library
+    #---------------------------------------------------------------------------
+    .globl _user_hello_std_start
+    .globl _user_hello_std_end
+    .align 4
+_user_hello_std_start:
+    .incbin "user/hello/target/riscv64gc-unknown-rvos/release/hello"
+_user_hello_std_end:
