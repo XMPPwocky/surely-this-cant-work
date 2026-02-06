@@ -145,6 +145,53 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
     pid
 }
 
+/// Spawn a user process from ELF data
+pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
+    let mut sched = SCHEDULER.lock();
+    let mut proc = Process::new_user_elf(elf_data);
+    let pid = proc.pid;
+    proc.set_name(name);
+
+    if pid < MAX_PROCS {
+        if sched.processes.len() <= pid {
+            while sched.processes.len() <= pid {
+                sched.processes.push(None);
+            }
+        }
+        sched.processes[pid] = Some(proc);
+        sched.ready_queue.push_back(pid);
+    } else {
+        panic!("Too many processes (max {})", MAX_PROCS);
+    }
+
+    crate::println!("  Spawned user ELF [{}] \"{}\" (PID {})", pid, name, pid);
+    pid
+}
+
+/// Spawn a user ELF process with handle 0 pre-set to boot_ep (boot channel).
+pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: usize) -> usize {
+    let mut sched = SCHEDULER.lock();
+    let mut proc = Process::new_user_elf(elf_data);
+    let pid = proc.pid;
+    proc.set_name(name);
+    proc.handles[0] = Some(boot_ep);
+
+    if pid < MAX_PROCS {
+        if sched.processes.len() <= pid {
+            while sched.processes.len() <= pid {
+                sched.processes.push(None);
+            }
+        }
+        sched.processes[pid] = Some(proc);
+        sched.ready_queue.push_back(pid);
+    } else {
+        panic!("Too many processes (max {})", MAX_PROCS);
+    }
+
+    crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
+    pid
+}
+
 /// Look up a handle in the current process's handle table.
 pub fn current_process_handle(handle: usize) -> Option<usize> {
     let sched = SCHEDULER.lock();
@@ -354,6 +401,36 @@ pub extern "C" fn restore_kernel_satp_asm() {
                 in(reg) satp,
             );
         }
+    }
+}
+
+/// Get current process's user_satp value (for mmap/munmap).
+pub fn current_process_user_satp() -> usize {
+    let sched = SCHEDULER.lock();
+    let pid = sched.current;
+    match sched.processes[pid].as_ref() {
+        Some(proc) => proc.user_satp,
+        None => 0,
+    }
+}
+
+/// Add an mmap region to the current process.
+pub fn current_process_add_mmap(base_ppn: usize, page_count: usize) {
+    let mut sched = SCHEDULER.lock();
+    let pid = sched.current;
+    if let Some(ref mut proc) = sched.processes[pid] {
+        proc.add_mmap_region(base_ppn, page_count);
+    }
+}
+
+/// Remove an mmap region from the current process. Returns true if found.
+pub fn current_process_remove_mmap(base_ppn: usize, page_count: usize) -> bool {
+    let mut sched = SCHEDULER.lock();
+    let pid = sched.current;
+    if let Some(ref mut proc) = sched.processes[pid] {
+        proc.remove_mmap_region(base_ppn, page_count)
+    } else {
+        false
     }
 }
 

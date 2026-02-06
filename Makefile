@@ -9,7 +9,6 @@ OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 
 build-shell:
 	. $$HOME/.cargo/env && cd user/shell && CARGO_ENCODED_RUSTFLAGS="" cargo build --release
-	$(OBJCOPY) --binary-architecture=riscv64 $(SHELL_ELF) --strip-all -O binary $(SHELL_BIN)
 
 build: build-shell
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml
@@ -74,4 +73,3 @@ clean:
 	. $$HOME/.cargo/env && cargo clean --manifest-path kernel/Cargo.toml
 	rm -f $(KERNEL_BIN)
 	cd user/shell && . $$HOME/.cargo/env && cargo clean 2>/dev/null || true
-	rm -f $(SHELL_BIN)

@@ -1,4 +1,5 @@
 pub mod address;
+pub mod elf;
 pub mod frame;
 pub mod heap;
 pub mod page_table;

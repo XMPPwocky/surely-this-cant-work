@@ -12,7 +12,14 @@ const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
 
 pub const MAX_PROCS: usize = 64;
 pub const MAX_HANDLES: usize = 16;
+pub const MAX_MMAP_REGIONS: usize = 32;
 const NAME_LEN: usize = 16;
+
+#[derive(Clone, Copy)]
+pub struct MmapRegion {
+    pub base_ppn: usize,
+    pub page_count: usize,
+}
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
@@ -39,6 +46,7 @@ pub struct Process {
     pub user_entry: usize,     // virtual (= physical) address of user code
     pub user_stack_top: usize, // virtual (= physical) address of user stack top
     pub handles: [Option<usize>; MAX_HANDLES], // local handle -> global endpoint ID
+    pub mmap_regions: [Option<MmapRegion>; MAX_MMAP_REGIONS],
     name: [u8; NAME_LEN],
     name_len: usize,
 }
@@ -66,6 +74,7 @@ impl Process {
             user_entry: 0,
             user_stack_top: 0,
             handles: [None; MAX_HANDLES],
+            mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
         }
@@ -126,6 +135,55 @@ impl Process {
             user_entry: code_phys,
             user_stack_top: stack_phys_top,
             handles: [None; MAX_HANDLES],
+            mmap_regions: [None; MAX_MMAP_REGIONS],
+            name: [0u8; NAME_LEN],
+            name_len: 0,
+        }
+    }
+
+    /// Create a user process from an ELF binary.
+    /// Parses ELF, loads PT_LOAD segments, creates page table.
+    pub fn new_user_elf(elf_data: &[u8]) -> Self {
+        let pid = alloc_pid();
+
+        // Allocate kernel stack
+        let kstack_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_PAGES)
+            .expect("Failed to allocate kernel stack for user process");
+        let kstack_base = kstack_ppn.0 * PAGE_SIZE;
+        let kstack_top = kstack_base + KERNEL_STACK_SIZE;
+
+        // Load ELF
+        let loaded = crate::mm::elf::load_elf(elf_data)
+            .expect("Failed to load ELF binary");
+
+        // Allocate user stack
+        let stack_ppn = frame::frame_alloc_contiguous(USER_STACK_PAGES)
+            .expect("Failed to allocate user stack pages");
+        let stack_phys_base = stack_ppn.0 * PAGE_SIZE;
+        let stack_phys_top = stack_phys_base + USER_STACK_SIZE;
+
+        // Create page table
+        let pt = create_user_page_table_identity(
+            loaded.code_ppn, loaded.total_pages,
+            stack_ppn, USER_STACK_PAGES,
+        );
+        let satp = pt.satp();
+        core::mem::forget(pt);
+
+        let context = TaskContext::new_user_entry(kstack_top);
+
+        Process {
+            pid,
+            state: ProcessState::Ready,
+            context,
+            kernel_stack_base: kstack_base,
+            kernel_stack_top: kstack_top,
+            is_user: true,
+            user_satp: satp,
+            user_entry: loaded.entry_pa,
+            user_stack_top: stack_phys_top,
+            handles: [None; MAX_HANDLES],
+            mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
         }
@@ -144,6 +202,7 @@ impl Process {
             user_entry: 0,
             user_stack_top: 0,
             handles: [None; MAX_HANDLES],
+            mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
         };
@@ -188,6 +247,30 @@ impl Process {
         if handle < MAX_HANDLES {
             self.handles[handle] = None;
         }
+    }
+
+    /// Record an mmap region in the first free slot.
+    pub fn add_mmap_region(&mut self, base_ppn: usize, page_count: usize) {
+        for slot in self.mmap_regions.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(MmapRegion { base_ppn, page_count });
+                return;
+            }
+        }
+        panic!("Process {}: mmap region table full", self.pid);
+    }
+
+    /// Remove an mmap region matching base_ppn and page_count. Returns true if found.
+    pub fn remove_mmap_region(&mut self, base_ppn: usize, page_count: usize) -> bool {
+        for slot in self.mmap_regions.iter_mut() {
+            if let Some(ref region) = slot {
+                if region.base_ppn == base_ppn && region.page_count == page_count {
+                    *slot = None;
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 

@@ -154,9 +154,9 @@ pub extern "C" fn kmain() -> ! {
     task::spawn_named(services::math::math_service, "math");
 
     // Spawn shells with boot channels
-    task::spawn_user_with_boot_channel(user_shell_code(), "shell-serial", shell_serial_boot_a);
+    task::spawn_user_elf_with_boot_channel(user_shell_code(), "shell-serial", shell_serial_boot_a);
     if let Some(boot_a) = shell_fb_boot_a {
-        task::spawn_user_with_boot_channel(user_shell_code(), "shell-fb", boot_a);
+        task::spawn_user_elf_with_boot_channel(user_shell_code(), "shell-fb", boot_a);
     }
 
     // ---- Phase 6: Enable preemptive scheduling ----
