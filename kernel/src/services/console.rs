@@ -211,9 +211,11 @@ pub fn serial_console_server() {
         }
 
         // Check for write requests from client
+        let mut got_write = false;
         loop {
             match ipc::channel_recv(client_ep) {
                 Some(msg) => {
+                    got_write = true;
                     if msg.len > 0 {
                         write_serial(&msg.data[..msg.len]);
                         write_fb(&msg.data[..msg.len]);
@@ -223,9 +225,9 @@ pub fn serial_console_server() {
             }
         }
 
-        if !got_input {
-            // No input available — block until woken by IRQ or message
-            // Use short yield rather than full block to stay responsive to writes
+        if !got_input && !got_write {
+            ipc::channel_set_blocked(client_ep, my_pid);
+            crate::task::block_process(my_pid);
             crate::task::schedule();
         }
     }
@@ -282,9 +284,11 @@ pub fn fb_console_server() {
         }
 
         // Check for write requests from client
+        let mut got_write = false;
         loop {
             match ipc::channel_recv(client_ep) {
                 Some(msg) => {
+                    got_write = true;
                     if msg.len > 0 {
                         write_fb(&msg.data[..msg.len]);
                     }
@@ -293,7 +297,9 @@ pub fn fb_console_server() {
             }
         }
 
-        if !got_input {
+        if !got_input && !got_write {
+            ipc::channel_set_blocked(client_ep, my_pid);
+            crate::task::block_process(my_pid);
             crate::task::schedule();
         }
     }

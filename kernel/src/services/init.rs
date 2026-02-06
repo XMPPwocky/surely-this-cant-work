@@ -93,6 +93,11 @@ pub fn init_server() {
         }
 
         if !handled {
+            // Register as blocked on ALL boot endpoints so any channel_send wakes us
+            for i in 0..count {
+                ipc::channel_set_blocked(endpoints[i].0, my_pid);
+            }
+            crate::task::block_process(my_pid);
             crate::task::schedule();
         }
     }
