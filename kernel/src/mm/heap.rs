@@ -3,149 +3,198 @@ use core::ptr;
 use crate::sync::SpinLock;
 
 const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+const MIN_ORDER: usize = 5;   // 32 bytes
+const MAX_ORDER: usize = 20;  // 1 MiB
+const NUM_ORDERS: usize = MAX_ORDER - MIN_ORDER + 1; // 16
 
 static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0u8; HEAP_SIZE];
 
-/// Free block header in the linked list.
-struct FreeBlock {
-    size: usize,
-    next: *mut FreeBlock,
+struct BuddyAllocator {
+    base: usize,
+    free_lists: [*mut usize; NUM_ORDERS],  // free_lists[i] = head of free list for order (i + MIN_ORDER)
+    bitmap: [u8; 4096],
 }
 
-const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
+unsafe impl Send for BuddyAllocator {}
 
-struct FreeListAllocator {
-    head: *mut FreeBlock,
-}
-
-unsafe impl Send for FreeListAllocator {}
-
-impl FreeListAllocator {
+impl BuddyAllocator {
     const fn new() -> Self {
-        FreeListAllocator {
-            head: ptr::null_mut(),
+        BuddyAllocator {
+            base: 0,
+            free_lists: [ptr::null_mut(); NUM_ORDERS],
+            bitmap: [0u8; 4096],
         }
     }
 
     unsafe fn init(&mut self, start: *mut u8, size: usize) {
-        let block = start as *mut FreeBlock;
-        (*block).size = size;
-        (*block).next = ptr::null_mut();
-        self.head = block;
+        assert!(size == HEAP_SIZE);
+        self.base = start as usize;
+        // The entire heap is one free block at MAX_ORDER
+        let idx = MAX_ORDER - MIN_ORDER;  // index 15
+        self.free_lists[idx] = start as *mut usize;
+        *(start as *mut usize) = 0; // null next pointer
     }
 
-    fn alloc(&mut self, layout: Layout) -> *mut u8 {
-        let size = layout.size().max(MIN_BLOCK_SIZE);
-        let align = layout.align();
-
-        let mut prev: *mut FreeBlock = ptr::null_mut();
-        let mut current = self.head;
-
-        while !current.is_null() {
-            let block_addr = current as usize;
-            let block_size = unsafe { (*current).size };
-            let block_end = block_addr + block_size;
-
-            // Align the start within this block
-            let aligned_start = (block_addr + align - 1) & !(align - 1);
-            let alloc_end = aligned_start + size;
-
-            if alloc_end <= block_end {
-                let next = unsafe { (*current).next };
-                let leading = aligned_start - block_addr;
-                let trailing = block_end - alloc_end;
-
-                // Remove this block from the list
-                if prev.is_null() {
-                    self.head = next;
-                } else {
-                    unsafe { (*prev).next = next; }
-                }
-
-                // Put back trailing space as a free block
-                if trailing >= MIN_BLOCK_SIZE {
-                    let trail = alloc_end as *mut FreeBlock;
-                    unsafe {
-                        (*trail).size = trailing;
-                        (*trail).next = self.head;
-                    }
-                    self.head = trail;
-                }
-
-                // Put back leading space as a free block
-                if leading >= MIN_BLOCK_SIZE {
-                    let lead = block_addr as *mut FreeBlock;
-                    unsafe {
-                        (*lead).size = leading;
-                        (*lead).next = self.head;
-                    }
-                    self.head = lead;
-                }
-
-                return aligned_start as *mut u8;
-            }
-
-            prev = current;
-            current = unsafe { (*current).next };
-        }
-
-        ptr::null_mut()
+    fn order_for_size(&self, size: usize) -> usize {
+        let size = size.max(1 << MIN_ORDER);
+        let order = (usize::BITS - (size - 1).leading_zeros()) as usize;
+        order.max(MIN_ORDER).min(MAX_ORDER)
     }
 
-    fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        let size = layout.size().max(MIN_BLOCK_SIZE);
-        let free_addr = ptr as usize;
+    fn bitmap_index(&self, order: usize, block_offset: usize) -> usize {
+        // offset into bitmap for this order level
+        let level_offset = (1 << (MAX_ORDER - MIN_ORDER)) - (1 << (MAX_ORDER - order));
+        // index within this level
+        let index_within = block_offset >> (order + 1);
+        level_offset + index_within
+    }
 
-        // Insert in address-sorted order for coalescing
-        let free_block = free_addr as *mut FreeBlock;
+    fn toggle_bit(&mut self, bit_idx: usize) -> bool {
+        let byte = bit_idx / 8;
+        let bit = bit_idx % 8;
+        self.bitmap[byte] ^= 1 << bit;
+        // Return the NEW value of the bit (after toggle)
+        (self.bitmap[byte] >> bit) & 1 == 1
+    }
+
+    fn list_index(order: usize) -> usize {
+        order - MIN_ORDER
+    }
+
+    fn push_free(&mut self, order: usize, addr: usize) {
+        let idx = Self::list_index(order);
+        let ptr = addr as *mut usize;
         unsafe {
-            (*free_block).size = size;
-            (*free_block).next = ptr::null_mut();
+            *ptr = self.free_lists[idx] as usize;
+        }
+        self.free_lists[idx] = ptr;
+    }
+
+    fn pop_free(&mut self, order: usize) -> Option<usize> {
+        let idx = Self::list_index(order);
+        let head = self.free_lists[idx];
+        if head.is_null() {
+            return None;
+        }
+        let addr = head as usize;
+        unsafe {
+            self.free_lists[idx] = (*head) as *mut usize;
+        }
+        Some(addr)
+    }
+
+    fn remove_free(&mut self, order: usize, addr: usize) -> bool {
+        let idx = Self::list_index(order);
+        let target = addr as *mut usize;
+
+        // Check if head
+        if self.free_lists[idx] == target {
+            unsafe {
+                self.free_lists[idx] = (*target) as *mut usize;
+            }
+            return true;
         }
 
-        if self.head.is_null() || free_addr < self.head as usize {
-            unsafe { (*free_block).next = self.head; }
-            self.head = free_block;
-            self.coalesce_from(free_block);
-            return;
-        }
-
-        // Find insertion point
-        let mut current = self.head;
-        loop {
-            let next = unsafe { (*current).next };
-            if next.is_null() || free_addr < next as usize {
+        // Walk the list
+        let mut current = self.free_lists[idx];
+        while !current.is_null() {
+            let next = unsafe { (*current) as *mut usize };
+            if next == target {
                 unsafe {
-                    (*free_block).next = next;
-                    (*current).next = free_block;
+                    (*current) = *target; // skip over target
                 }
-                self.coalesce_from(free_block);
-                self.coalesce_from(current);
-                return;
+                return true;
             }
             current = next;
         }
+        false
     }
 
-    /// Try to merge `block` with its successor if they are adjacent.
-    fn coalesce_from(&self, block: *mut FreeBlock) {
-        if block.is_null() {
-            return;
+    fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        let effective = layout.size().max(layout.align());
+        let order = self.order_for_size(effective);
+
+        if order > MAX_ORDER {
+            return ptr::null_mut();
         }
-        unsafe {
-            let next = (*block).next;
-            if !next.is_null() {
-                let block_end = (block as usize) + (*block).size;
-                if block_end == next as usize {
-                    (*block).size += (*next).size;
-                    (*block).next = (*next).next;
-                }
+
+        // Find the smallest order with a free block
+        let mut found_order = None;
+        for o in order..=MAX_ORDER {
+            if !self.free_lists[Self::list_index(o)].is_null() {
+                found_order = Some(o);
+                break;
             }
+        }
+
+        let found_order = match found_order {
+            Some(o) => o,
+            None => return ptr::null_mut(),
+        };
+
+        // Pop a block from found_order
+        let block_addr = self.pop_free(found_order).unwrap();
+        let block_offset = block_addr - self.base;
+
+        // Toggle buddy bit at found_order
+        if found_order < MAX_ORDER {
+            let bit_idx = self.bitmap_index(found_order, block_offset);
+            self.toggle_bit(bit_idx);
+        }
+
+        // Split down to the requested order
+        let mut current_order = found_order;
+        while current_order > order {
+            current_order -= 1;
+            // The "upper half" buddy goes on the free list at current_order
+            let buddy_addr = block_addr + (1 << current_order);
+            self.push_free(current_order, buddy_addr);
+            // Toggle buddy bit at current_order (we're splitting, so one half is allocated, one is free)
+            if current_order < MAX_ORDER {
+                let buddy_offset = buddy_addr - self.base;
+                let bit_idx = self.bitmap_index(current_order, block_offset.min(buddy_offset));
+                self.toggle_bit(bit_idx);
+            }
+        }
+
+        block_addr as *mut u8
+    }
+
+    fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
+        let addr = ptr as usize;
+        let effective = layout.size().max(1 << MIN_ORDER);
+        let mut order = self.order_for_size(effective);
+        let mut block_addr = addr;
+
+        loop {
+            if order >= MAX_ORDER {
+                // Can't merge beyond max order -- just add to free list
+                self.push_free(order, block_addr);
+                return;
+            }
+
+            let block_offset = block_addr - self.base;
+            let bit_idx = self.bitmap_index(order, block_offset);
+            let bit_is_set = self.toggle_bit(bit_idx);
+
+            if bit_is_set {
+                // Buddy is NOT free -- just add this block to free list
+                self.push_free(order, block_addr);
+                return;
+            }
+
+            // Buddy IS free -- remove it from free list and merge
+            let buddy_addr = self.base + (block_offset ^ (1 << order));
+            self.remove_free(order, buddy_addr);
+
+            // Merged block starts at the lower address
+            block_addr = block_addr.min(buddy_addr);
+            order += 1;
         }
     }
 }
 
-struct LockedHeap(SpinLock<FreeListAllocator>);
+struct LockedHeap(SpinLock<BuddyAllocator>);
 
 unsafe impl GlobalAlloc for LockedHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -158,14 +207,14 @@ unsafe impl GlobalAlloc for LockedHeap {
 }
 
 #[global_allocator]
-static HEAP: LockedHeap = LockedHeap(SpinLock::new(FreeListAllocator::new()));
+static HEAP: LockedHeap = LockedHeap(SpinLock::new(BuddyAllocator::new()));
 
 pub fn init() {
     unsafe {
         let start = core::ptr::addr_of_mut!(HEAP_SPACE) as *mut u8;
         HEAP.0.lock().init(start, HEAP_SIZE);
     }
-    crate::println!("Heap initialized: {} KiB", HEAP_SIZE / 1024);
+    crate::println!("Heap initialized: {} KiB (buddy allocator)", HEAP_SIZE / 1024);
 }
 
 #[alloc_error_handler]
