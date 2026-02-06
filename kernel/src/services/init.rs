@@ -69,22 +69,26 @@ pub fn init_server() {
     let my_pid = crate::task::current_pid();
 
     loop {
-        let mut handled = false;
-        let config = INIT_CONFIG.lock();
-
-        for i in 0..MAX_BOOT_REGS {
-            if let Some(ref reg) = config.boot_regs[i] {
-                let boot_ep_b = reg.boot_ep_b;
-                let console_type = reg.console_type;
-                drop(config); // release lock before IPC operations
-
-                if let Some(msg) = ipc::channel_recv(boot_ep_b) {
-                    handle_request(boot_ep_b, console_type, &msg, my_pid);
-                    handled = true;
+        // Snapshot boot registrations under the lock
+        let mut endpoints = [(0usize, ConsoleType::Serial); MAX_BOOT_REGS];
+        let mut count = 0;
+        {
+            let config = INIT_CONFIG.lock();
+            for i in 0..MAX_BOOT_REGS {
+                if let Some(ref reg) = config.boot_regs[i] {
+                    endpoints[count] = (reg.boot_ep_b, reg.console_type);
+                    count += 1;
                 }
+            }
+        }
 
-                // Re-acquire lock for next iteration
-                break; // must break and restart loop since we dropped the lock
+        // Poll all endpoints without holding the lock
+        let mut handled = false;
+        for i in 0..count {
+            let (boot_ep_b, console_type) = endpoints[i];
+            if let Some(msg) = ipc::channel_recv(boot_ep_b) {
+                handle_request(boot_ep_b, console_type, &msg, my_pid);
+                handled = true;
             }
         }
 

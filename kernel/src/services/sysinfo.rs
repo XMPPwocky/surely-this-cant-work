@@ -9,47 +9,50 @@ pub fn set_control_ep(ep: usize) {
 }
 
 /// Sysinfo service - runs as a kernel task.
-/// Waits for a client endpoint via its control channel,
-/// then serves requests on that endpoint.
+/// Each iteration: wait for a client endpoint from init, serve one request, repeat.
 pub fn sysinfo_service() {
     let control_ep = SYSINFO_CONTROL_EP.load(Ordering::Relaxed);
     let my_pid = crate::task::current_pid();
 
-    // Wait for client endpoint from init server
-    let client_ep = loop {
-        match ipc::channel_recv(control_ep) {
-            Some(msg) => {
-                if msg.cap != NO_CAP {
-                    break msg.cap;
-                }
-            }
-            None => {
-                ipc::channel_set_blocked(control_ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
-            }
-        }
-    };
-
-    crate::println!("[sysinfo] Got client endpoint {}", client_ep);
-
-    // Main service loop: serve requests on the client channel
     loop {
-        match ipc::channel_recv(client_ep) {
-            Some(msg) => {
-                let cmd = &msg.data[..msg.len];
-                if cmd == b"PS" {
-                    send_process_list(client_ep, my_pid);
-                } else {
-                    send_error(client_ep, my_pid, b"Unknown command");
+        // Wait for a new client endpoint from init server
+        let client_ep = loop {
+            match ipc::channel_recv(control_ep) {
+                Some(msg) => {
+                    if msg.cap != NO_CAP {
+                        break msg.cap;
+                    }
+                }
+                None => {
+                    ipc::channel_set_blocked(control_ep, my_pid);
+                    crate::task::block_process(my_pid);
+                    crate::task::schedule();
                 }
             }
-            None => {
-                ipc::channel_set_blocked(client_ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
+        };
+
+        // Wait for one request from this client
+        let msg = loop {
+            match ipc::channel_recv(client_ep) {
+                Some(msg) => break msg,
+                None => {
+                    ipc::channel_set_blocked(client_ep, my_pid);
+                    crate::task::block_process(my_pid);
+                    crate::task::schedule();
+                }
             }
+        };
+
+        // Handle the request
+        let cmd = &msg.data[..msg.len];
+        if cmd == b"PS" {
+            send_process_list(client_ep, my_pid);
+        } else {
+            send_error(client_ep, my_pid, b"Unknown command");
         }
+
+        // Done with this client — go back to waiting for the next one
+        // (Don't close the channel; the client will close it)
     }
 }
 
