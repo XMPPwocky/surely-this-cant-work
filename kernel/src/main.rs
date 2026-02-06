@@ -37,6 +37,18 @@ fn user_shell_code() -> &'static [u8] {
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     // ---- Phase 1: Boot and hardware init ----
+
+    // Drain any chars the UART received during firmware boot BEFORE our init
+    // clears the FIFO.  OpenSBI left the UART in a working state, so getchar()
+    // is safe even before our own init.  We push directly into the ring buffer
+    // (it's a compile-time static, always valid) without calling wake_process.
+    {
+        let uart = drivers::uart::UART.lock();
+        while let Some(ch) = uart.getchar() {
+            drivers::tty::SERIAL_INPUT.lock().push(ch);
+        }
+    }
+
     drivers::uart::init();
 
     println!();
@@ -148,6 +160,17 @@ pub extern "C" fn kmain() -> ! {
     }
 
     // ---- Phase 6: Enable preemptive scheduling ----
+
+    // Drain any chars that arrived at the UART during boot (before IRQs were enabled).
+    // They're sitting in the FIFO — move them to the ring buffer so the console server
+    // will see them once it starts running.
+    {
+        let uart = drivers::uart::UART.lock();
+        while let Some(ch) = uart.getchar() {
+            drivers::tty::SERIAL_INPUT.lock().push(ch);
+        }
+    }
+
     arch::trap::enable_timer();
     println!("[boot] System ready.\n");
 
