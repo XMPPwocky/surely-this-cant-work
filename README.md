@@ -1,20 +1,23 @@
 # rvOS
 
-A from-scratch RISC-V 64-bit microkernel operating system written in Rust. Targets `qemu-system-riscv64` (virt machine). Zero external crates — only `core` and `alloc`.
+A from-scratch RISC-V 64-bit microkernel operating system written in Rust. Targets `qemu-system-riscv64` (virt machine). Zero external crates — only `core` and `alloc` in the kernel.
 
-~4,200 lines of Rust and RISC-V assembly across 33 source files.
+~5,000 lines of Rust and RISC-V assembly across 40+ source files.
 
 ## Features
 
 - **Sv39 virtual memory** — 3-level page tables with identity-mapped kernel and per-process user address spaces
 - **Preemptive multitasking** — round-robin scheduler driven by timer interrupts, context switch in ~28 instructions
 - **User mode** — processes run in U-mode with separate page tables; kernel pages are inaccessible from user code
-- **Syscall interface** — `ecall`-based: `SYS_WRITE`, `SYS_EXIT`, `SYS_YIELD`, `SYS_GETPID`, plus IPC syscalls
-- **Async IPC channels** — kernel-buffered message passing between processes
-- **Interrupt handling** — full trap vector with save/restore of all 32 registers + CSRs, PLIC for external interrupts
+- **ELF loader** — loads standard RISC-V ELF binaries as user processes
+- **Capability-based IPC** — Fuchsia-style bidirectional channels with capability passing; all I/O is channel-based
+- **Service discovery** — init server acts as a service directory; user processes request services by name and receive channel capabilities
+- **mmap/munmap** — user processes can dynamically allocate and free memory pages
+- **Rust std support** — custom `riscv64gc-unknown-rvos` compiler target enables user programs with full Rust `std`
+- **Interrupt-driven I/O** — UART and keyboard input via IRQ with ring buffers and process wake-up
 - **UART serial console** — 16550A driver with `print!`/`println!` macros via `core::fmt::Write`
-- **VirtIO GPU driver** — MMIO transport, split virtqueue, GPU command interface (framebuffer console with 8x16 bitmap font)
-- **Physical frame allocator** — bitmap-based, supports contiguous allocation
+- **VirtIO GPU driver** — MMIO transport, split virtqueue, framebuffer console with 8x16 bitmap font
+- **Buddy allocator** — physical frame allocator with efficient contiguous allocation for DMA
 - **Kernel heap** — linked-list free-list allocator (`#[global_allocator]`), enabling `Vec`, `Box`, `String`
 - **SpinLock** — atomic spinlock with RAII guard and interrupt disable/restore
 
@@ -41,102 +44,55 @@ sudo apt-get install -y qemu-system-misc
 ### Build and Run
 
 ```bash
-make build    # Build kernel binary
+make build    # Build kernel + user programs
 make run      # Boot in QEMU (serial on stdio)
 ```
 
-### Sample Output
+### Shell Commands
+
+Once booted, an interactive shell appears on the serial console:
 
 ```
-  ________  ____  _____
-  |_____  \/ /\ \/  __ \  ___
-   _ __|  / /  \    / / / /__\
-  | | |\ \ \  / \  / / /\___  \
-  |_|  \_\_\/ /\_\/__/  \____/
-
-  rvOS v0.1.0 -- RISC-V 64-bit Microkernel
-  QEMU virt machine, 128 MiB RAM
-
-Heap initialized: 1024 KiB
-Frame allocator: 795 frames reserved, 32768 total (124 MiB free)
-[boot] Sv39 paging enabled (root PPN=0x8031b)
-
-Trap handler installed at 0x80200034
-PLIC initialized (UART IRQ 10 enabled)
-Scheduler initialized (max 64 processes)
-[demo] Spawning kernel demo tasks...
-  Spawned [1] "counter-A" (PID 1)
-  Spawned [2] "counter-B" (PID 2)
-  Spawned [3] "ping" (PID 3)
-  Spawned [4] "pong" (PID 4)
-[demo] Spawning user-mode tasks...
-  Spawned user [5] "user-hello" (PID 5)
-  Spawned user [6] "user-getpid" (PID 6)
-
-[counter-A] pid=1 iteration 0
-[counter-B] pid=2 iteration 0
-[ping] sent ping #0
-[pong] received: "ping" from PID 3
-[pong] sent pong reply
-User OK!
-PID=6
-[ping] received: "pong" from PID 4
-...
-[shutdown] rvOS shutting down. Goodbye!
-```
-
-## Project Structure
-
-```
-rvos/
-├── Makefile                     # build, run, run-gui, run-vnc, debug, clean
-├── kernel/
-│   ├── Cargo.toml
-│   ├── linker.ld                # Kernel at 0x80200000, BSS markers, 64K boot stack
-│   └── src/
-│       ├── main.rs              # Entry point, demo task spawning, shutdown
-│       ├── panic.rs             # Panic handler with CSR dump
-│       ├── arch/
-│       │   ├── boot.S           # Assembly entry: set stack, zero BSS, call kmain
-│       │   ├── trap.S           # Trap vector: save/restore regs, U/S-mode dispatch
-│       │   ├── switch.S         # Context switch (callee-saved), user entry trampoline
-│       │   ├── user_programs.S  # Embedded user-mode programs (raw RISC-V machine code)
-│       │   ├── trap.rs          # Trap dispatcher, syscall handler, timer/PLIC handling
-│       │   ├── paging.rs        # Kernel page table setup, enable Sv39
-│       │   ├── csr.rs           # CSR read/write macros (sstatus, scause, satp, etc.)
-│       │   └── sbi.rs           # SBI calls (console, timer, shutdown)
-│       ├── mm/
-│       │   ├── address.rs       # PhysAddr, VirtAddr, PhysPageNum, VirtPageNum newtypes
-│       │   ├── frame.rs         # Bitmap physical frame allocator (128MB / 4K = 32768 frames)
-│       │   ├── heap.rs          # Linked-list kernel heap allocator (1MB, #[global_allocator])
-│       │   └── page_table.rs    # Sv39 PageTable: map/unmap/translate, PTE flags
-│       ├── task/
-│       │   ├── process.rs       # Process struct, user/kernel creation, user page tables
-│       │   ├── scheduler.rs     # Round-robin scheduler, spawn, schedule, exit, process list
-│       │   └── context.rs       # TaskContext (callee-saved regs for kernel switch)
-│       ├── ipc/
-│       │   └── mod.rs           # Channel-based IPC: create, send, recv, close
-│       ├── drivers/
-│       │   ├── uart.rs          # UART 16550A (0x10000000): polling putchar/getchar
-│       │   ├── plic.rs          # PLIC (0x0C000000): init, claim, complete
-│       │   └── virtio/
-│       │       ├── mmio.rs      # VirtIO MMIO transport: probe, init, register access
-│       │       ├── queue.rs     # Split virtqueue: descriptor table, avail/used rings
-│       │       └── gpu.rs       # VirtIO GPU: display info, resource create, scanout, flush
-│       ├── console/
-│       │   ├── mod.rs           # print!/println! macros, dual UART + framebuffer output
-│       │   ├── framebuffer.rs   # FbConsole: pixel rendering, cursor, scrolling
-│       │   └── font.rs          # 8x16 bitmap font (128 ASCII characters)
-│       └── sync/
-│           └── spinlock.rs      # SpinLock<T> with RAII guard, interrupt save/restore
-└── vendor/
-    ├── qemu/                    # QEMU source (submodule, for driver reference)
-    └── riscv-isa-manual/        # RISC-V ISA spec (submodule, for arch reference)
+rvos> help       # List available commands
+rvos> echo hi    # Echo text
+rvos> ps         # Process list (via sysinfo service)
+rvos> math add 3 5   # Math service (add/mul/sub)
+rvos> shutdown   # Shut down the system
 ```
 
 ## Architecture
 
-### Memory Layout (QEMU virt, 128MB)
+rvOS follows a **microkernel service model**. All user-visible services (console I/O, process info, math) run as kernel tasks communicating over IPC channels. User processes access services through capability-based channel endpoints obtained via the init server.
+
+### Process List
+
+| PID | Name | Type | Role |
+|-----|------|------|------|
+| 0 | idle | kernel | Idle loop (kmain) |
+| 1 | init | kernel | Service directory |
+| 2 | serial-con | kernel | Serial console server |
+| 3 | fb-con | kernel | Framebuffer console (if GPU) |
+| 4 | sysinfo | kernel | Process list service |
+| 5 | math | kernel | Computation service |
+| 6 | hello-std | user | Test program (Rust std) |
+| 7 | shell-serial | user | Interactive shell (serial) |
+| 8 | shell-fb | user | Interactive shell (framebuffer, if GPU) |
+
+### IPC Model
+
+```
+User Process                     Init Server                 Service
+     |                               |                          |
+     |-- "stdio" on boot channel --->|                          |
+     |                               |-- endpoint via ctrl ch ->|
+     |<-- channel cap on boot ch ----|                          |
+     |                                                          |
+     |============= direct channel ============================|
+     |-- write data -->                              <-- read --|
+     |<-- input data --                              -- send -->|
+```
+
+### Memory Layout (QEMU virt, 128 MiB)
 
 | Range | Contents |
 |-------|----------|
@@ -148,6 +104,23 @@ rvos/
 | `0x80200000` | Kernel image (text, rodata, data, bss) |
 | `_end + 64K` | Boot stack top |
 | `_end` ... `0x88000000` | Free physical frames |
+
+### Syscall Interface
+
+| # | Name | Description |
+|---|------|-------------|
+| 93 | `SYS_EXIT` | Terminate process |
+| 124 | `SYS_YIELD` | Yield CPU |
+| 172 | `SYS_GETPID` | Get process ID |
+| 200 | `SYS_CHAN_CREATE` | Create bidirectional channel pair |
+| 201 | `SYS_CHAN_SEND` | Send message on channel |
+| 202 | `SYS_CHAN_RECV` | Non-blocking receive |
+| 203 | `SYS_CHAN_CLOSE` | Close channel handle |
+| 204 | `SYS_CHAN_RECV_BLOCKING` | Blocking receive |
+| 222 | `SYS_MMAP` | Allocate and map pages |
+| 215 | `SYS_MUNMAP` | Unmap and free pages |
+
+See [docs/kernel-abi.md](docs/kernel-abi.md) for the full ABI reference.
 
 ### User Mode
 
@@ -163,15 +136,50 @@ Only 4 assembly files (< 400 lines total):
 - `boot.S` — set stack, zero BSS, jump to Rust
 - `trap.S` — trap entry/exit for both S-mode and U-mode traps
 - `switch.S` — context switch + kernel/user task trampolines
-- `user_programs.S` — embedded user programs as raw machine code
+- `user_programs.S` — embedded user ELF binaries
 
 Everything else is Rust with inline `asm!` for CSR access, `wfi`, `sfence.vma`, and `ecall`.
+
+## Project Structure
+
+```
+rvos/
+├── Makefile                     # build, run, run-gui, run-vnc, debug, clean
+├── kernel/
+│   ├── Cargo.toml
+│   ├── linker.ld                # Kernel at 0x80200000
+│   └── src/
+│       ├── main.rs              # Entry point, boot sequence, service spawning
+│       ├── arch/                # boot.S, trap.S, switch.S, trap.rs, paging, CSR
+│       ├── mm/                  # Heap, frame allocator, Sv39 page tables
+│       ├── task/                # Process model and round-robin scheduler
+│       ├── ipc/                 # Bidirectional channel IPC
+│       ├── services/            # init, console, sysinfo, math servers
+│       ├── drivers/             # UART, PLIC, TTY, VirtIO (GPU, keyboard)
+│       ├── console/             # print! macros, framebuffer text rendering
+│       └── sync/                # SpinLock with interrupt save/restore
+├── user/
+│   ├── shell/                   # Interactive shell (no_std, raw syscalls)
+│   ├── hello/                   # Hello world with Rust std
+│   └── rvos-rt/                 # Runtime crate for std programs
+├── lib/
+│   ├── rvos-wire/               # Serialization library (no_std)
+│   └── rust-std/                # Patched Rust std library sources
+├── vendor/
+│   ├── rust/                    # Custom Rust compiler (rvOS target)
+│   ├── qemu/                    # QEMU source (device reference)
+│   └── riscv-isa-manual/        # RISC-V ISA specification
+└── docs/
+    ├── architecture.md          # System architecture deep-dive
+    ├── kernel-abi.md            # Syscall and IPC ABI reference
+    └── building.md              # Build system and development guide
+```
 
 ## Make Targets
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Build kernel ELF and raw binary |
+| `make build` | Build kernel + all user programs |
 | `make run` | Boot in QEMU with serial on stdio |
 | `make run-gui` | Boot with VirtIO GPU (requires X/GTK display) |
 | `make run-vnc` | Boot with VirtIO GPU on VNC port 5900 |
@@ -179,14 +187,21 @@ Everything else is Rust with inline `asm!` for CSR access, `wfi`, `sfence.vma`, 
 | `make debug` | QEMU with GDB stub (`-s -S`) |
 | `make clean` | Remove build artifacts |
 
+## Documentation
+
+- [Architecture Overview](docs/architecture.md) — boot flow, trap handling, context switching, service model
+- [Kernel ABI Reference](docs/kernel-abi.md) — syscalls, message format, handle table, boot protocol
+- [Building Guide](docs/building.md) — toolchain setup, build system, adding user programs
+
 ## Design Decisions
 
-- **No external crates** — everything built on `core` and `alloc` only
-- **Identity-mapped kernel** — simplifies early boot and physical/virtual address conversion
-- **Polling I/O** — UART and VirtIO GPU use polling (interrupt-driven is available via PLIC but not required for the demo)
-- **Bitmap frame allocator** — simple, O(n) scan but sufficient for 128MB; supports contiguous allocation for DMA buffers
-- **Linked-list heap** — first-fit with coalescing; backs `Vec`, `Box`, `String` via `#[global_allocator]`
-- **Round-robin scheduling** — timer-driven preemption at ~10ms intervals; cooperative yield also available
+- **No external crates** — kernel built on `core` and `alloc` only
+- **Identity-mapped kernel** — simplifies early boot and VA↔PA conversion
+- **Channel-based I/O** — all user I/O goes through IPC channels (no direct read/write syscalls)
+- **Capability passing** — channel endpoints transferred between processes via messages
+- **Buddy allocator** — efficient O(log n) allocation with contiguous frame support for DMA
+- **Round-robin scheduling** — timer-driven preemption at ~100ms intervals; cooperative yield also available
+- **Custom Rust target** — `riscv64gc-unknown-rvos` enables user programs with full Rust `std` support
 
 ## License
 
