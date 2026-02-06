@@ -369,7 +369,6 @@ pub fn exit_current_from_syscall() {
                         }
                     }
                 }
-                core::mem::forget(pt);
             }
             proc.state = ProcessState::Dead;
         }

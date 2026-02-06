@@ -15,5 +15,6 @@ pub use error::{SysError, SysResult};
 pub use message::Message;
 pub use channel::Channel;
 pub use service::connect_to_service;
+pub use raw::NO_CAP;
 
 pub use rvos_wire;

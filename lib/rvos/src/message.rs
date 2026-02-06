@@ -9,10 +9,10 @@ const MAX_MSG_SIZE: usize = 64;
 #[repr(C)]
 #[derive(Clone)]
 pub struct Message {
-    data: [u8; MAX_MSG_SIZE],
-    len: usize,
-    sender_pid: usize,
-    cap: usize,
+    pub data: [u8; MAX_MSG_SIZE],
+    pub len: usize,
+    pub sender_pid: usize,
+    pub cap: usize,
 }
 
 impl Message {

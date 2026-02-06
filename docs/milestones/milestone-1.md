@@ -1,6 +1,7 @@
 # Milestone 1 — Harden for Compositor, Networking, and Persistent FS
 
 **Date:** 2026-02-06
+**Completed:** 2026-02-06
 **Input:** [Architecture Review 1](../arch-review-1.md)
 **Goal:** Fix the subset of arch-review findings that will block or complicate the next
 three planned features: a window compositor, a network stack, and a persistent
@@ -17,12 +18,12 @@ All six items must be complete before the milestone is closed.
 
 ### 1. Bump resource limits
 
-- [ ] `MAX_HANDLES` ≥ 32 (was 16) — a compositor process needs handles for: GPU device,
+- [x] `MAX_HANDLES` ≥ 32 (was 16) — a compositor process needs handles for: GPU device,
   SHM framebuffer, per-client channels (×N), plus its own boot/control channels.
   16 is already exhausted with ~4 clients.
-- [ ] `MAX_CHANNELS` ≥ 64 (was 32) — currently 7 services × ~3 channels each = 21
+- [x] `MAX_CHANNELS` ≥ 64 (was 32) — currently 7 services × ~3 channels each = 21
   consumed at boot. Compositor + networking adds at minimum 10 more.
-- [ ] `MAX_SERVICES` ≥ 8 (was 4) — currently at capacity with stdio, sysinfo, math, fs.
+- [x] `MAX_SERVICES` ≥ 8 (was 4) — currently at capacity with stdio, sysinfo, math, fs.
   Compositor and networking each register as a service.
 
 **Why now:** Every new feature hits these ceilings immediately. Trivial constant changes
@@ -34,9 +35,9 @@ but they silently fail if not bumped.
 
 ### 2. Add message queue depth limits
 
-- [ ] Each channel endpoint enforces a maximum queue depth (e.g., 64 messages).
-- [ ] `sys_chan_send` returns an error code (e.g., `QUEUE_FULL`) when the limit is hit.
-- [ ] User-space `lib/rvos` exposes the error so callers can implement backpressure.
+- [x] Each channel endpoint enforces a maximum queue depth (e.g., 64 messages).
+- [x] `sys_chan_send` returns an error code (e.g., `QUEUE_FULL`) when the limit is hit.
+- [x] User-space `lib/rvos` exposes the error so callers can implement backpressure.
 
 **Why now:** A compositor pushes frame-dirty notifications to every client. A network
 stack receives packets from the NIC driver. Without backpressure, either feature can
@@ -49,9 +50,9 @@ security concern from the arch review.
 
 ### 3. Fix fs endpoint leak
 
-- [ ] `do_open()` in `user/fs/src/main.rs` closes `client_file_handle` after sending it
+- [x] `do_open()` in `user/fs/src/main.rs` closes `client_file_handle` after sending it
   to the client, or restructures ownership so the handle is not leaked.
-- [ ] Verified: can open and close >14 files in a single session without `NO_CAP` errors.
+- [x] Verified: can open and close >14 files in a single session without `NO_CAP` errors.
 
 **Why now:** A persistent filesystem will have long-lived sessions with many opens. The
 current leak limits the system to ~14 file opens total before the handle table fills.
@@ -62,10 +63,10 @@ current leak limits the system to ~14 file opens total before the handle table f
 
 ### 4. Deduplicate init.rs service handlers
 
-- [ ] `handle_sysinfo_request`, `handle_math_request`, and `handle_fs_request` are
+- [x] `handle_sysinfo_request`, `handle_math_request`, and `handle_fs_request` are
   replaced by a single generic function, e.g.,
   `handle_service_request(service_ep: &AtomicUsize, boot_ep_b: usize)`.
-- [ ] Adding a new service requires only adding an entry to a table/array, not a new
+- [x] Adding a new service requires only adding an entry to a table/array, not a new
   function.
 
 **Why now:** Compositor and networking each add a new service. Without this fix, that's
@@ -78,10 +79,10 @@ of a subtle copy-paste bug (e.g., forgetting to update the atomic variable).
 
 ### 5. Port user/fs and user/shell to lib/rvos
 
-- [ ] `user/fs/src/syscall.rs` is deleted; `user/fs` depends on `lib/rvos` for raw
+- [x] `user/fs/src/syscall.rs` is deleted; `user/fs` depends on `lib/rvos` for raw
   syscalls and channel operations.
-- [ ] `user/shell/src/syscall.rs` is deleted; `user/shell` depends on `lib/rvos`.
-- [ ] Both programs build and pass their existing functional tests.
+- [x] `user/shell/src/syscall.rs` is deleted; `user/shell` depends on `lib/rvos`.
+- [x] Both programs build and pass their existing functional tests.
 
 **Why now:** Every new user-space program (compositor, network daemon, block-device
 driver) will face the same "do I duplicate syscalls or use the shared library?" question.
@@ -94,11 +95,11 @@ duplication. Fix the existing programs so the shared library is the obvious path
 
 ### 6. Fix PageTable mem::forget pattern
 
-- [ ] `PageTable::drop()` is a no-op (does not free page table frames).
-- [ ] An explicit method (e.g., `PageTable::free()` or `PageTable::into_raw()`) is the
+- [x] `PageTable::drop()` is a no-op (does not free page table frames).
+- [x] An explicit method (e.g., `PageTable::free()` or `PageTable::into_raw()`) is the
   only way to free page table frames.
-- [ ] All 10 `mem::forget(PageTable)` call sites are removed.
-- [ ] Kernel boots and runs all existing user programs without page table corruption.
+- [x] All 10 `mem::forget(PageTable)` call sites are removed.
+- [x] Kernel boots and runs all existing user programs without page table corruption.
 
 **Why now:** The compositor will add `mmap` for GPU buffers, which means new code paths
 that create/modify `PageTable` wrappers. Every such site must remember to call

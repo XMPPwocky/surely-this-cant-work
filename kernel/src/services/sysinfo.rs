@@ -70,16 +70,18 @@ fn send_process_list(ep: usize, pid: usize) {
         msg.data[..chunk.len()].copy_from_slice(chunk);
         msg.len = chunk.len();
         msg.sender_pid = pid;
-        let wake = ipc::channel_send(ep, msg);
-        if wake != 0 { crate::task::wake_process(wake); }
+        if let Ok(wake) = ipc::channel_send(ep, msg) {
+            if wake != 0 { crate::task::wake_process(wake); }
+        }
         offset = end;
     }
 
     // Send sentinel (len=0)
     let mut sentinel = Message::new();
     sentinel.sender_pid = pid;
-    let wake = ipc::channel_send(ep, sentinel);
-    if wake != 0 { crate::task::wake_process(wake); }
+    if let Ok(wake) = ipc::channel_send(ep, sentinel) {
+        if wake != 0 { crate::task::wake_process(wake); }
+    }
 }
 
 fn send_error(ep: usize, pid: usize, err_msg: &[u8]) {
@@ -88,12 +90,14 @@ fn send_error(ep: usize, pid: usize, err_msg: &[u8]) {
     msg.data[..copy_len].copy_from_slice(&err_msg[..copy_len]);
     msg.len = copy_len;
     msg.sender_pid = pid;
-    let wake = ipc::channel_send(ep, msg);
-    if wake != 0 { crate::task::wake_process(wake); }
+    if let Ok(wake) = ipc::channel_send(ep, msg) {
+        if wake != 0 { crate::task::wake_process(wake); }
+    }
 
     // Sentinel
     let mut sentinel = Message::new();
     sentinel.sender_pid = pid;
-    let wake = ipc::channel_send(ep, sentinel);
-    if wake != 0 { crate::task::wake_process(wake); }
+    if let Ok(wake) = ipc::channel_send(ep, sentinel) {
+        if wake != 0 { crate::task::wake_process(wake); }
+    }
 }

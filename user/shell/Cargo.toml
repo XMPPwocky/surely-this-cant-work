@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 rvos-rt = { path = "../rvos-rt" }
-rvos-wire = { path = "../../lib/rvos-wire" }
+rvos = { path = "../../lib/rvos" }
 
 [profile.release]
 panic = "abort"

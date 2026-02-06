@@ -1,7 +1,8 @@
 use std::io::{self, BufRead, Write};
 
-use crate::syscall::{self, Message};
-use rvos_wire::{Deserialize, Reader, Serialize, WireError, Writer};
+use rvos::raw;
+use rvos::Message;
+use rvos::rvos_wire::{Deserialize, Reader, Serialize, WireError, Writer};
 
 // --- Math protocol types ---
 
@@ -36,8 +37,8 @@ fn request_service(name: &[u8]) -> usize {
     let mut msg = Message::new();
     msg.data[..name.len()].copy_from_slice(name);
     msg.len = name.len();
-    syscall::sys_chan_send(0, &msg);
-    syscall::sys_chan_recv_blocking(0, &mut msg);
+    raw::sys_chan_send(0, &msg);
+    raw::sys_chan_recv_blocking(0, &mut msg);
     msg.cap
 }
 
@@ -141,11 +142,11 @@ fn cmd_ps() {
     msg.data[0] = b'P';
     msg.data[1] = b'S';
     msg.len = 2;
-    syscall::sys_chan_send(sysinfo_handle, &msg);
+    raw::sys_chan_send(sysinfo_handle, &msg);
 
     loop {
         let mut resp = Message::new();
-        syscall::sys_chan_recv_blocking(sysinfo_handle, &mut resp);
+        raw::sys_chan_recv_blocking(sysinfo_handle, &mut resp);
         if resp.len == 0 {
             break;
         }
@@ -153,7 +154,7 @@ fn cmd_ps() {
     }
     io::stdout().flush().ok();
 
-    syscall::sys_chan_close(sysinfo_handle);
+    raw::sys_chan_close(sysinfo_handle);
 }
 
 fn cmd_math(args: &str) {
@@ -194,14 +195,14 @@ fn cmd_math(args: &str) {
     let mut writer = Writer::new(&mut msg.data);
     if op.serialize(&mut writer).is_err() {
         println!("Serialize error");
-        syscall::sys_chan_close(math_handle);
+        raw::sys_chan_close(math_handle);
         return;
     }
     msg.len = writer.position();
-    syscall::sys_chan_send(math_handle, &msg);
+    raw::sys_chan_send(math_handle, &msg);
 
     let mut resp = Message::new();
-    syscall::sys_chan_recv_blocking(math_handle, &mut resp);
+    raw::sys_chan_recv_blocking(math_handle, &mut resp);
 
     let mut reader = Reader::new(&resp.data[..resp.len]);
     match MathResponse::deserialize(&mut reader) {
@@ -209,7 +210,7 @@ fn cmd_math(args: &str) {
         Err(_) => println!("Bad response from math service"),
     }
 
-    syscall::sys_chan_close(math_handle);
+    raw::sys_chan_close(math_handle);
 }
 
 pub fn run() {

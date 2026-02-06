@@ -61,8 +61,6 @@ impl PageTable {
 
     /// Wrap an existing page table root for runtime modifications.
     /// The `frames` vec starts empty -- we don't track existing PT frames.
-    /// New PT frames allocated during map() are tracked but NOT freed on drop
-    /// because the page table outlives this wrapper (caller must mem::forget).
     pub fn from_root(root_ppn: PhysPageNum) -> Self {
         PageTable {
             root_ppn,
@@ -169,9 +167,19 @@ impl PageTable {
 
 impl Drop for PageTable {
     fn drop(&mut self) {
-        // Free all page table frames
+        // No-op: dropping a PageTable wrapper does NOT free page table frames.
+        // Use PageTable::free() to explicitly free all tracked frames.
+    }
+}
+
+impl PageTable {
+    /// Explicitly free all page table frames tracked by this wrapper.
+    /// This is the ONLY way to reclaim page table memory. Drop is a no-op.
+    #[allow(dead_code)]
+    pub fn free(self) {
         for &frame in &self.frames {
             frame::frame_dealloc(frame);
         }
+        // self is dropped here, but Drop is a no-op
     }
 }

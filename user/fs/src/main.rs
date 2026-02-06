@@ -1,9 +1,8 @@
 extern crate rvos_rt;
 
-mod syscall;
-
-use syscall::{Message, NO_CAP};
-use rvos_wire::{Reader, Writer};
+use rvos::raw::{self, NO_CAP};
+use rvos::Message;
+use rvos::rvos_wire::{Reader, Writer};
 
 // --- Constants ---
 
@@ -384,7 +383,7 @@ fn send_ok(handle: usize, cap: usize) {
     let _ = w.write_u8(0); // tag: Ok
     msg.len = w.position();
     msg.cap = cap;
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_error(handle: usize, code: u8) {
@@ -393,7 +392,7 @@ fn send_error(handle: usize, code: u8) {
     let _ = w.write_u8(1); // tag: Error
     let _ = w.write_u8(code);
     msg.len = w.position();
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_data_chunk(handle: usize, data: &[u8]) {
@@ -402,7 +401,7 @@ fn send_data_chunk(handle: usize, data: &[u8]) {
     let _ = w.write_u8(0); // tag: Data
     let _ = w.write_bytes(data);
     msg.len = w.position();
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_data_sentinel(handle: usize) {
@@ -411,7 +410,7 @@ fn send_data_sentinel(handle: usize) {
     let _ = w.write_u8(0); // tag: Data
     let _ = w.write_u16(0); // zero-length payload
     msg.len = w.position();
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_write_ok(handle: usize, written: u32) {
@@ -420,7 +419,7 @@ fn send_write_ok(handle: usize, written: u32) {
     let _ = w.write_u8(1); // tag: Ok
     let _ = w.write_u32(written);
     msg.len = w.position();
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_stat_ok(handle: usize, kind: u8, size: u64) {
@@ -431,7 +430,7 @@ fn send_stat_ok(handle: usize, kind: u8, size: u64) {
     let _ = w.write_u64(size);
     msg.len = w.position();
     msg.cap = NO_CAP;
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_dir_entry(handle: usize, kind: u8, size: u64, name: &[u8]) {
@@ -443,7 +442,7 @@ fn send_dir_entry(handle: usize, kind: u8, size: u64, name: &[u8]) {
     let _ = w.write_bytes(name);
     msg.len = w.position();
     msg.cap = NO_CAP;
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_dir_sentinel(handle: usize) {
@@ -452,7 +451,7 @@ fn send_dir_sentinel(handle: usize) {
     let _ = w.write_u8(0);    // tag: Entry
     let _ = w.write_u8(0xFF); // sentinel kind
     msg.len = w.position();
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 fn send_file_error(handle: usize, code: u8) {
@@ -461,7 +460,7 @@ fn send_file_error(handle: usize, code: u8) {
     let _ = w.write_u8(2); // tag: Error
     let _ = w.write_u8(code);
     msg.len = w.position();
-    syscall::sys_chan_send(handle, &msg);
+    raw::sys_chan_send(handle, &msg);
 }
 
 // --- Main server ---
@@ -686,7 +685,7 @@ fn main() {
             // The sysinfo and math services also work this way.
 
             // Wait for a new client endpoint from init
-            syscall::sys_chan_recv_blocking(CONTROL_HANDLE, &mut msg);
+            raw::sys_chan_recv_blocking(CONTROL_HANDLE, &mut msg);
 
             if msg.cap != NO_CAP {
                 let client_ctl_handle = msg.cap;
@@ -711,7 +710,7 @@ fn serve_client(client_handle: usize) {
     // until it closes, then return to waiting on the control channel.
     loop {
         let mut msg = Message::new();
-        syscall::sys_chan_recv_blocking(client_handle, &mut msg);
+        raw::sys_chan_recv_blocking(client_handle, &mut msg);
 
         if msg.len == 0 {
             // Client probably closed the control channel
@@ -856,33 +855,34 @@ fn do_open(client_handle: usize, flags: u8, path_bytes: &[u8]) {
     };
 
     // Create channel pair for file I/O
-    let (my_handle, client_file_handle) = syscall::sys_chan_create();
+    let (my_handle, client_file_handle) = raw::sys_chan_create();
 
     if !fs.register_open_file(my_handle, inode_idx) {
-        syscall::sys_chan_close(my_handle);
-        syscall::sys_chan_close(client_file_handle);
+        raw::sys_chan_close(my_handle);
+        raw::sys_chan_close(client_file_handle);
         send_error(client_handle, ERR_IO);
         return;
     }
 
     // Send Ok with the file handle as capability.
-    // NOTE: client_file_handle leaks in our handle table (channel_close would
-    // deactivate the channel the client is using). This limits us to ~14 opens
-    // before the table fills. A proper fix needs per-endpoint ref-counting.
     send_ok(client_handle, client_file_handle);
+    // Release our local handle slot -- the capability was transferred to the
+    // client via IPC. We use handle_release (not chan_close) to avoid
+    // deactivating the channel that the client now holds.
+    raw::sys_handle_release(client_file_handle);
 
     // Now serve this file channel until the client closes it
     serve_file_channel(my_handle, inode_idx);
 
     // Clean up
     fs.close_open_file(my_handle);
-    syscall::sys_chan_close(my_handle);
+    raw::sys_chan_close(my_handle);
 }
 
 fn serve_file_channel(file_handle: usize, inode_idx: usize) {
     loop {
         let mut msg = Message::new();
-        syscall::sys_chan_recv_blocking(file_handle, &mut msg);
+        raw::sys_chan_recv_blocking(file_handle, &mut msg);
 
         // If recv returns with len=0, the channel may be closed
         if msg.len == 0 {
@@ -952,5 +952,5 @@ fn do_delete(client_handle: usize, path_bytes: &[u8]) {
     let _ = w.write_u8(0); // Ok
     msg.len = w.position();
     msg.cap = NO_CAP;
-    syscall::sys_chan_send(client_handle, &msg);
+    raw::sys_chan_send(client_handle, &msg);
 }

@@ -103,8 +103,9 @@ pub fn math_service() {
                 resp.data[..err.len()].copy_from_slice(err);
                 resp.len = err.len();
                 resp.sender_pid = my_pid;
-                let wake = ipc::channel_send(client_ep, resp);
-                if wake != 0 { crate::task::wake_process(wake); }
+                if let Ok(wake) = ipc::channel_send(client_ep, resp) {
+                    if wake != 0 { crate::task::wake_process(wake); }
+                }
                 continue;
             }
         };
@@ -116,7 +117,8 @@ pub fn math_service() {
         let _ = response.serialize(&mut writer);
         resp.len = writer.position();
         resp.sender_pid = my_pid;
-        let wake = ipc::channel_send(client_ep, resp);
-        if wake != 0 { crate::task::wake_process(wake); }
+        if let Ok(wake) = ipc::channel_send(client_ep, resp) {
+            if wake != 0 { crate::task::wake_process(wake); }
+        }
     }
 }

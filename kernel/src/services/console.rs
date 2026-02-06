@@ -147,9 +147,8 @@ fn send_line(client_ep: usize, data: &[u8]) {
         msg.data[..chunk_len].copy_from_slice(&data[offset..offset + chunk_len]);
         msg.len = chunk_len;
         msg.sender_pid = pid;
-        let wake = ipc::channel_send(client_ep, msg);
-        if wake != 0 {
-            crate::task::wake_process(wake);
+        if let Ok(wake) = ipc::channel_send(client_ep, msg) {
+            if wake != 0 { crate::task::wake_process(wake); }
         }
         offset += chunk_len;
     }

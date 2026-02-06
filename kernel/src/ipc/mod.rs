@@ -6,12 +6,23 @@ use crate::mm::address::PhysPageNum;
 /// Maximum message payload size in bytes
 const MAX_MSG_SIZE: usize = 64;
 /// Maximum number of bidirectional channels
-const MAX_CHANNELS: usize = 32;
+const MAX_CHANNELS: usize = 64;
 /// Maximum number of shared memory regions
 const MAX_SHM_REGIONS: usize = 32;
+/// Maximum number of messages queued per endpoint before backpressure kicks in
+pub const MAX_QUEUE_DEPTH: usize = 64;
 
 /// Sentinel value meaning "no capability attached"
 pub const NO_CAP: usize = usize::MAX;
+
+/// Errors returned by channel send operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendError {
+    /// The channel has been closed/deactivated.
+    ChannelClosed,
+    /// The destination queue has reached MAX_QUEUE_DEPTH.
+    QueueFull,
+}
 
 // Internal capability encoding in message queue (bits 63..62)
 // 00 = no capability (NO_CAP)
@@ -177,57 +188,69 @@ pub fn channel_create_pair() -> (usize, usize) {
 
 /// Send a message on an endpoint.
 /// send(ep_a) delivers to queue_b, send(ep_b) delivers to queue_a.
-/// Returns the PID of a blocked receiver to wake (0 = none).
-pub fn channel_send(endpoint: usize, msg: Message) -> usize {
+/// Returns Ok(wake_pid) where wake_pid is the PID of a blocked receiver to wake (0 = none).
+pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, SendError> {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
         if !channel.active {
-            return 0;
+            return Err(SendError::ChannelClosed);
         }
         if is_b {
             // Sending from B side -> push to queue_a (for A to recv)
+            if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
+                return Err(SendError::QueueFull);
+            }
             channel.queue_a.push_back(msg);
             let wake = channel.blocked_a;
             if wake != 0 {
                 channel.blocked_a = 0;
             }
-            wake
+            Ok(wake)
         } else {
             // Sending from A side -> push to queue_b (for B to recv)
+            if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
+                return Err(SendError::QueueFull);
+            }
             channel.queue_b.push_back(msg);
             let wake = channel.blocked_b;
             if wake != 0 {
                 channel.blocked_b = 0;
             }
-            wake
+            Ok(wake)
         }
     } else {
-        0
+        Err(SendError::ChannelClosed)
     }
 }
 
-/// Send by reference (for syscall path). Returns Ok(wake_pid) or Err(()).
-pub fn channel_send_ref(endpoint: usize, msg: &Message) -> Result<usize, ()> {
+/// Send by reference (for syscall path). Returns Ok(wake_pid) or Err(SendError).
+pub fn channel_send_ref(endpoint: usize, msg: &Message) -> Result<usize, SendError> {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
         if !channel.active {
-            return Err(());
+            return Err(SendError::ChannelClosed);
         }
         if is_b {
+            if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
+                return Err(SendError::QueueFull);
+            }
             channel.queue_a.push_back(msg.clone());
             let wake = channel.blocked_a;
             if wake != 0 { channel.blocked_a = 0; }
             Ok(wake)
         } else {
+            if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
+                return Err(SendError::QueueFull);
+            }
             channel.queue_b.push_back(msg.clone());
             let wake = channel.blocked_b;
             if wake != 0 { channel.blocked_b = 0; }
             Ok(wake)
         }
     } else {
-        Err(())
+        Err(SendError::ChannelClosed)
     }
 }
 

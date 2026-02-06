@@ -11,7 +11,7 @@ const USER_STACK_PAGES: usize = 8; // 32 KiB
 const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
 
 pub const MAX_PROCS: usize = 64;
-pub const MAX_HANDLES: usize = 16;
+pub const MAX_HANDLES: usize = 32;
 pub const MAX_MMAP_REGIONS: usize = 32;
 const NAME_LEN: usize = 16;
 
@@ -129,7 +129,6 @@ impl Process {
             code_ppn, code_pages, stack_ppn, USER_STACK_PAGES,
         );
         let satp = pt.satp();
-        core::mem::forget(pt);
 
         let context = TaskContext::new_user_entry(kstack_top);
 
@@ -177,7 +176,6 @@ impl Process {
             stack_ppn, USER_STACK_PAGES,
         );
         let satp = pt.satp();
-        core::mem::forget(pt);
 
         let context = TaskContext::new_user_entry(kstack_top);
 

@@ -64,12 +64,7 @@ pub fn init_kernel_page_table() -> PhysPageNum {
     println!("  Mapping VirtIO: {:#x}..{:#x} (R+W)", 0x1000_1000usize, 0x1000_9000usize);
     pt.map_range(0x1000_1000, 0x1000_1000, 0x0000_8000, PTE_R | PTE_W);
 
-    let root = pt.root_ppn();
-
-    // Leak the page table so it lives forever
-    core::mem::forget(pt);
-
-    root
+    pt.root_ppn()
 }
 
 /// Enable Sv39 paging by writing to satp and flushing the TLB.

@@ -36,7 +36,7 @@ handle, bad pointer, allocation failure, etc.). The non-blocking receive
 
 ### User-Side Wrapper Patterns
 
-The user-side syscall wrappers (see `user/shell/src/syscall.rs`) use inline
+The user-side syscall wrappers (see `lib/rvos/src/raw.rs`) use inline
 assembly with three patterns:
 
 ```rust
@@ -62,10 +62,11 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 124    | `SYS_YIELD`           | (none)                        | `a0` = 0                  | Voluntarily yields the CPU to the scheduler.               |
 | 172    | `SYS_GETPID`          | (none)                        | `a0` = PID                | Returns the calling process's PID.                         |
 | 200    | `SYS_CHAN_CREATE`      | (none)                        | `a0` = handle_a, `a1` = handle_b | Creates a bidirectional channel pair. Returns two handles. |
-| 201    | `SYS_CHAN_SEND`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX`  | Sends a message on a channel. Non-blocking.                |
+| 201    | `SYS_CHAN_SEND`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 5, or `usize::MAX` | Sends a message on a channel. Non-blocking. 0=success, 5=queue full, MAX=error. |
 | 202    | `SYS_CHAN_RECV`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 1, or `usize::MAX` | Non-blocking receive. 0=success, 1=empty, MAX=error.    |
 | 203    | `SYS_CHAN_CLOSE`       | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Closes a channel handle. Deactivates the underlying channel. |
 | 204    | `SYS_CHAN_RECV_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking receive. Suspends the process until a message arrives. |
+| 207    | `SYS_HANDLE_RELEASE`  | `a0` = handle                 | `a0` = 0                   | Frees a local handle slot without closing the underlying channel. |
 | 222    | `SYS_MMAP`            | `a0` = hint (ignored), `a1` = length | `a0` = address or `usize::MAX` | Allocates zeroed pages and maps them into the process. |
 | 215    | `SYS_MUNMAP`          | `a0` = address, `a1` = length | `a0` = 0 or `usize::MAX`  | Unmaps and frees previously mmap'd pages.                  |
 
@@ -110,11 +111,17 @@ The kernel:
 3. Reads the `Message` from user memory.
 4. Overwrites `msg.sender_pid` with the calling process's actual PID (cannot be forged).
 5. If `msg.cap != NO_CAP`, translates the capability handle from a local handle to a global endpoint ID.
-6. Enqueues the message on the peer's receive queue.
-7. If the peer was blocked on a receive, wakes it.
+6. Checks that the destination queue has not reached `MAX_QUEUE_DEPTH` (64).
+7. Enqueues the message on the peer's receive queue.
+8. If the peer was blocked on a receive, wakes it.
 
-Returns 0 on success, `usize::MAX` on error (invalid handle, invalid pointer,
-invalid cap handle, closed channel).
+Returns:
+- `0` -- success.
+- `5` -- queue full (`QUEUE_FULL`). The destination endpoint's message queue has
+  reached `MAX_QUEUE_DEPTH`. The message was **not** enqueued. The caller should
+  retry later or implement backpressure.
+- `usize::MAX` -- error (invalid handle, invalid pointer, invalid cap handle,
+  closed channel).
 
 #### SYS_CHAN_RECV (202)
 
@@ -152,6 +159,20 @@ subsequent sends to either endpoint will fail. Currently, closing either
 endpoint deactivates the entire channel.
 
 Returns 0 on success, `usize::MAX` if the handle is invalid.
+
+#### SYS_HANDLE_RELEASE (207)
+
+Frees a local handle slot without closing the underlying channel or SHM
+region. This is used after sending a capability via IPC: the sender no longer
+needs its local handle, but calling `SYS_CHAN_CLOSE` would deactivate the
+channel for the receiver.
+
+Returns 0 unconditionally.
+
+**Note:** This is a stopgap until `SYS_CHAN_CLOSE` gains per-endpoint
+reference counting, at which point `SYS_HANDLE_RELEASE` can be removed and
+`SYS_CHAN_CLOSE` will only deactivate a channel when all handles to both
+endpoints are closed.
 
 #### SYS_MMAP (222)
 
@@ -240,18 +261,18 @@ Each process has a fixed-size handle table that maps local handle indices to
 global IPC endpoint IDs.
 
 ```rust
-pub const MAX_HANDLES: usize = 16;
+pub const MAX_HANDLES: usize = 32;
 
 pub struct Process {
     // ...
-    pub handles: [Option<usize>; MAX_HANDLES],
+    pub handles: [Option<HandleObject>; MAX_HANDLES],
     // ...
 }
 ```
 
 ### Properties
 
-- **Size:** 16 slots, indexed 0..15.
+- **Size:** 32 slots, indexed 0..31.
 - **Slot contents:** `None` = free, `Some(global_endpoint_id)` = occupied.
 - **Allocation:** Linear scan for the first `None` slot. Panics if the table is full.
 - **Lookup:** `handles[local_handle]` returns `Some(global_endpoint_id)` or `None`.
@@ -272,9 +293,11 @@ server (see Boot Protocol below).
 1. **Creation:** `SYS_CHAN_CREATE` allocates two handles (for endpoints A and B).
 2. **Transfer:** Sending a message with `cap` set to a local handle transfers
    the underlying endpoint to the receiver (the receiver gets a new handle via
-   capability translation).
+   capability translation). The sender should call `SYS_HANDLE_RELEASE` to free
+   its local handle slot without deactivating the channel.
 3. **Closure:** `SYS_CHAN_CLOSE` frees the local handle slot and deactivates the
-   channel.
+   channel. Use `SYS_HANDLE_RELEASE` instead when the channel should remain
+   active for other holders.
 
 ---
 
@@ -309,9 +332,10 @@ Internally, endpoints are identified by global IDs:
 
 ### Channel Limits
 
-- `MAX_CHANNELS` = 32 -- maximum number of simultaneous channels.
-- Each channel has unbounded queues (backed by `VecDeque`), so there is no
-  per-channel message limit (bounded only by heap memory).
+- `MAX_CHANNELS` = 64 -- maximum number of simultaneous channels.
+- `MAX_QUEUE_DEPTH` = 64 -- maximum number of messages queued per endpoint.
+  When a send would exceed this limit, `SYS_CHAN_SEND` returns error code 5
+  (`QUEUE_FULL`) and the message is not enqueued.
 
 ### Blocking Semantics
 
@@ -458,6 +482,7 @@ User Process                          Init Server
 | `"stdio"`    | Console I/O. Returns a channel connected to the appropriate console server (serial or framebuffer, depending on how the process was spawned). |
 | `"sysinfo"`  | System information. Returns a channel connected to the sysinfo service. Send `"PS"` to get a process list (multi-message response terminated by a zero-length sentinel). |
 | `"math"`     | Math computation service. Returns a channel connected to the math service. Send serialized `MathOp` messages; receive `MathResponse` messages (uses the `rvos_wire` serialization format). |
+| `"fs"`       | Filesystem service. Returns a control channel to the tmpfs server. Send Open/Delete/Stat/Readdir requests; Open returns a file channel capability for Read/Write operations. |
 
 ### Service Channel Lifecycle
 
@@ -529,9 +554,10 @@ After obtaining a `"sysinfo"` channel:
 
 | Constant            | Value | Description                         |
 |---------------------|-------|-------------------------------------|
-| `MAX_HANDLES`       | 16    | Handle table slots per process      |
+| `MAX_HANDLES`       | 32    | Handle table slots per process      |
 | `MAX_PROCS`         | 64    | Maximum number of processes         |
-| `MAX_CHANNELS`      | 32    | Maximum simultaneous channels       |
+| `MAX_CHANNELS`      | 64    | Maximum simultaneous channels       |
+| `MAX_QUEUE_DEPTH`   | 64    | Maximum messages per endpoint queue  |
 | `MAX_MSG_SIZE`      | 64    | Maximum message payload (bytes)     |
 | `MAX_MMAP_REGIONS`  | 32    | mmap tracking slots per process     |
 | `PAGE_SIZE`         | 4096  | Page size (bytes)                   |

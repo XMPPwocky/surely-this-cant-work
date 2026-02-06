@@ -18,6 +18,7 @@ pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
 pub const SYS_SHM_CREATE: usize = 205;
 pub const SYS_SHM_DUP_RO: usize = 206;
+pub const SYS_HANDLE_RELEASE: usize = 207;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 
@@ -125,6 +126,9 @@ fn handle_syscall(tf: &mut TrapFrame) {
         SYS_SHM_DUP_RO => {
             tf.regs[10] = sys_shm_dup_ro(a0);
         }
+        SYS_HANDLE_RELEASE => {
+            tf.regs[10] = sys_handle_release(a0);
+        }
         SYS_MMAP => {
             tf.regs[10] = sys_mmap(a0, a1);
         }
@@ -200,7 +204,8 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     // Send
     let wake_pid = match crate::ipc::channel_send_ref(endpoint, &msg) {
         Ok(w) => w,
-        Err(()) => return usize::MAX,
+        Err(crate::ipc::SendError::QueueFull) => return 5, // QUEUE_FULL error code
+        Err(_) => return usize::MAX,
     };
     if wake_pid != 0 {
         crate::task::wake_process(wake_pid);
@@ -400,6 +405,14 @@ fn sys_shm_dup_ro(handle: usize) -> usize {
     }
 }
 
+/// SYS_HANDLE_RELEASE: free a local handle slot without closing the underlying
+/// channel or SHM region. Used after sending a capability to release the sender's
+/// copy without deactivating the channel for the receiver.
+fn sys_handle_release(handle: usize) -> usize {
+    crate::task::current_process_free_handle(handle);
+    0
+}
+
 /// SYS_MMAP: map pages into process address space.
 /// a0 == 0: anonymous mapping (allocate fresh pages)
 /// a0 != 0: SHM handle mapping (map shared region)
@@ -458,9 +471,6 @@ fn sys_mmap_anonymous(length: usize) -> usize {
             crate::mm::page_table::PTE_U);
     }
 
-    // Don't drop the PageTable wrapper (it would free intermediate PT frames)
-    core::mem::forget(pt);
-
     // Record mmap region in process (anonymous: shm_id = None)
     if !crate::task::current_process_add_mmap(ppn.0, pages, None) {
         // mmap region table full - unmap and free
@@ -469,7 +479,6 @@ fn sys_mmap_anonymous(length: usize) -> usize {
             pt2.unmap(crate::mm::address::VirtPageNum(ppn.0 + i));
             crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
         }
-        core::mem::forget(pt2);
         unsafe { core::arch::asm!("sfence.vma"); }
         return usize::MAX;
     }
@@ -523,8 +532,6 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
         pt.map(vpn, page_ppn, flags);
     }
 
-    core::mem::forget(pt);
-
     // Record mmap region (SHM-backed: shm_id = Some(id))
     if !crate::task::current_process_add_mmap(base_ppn.0, map_pages, Some(shm_id)) {
         // Table full - unmap
@@ -532,7 +539,6 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
         for i in 0..map_pages {
             pt2.unmap(crate::mm::address::VirtPageNum(base_ppn.0 + i));
         }
-        core::mem::forget(pt2);
         unsafe { core::arch::asm!("sfence.vma"); }
         return usize::MAX;
     }
@@ -577,8 +583,6 @@ fn sys_munmap(addr: usize, length: usize) -> usize {
         // SHM-backed: do NOT free the physical frame
     }
 
-    core::mem::forget(pt);
-
     // Flush TLB
     unsafe { core::arch::asm!("sfence.vma"); }
 
@@ -599,11 +603,9 @@ fn translate_user_va(va: usize) -> Option<usize> {
     let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
     let pt = crate::mm::page_table::PageTable::from_root(root_ppn);
     let vpn = crate::mm::address::VirtPageNum(va / crate::mm::address::PAGE_SIZE);
-    let result = pt.translate(vpn).map(|ppn| {
+    pt.translate(vpn).map(|ppn| {
         ppn.0 * crate::mm::address::PAGE_SIZE + (va % crate::mm::address::PAGE_SIZE)
-    });
-    core::mem::forget(pt);
-    result
+    })
 }
 
 /// Validate a user buffer and return its physical address.

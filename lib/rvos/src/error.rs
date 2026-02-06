@@ -7,6 +7,7 @@ pub enum SysError {
     ChannelClosed,
     NoResources,
     BadAddress,
+    QueueFull,
     Unknown(usize),
 }
 
@@ -22,6 +23,7 @@ impl SysError {
             2 => Err(SysError::ChannelClosed),
             3 => Err(SysError::NoResources),
             4 => Err(SysError::BadAddress),
+            5 => Err(SysError::QueueFull),
             n => Err(SysError::Unknown(n)),
         }
     }
