@@ -88,12 +88,6 @@ fn handle_syscall(tf: &mut TrapFrame) {
     let syscall_num = tf.regs[17]; // a7
     let a0 = tf.regs[10];
     let a1 = tf.regs[11];
-    let pid = crate::task::current_pid();
-
-    // Debug: trace syscalls from hello-std (PID 5)
-    if pid == 5 {
-        crate::println!("[trace] PID 5 syscall={} a0={:#x} a1={:#x}", syscall_num, a0, a1);
-    }
 
     match syscall_num {
         SYS_EXIT => {
@@ -367,7 +361,6 @@ fn sys_munmap(addr: usize, length: usize) -> usize {
 }
 
 fn sys_exit() {
-    crate::println!("[syscall] PID {} called SYS_EXIT", crate::task::current_pid());
     crate::task::exit_current_from_syscall();
 }
 

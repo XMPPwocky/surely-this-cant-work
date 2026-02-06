@@ -155,9 +155,11 @@ fn send_line(client_ep: usize, data: &[u8]) {
     }
 }
 
+const MAX_CONSOLE_CLIENTS: usize = 4;
+
 /// Serial console server kernel task.
-/// Owns UART I/O. Receives a client endpoint via its control channel,
-/// then serves I/O on that client endpoint.
+/// Owns UART I/O. Accepts multiple client endpoints via its control channel.
+/// All clients can write output; input goes to client 0 (the primary shell).
 pub fn serial_console_server() {
     let control_ep = SERIAL_CONTROL_EP.load(Ordering::Relaxed);
     let my_pid = crate::task::current_pid();
@@ -165,12 +167,17 @@ pub fn serial_console_server() {
     // Register for wake on serial input
     tty::set_serial_wake_pid(my_pid);
 
-    // Wait for client endpoint via control channel
-    let client_ep = loop {
+    let mut client_eps: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
+    let mut client_count: usize = 0;
+
+    // Wait for at least the first client endpoint via control channel
+    loop {
         match ipc::channel_recv(control_ep) {
             Some(msg) => {
-                if msg.cap != NO_CAP {
-                    break msg.cap; // This is the server-side endpoint for the client
+                if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
+                    client_eps[client_count] = msg.cap;
+                    client_count += 1;
+                    break;
                 }
             }
             None => {
@@ -179,12 +186,20 @@ pub fn serial_console_server() {
                 crate::task::schedule();
             }
         }
-    };
+    }
 
     let mut line_disc = LineDiscipline::new();
 
     // Main loop
     loop {
+        // Check control channel for new client registrations
+        while let Some(msg) = ipc::channel_recv(control_ep) {
+            if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
+                client_eps[client_count] = msg.cap;
+                client_count += 1;
+            }
+        }
+
         // Check for input characters from UART ring buffer
         let mut got_input = false;
         loop {
@@ -196,37 +211,45 @@ pub fn serial_console_server() {
                     // Also echo to FB if active
                     echo_fb(ch);
                     if let Some(len) = line_disc.push_char(ch) {
-                        // Complete line — send to client
+                        // Complete line — send to primary client (client 0)
                         let data_copy = {
                             let src = line_disc.line_data(len);
                             let mut buf = [0u8; LINE_BUF_SIZE];
                             buf[..len].copy_from_slice(src);
                             (buf, len)
                         };
-                        send_line(client_ep, &data_copy.0[..data_copy.1]);
+                        if client_count > 0 {
+                            send_line(client_eps[0], &data_copy.0[..data_copy.1]);
+                        }
                     }
                 }
                 None => break,
             }
         }
 
-        // Check for write requests from client
+        // Check for write requests from ALL clients
         let mut got_write = false;
-        loop {
-            match ipc::channel_recv(client_ep) {
-                Some(msg) => {
-                    got_write = true;
-                    if msg.len > 0 {
-                        write_serial(&msg.data[..msg.len]);
-                        write_fb(&msg.data[..msg.len]);
+        for i in 0..client_count {
+            loop {
+                match ipc::channel_recv(client_eps[i]) {
+                    Some(msg) => {
+                        got_write = true;
+                        if msg.len > 0 {
+                            write_serial(&msg.data[..msg.len]);
+                            write_fb(&msg.data[..msg.len]);
+                        }
                     }
+                    None => break,
                 }
-                None => break,
             }
         }
 
         if !got_input && !got_write {
-            ipc::channel_set_blocked(client_ep, my_pid);
+            // Register blocked on control channel + all client endpoints
+            ipc::channel_set_blocked(control_ep, my_pid);
+            for i in 0..client_count {
+                ipc::channel_set_blocked(client_eps[i], my_pid);
+            }
             crate::task::block_process(my_pid);
             crate::task::schedule();
         }
@@ -234,7 +257,7 @@ pub fn serial_console_server() {
 }
 
 /// FB console server kernel task.
-/// Owns framebuffer + keyboard. Same pattern as serial console server.
+/// Owns framebuffer + keyboard. Same multi-client pattern as serial console server.
 pub fn fb_console_server() {
     let control_ep = FB_CONTROL_EP.load(Ordering::Relaxed);
     let my_pid = crate::task::current_pid();
@@ -242,12 +265,17 @@ pub fn fb_console_server() {
     // Register for wake on keyboard input
     tty::set_kbd_wake_pid(my_pid);
 
-    // Wait for client endpoint
-    let client_ep = loop {
+    let mut client_eps: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
+    let mut client_count: usize = 0;
+
+    // Wait for at least the first client
+    loop {
         match ipc::channel_recv(control_ep) {
             Some(msg) => {
-                if msg.cap != NO_CAP {
-                    break msg.cap;
+                if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
+                    client_eps[client_count] = msg.cap;
+                    client_count += 1;
+                    break;
                 }
             }
             None => {
@@ -256,11 +284,19 @@ pub fn fb_console_server() {
                 crate::task::schedule();
             }
         }
-    };
+    }
 
     let mut line_disc = LineDiscipline::new();
 
     loop {
+        // Check control channel for new clients
+        while let Some(msg) = ipc::channel_recv(control_ep) {
+            if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
+                client_eps[client_count] = msg.cap;
+                client_count += 1;
+            }
+        }
+
         // Check for keyboard input
         let mut got_input = false;
         loop {
@@ -276,29 +312,36 @@ pub fn fb_console_server() {
                             buf[..len].copy_from_slice(src);
                             (buf, len)
                         };
-                        send_line(client_ep, &data_copy.0[..data_copy.1]);
+                        if client_count > 0 {
+                            send_line(client_eps[0], &data_copy.0[..data_copy.1]);
+                        }
                     }
                 }
                 None => break,
             }
         }
 
-        // Check for write requests from client
+        // Check for write requests from ALL clients
         let mut got_write = false;
-        loop {
-            match ipc::channel_recv(client_ep) {
-                Some(msg) => {
-                    got_write = true;
-                    if msg.len > 0 {
-                        write_fb(&msg.data[..msg.len]);
+        for i in 0..client_count {
+            loop {
+                match ipc::channel_recv(client_eps[i]) {
+                    Some(msg) => {
+                        got_write = true;
+                        if msg.len > 0 {
+                            write_fb(&msg.data[..msg.len]);
+                        }
                     }
+                    None => break,
                 }
-                None => break,
             }
         }
 
         if !got_input && !got_write {
-            ipc::channel_set_blocked(client_ep, my_pid);
+            ipc::channel_set_blocked(control_ep, my_pid);
+            for i in 0..client_count {
+                ipc::channel_set_blocked(client_eps[i], my_pid);
+            }
             crate::task::block_process(my_pid);
             crate::task::schedule();
         }

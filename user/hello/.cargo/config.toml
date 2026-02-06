@@ -1,0 +1,7 @@
+[build]
+target = "riscv64gc-unknown-rvos"
+
+[target.riscv64gc-unknown-rvos]
+rustflags = ["-C", "link-arg=-T../user.ld"]
+
+[unstable]

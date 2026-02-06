@@ -1,9 +1,2 @@
-[build]
-target = "riscv64gc-unknown-none-elf"
-
 [target.riscv64gc-unknown-none-elf]
 rustflags = ["-C", "link-arg=-T", "-C", "link-arg=kernel/linker.ld"]
-
-[unstable]
-build-std = ["core", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
