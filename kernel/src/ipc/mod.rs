@@ -127,6 +127,8 @@ struct Channel {
     queue_b: VecDeque<Message>, // messages waiting for endpoint B to recv
     blocked_a: usize, // PID blocked on recv(ep_a), 0 = none
     blocked_b: usize, // PID blocked on recv(ep_b), 0 = none
+    ref_count_a: usize, // number of handles referencing endpoint A across all processes
+    ref_count_b: usize, // number of handles referencing endpoint B across all processes
     active: bool,
 }
 
@@ -137,6 +139,8 @@ impl Channel {
             queue_b: VecDeque::new(),
             blocked_a: 0,
             blocked_b: 0,
+            ref_count_a: 1,
+            ref_count_b: 1,
             active: true,
         }
     }
@@ -294,17 +298,57 @@ pub fn channel_is_active(endpoint: usize) -> bool {
     }
 }
 
-/// Close an endpoint. Wakes any blocked peer so it can detect the close.
+/// Increment the ref count for a channel endpoint. Returns false if
+/// the channel is inactive or invalid (mirrors `shm_inc_ref`).
+pub fn channel_inc_ref(endpoint: usize) -> bool {
+    let (ch_idx, is_b) = ep_to_channel(endpoint);
+    let mut mgr = CHANNELS.lock();
+    if let Some(Some(ref mut ch)) = mgr.channels.get_mut(ch_idx) {
+        if !ch.active {
+            return false;
+        }
+        if is_b {
+            ch.ref_count_b += 1;
+        } else {
+            ch.ref_count_a += 1;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Close an endpoint. Decrements the endpoint's ref count. Only deactivates
+/// the channel when the ref count reaches 0. Wakes any blocked peer so it
+/// can detect the close. Frees the channel slot when both ref counts are 0.
 pub fn channel_close(endpoint: usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     let wake_pid;
     if let Some(Some(ref mut ch)) = mgr.channels.get_mut(ch_idx) {
+        // Decrement the appropriate ref count
+        let rc = if is_b { &mut ch.ref_count_b } else { &mut ch.ref_count_a };
+        if *rc > 0 {
+            *rc -= 1;
+        }
+        let this_rc = if is_b { ch.ref_count_b } else { ch.ref_count_a };
+
+        if this_rc > 0 {
+            // Other handles still reference this endpoint; don't deactivate
+            return;
+        }
+
+        // This endpoint's last handle is gone — deactivate the channel
         ch.active = false;
         // Wake the peer blocked on the other endpoint
         wake_pid = if is_b { ch.blocked_a } else { ch.blocked_b };
         if wake_pid != 0 {
             if is_b { ch.blocked_a = 0; } else { ch.blocked_b = 0; }
+        }
+
+        // Free the channel slot if both sides have zero refs
+        if ch.ref_count_a == 0 && ch.ref_count_b == 0 {
+            mgr.channels[ch_idx] = None;
         }
     } else {
         return;

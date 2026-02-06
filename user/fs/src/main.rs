@@ -866,10 +866,10 @@ fn do_open(client_handle: usize, flags: u8, path_bytes: &[u8]) {
 
     // Send Ok with the file handle as capability.
     send_ok(client_handle, client_file_handle);
-    // Release our local handle slot -- the capability was transferred to the
-    // client via IPC. We use handle_release (not chan_close) to avoid
-    // deactivating the channel that the client now holds.
-    raw::sys_handle_release(client_file_handle);
+    // Close our local handle for the client's file endpoint. The channel
+    // stays alive because the client still holds a reference (ref counting
+    // was incremented when the capability was sent via IPC).
+    raw::sys_chan_close(client_file_handle);
 
     // Now serve this file channel until the client closes it
     serve_file_channel(my_handle, inode_idx);

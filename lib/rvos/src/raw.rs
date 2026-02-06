@@ -8,7 +8,6 @@ pub const SYS_CHAN_SEND: usize = 201;
 pub const SYS_CHAN_RECV: usize = 202;
 pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
-pub const SYS_HANDLE_RELEASE: usize = 207;
 
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
@@ -98,8 +97,3 @@ pub fn sys_chan_close(handle: usize) {
     syscall1(SYS_CHAN_CLOSE, handle);
 }
 
-/// Release a local handle slot without closing the underlying channel.
-/// Used after sending a capability to free the sender's copy.
-pub fn sys_handle_release(handle: usize) {
-    syscall1(SYS_HANDLE_RELEASE, handle);
-}

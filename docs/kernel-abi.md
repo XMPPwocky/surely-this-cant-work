@@ -64,9 +64,8 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 200    | `SYS_CHAN_CREATE`      | (none)                        | `a0` = handle_a, `a1` = handle_b | Creates a bidirectional channel pair. Returns two handles. |
 | 201    | `SYS_CHAN_SEND`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 5, or `usize::MAX` | Sends a message on a channel. Non-blocking. 0=success, 5=queue full, MAX=error. |
 | 202    | `SYS_CHAN_RECV`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 1, or `usize::MAX` | Non-blocking receive. 0=success, 1=empty, MAX=error.    |
-| 203    | `SYS_CHAN_CLOSE`       | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Closes a channel handle. Deactivates the underlying channel. |
+| 203    | `SYS_CHAN_CLOSE`       | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Closes a channel handle. Decrements the endpoint's ref count; deactivates only when the last handle is closed. |
 | 204    | `SYS_CHAN_RECV_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking receive. Suspends the process until a message arrives. |
-| 207    | `SYS_HANDLE_RELEASE`  | `a0` = handle                 | `a0` = 0                   | Frees a local handle slot without closing the underlying channel. |
 | 222    | `SYS_MMAP`            | `a0` = hint (ignored), `a1` = length | `a0` = address or `usize::MAX` | Allocates zeroed pages and maps them into the process. |
 | 215    | `SYS_MUNMAP`          | `a0` = address, `a1` = length | `a0` = 0 or `usize::MAX`  | Unmaps and frees previously mmap'd pages.                  |
 
@@ -154,25 +153,21 @@ Returns 0 on success, `usize::MAX` on error.
 #### SYS_CHAN_CLOSE (203)
 
 Closes the channel handle. The local handle slot is freed in the process's
-handle table. The underlying channel is marked inactive (deactivated);
-subsequent sends to either endpoint will fail. Currently, closing either
-endpoint deactivates the entire channel.
+handle table. The endpoint's reference count is decremented. If the ref count
+reaches 0, the channel is deactivated and any blocked peer is woken. If both
+endpoints' ref counts are 0, the channel slot is freed entirely.
+
+This means `SYS_CHAN_CLOSE` is safe to call after transferring a capability
+via IPC: the sender can close its local handle and the channel stays alive as
+long as the receiver (or any other holder) still has a reference.
+
+When a channel capability is sent via `SYS_CHAN_SEND`, the kernel increments
+the endpoint's ref count before enqueuing. When the receiver installs the
+capability as a handle, no additional increment is needed. When the receiver
+eventually closes that handle via `SYS_CHAN_CLOSE`, the ref count is
+decremented back.
 
 Returns 0 on success, `usize::MAX` if the handle is invalid.
-
-#### SYS_HANDLE_RELEASE (207)
-
-Frees a local handle slot without closing the underlying channel or SHM
-region. This is used after sending a capability via IPC: the sender no longer
-needs its local handle, but calling `SYS_CHAN_CLOSE` would deactivate the
-channel for the receiver.
-
-Returns 0 unconditionally.
-
-**Note:** This is a stopgap until `SYS_CHAN_CLOSE` gains per-endpoint
-reference counting, at which point `SYS_HANDLE_RELEASE` can be removed and
-`SYS_CHAN_CLOSE` will only deactivate a channel when all handles to both
-endpoints are closed.
 
 #### SYS_MMAP (222)
 
@@ -293,11 +288,12 @@ server (see Boot Protocol below).
 1. **Creation:** `SYS_CHAN_CREATE` allocates two handles (for endpoints A and B).
 2. **Transfer:** Sending a message with `cap` set to a local handle transfers
    the underlying endpoint to the receiver (the receiver gets a new handle via
-   capability translation). The sender should call `SYS_HANDLE_RELEASE` to free
-   its local handle slot without deactivating the channel.
-3. **Closure:** `SYS_CHAN_CLOSE` frees the local handle slot and deactivates the
-   channel. Use `SYS_HANDLE_RELEASE` instead when the channel should remain
-   active for other holders.
+   capability translation). The kernel increments the endpoint's ref count on
+   send, so the sender can safely call `SYS_CHAN_CLOSE` afterward without
+   deactivating the channel.
+3. **Closure:** `SYS_CHAN_CLOSE` frees the local handle slot and decrements the
+   endpoint's ref count. The channel is only deactivated when the last handle
+   to an endpoint is closed.
 
 ---
 
@@ -346,9 +342,11 @@ checks for a blocked PID and wakes that process.
 
 ### Channel Closure
 
-Closing either endpoint deactivates the entire channel. After deactivation,
+Each endpoint has a reference count. When all handles to an endpoint are
+closed (ref count reaches 0), the channel is deactivated. After deactivation,
 sends return an error and no new messages can be delivered. Messages already
-in the queue can still be drained.
+in the queue can still be drained. When both endpoints' ref counts reach 0,
+the channel slot is freed for reuse.
 
 ---
 

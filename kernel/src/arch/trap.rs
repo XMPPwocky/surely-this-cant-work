@@ -18,7 +18,6 @@ pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
 pub const SYS_SHM_CREATE: usize = 205;
 pub const SYS_SHM_DUP_RO: usize = 206;
-pub const SYS_HANDLE_RELEASE: usize = 207;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 
@@ -126,9 +125,6 @@ fn handle_syscall(tf: &mut TrapFrame) {
         SYS_SHM_DUP_RO => {
             tf.regs[10] = sys_shm_dup_ro(a0);
         }
-        SYS_HANDLE_RELEASE => {
-            tf.regs[10] = sys_handle_release(a0);
-        }
         SYS_MMAP => {
             tf.regs[10] = sys_mmap(a0, a1);
         }
@@ -188,6 +184,9 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     if msg.cap != crate::ipc::NO_CAP {
         match crate::task::current_process_handle(msg.cap) {
             Some(HandleObject::Channel(global_ep)) => {
+                if !crate::ipc::channel_inc_ref(global_ep) {
+                    return usize::MAX;
+                }
                 msg.cap = crate::ipc::encode_cap_channel(global_ep);
             }
             Some(HandleObject::Shm { id, rw }) => {
@@ -221,7 +220,11 @@ fn install_received_cap(encoded_cap: usize) -> usize {
         crate::ipc::DecodedCap::Channel(global_ep) => {
             match crate::task::current_process_alloc_handle(HandleObject::Channel(global_ep)) {
                 Some(h) => h,
-                None => crate::ipc::NO_CAP,
+                None => {
+                    // Failed to install; decrement ref_count since it was incremented on send
+                    crate::ipc::channel_close(global_ep);
+                    crate::ipc::NO_CAP
+                }
             }
         }
         crate::ipc::DecodedCap::Shm { id, rw } => {
@@ -403,14 +406,6 @@ fn sys_shm_dup_ro(handle: usize) -> usize {
             usize::MAX
         }
     }
-}
-
-/// SYS_HANDLE_RELEASE: free a local handle slot without closing the underlying
-/// channel or SHM region. Used after sending a capability to release the sender's
-/// copy without deactivating the channel for the receiver.
-fn sys_handle_release(handle: usize) -> usize {
-    crate::task::current_process_free_handle(handle);
-    0
 }
 
 /// SYS_MMAP: map pages into process address space.
