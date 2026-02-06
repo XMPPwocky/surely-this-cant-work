@@ -423,6 +423,38 @@ fn send_write_ok(handle: usize, written: u32) {
     syscall::sys_chan_send(handle, &msg);
 }
 
+fn send_stat_ok(handle: usize, kind: u8, size: u64) {
+    let mut msg = Message::new();
+    let mut w = Writer::new(&mut msg.data);
+    let _ = w.write_u8(0); // tag: Ok
+    let _ = w.write_u8(kind);
+    let _ = w.write_u64(size);
+    msg.len = w.position();
+    msg.cap = NO_CAP;
+    syscall::sys_chan_send(handle, &msg);
+}
+
+fn send_dir_entry(handle: usize, kind: u8, size: u64, name: &[u8]) {
+    let mut msg = Message::new();
+    let mut w = Writer::new(&mut msg.data);
+    let _ = w.write_u8(0);    // tag: Entry
+    let _ = w.write_u8(kind);
+    let _ = w.write_u64(size);
+    let _ = w.write_bytes(name);
+    msg.len = w.position();
+    msg.cap = NO_CAP;
+    syscall::sys_chan_send(handle, &msg);
+}
+
+fn send_dir_sentinel(handle: usize) {
+    let mut msg = Message::new();
+    let mut w = Writer::new(&mut msg.data);
+    let _ = w.write_u8(0);    // tag: Entry
+    let _ = w.write_u8(0xFF); // sentinel kind
+    msg.len = w.position();
+    syscall::sys_chan_send(handle, &msg);
+}
+
 fn send_file_error(handle: usize, code: u8) {
     let mut msg = Message::new();
     let mut w = Writer::new(&mut msg.data);
@@ -539,6 +571,79 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
         }
         send_write_ok(file_handle, data.len() as u32);
     }
+}
+
+fn do_stat(client_handle: usize, r: &mut Reader) {
+    let path = match r.read_str() {
+        Ok(p) => p,
+        Err(_) => {
+            send_error(client_handle, ERR_INVALID_PATH);
+            return;
+        }
+    };
+    let path_bytes = path.as_bytes();
+    if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
+        send_error(client_handle, ERR_INVALID_PATH);
+        return;
+    }
+
+    let fs = fs();
+    match fs.resolve_path(path_bytes) {
+        Some(idx) => {
+            let kind = if fs.inodes[idx].kind == InodeKind::Dir { 1u8 } else { 0u8 };
+            let size = if fs.inodes[idx].kind == InodeKind::File { fs.inodes[idx].data_len as u64 } else { 0u64 };
+            send_stat_ok(client_handle, kind, size);
+        }
+        None => {
+            send_error(client_handle, ERR_NOT_FOUND);
+        }
+    }
+}
+
+fn do_readdir(client_handle: usize, r: &mut Reader) {
+    let path = match r.read_str() {
+        Ok(p) => p,
+        Err(_) => {
+            send_error(client_handle, ERR_INVALID_PATH);
+            return;
+        }
+    };
+    let path_bytes = path.as_bytes();
+    if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
+        send_error(client_handle, ERR_INVALID_PATH);
+        return;
+    }
+
+    let fs = fs();
+    let idx = match fs.resolve_path(path_bytes) {
+        Some(i) => i,
+        None => {
+            send_error(client_handle, ERR_NOT_FOUND);
+            return;
+        }
+    };
+
+    if fs.inodes[idx].kind != InodeKind::Dir {
+        send_error(client_handle, ERR_NOT_A_FILE);
+        return;
+    }
+
+    // Send each child entry
+    for i in 0..MAX_CHILDREN {
+        if let Some(ref entry) = fs.inodes[idx].children[i] {
+            let child_inode = entry.inode;
+            let kind = if fs.inodes[child_inode].kind == InodeKind::Dir { 1u8 } else { 0u8 };
+            let size = if fs.inodes[child_inode].kind == InodeKind::File {
+                fs.inodes[child_inode].data_len as u64
+            } else {
+                0u64
+            };
+            send_dir_entry(client_handle, kind, size, entry.name_bytes());
+        }
+    }
+
+    // Send sentinel
+    send_dir_sentinel(client_handle);
 }
 
 fn main() {
@@ -660,6 +765,14 @@ fn serve_client(client_handle: usize) {
                     }
                 };
                 do_delete(client_handle, path.as_bytes());
+            }
+            2 => {
+                // Stat
+                do_stat(client_handle, &mut r);
+            }
+            3 => {
+                // Readdir
+                do_readdir(client_handle, &mut r);
             }
             _ => {
                 send_error(client_handle, ERR_IO);

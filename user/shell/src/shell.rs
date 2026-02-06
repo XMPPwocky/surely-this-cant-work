@@ -51,11 +51,87 @@ fn cmd_echo(line: &str) {
 
 fn cmd_help() {
     println!("Available commands:");
-    println!("  echo <text>  - Print text");
-    println!("  math <op> <a> <b> - Compute math (add/mul/sub)");
-    println!("  ps           - Show process list");
-    println!("  help         - Show this help");
-    println!("  shutdown     - Shut down the system");
+    println!("  echo <text>           - Print text");
+    println!("  math <op> <a> <b>     - Compute math (add/mul/sub)");
+    println!("  ps                    - Show process list");
+    println!("  ls [path]             - List directory");
+    println!("  cat <path>            - Read file");
+    println!("  write <path> <text>   - Write to file");
+    println!("  stat <path>           - Show file metadata");
+    println!("  help                  - Show this help");
+    println!("  shutdown              - Shut down the system");
+}
+
+fn cmd_cat(args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println!("Usage: cat <path>");
+        return;
+    }
+    match std::fs::read_to_string(path) {
+        Ok(contents) => print!("{}", contents),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn cmd_write(args: &str) {
+    let args = args.trim();
+    let (path, content) = match args.split_once(' ') {
+        Some((p, c)) => (p, c),
+        None => {
+            println!("Usage: write <path> <content>");
+            return;
+        }
+    };
+    // Strip surrounding quotes if present
+    let content = if content.starts_with('"') && content.ends_with('"') && content.len() >= 2 {
+        &content[1..content.len() - 1]
+    } else {
+        content
+    };
+    match std::fs::write(path, content) {
+        Ok(()) => println!("Wrote {} bytes to {}", content.len(), path),
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn cmd_ls(args: &str) {
+    let path = if args.is_empty() { "/" } else { args.trim() };
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) => {
+                        let kind = if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                            "dir "
+                        } else {
+                            "file"
+                        };
+                        let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                        println!("  {} {:>5}  {}", kind, size, e.file_name().to_string_lossy());
+                    }
+                    Err(e) => println!("  Error: {}", e),
+                }
+            }
+        }
+        Err(e) => println!("Error: {}", e),
+    }
+}
+
+fn cmd_stat(args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println!("Usage: stat <path>");
+        return;
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let kind = if meta.is_dir() { "directory" } else { "file" };
+            println!("  Type: {}", kind);
+            println!("  Size: {} bytes", meta.len());
+        }
+        Err(e) => println!("Error: {}", e),
+    }
 }
 
 fn cmd_ps() {
@@ -168,6 +244,22 @@ pub fn run() {
                 }
             }
             "ps" => cmd_ps(),
+            "cat" | "read" => {
+                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                cmd_cat(args);
+            }
+            "write" => {
+                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                cmd_write(args);
+            }
+            "ls" => {
+                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                cmd_ls(args);
+            }
+            "stat" => {
+                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                cmd_stat(args);
+            }
             "help" => cmd_help(),
             "shutdown" => {
                 println!("Shutting down...");

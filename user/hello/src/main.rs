@@ -59,5 +59,33 @@ fn main() {
         Err(e) => println!("ERR: {}", e),
     }
 
+    // 7. Stat
+    print!("7. stat: ");
+    match std::fs::metadata("/tmp") {
+        Ok(m) => {
+            let kind = if m.is_dir() { "dir" } else { "file" };
+            println!("ok ({}, {} bytes)", kind, m.len());
+        }
+        Err(e) => println!("ERR: {}", e),
+    }
+
+    // 8. Readdir
+    print!("8. readdir: ");
+    std::fs::write("/tmp/x.txt", "abc").ok();
+    std::fs::write("/tmp/y.txt", "defgh").ok();
+    match std::fs::read_dir("/tmp") {
+        Ok(entries) => {
+            let names: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            println!("ok ({} entries: {})", names.len(), names.join(", "));
+        }
+        Err(e) => println!("ERR: {}", e),
+    }
+    // Clean up
+    std::fs::remove_file("/tmp/x.txt").ok();
+    std::fs::remove_file("/tmp/y.txt").ok();
+
     println!("--- done ---");
 }

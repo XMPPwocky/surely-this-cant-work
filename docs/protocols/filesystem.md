@@ -59,10 +59,12 @@ All subsequent control-channel operations use `fs_control_handle`.
 
 ### Request (client → server)
 
-| Tag | Name     | Fields                          |
-|-----|----------|---------------------------------|
-| `0` | `Open`   | `flags: u8`, `path: str`        |
-| `1` | `Delete` | `path: str`                     |
+| Tag | Name      | Fields                          |
+|-----|-----------|---------------------------------|
+| `0` | `Open`    | `flags: u8`, `path: str`        |
+| `1` | `Delete`  | `path: str`                     |
+| `2` | `Stat`    | `path: str`                     |
+| `3` | `Readdir` | `path: str`                     |
 
 ### Response (server → client)
 
@@ -119,6 +121,65 @@ Byte  Type   Field
 0     u8     tag = 1
 1..   str    path  (u16-LE length prefix + UTF-8 bytes)
 ```
+
+### Stat
+
+Returns metadata for a path (file or directory). No file handle is opened.
+
+**Request wire format:**
+
+```
+Byte  Type   Field
+0     u8     tag = 2
+1..   str    path  (u16-LE length prefix + UTF-8 bytes)
+```
+
+**Response wire format (Ok):**
+
+```
+Byte  Type   Field
+0     u8     tag = 0
+1     u8     kind  (0 = file, 1 = directory)
+2..9  u64    size  (little-endian; bytes for files, 0 for directories)
+```
+
+`msg.cap` is `NO_CAP` — no file handle returned.
+
+On error, returns the standard `Error` response (tag=1).
+
+### Readdir
+
+Lists directory entries. The server sends a sequence of entry messages
+followed by a sentinel.
+
+**Request wire format:**
+
+```
+Byte  Type   Field
+0     u8     tag = 3
+1..   str    path  (u16-LE length prefix + UTF-8 bytes)
+```
+
+**Entry response:**
+
+```
+Byte  Type   Field
+0     u8     tag = 0 (Entry)
+1     u8     kind  (0 = file, 1 = directory)
+2..9  u64    size  (little-endian)
+10..  str    name  (u16-LE length prefix + UTF-8 bytes)
+```
+
+**Sentinel (end of listing):**
+
+```
+Byte  Type   Field
+0     u8     tag = 0 (Entry)
+1     u8     kind = 0xFF (sentinel marker)
+```
+
+On error (e.g. path not found, path is not a directory), returns the
+standard `Error` response (tag=1).
 
 ### Control Response Wire Format
 
