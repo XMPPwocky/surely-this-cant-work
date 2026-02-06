@@ -25,9 +25,10 @@ const ERR_NOT_EMPTY: u8 = 4;
 const ERR_INVALID_PATH: u8 = 5;
 // const ERR_NO_SPACE: u8 = 6;
 const ERR_IO: u8 = 7;
+const ERR_READ_ONLY: u8 = 8;
 
 // Max data payload per chunk (64 - 1 tag - 2 length prefix = 61)
-const MAX_DATA_CHUNK: usize = 61;
+const MAX_DATA_CHUNK: usize = 1021; // MAX_MSG_SIZE(1024) - 3 (tag u8 + length u16)
 
 // Control channel handle (set by kernel at spawn)
 const CONTROL_HANDLE: usize = 1;
@@ -61,6 +62,10 @@ struct Inode {
     children: [Option<DirEntry>; MAX_CHILDREN],
     child_count: usize,
     active: bool,
+    // Read-only static file backing (for files embedded via include_bytes!)
+    read_only: bool,
+    static_data: *const u8,
+    static_data_len: usize,
 }
 
 impl Inode {
@@ -72,6 +77,9 @@ impl Inode {
             children: [const { None }; MAX_CHILDREN],
             child_count: 0,
             active: false,
+            read_only: false,
+            static_data: core::ptr::null(),
+            static_data_len: 0,
         }
     }
 
@@ -321,6 +329,23 @@ impl Filesystem {
         Some((current, filename))
     }
 
+    /// Add a read-only file backed by static data (e.g. include_bytes!).
+    /// Creates intermediate directories as needed (mkdir -p behavior).
+    fn add_static_file(&mut self, path: &[u8], data: &'static [u8]) {
+        let (parent_inode, filename) = self.ensure_parent_dirs(path)
+            .expect("add_static_file: invalid path");
+        let new_inode = self.alloc_inode().expect("add_static_file: no free inodes");
+        self.inodes[new_inode].init_file();
+        self.inodes[new_inode].read_only = true;
+        self.inodes[new_inode].static_data = data.as_ptr();
+        self.inodes[new_inode].static_data_len = data.len();
+        self.inodes[new_inode].data_len = data.len();
+        assert!(
+            self.inodes[parent_inode].add_child(filename, new_inode),
+            "add_static_file: failed to add child"
+        );
+    }
+
     fn register_open_file(&mut self, endpoint_handle: usize, inode: usize) -> bool {
         for i in 0..MAX_OPEN_FILES {
             if !self.open_files[i].active {
@@ -401,7 +426,7 @@ fn send_data_chunk(handle: usize, data: &[u8]) {
     let _ = w.write_u8(0); // tag: Data
     let _ = w.write_bytes(data);
     msg.len = w.position();
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_retry(handle, &msg);
 }
 
 fn send_data_sentinel(handle: usize) {
@@ -410,7 +435,7 @@ fn send_data_sentinel(handle: usize) {
     let _ = w.write_u8(0); // tag: Data
     let _ = w.write_u16(0); // zero-length payload
     msg.len = w.position();
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_retry(handle, &msg);
 }
 
 fn send_write_ok(handle: usize, written: u32) {
@@ -504,12 +529,18 @@ fn handle_read(file_handle: usize, inode_idx: usize, r: &mut Reader) {
 
     let available = inode.data_len - offset;
     let to_send = if len < available { len } else { available };
-    let data = &inode.data[offset..offset + to_send];
+
+    // Read from static data or mutable data buffer
+    let data_slice: &[u8] = if inode.read_only {
+        unsafe { core::slice::from_raw_parts(inode.static_data.add(offset), to_send) }
+    } else {
+        &inode.data[offset..offset + to_send]
+    };
 
     let mut sent = 0;
     while sent < to_send {
         let chunk_end = if sent + MAX_DATA_CHUNK < to_send { sent + MAX_DATA_CHUNK } else { to_send };
-        send_data_chunk(file_handle, &data[sent..chunk_end]);
+        send_data_chunk(file_handle, &data_slice[sent..chunk_end]);
         sent = chunk_end;
     }
 
@@ -536,6 +567,11 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
 
     let fs = fs();
     let inode = &mut fs.inodes[inode_idx];
+
+    if inode.read_only {
+        send_file_error(file_handle, ERR_READ_ONLY);
+        return;
+    }
 
     let end = offset + data.len();
     if end > MAX_FILE_SIZE {
@@ -645,11 +681,18 @@ fn do_readdir(client_handle: usize, r: &mut Reader) {
     send_dir_sentinel(client_handle);
 }
 
+static HELLO_STD_ELF: &[u8] = include_bytes!(
+    "../../../user/hello/target/riscv64gc-unknown-rvos/release/hello"
+);
+
 fn main() {
     // Initialize filesystem
     unsafe {
         *FS.0.get() = Some(Filesystem::new());
     }
+
+    // Register read-only static files
+    fs().add_static_file(b"/bin/hello-std", HELLO_STD_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)
@@ -797,6 +840,10 @@ fn do_open(client_handle: usize, flags: u8, path_bytes: &[u8]) {
                 send_error(client_handle, ERR_NOT_A_FILE);
                 return;
             }
+            if truncate && fs.inodes[idx].read_only {
+                send_error(client_handle, ERR_READ_ONLY);
+                return;
+            }
             if truncate {
                 fs.inodes[idx].data_len = 0;
             }
@@ -937,6 +984,11 @@ fn do_delete(client_handle: usize, path_bytes: &[u8]) {
 
     if fs.inodes[target_inode].kind == InodeKind::Dir && fs.inodes[target_inode].child_count > 0 {
         send_error(client_handle, ERR_NOT_EMPTY);
+        return;
+    }
+
+    if fs.inodes[target_inode].read_only {
+        send_error(client_handle, ERR_READ_ONLY);
         return;
     }
 

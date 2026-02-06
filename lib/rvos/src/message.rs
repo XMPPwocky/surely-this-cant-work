@@ -3,7 +3,7 @@
 use crate::raw::NO_CAP;
 use rvos_wire::{Reader, Writer};
 
-const MAX_MSG_SIZE: usize = 64;
+const MAX_MSG_SIZE: usize = 1024;
 
 /// Fixed-size IPC message matching kernel's `ipc::Message` layout exactly.
 #[repr(C)]

@@ -100,16 +100,6 @@ _user_shell_start:
 _user_shell_end:
 
     #---------------------------------------------------------------------------
-    # User program: "hello-std" - test program using Rust std library
-    #---------------------------------------------------------------------------
-    .globl _user_hello_std_start
-    .globl _user_hello_std_end
-    .align 4
-_user_hello_std_start:
-    .incbin "user/hello/target/riscv64gc-unknown-rvos/release/hello"
-_user_hello_std_end:
-
-    #---------------------------------------------------------------------------
     # User program: "fs" - RAM-backed filesystem server (tmpfs)
     #---------------------------------------------------------------------------
     .globl _user_fs_start

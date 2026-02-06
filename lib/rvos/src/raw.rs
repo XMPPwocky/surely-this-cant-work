@@ -97,3 +97,19 @@ pub fn sys_chan_close(handle: usize) {
     syscall1(SYS_CHAN_CLOSE, handle);
 }
 
+/// Yield the current time slice.
+pub fn sys_yield() {
+    syscall0(SYS_YIELD);
+}
+
+/// Send a message, retrying with yield on queue-full (error code 5).
+pub fn sys_chan_send_retry(handle: usize, msg: &Message) -> usize {
+    loop {
+        let rc = sys_chan_send(handle, msg);
+        if rc != 5 {
+            return rc;
+        }
+        sys_yield();
+    }
+}
+

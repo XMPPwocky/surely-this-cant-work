@@ -1,4 +1,5 @@
-use crate::ipc::{self, Message};
+use alloc::vec::Vec;
+use crate::ipc::{self, Message, NO_CAP};
 use crate::sync::SpinLock;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -123,10 +124,41 @@ pub fn register_console(console_type: ConsoleType, control_ep: usize) {
     panic!("Too many service registrations");
 }
 
+/// State machine for loading a program from the filesystem.
+#[derive(Clone, Copy, PartialEq)]
+enum FsLaunchState {
+    /// Waiting for Stat response on ctl_ep
+    WaitStat,
+    /// Waiting for Open response on ctl_ep
+    WaitOpen,
+    /// Waiting for Read data on file_ep
+    WaitRead,
+    /// Done (success or failure)
+    Done,
+}
+
+/// Tracks an in-progress fs-based program launch.
+struct FsLaunchCtx {
+    state: FsLaunchState,
+    ctl_ep: usize,
+    file_ep: usize,
+    file_size: usize,
+    data: Vec<u8>,
+    path: &'static [u8],
+    name: &'static str,
+    console_type: ConsoleType,
+}
+
+const MAX_FS_LAUNCHES: usize = 4;
+
 /// Init server kernel task.
-/// Polls boot channel endpoints for service discovery requests from user processes.
+/// Polls boot channel endpoints for service discovery requests from user processes,
+/// and concurrently loads programs from the filesystem.
 pub fn init_server() {
     let my_pid = crate::task::current_pid();
+    // Set up fs launch state machines (non-blocking)
+    let mut fs_launches: [Option<FsLaunchCtx>; MAX_FS_LAUNCHES] = [const { None }; MAX_FS_LAUNCHES];
+    init_fs_launches(&mut fs_launches, my_pid);
 
     loop {
         // Snapshot boot registrations under the lock
@@ -142,7 +174,7 @@ pub fn init_server() {
             }
         }
 
-        // Poll all endpoints without holding the lock
+        // Poll all boot endpoints without holding the lock
         let mut handled = false;
         for i in 0..count {
             let (boot_ep_b, console_type) = endpoints[i];
@@ -152,10 +184,32 @@ pub fn init_server() {
             }
         }
 
+        // Poll fs launch endpoints
+        for slot in fs_launches.iter_mut() {
+            if let Some(ref mut ctx) = slot {
+                if poll_fs_launch(ctx, my_pid) {
+                    handled = true;
+                }
+                if ctx.state == FsLaunchState::Done {
+                    *slot = None;
+                }
+            }
+        }
+
         if !handled {
-            // Register as blocked on ALL boot endpoints so any channel_send wakes us
+            // Register as blocked on ALL boot endpoints and fs launch endpoints
             for i in 0..count {
                 ipc::channel_set_blocked(endpoints[i].0, my_pid);
+            }
+            for slot in fs_launches.iter() {
+                if let Some(ref ctx) = slot {
+                    let ep = match ctx.state {
+                        FsLaunchState::WaitStat | FsLaunchState::WaitOpen => ctx.ctl_ep,
+                        FsLaunchState::WaitRead => ctx.file_ep,
+                        FsLaunchState::Done => continue,
+                    };
+                    ipc::channel_set_blocked(ep, my_pid);
+                }
             }
             crate::task::block_process(my_pid);
             crate::task::schedule();
@@ -275,3 +329,230 @@ fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
     }
     &data[..prefix.len()] == prefix
 }
+
+// ============================================================
+// Filesystem client: launch ELF binaries from the fs service
+// ============================================================
+
+/// Programs to launch from the filesystem at boot time.
+/// Each entry: (path, process name, console type).
+const FS_PROGRAMS: &[(&[u8], &str, ConsoleType)] = &[
+    (b"/bin/hello-std", "hello-std", ConsoleType::Serial),
+];
+
+/// Initialize fs launch state machines. For each program, create a client
+/// connection to the fs server and send the initial Stat request (non-blocking).
+fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid: usize) {
+    let fs_svc = match find_named_service(b"fs") {
+        Some(svc) => svc,
+        None => return,
+    };
+    let fs_init_ctl_ep = fs_svc.control_ep.load(Ordering::Relaxed);
+    if fs_init_ctl_ep == usize::MAX {
+        return;
+    }
+
+    for (i, &(path, name, console_type)) in FS_PROGRAMS.iter().enumerate() {
+        if i >= MAX_FS_LAUNCHES { break; }
+
+        let (my_ctl_ep, server_ep) = ipc::channel_create_pair();
+
+        // Send the server endpoint to the fs service via its control channel
+        let mut ctl_msg = Message::new();
+        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.sender_pid = my_pid;
+        send_and_wake(fs_init_ctl_ep, ctl_msg);
+
+        // Send the initial Stat request
+        let mut msg = Message::new();
+        let mut pos = 0;
+        pos = wire_write_u8(&mut msg.data, pos, 2); // tag: Stat
+        pos = wire_write_str(&mut msg.data, pos, path);
+        msg.len = pos;
+        msg.sender_pid = my_pid;
+        send_and_wake(my_ctl_ep, msg);
+
+        launches[i] = Some(FsLaunchCtx {
+            state: FsLaunchState::WaitStat,
+            ctl_ep: my_ctl_ep,
+            file_ep: 0,
+            file_size: 0,
+            data: Vec::new(),
+            path,
+            name,
+            console_type,
+        });
+    }
+}
+
+/// Poll a single fs launch state machine. Returns true if progress was made.
+fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
+    match ctx.state {
+        FsLaunchState::WaitStat => {
+            if let Some(resp) = ipc::channel_recv(ctx.ctl_ep) {
+                let tag = wire_read_u8(&resp.data, 0);
+                if tag != 0 {
+                    crate::println!("[init] fs: stat {} failed", ctx.name);
+                    ipc::channel_close(ctx.ctl_ep);
+                    ctx.state = FsLaunchState::Done;
+                    return true;
+                }
+                // Ok response: u8(0) + u8(kind) + u64(size)
+                ctx.file_size = wire_read_u64(&resp.data, 2) as usize;
+                ctx.data = Vec::with_capacity(ctx.file_size);
+
+                // Send Open request
+                let mut msg = Message::new();
+                let mut pos = 0;
+                pos = wire_write_u8(&mut msg.data, pos, 0); // tag: Open
+                pos = wire_write_u8(&mut msg.data, pos, 0); // flags: 0
+                pos = wire_write_str(&mut msg.data, pos, ctx.path);
+                msg.len = pos;
+                msg.sender_pid = my_pid;
+                send_and_wake(ctx.ctl_ep, msg);
+                ctx.state = FsLaunchState::WaitOpen;
+                return true;
+            }
+        }
+        FsLaunchState::WaitOpen => {
+            if let Some(resp) = ipc::channel_recv(ctx.ctl_ep) {
+                let tag = wire_read_u8(&resp.data, 0);
+                if tag != 0 || resp.cap == NO_CAP {
+                    crate::println!("[init] fs: open {} failed", ctx.name);
+                    ipc::channel_close(ctx.ctl_ep);
+                    ctx.state = FsLaunchState::Done;
+                    return true;
+                }
+                // Decode the file channel endpoint from the cap
+                match ipc::decode_cap_channel(resp.cap) {
+                    Some(ep) => ctx.file_ep = ep,
+                    None => {
+                        crate::println!("[init] fs: open {} bad cap", ctx.name);
+                        ipc::channel_close(ctx.ctl_ep);
+                        ctx.state = FsLaunchState::Done;
+                        return true;
+                    }
+                }
+
+                // Send Read request for the whole file
+                let mut msg = Message::new();
+                let mut pos = 0;
+                pos = wire_write_u8(&mut msg.data, pos, 0); // tag: Read
+                pos = wire_write_u64(&mut msg.data, pos, 0); // offset: 0
+                pos = wire_write_u32(&mut msg.data, pos, ctx.file_size as u32);
+                msg.len = pos;
+                msg.sender_pid = my_pid;
+                send_and_wake(ctx.file_ep, msg);
+                ctx.state = FsLaunchState::WaitRead;
+                return true;
+            }
+        }
+        FsLaunchState::WaitRead => {
+            let mut progress = false;
+            // Drain all available chunks in one go for throughput
+            loop {
+                match ipc::channel_recv(ctx.file_ep) {
+                    Some(resp) => {
+                        progress = true;
+                        if resp.len < 3 {
+                            // Sentinel or malformed — end of data
+                            finish_fs_launch(ctx, my_pid);
+                            return true;
+                        }
+                        let tag = wire_read_u8(&resp.data, 0);
+                        if tag == 2 {
+                            // Error response
+                            crate::println!("[init] fs: read {} error", ctx.name);
+                            ipc::channel_close(ctx.file_ep);
+                            ipc::channel_close(ctx.ctl_ep);
+                            ctx.state = FsLaunchState::Done;
+                            return true;
+                        }
+                        // Data chunk: u8(0) + u16(len) + bytes
+                        let chunk_len = wire_read_u16(&resp.data, 1) as usize;
+                        if chunk_len == 0 {
+                            // Sentinel — all data received
+                            finish_fs_launch(ctx, my_pid);
+                            return true;
+                        }
+                        ctx.data.extend_from_slice(&resp.data[3..3 + chunk_len]);
+                    }
+                    None => break,
+                }
+            }
+            return progress;
+        }
+        FsLaunchState::Done => {}
+    }
+    false
+}
+
+/// Complete an fs launch: close channels, spawn the process.
+fn finish_fs_launch(ctx: &mut FsLaunchCtx, _my_pid: usize) {
+    ipc::channel_close(ctx.file_ep);
+    ipc::channel_close(ctx.ctl_ep);
+
+    if ctx.data.is_empty() {
+        crate::println!("[init] fs: {} empty, skipping", ctx.name);
+        ctx.state = FsLaunchState::Done;
+        return;
+    }
+
+    crate::println!("[init] Loaded {} from fs ({} bytes)", ctx.name, ctx.data.len());
+
+    // Create boot channel and spawn
+    let (boot_a, boot_b) = ipc::channel_create_pair();
+    register_boot(boot_b, ctx.console_type);
+    crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name, boot_a);
+    ctx.state = FsLaunchState::Done;
+}
+
+// --- Wire protocol helpers (manual byte packing, no rvos-wire dependency) ---
+
+/// Write a u16 little-endian length-prefixed string into buf at pos.
+/// Returns the new position.
+fn wire_write_str(buf: &mut [u8], pos: usize, s: &[u8]) -> usize {
+    let len = s.len() as u16;
+    buf[pos] = len as u8;
+    buf[pos + 1] = (len >> 8) as u8;
+    buf[pos + 2..pos + 2 + s.len()].copy_from_slice(s);
+    pos + 2 + s.len()
+}
+
+/// Write a u8 into buf at pos. Returns new position.
+fn wire_write_u8(buf: &mut [u8], pos: usize, v: u8) -> usize {
+    buf[pos] = v;
+    pos + 1
+}
+
+/// Write a u32 little-endian into buf at pos. Returns new position.
+fn wire_write_u32(buf: &mut [u8], pos: usize, v: u32) -> usize {
+    let bytes = v.to_le_bytes();
+    buf[pos..pos + 4].copy_from_slice(&bytes);
+    pos + 4
+}
+
+/// Write a u64 little-endian into buf at pos. Returns new position.
+fn wire_write_u64(buf: &mut [u8], pos: usize, v: u64) -> usize {
+    let bytes = v.to_le_bytes();
+    buf[pos..pos + 8].copy_from_slice(&bytes);
+    pos + 8
+}
+
+/// Read a u8 from buf at pos.
+fn wire_read_u8(buf: &[u8], pos: usize) -> u8 {
+    buf[pos]
+}
+
+/// Read a u16 little-endian from buf at pos.
+fn wire_read_u16(buf: &[u8], pos: usize) -> u16 {
+    u16::from_le_bytes([buf[pos], buf[pos + 1]])
+}
+
+/// Read a u64 little-endian from buf at pos.
+fn wire_read_u64(buf: &[u8], pos: usize) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&buf[pos..pos + 8]);
+    u64::from_le_bytes(bytes)
+}
+

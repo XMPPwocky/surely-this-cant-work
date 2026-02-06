@@ -4,7 +4,7 @@ use crate::sync::SpinLock;
 use crate::mm::address::PhysPageNum;
 
 /// Maximum message payload size in bytes
-const MAX_MSG_SIZE: usize = 64;
+const MAX_MSG_SIZE: usize = 1024;
 /// Maximum number of bidirectional channels
 const MAX_CHANNELS: usize = 64;
 /// Maximum number of shared memory regions
@@ -284,6 +284,23 @@ pub fn channel_set_blocked(endpoint: usize, pid: usize) {
         } else {
             channel.blocked_a = pid;
         }
+    }
+}
+
+/// Blocking receive for kernel tasks. Blocks the calling kernel task until
+/// a message arrives or the channel is closed (returns None on close).
+#[allow(dead_code)]
+pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
+    loop {
+        if let Some(msg) = channel_recv(endpoint) {
+            return Some(msg);
+        }
+        if !channel_is_active(endpoint) {
+            return None; // channel closed
+        }
+        channel_set_blocked(endpoint, pid);
+        crate::task::block_process(pid);
+        crate::task::schedule();
     }
 }
 

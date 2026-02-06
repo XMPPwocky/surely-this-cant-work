@@ -272,7 +272,6 @@ fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
 fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
     let handle = tf.regs[10];
     let msg_buf_ptr = tf.regs[11];
-
     let msg_pa = match validate_user_buffer(msg_buf_ptr, core::mem::size_of::<crate::ipc::Message>()) {
         Some(pa) => pa,
         None => {
@@ -289,6 +288,7 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
         }
     };
 
+    let cur_pid = crate::task::current_pid();
     loop {
         match crate::ipc::channel_recv(endpoint) {
             Some(mut msg) => {
@@ -315,9 +315,8 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
                     return;
                 }
                 // Block and wait
-                let pid = crate::task::current_pid();
-                crate::ipc::channel_set_blocked(endpoint, pid);
-                crate::task::block_process(pid);
+                crate::ipc::channel_set_blocked(endpoint, cur_pid);
+                crate::task::block_process(cur_pid);
                 crate::task::schedule();
                 // Woken up — loop back and retry
             }
