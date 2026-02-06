@@ -22,20 +22,6 @@ impl Message {
 }
 
 #[inline(always)]
-fn syscall0(num: usize) -> usize {
-    let ret: usize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") 0usize => ret,
-            in("a7") num,
-            options(nostack),
-        );
-    }
-    ret
-}
-
-#[inline(always)]
 fn syscall1(num: usize, a0: usize) -> usize {
     let ret: usize;
     unsafe {
@@ -65,53 +51,16 @@ fn syscall2(num: usize, a0: usize, a1: usize) -> (usize, usize) {
     (ret0, ret1)
 }
 
-pub fn sys_exit(code: usize) -> ! {
-    syscall1(93, code);
-    loop {}
-}
-
-pub fn sys_yield() {
-    syscall0(124);
-}
-
-pub fn sys_getpid() -> usize {
-    syscall0(172)
-}
-
-/// Create a bidirectional channel pair. Returns (handle_a, handle_b).
-pub fn sys_chan_create() -> (usize, usize) {
-    syscall2(200, 0, 0)
-}
-
 pub fn sys_chan_send(handle: usize, msg: &Message) -> usize {
     let (ret, _) = syscall2(201, handle, msg as *const Message as usize);
     ret
 }
 
-pub fn sys_chan_recv(handle: usize, msg: &mut Message) -> usize {
-    let (ret, _) = syscall2(202, handle, msg as *mut Message as usize);
-    ret
-}
-
-pub fn sys_chan_close(handle: usize) {
-    syscall1(203, handle);
-}
-
-/// Blocking receive: blocks until a message is available.
 pub fn sys_chan_recv_blocking(handle: usize, msg: &mut Message) -> usize {
     let (ret, _) = syscall2(204, handle, msg as *mut Message as usize);
     ret
 }
 
-pub const SYS_MMAP: usize = 222;
-pub const SYS_MUNMAP: usize = 215;
-
-pub fn sys_mmap(hint: usize, length: usize) -> usize {
-    let (ret, _) = syscall2(SYS_MMAP, hint, length);
-    ret
-}
-
-pub fn sys_munmap(addr: usize, length: usize) -> usize {
-    let (ret, _) = syscall2(SYS_MUNMAP, addr, length);
-    ret
+pub fn sys_chan_close(handle: usize) {
+    syscall1(203, handle);
 }

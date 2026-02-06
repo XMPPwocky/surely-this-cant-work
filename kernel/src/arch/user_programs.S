@@ -96,7 +96,7 @@ _user_getpid_end:
     .globl _user_shell_end
     .align 4
 _user_shell_start:
-    .incbin "user/shell/target/riscv64gc-unknown-none-elf/release/shell"
+    .incbin "user/shell/target/riscv64gc-unknown-rvos/release/shell"
 _user_shell_end:
 
     #---------------------------------------------------------------------------

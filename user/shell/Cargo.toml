@@ -6,6 +6,7 @@ edition = "2021"
 [workspace]
 
 [dependencies]
+rvos-rt = { path = "../rvos-rt" }
 rvos-wire = { path = "../../lib/rvos-wire" }
 
 [profile.release]

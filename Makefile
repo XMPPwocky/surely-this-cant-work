@@ -9,8 +9,9 @@ BUILD_STD = -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 .PHONY: build build-shell build-hello build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
 
 build-shell:
-	. $$HOME/.cargo/env && cd user/shell && CARGO_ENCODED_RUSTFLAGS="" \
-		cargo build --release --target riscv64gc-unknown-none-elf $(BUILD_STD)
+	. $$HOME/.cargo/env && cargo +rvos build --release \
+		--manifest-path user/shell/Cargo.toml \
+		--target riscv64gc-unknown-rvos
 
 # Rebuild the rvOS std library via x.py (run after modifying vendor/rust/library/)
 build-std-lib:
