@@ -281,23 +281,8 @@ pub fn draw_boot_logo(fb: *mut u32, width: u32, height: u32) -> u32 {
     (BANNER_HEIGHT + 15) / 16
 }
 
-/// Keep the triangle animation spinning forever (call after demo completes).
-/// This never returns — the user kills QEMU with Ctrl+C.
-#[allow(dead_code)]
-pub fn animate_forever(fb: *mut u32, width: u32, height: u32) -> ! {
-    let c = Canvas { fb, stride: width, width, height };
-    let cx = 120i32;
-    let cy = 105i32;
-
-    let mut global_frame = 0u32;
-    loop {
-        animate_triangles(&c, cx, cy, 64, global_frame);
-        global_frame = global_frame.wrapping_add(64);
-    }
-}
-
-/// Run `num_frames` of the spinning triangle animation starting at `start_frame`.
-fn animate_triangles(c: &Canvas, cx: i32, cy: i32, num_frames: u32, start_frame: u32) {
+/// Draw a single animation frame (triangles + ring) without flushing.
+fn draw_triangle_frame(c: &Canvas, cx: i32, cy: i32, frame: u32) {
     let outer_r = 72i32;
     let inner_r = 36i32;
     let clear_margin = 77u32;
@@ -305,42 +290,69 @@ fn animate_triangles(c: &Canvas, cx: i32, cy: i32, num_frames: u32, start_frame:
     let clear_y = (cy as u32).saturating_sub(clear_margin);
     let clear_size = clear_margin * 2;
 
+    // Clear triangle area (preserve ring)
+    c.fill_rect(clear_x, clear_y, clear_size, clear_size, BG_DARK);
+
+    // Outer gradient triangle — rotates clockwise
+    let step = frame as usize;
+    let (x0, y0) = tri_vertex(cx, cy, outer_r, step);
+    let (x1, y1) = tri_vertex(cx, cy, outer_r, step + 21);
+    let (x2, y2) = tri_vertex(cx, cy, outer_r, step + 42);
+
+    // Vertex colors cycle through hues (full cycle every 64 frames)
+    let hue_base = frame.wrapping_mul(256) / 64;
+    let c0 = hue_to_rgb(hue_base);
+    let c1 = hue_to_rgb(hue_base + 85);
+    let c2 = hue_to_rgb(hue_base + 170);
+
+    c.draw_gradient_triangle(x0, y0, c0, x1, y1, c1, x2, y2, c2);
+
+    // Inner triangle — rotates counter-clockwise, white with slight tint
+    let istep = 64usize.wrapping_sub(frame as usize * 2);
+    let (ix0, iy0) = tri_vertex(cx, cy, inner_r, istep);
+    let (ix1, iy1) = tri_vertex(cx, cy, inner_r, istep + 21);
+    let (ix2, iy2) = tri_vertex(cx, cy, inner_r, istep + 42);
+
+    let inner_tint = hue_to_rgb(hue_base + 128);
+    let inner_white = rgb(240, 245, 255);
+    c.draw_gradient_triangle(
+        ix0, iy0, inner_white,
+        ix1, iy1, inner_tint,
+        ix2, iy2, inner_white,
+    );
+
+    // Redraw ring on top (triangles may clip edges)
+    c.draw_ring(cx, cy, 82, 78, RING_COLOR);
+}
+
+/// Run `num_frames` of the spinning triangle animation starting at `start_frame`.
+fn animate_triangles(c: &Canvas, cx: i32, cy: i32, num_frames: u32, start_frame: u32) {
     for i in 0..num_frames {
         let frame = start_frame.wrapping_add(i);
-
-        // Clear triangle area (preserve ring)
-        c.fill_rect(clear_x, clear_y, clear_size, clear_size, BG_DARK);
-
-        // Outer gradient triangle — rotates clockwise
-        let step = frame as usize;
-        let (x0, y0) = tri_vertex(cx, cy, outer_r, step);
-        let (x1, y1) = tri_vertex(cx, cy, outer_r, step + 21);
-        let (x2, y2) = tri_vertex(cx, cy, outer_r, step + 42);
-
-        // Vertex colors cycle through hues (full cycle every 64 frames)
-        let hue_base = frame.wrapping_mul(256) / 64;
-        let c0 = hue_to_rgb(hue_base);
-        let c1 = hue_to_rgb(hue_base + 85);
-        let c2 = hue_to_rgb(hue_base + 170);
-
-        c.draw_gradient_triangle(x0, y0, c0, x1, y1, c1, x2, y2, c2);
-
-        // Inner triangle — rotates counter-clockwise, white with slight tint
-        let istep = 64usize.wrapping_sub(frame as usize * 2);
-        let (ix0, iy0) = tri_vertex(cx, cy, inner_r, istep);
-        let (ix1, iy1) = tri_vertex(cx, cy, inner_r, istep + 21);
-        let (ix2, iy2) = tri_vertex(cx, cy, inner_r, istep + 42);
-
-        let inner_tint = hue_to_rgb(hue_base + 128);
-        let inner_white = rgb(240, 245, 255);
-        c.draw_gradient_triangle(
-            ix0, iy0, inner_white,
-            ix1, iy1, inner_tint,
-            ix2, iy2, inner_white,
-        );
-
-        // Flush to display + delay
+        draw_triangle_frame(c, cx, cy, frame);
         crate::drivers::virtio::gpu::flush();
         delay_ms(50);
     }
+}
+
+// 50ms per frame at 10MHz rdtime clock
+const FRAME_TICKS: u64 = 500_000;
+
+static mut LAST_FRAME: u64 = 0;
+
+/// Advance the logo animation by one time-based step.
+/// Call from the idle loop. Draws a new frame only when enough time has passed.
+pub fn tick(fb: *mut u32, width: u32, height: u32) {
+    let now = read_time();
+    let cur_frame = now / FRAME_TICKS;
+
+    let last = unsafe { LAST_FRAME };
+    if cur_frame == last {
+        return;
+    }
+    unsafe { LAST_FRAME = cur_frame; }
+
+    let c = Canvas { fb, stride: width, width, height };
+    draw_triangle_frame(&c, 120, 105, (cur_frame % 64) as u32);
+    crate::drivers::virtio::gpu::flush();
 }

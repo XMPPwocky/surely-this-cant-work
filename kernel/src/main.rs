@@ -195,7 +195,7 @@ pub extern "C" fn kmain() -> ! {
     // Idle loop: run forever, shell "shutdown" command calls sys_exit
     loop {
         task::schedule();
-        console::fb_flush();
+        console::logo_tick();
         unsafe { core::arch::asm!("wfi"); }
     }
 }

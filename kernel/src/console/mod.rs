@@ -35,11 +35,6 @@ pub fn init_fb(fb: *mut u32, width: u32, height: u32) {
     con.init(fb, width, height);
 }
 
-/// Flush the framebuffer to the GPU display.
-pub fn fb_flush() {
-    crate::drivers::virtio::gpu::flush();
-}
-
 /// Draw the animated boot logo and offset the text console below it.
 pub fn draw_boot_logo() {
     if let Some((fb, w, h)) = crate::drivers::virtio::gpu::framebuffer() {
@@ -49,13 +44,10 @@ pub fn draw_boot_logo() {
     }
 }
 
-/// Keep the logo triangle spinning forever (call at shutdown).
-/// Only does anything if GPU is active. Never returns.
-#[allow(dead_code)]
-pub fn animate_logo_forever() -> ! {
+/// Advance the logo animation by one time-based step.
+/// Call from the idle loop. No-op if GPU is not active.
+pub fn logo_tick() {
     if let Some((fb, w, h)) = crate::drivers::virtio::gpu::framebuffer() {
-        logo::animate_forever(fb, w, h);
+        logo::tick(fb, w, h);
     }
-    // No GPU — just halt
-    loop { unsafe { core::arch::asm!("wfi"); } }
 }
