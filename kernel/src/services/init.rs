@@ -105,6 +105,8 @@ fn handle_request(boot_ep_b: usize, console_type: ConsoleType, msg: &Message, my
         handle_stdio_request(boot_ep_b, console_type, my_pid);
     } else if starts_with(request, b"sysinfo") {
         handle_sysinfo_request(boot_ep_b, my_pid);
+    } else if starts_with(request, b"math") {
+        handle_math_request(boot_ep_b, my_pid);
     } else {
         // Unknown request - send error response
         let mut resp = Message::new();
@@ -191,6 +193,38 @@ static SYSINFO_CONTROL_EP: core::sync::atomic::AtomicUsize =
 
 pub fn set_sysinfo_control_ep(ep: usize) {
     SYSINFO_CONTROL_EP.store(ep, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Math service control endpoint (set by kmain)
+static MATH_CONTROL_EP: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub fn set_math_control_ep(ep: usize) {
+    MATH_CONTROL_EP.store(ep, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn handle_math_request(boot_ep_b: usize, my_pid: usize) {
+    let (client_ep, server_ep) = ipc::channel_create_pair();
+
+    let math_ctl = MATH_CONTROL_EP.load(core::sync::atomic::Ordering::Relaxed);
+    if math_ctl != usize::MAX {
+        // Send server endpoint to math service via control channel
+        let mut ctl_msg = Message::new();
+        ctl_msg.cap = server_ep;
+        ctl_msg.sender_pid = my_pid;
+        let wake = ipc::channel_send(math_ctl, ctl_msg);
+        if wake != 0 { crate::task::wake_process(wake); }
+
+        // Respond to client with client endpoint
+        let mut resp = Message::new();
+        resp.cap = client_ep;
+        resp.sender_pid = my_pid;
+        let ok = b"ok";
+        resp.data[..ok.len()].copy_from_slice(ok);
+        resp.len = ok.len();
+        let wake = ipc::channel_send(boot_ep_b, resp);
+        if wake != 0 { crate::task::wake_process(wake); }
+    }
 }
 
 fn starts_with(data: &[u8], prefix: &[u8]) -> bool {

@@ -3,6 +3,9 @@ name = "kernel"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+rvos-wire = { path = "../lib/rvos-wire" }
+
 [profile.release]
 panic = "abort"
 opt-level = 2

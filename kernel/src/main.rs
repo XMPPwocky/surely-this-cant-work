@@ -109,6 +109,11 @@ pub extern "C" fn kmain() -> ! {
     services::sysinfo::set_control_ep(sysinfo_ctl_ep);
     services::init::set_sysinfo_control_ep(init_sysinfo_ep);
 
+    // Math service control channel
+    let (init_math_ep, math_ctl_ep) = ipc::channel_create_pair();
+    services::math::set_control_ep(math_ctl_ep);
+    services::init::set_math_control_ep(init_math_ep);
+
     // Boot channels for shells
     let (shell_serial_boot_a, shell_serial_boot_b) = ipc::channel_create_pair();
     services::init::register_boot(shell_serial_boot_b, services::init::ConsoleType::Serial);
@@ -134,6 +139,7 @@ pub extern "C" fn kmain() -> ! {
         task::spawn_named(services::console::fb_console_server, "fb-con");
     }
     task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo");
+    task::spawn_named(services::math::math_service, "math");
 
     // Spawn shells with boot channels
     task::spawn_user_with_boot_channel(user_shell_code(), "shell-serial", shell_serial_boot_a);

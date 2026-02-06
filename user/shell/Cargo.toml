@@ -5,6 +5,9 @@ edition = "2021"
 
 [workspace]
 
+[dependencies]
+rvos-wire = { path = "../../lib/rvos-wire" }
+
 [profile.release]
 panic = "abort"
 opt-level = "s"
