@@ -52,8 +52,8 @@ pub struct LoadedElf {
 }
 
 /// Load an ELF64 binary. Allocates contiguous physical pages, copies
-/// PT_LOAD segments, zeros .bss, and returns physical entry point.
-/// Uses identity mapping (VA = PA for user pages).
+/// PT_LOAD segments, and zeros .bss. The caller is responsible for
+/// mapping the returned pages into a user page table.
 pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, &'static str> {
     if elf_data.len() < 64 {
         return Err("ELF too small");
