@@ -1,14 +1,70 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use crate::sync::SpinLock;
+use crate::mm::address::PhysPageNum;
 
 /// Maximum message payload size in bytes
 const MAX_MSG_SIZE: usize = 64;
 /// Maximum number of bidirectional channels
 const MAX_CHANNELS: usize = 32;
+/// Maximum number of shared memory regions
+const MAX_SHM_REGIONS: usize = 32;
 
 /// Sentinel value meaning "no capability attached"
 pub const NO_CAP: usize = usize::MAX;
+
+// Internal capability encoding in message queue (bits 63..62)
+// 00 = no capability (NO_CAP)
+// 01 = channel endpoint
+// 10 = shared memory (RW)
+// 11 = shared memory (RO)
+const CAP_TAG_CHANNEL: usize = 0b01 << 62;
+const CAP_TAG_SHM_RW: usize = 0b10 << 62;
+const CAP_TAG_SHM_RO: usize = 0b11 << 62;
+const CAP_TAG_MASK: usize = 0b11 << 62;
+const CAP_ID_MASK: usize = !(0b11 << 62);
+
+/// Encode a channel endpoint capability for the message queue.
+pub fn encode_cap_channel(global_ep: usize) -> usize {
+    CAP_TAG_CHANNEL | (global_ep & CAP_ID_MASK)
+}
+
+/// Encode a SHM capability for the message queue.
+pub fn encode_cap_shm(global_shm_id: usize, rw: bool) -> usize {
+    let tag = if rw { CAP_TAG_SHM_RW } else { CAP_TAG_SHM_RO };
+    tag | (global_shm_id & CAP_ID_MASK)
+}
+
+/// Decoded capability from message queue.
+pub enum DecodedCap {
+    None,
+    Channel(usize),           // global endpoint ID
+    Shm { id: usize, rw: bool }, // global SHM ID + permission
+}
+
+/// Decode a capability from the message queue.
+pub fn decode_cap(encoded: usize) -> DecodedCap {
+    if encoded == NO_CAP {
+        return DecodedCap::None;
+    }
+    let tag = encoded & CAP_TAG_MASK;
+    let id = encoded & CAP_ID_MASK;
+    match tag {
+        CAP_TAG_CHANNEL => DecodedCap::Channel(id),
+        CAP_TAG_SHM_RW => DecodedCap::Shm { id, rw: true },
+        CAP_TAG_SHM_RO => DecodedCap::Shm { id, rw: false },
+        _ => DecodedCap::None, // tag 00 with non-MAX value, treat as none
+    }
+}
+
+/// Convenience: decode an encoded cap as a channel endpoint ID.
+/// Used by kernel-internal services that receive caps through message queues.
+pub fn decode_cap_channel(encoded: usize) -> Option<usize> {
+    match decode_cap(encoded) {
+        DecodedCap::Channel(ep) => Some(ep),
+        _ => None,
+    }
+}
 
 /// A fixed-size message with optional capability
 #[derive(Clone)]
@@ -98,6 +154,7 @@ static CHANNELS: SpinLock<ChannelManager> = SpinLock::new(ChannelManager::new())
 
 pub fn init() {
     CHANNELS.lock().init();
+    shm_init();
 }
 
 /// Helper: endpoint ID -> (channel_index, is_b_side)
@@ -213,4 +270,108 @@ pub fn channel_close(endpoint: usize) {
             ch.active = false;
         }
     }
+}
+
+// ============================================================
+// Shared Memory Region Manager
+// ============================================================
+
+struct ShmRegion {
+    base_ppn: PhysPageNum, // first physical page of the region
+    page_count: usize,     // number of contiguous physical pages
+    ref_count: usize,      // number of outstanding handles (RO + RW)
+    active: bool,          // false after freed
+}
+
+struct ShmManager {
+    regions: Vec<Option<ShmRegion>>,
+}
+
+impl ShmManager {
+    const fn new() -> Self {
+        ShmManager {
+            regions: Vec::new(),
+        }
+    }
+
+    fn init(&mut self) {
+        self.regions = Vec::with_capacity(MAX_SHM_REGIONS);
+        for _ in 0..MAX_SHM_REGIONS {
+            self.regions.push(None);
+        }
+    }
+}
+
+static SHM_REGIONS: SpinLock<ShmManager> = SpinLock::new(ShmManager::new());
+
+/// Initialize the SHM manager (call from ipc::init).
+fn shm_init() {
+    SHM_REGIONS.lock().init();
+}
+
+/// Create a new SHM region with the given number of contiguous physical pages.
+/// The pages must already be allocated and zeroed.
+/// Returns the global SHM ID, or None if the table is full.
+pub fn shm_create(base_ppn: PhysPageNum, page_count: usize) -> Option<usize> {
+    let mut mgr = SHM_REGIONS.lock();
+    for (i, slot) in mgr.regions.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(ShmRegion {
+                base_ppn,
+                page_count,
+                ref_count: 1,
+                active: true,
+            });
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Increment the ref_count of a SHM region. Returns false if the region is invalid.
+pub fn shm_inc_ref(shm_id: usize) -> bool {
+    let mut mgr = SHM_REGIONS.lock();
+    if let Some(Some(ref mut region)) = mgr.regions.get_mut(shm_id) {
+        if region.active {
+            region.ref_count += 1;
+            return true;
+        }
+    }
+    false
+}
+
+/// Decrement the ref_count of a SHM region. If it reaches 0, free the physical frames
+/// and mark the region as inactive. Returns true if the region was valid.
+pub fn shm_dec_ref(shm_id: usize) -> bool {
+    let mut mgr = SHM_REGIONS.lock();
+    if let Some(Some(ref mut region)) = mgr.regions.get_mut(shm_id) {
+        if !region.active {
+            return false;
+        }
+        if region.ref_count > 0 {
+            region.ref_count -= 1;
+        }
+        if region.ref_count == 0 {
+            // Free physical frames
+            for i in 0..region.page_count {
+                crate::mm::frame::frame_dealloc(PhysPageNum(region.base_ppn.0 + i));
+            }
+            region.active = false;
+            // Remove from table
+            mgr.regions[shm_id] = None;
+        }
+        return true;
+    }
+    false
+}
+
+/// Get the base PPN and page count of a SHM region. Returns None if invalid.
+pub fn shm_get_info(shm_id: usize) -> Option<(PhysPageNum, usize)> {
+    let mgr = SHM_REGIONS.lock();
+    if let Some(Some(ref region)) = mgr.regions.get(shm_id) {
+        if region.active {
+            return Some((region.base_ppn, region.page_count));
+        }
+    }
+    None
 }

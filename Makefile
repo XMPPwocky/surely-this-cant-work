@@ -6,7 +6,7 @@ OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 # build-std flags (moved out of .cargo/config.toml to avoid leaking into x.py)
 BUILD_STD = -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 
-.PHONY: build build-shell build-hello build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
+.PHONY: build build-shell build-hello build-fs build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
 
 build-shell:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
@@ -23,7 +23,12 @@ build-hello:
 		--manifest-path user/hello/Cargo.toml \
 		--target riscv64gc-unknown-rvos
 
-build: build-shell build-hello
+build-fs:
+	. $$HOME/.cargo/env && cargo +rvos build --release \
+		--manifest-path user/fs/Cargo.toml \
+		--target riscv64gc-unknown-rvos
+
+build: build-shell build-hello build-fs
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml \
 		--target riscv64gc-unknown-none-elf $(BUILD_STD)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)

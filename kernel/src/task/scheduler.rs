@@ -5,7 +5,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::SpinLock;
 use crate::task::context::TaskContext;
-use crate::task::process::{Process, ProcessState, MAX_PROCS};
+use crate::task::process::{Process, ProcessState, HandleObject, MAX_PROCS};
 
 extern "C" {
     fn switch_context(old: *mut TaskContext, new: *const TaskContext);
@@ -130,7 +130,7 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
     let mut proc = Process::new_user(user_code);
     let pid = proc.pid;
     proc.set_name(name);
-    proc.handles[0] = Some(boot_ep);
+    proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
     if pid < MAX_PROCS {
         if sched.processes.len() <= pid {
@@ -178,7 +178,7 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: us
     let mut proc = Process::new_user_elf(elf_data);
     let pid = proc.pid;
     proc.set_name(name);
-    proc.handles[0] = Some(boot_ep);
+    proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
     if pid < MAX_PROCS {
         if sched.processes.len() <= pid {
@@ -196,8 +196,33 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: us
     pid
 }
 
+/// Spawn a user ELF process with handle 0 = boot_ep and handle 1 = extra_ep.
+pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, extra_ep: usize) -> usize {
+    let mut sched = SCHEDULER.lock();
+    let mut proc = Process::new_user_elf(elf_data);
+    let pid = proc.pid;
+    proc.set_name(name);
+    proc.handles[0] = Some(HandleObject::Channel(boot_ep));
+    proc.handles[1] = Some(HandleObject::Channel(extra_ep));
+
+    if pid < MAX_PROCS {
+        if sched.processes.len() <= pid {
+            while sched.processes.len() <= pid {
+                sched.processes.push(None);
+            }
+        }
+        sched.processes[pid] = Some(proc);
+        sched.ready_queue.push_back(pid);
+    } else {
+        panic!("Too many processes (max {})", MAX_PROCS);
+    }
+
+    crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={}, extra_ep={})", pid, name, pid, boot_ep, extra_ep);
+    pid
+}
+
 /// Look up a handle in the current process's handle table.
-pub fn current_process_handle(handle: usize) -> Option<usize> {
+pub fn current_process_handle(handle: usize) -> Option<HandleObject> {
     let sched = SCHEDULER.lock();
     let pid = sched.current;
     match sched.processes[pid].as_ref() {
@@ -206,11 +231,12 @@ pub fn current_process_handle(handle: usize) -> Option<usize> {
     }
 }
 
-/// Allocate a new handle in the current process for the given global endpoint.
-pub fn current_process_alloc_handle(global_ep: usize) -> usize {
+/// Allocate a new handle in the current process for the given HandleObject.
+/// Returns the local handle index, or None if the table is full.
+pub fn current_process_alloc_handle(obj: HandleObject) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
     let pid = sched.current;
-    sched.processes[pid].as_mut().expect("no current process").alloc_handle(global_ep)
+    sched.processes[pid].as_mut().expect("no current process").alloc_handle(obj)
 }
 
 /// Free a handle in the current process.
@@ -299,12 +325,48 @@ pub fn exit_current() -> ! {
     unreachable!("exit_current: schedule returned to dead task");
 }
 
-/// Mark current task as dead (called from syscall context, may return)
+/// Mark current task as dead (called from syscall context, may return).
+/// Cleans up all handles (channel + SHM) and SHM-backed mmap regions.
 pub fn exit_current_from_syscall() {
     {
         let mut sched = SCHEDULER.lock();
         let pid = sched.current;
         if let Some(ref mut proc) = sched.processes[pid] {
+            // Clean up all handles
+            for i in 0..crate::task::process::MAX_HANDLES {
+                if let Some(handle_obj) = proc.handles[i].take() {
+                    match handle_obj {
+                        HandleObject::Channel(ep) => {
+                            crate::ipc::channel_close(ep);
+                        }
+                        HandleObject::Shm { id, .. } => {
+                            crate::ipc::shm_dec_ref(id);
+                        }
+                    }
+                }
+            }
+            // Clean up mmap regions: for SHM-backed, unmap PTEs but don't free frames
+            // For anonymous, unmap and free frames
+            if proc.user_satp != 0 {
+                let root_ppn = crate::mm::address::PhysPageNum(proc.user_satp & ((1usize << 44) - 1));
+                let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
+                for slot in proc.mmap_regions.iter_mut() {
+                    if let Some(region) = slot.take() {
+                        for j in 0..region.page_count {
+                            let vpn = crate::mm::address::VirtPageNum(region.base_ppn + j);
+                            pt.unmap(vpn);
+                            if region.shm_id.is_none() {
+                                // Anonymous: free the frame
+                                crate::mm::frame::frame_dealloc(
+                                    crate::mm::address::PhysPageNum(region.base_ppn + j),
+                                );
+                            }
+                            // SHM-backed: do NOT free the frame
+                        }
+                    }
+                }
+                core::mem::forget(pt);
+            }
             proc.state = ProcessState::Dead;
         }
     }
@@ -421,23 +483,27 @@ pub fn current_process_user_satp() -> usize {
     }
 }
 
-/// Add an mmap region to the current process.
-pub fn current_process_add_mmap(base_ppn: usize, page_count: usize) {
+/// Add an mmap region to the current process. Returns true on success.
+pub fn current_process_add_mmap(base_ppn: usize, page_count: usize, shm_id: Option<usize>) -> bool {
     let mut sched = SCHEDULER.lock();
     let pid = sched.current;
     if let Some(ref mut proc) = sched.processes[pid] {
-        proc.add_mmap_region(base_ppn, page_count);
+        proc.add_mmap_region(base_ppn, page_count, shm_id)
+    } else {
+        false
     }
 }
 
-/// Remove an mmap region from the current process. Returns true if found.
-pub fn current_process_remove_mmap(base_ppn: usize, page_count: usize) -> bool {
+/// Remove an mmap region from the current process.
+/// Returns Some(shm_id) if found (None inside means anonymous, Some(id) means SHM).
+/// Returns None if not found.
+pub fn current_process_remove_mmap(base_ppn: usize, page_count: usize) -> Option<Option<usize>> {
     let mut sched = SCHEDULER.lock();
     let pid = sched.current;
     if let Some(ref mut proc) = sched.processes[pid] {
         proc.remove_mmap_region(base_ppn, page_count)
     } else {
-        false
+        None
     }
 }
 

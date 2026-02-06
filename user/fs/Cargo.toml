@@ -1,0 +1,15 @@
+[package]
+name = "fs"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+rvos-rt = { path = "../rvos-rt" }
+rvos-wire = { path = "../../lib/rvos-wire" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

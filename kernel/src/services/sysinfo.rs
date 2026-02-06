@@ -1,4 +1,4 @@
-use crate::ipc::{self, Message, NO_CAP};
+use crate::ipc::{self, Message};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Control endpoint for sysinfo service (set by kmain before spawn)
@@ -19,8 +19,8 @@ pub fn sysinfo_service() {
         let client_ep = loop {
             match ipc::channel_recv(control_ep) {
                 Some(msg) => {
-                    if msg.cap != NO_CAP {
-                        break msg.cap;
+                    if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
+                        break ep;
                     }
                 }
                 None => {

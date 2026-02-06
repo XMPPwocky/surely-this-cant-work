@@ -47,6 +47,19 @@ fn user_hello_std_code() -> &'static [u8] {
     }
 }
 
+fn user_fs_code() -> &'static [u8] {
+    extern "C" {
+        static _user_fs_start: u8;
+        static _user_fs_end: u8;
+    }
+    unsafe {
+        let start = &_user_fs_start as *const u8;
+        let end = &_user_fs_end as *const u8;
+        let len = end as usize - start as usize;
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     // ---- Phase 1: Boot and hardware init ----
@@ -139,6 +152,10 @@ pub extern "C" fn kmain() -> ! {
     services::math::set_control_ep(math_ctl_ep);
     services::init::set_math_control_ep(init_math_ep);
 
+    // Filesystem service: control channel goes to a user-space fs server
+    let (init_fs_ep, fs_ctl_ep) = ipc::channel_create_pair();
+    services::init::set_fs_control_ep(init_fs_ep);
+
     // Boot channels for shells
     let (shell_serial_boot_a, shell_serial_boot_b) = ipc::channel_create_pair();
     services::init::register_boot(shell_serial_boot_b, services::init::ConsoleType::Serial);
@@ -165,6 +182,11 @@ pub extern "C" fn kmain() -> ! {
     }
     task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo");
     task::spawn_named(services::math::math_service, "math");
+
+    // Spawn fs server as a user process with boot channel + control channel
+    let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair();
+    services::init::register_boot(fs_boot_b, services::init::ConsoleType::Serial);
+    task::spawn_user_elf_with_handles(user_fs_code(), "fs", fs_boot_a, fs_ctl_ep);
 
     // Spawn hello-std test program with its own boot channel
     let (hello_boot_a, hello_boot_b) = ipc::channel_create_pair();

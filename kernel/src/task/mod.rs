@@ -2,9 +2,11 @@ pub mod context;
 pub mod process;
 pub mod scheduler;
 
+pub use process::HandleObject;
 pub use scheduler::{
     init, spawn_named,
     spawn_user_elf_with_boot_channel,
+    spawn_user_elf_with_handles,
     schedule, current_pid,
     exit_current_from_syscall,
     block_process, wake_process, save_kernel_satp,

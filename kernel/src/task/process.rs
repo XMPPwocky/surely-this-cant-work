@@ -15,10 +15,17 @@ pub const MAX_HANDLES: usize = 16;
 pub const MAX_MMAP_REGIONS: usize = 32;
 const NAME_LEN: usize = 16;
 
+#[derive(Clone, Copy, Debug)]
+pub enum HandleObject {
+    Channel(usize),              // global endpoint ID
+    Shm { id: usize, rw: bool }, // global SHM ID + permission flag
+}
+
 #[derive(Clone, Copy)]
 pub struct MmapRegion {
     pub base_ppn: usize,
     pub page_count: usize,
+    pub shm_id: Option<usize>, // None = anonymous, Some(id) = SHM-backed
 }
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
@@ -46,7 +53,7 @@ pub struct Process {
     pub user_satp: usize,      // satp value for user page table (0 = kernel task)
     pub user_entry: usize,     // virtual (= physical) address of user code
     pub user_stack_top: usize, // virtual (= physical) address of user stack top
-    pub handles: [Option<usize>; MAX_HANDLES], // local handle -> global endpoint ID
+    pub handles: [Option<HandleObject>; MAX_HANDLES], // local handle -> HandleObject
     pub mmap_regions: [Option<MmapRegion>; MAX_MMAP_REGIONS],
     name: [u8; NAME_LEN],
     name_len: usize,
@@ -223,20 +230,20 @@ impl Process {
         core::str::from_utf8(&self.name[..self.name_len]).unwrap_or("???")
     }
 
-    /// Allocate a handle in this process's table for the given global endpoint ID.
-    /// Returns the local handle index.
-    pub fn alloc_handle(&mut self, global_ep: usize) -> usize {
+    /// Allocate a handle in this process's table for the given HandleObject.
+    /// Returns the local handle index, or None if the table is full.
+    pub fn alloc_handle(&mut self, obj: HandleObject) -> Option<usize> {
         for (i, slot) in self.handles.iter_mut().enumerate() {
             if slot.is_none() {
-                *slot = Some(global_ep);
-                return i;
+                *slot = Some(obj);
+                return Some(i);
             }
         }
-        panic!("Process {}: handle table full", self.pid);
+        None
     }
 
-    /// Look up a local handle to get the global endpoint ID.
-    pub fn lookup_handle(&self, handle: usize) -> Option<usize> {
+    /// Look up a local handle to get the HandleObject.
+    pub fn lookup_handle(&self, handle: usize) -> Option<HandleObject> {
         if handle < MAX_HANDLES {
             self.handles[handle]
         } else {
@@ -251,28 +258,30 @@ impl Process {
         }
     }
 
-    /// Record an mmap region in the first free slot.
-    pub fn add_mmap_region(&mut self, base_ppn: usize, page_count: usize) {
+    /// Record an mmap region in the first free slot. Returns true on success, false if full.
+    pub fn add_mmap_region(&mut self, base_ppn: usize, page_count: usize, shm_id: Option<usize>) -> bool {
         for slot in self.mmap_regions.iter_mut() {
             if slot.is_none() {
-                *slot = Some(MmapRegion { base_ppn, page_count });
-                return;
-            }
-        }
-        panic!("Process {}: mmap region table full", self.pid);
-    }
-
-    /// Remove an mmap region matching base_ppn and page_count. Returns true if found.
-    pub fn remove_mmap_region(&mut self, base_ppn: usize, page_count: usize) -> bool {
-        for slot in self.mmap_regions.iter_mut() {
-            if let Some(ref region) = slot {
-                if region.base_ppn == base_ppn && region.page_count == page_count {
-                    *slot = None;
-                    return true;
-                }
+                *slot = Some(MmapRegion { base_ppn, page_count, shm_id });
+                return true;
             }
         }
         false
+    }
+
+    /// Remove an mmap region matching base_ppn and page_count.
+    /// Returns Some(shm_id) if found (shm_id is None for anonymous, Some(id) for SHM-backed).
+    pub fn remove_mmap_region(&mut self, base_ppn: usize, page_count: usize) -> Option<Option<usize>> {
+        for slot in self.mmap_regions.iter_mut() {
+            if let Some(ref region) = slot {
+                if region.base_ppn == base_ppn && region.page_count == page_count {
+                    let shm_id = region.shm_id;
+                    *slot = None;
+                    return Some(shm_id);
+                }
+            }
+        }
+        None
     }
 }
 

@@ -112,6 +112,8 @@ fn handle_request(boot_ep_b: usize, console_type: ConsoleType, msg: &Message, my
         handle_sysinfo_request(boot_ep_b, my_pid);
     } else if starts_with(request, b"math") {
         handle_math_request(boot_ep_b, my_pid);
+    } else if starts_with(request, b"fs") {
+        handle_fs_request(boot_ep_b, my_pid);
     } else {
         // Unknown request - send error response
         let mut resp = Message::new();
@@ -146,14 +148,14 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, my_pid: usi
     if let Some(ctl_ep) = control_ep {
         // Send server endpoint to console server via its control channel
         let mut ctl_msg = Message::new();
-        ctl_msg.cap = server_ep;
+        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
         ctl_msg.sender_pid = my_pid;
         let wake = ipc::channel_send(ctl_ep, ctl_msg);
         if wake != 0 { crate::task::wake_process(wake); }
 
         // Respond to client with client endpoint as capability
         let mut resp = Message::new();
-        resp.cap = client_ep;
+        resp.cap = ipc::encode_cap_channel(client_ep);
         resp.sender_pid = my_pid;
         let ok = b"ok";
         resp.data[..ok.len()].copy_from_slice(ok);
@@ -175,14 +177,14 @@ fn handle_sysinfo_request(boot_ep_b: usize, my_pid: usize) {
     if sysinfo_ctl != usize::MAX {
         // Send server endpoint to sysinfo
         let mut ctl_msg = Message::new();
-        ctl_msg.cap = server_ep;
+        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
         ctl_msg.sender_pid = my_pid;
         let wake = ipc::channel_send(sysinfo_ctl, ctl_msg);
         if wake != 0 { crate::task::wake_process(wake); }
 
         // Respond to client with client endpoint
         let mut resp = Message::new();
-        resp.cap = client_ep;
+        resp.cap = ipc::encode_cap_channel(client_ep);
         resp.sender_pid = my_pid;
         let ok = b"ok";
         resp.data[..ok.len()].copy_from_slice(ok);
@@ -215,14 +217,46 @@ fn handle_math_request(boot_ep_b: usize, my_pid: usize) {
     if math_ctl != usize::MAX {
         // Send server endpoint to math service via control channel
         let mut ctl_msg = Message::new();
-        ctl_msg.cap = server_ep;
+        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
         ctl_msg.sender_pid = my_pid;
         let wake = ipc::channel_send(math_ctl, ctl_msg);
         if wake != 0 { crate::task::wake_process(wake); }
 
         // Respond to client with client endpoint
         let mut resp = Message::new();
-        resp.cap = client_ep;
+        resp.cap = ipc::encode_cap_channel(client_ep);
+        resp.sender_pid = my_pid;
+        let ok = b"ok";
+        resp.data[..ok.len()].copy_from_slice(ok);
+        resp.len = ok.len();
+        let wake = ipc::channel_send(boot_ep_b, resp);
+        if wake != 0 { crate::task::wake_process(wake); }
+    }
+}
+
+/// Filesystem service control endpoint (set by kmain)
+static FS_CONTROL_EP: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub fn set_fs_control_ep(ep: usize) {
+    FS_CONTROL_EP.store(ep, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn handle_fs_request(boot_ep_b: usize, my_pid: usize) {
+    let (client_ep, server_ep) = ipc::channel_create_pair();
+
+    let fs_ctl = FS_CONTROL_EP.load(core::sync::atomic::Ordering::Relaxed);
+    if fs_ctl != usize::MAX {
+        // Send server endpoint to fs service via control channel
+        let mut ctl_msg = Message::new();
+        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.sender_pid = my_pid;
+        let wake = ipc::channel_send(fs_ctl, ctl_msg);
+        if wake != 0 { crate::task::wake_process(wake); }
+
+        // Respond to client with client endpoint
+        let mut resp = Message::new();
+        resp.cap = ipc::encode_cap_channel(client_ep);
         resp.sender_pid = my_pid;
         let ok = b"ok";
         resp.data[..ok.len()].copy_from_slice(ok);

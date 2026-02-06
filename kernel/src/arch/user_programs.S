@@ -108,3 +108,13 @@ _user_shell_end:
 _user_hello_std_start:
     .incbin "user/hello/target/riscv64gc-unknown-rvos/release/hello"
 _user_hello_std_end:
+
+    #---------------------------------------------------------------------------
+    # User program: "fs" - RAM-backed filesystem server (tmpfs)
+    #---------------------------------------------------------------------------
+    .globl _user_fs_start
+    .globl _user_fs_end
+    .align 4
+_user_fs_start:
+    .incbin "user/fs/target/riscv64gc-unknown-rvos/release/fs"
+_user_fs_end:

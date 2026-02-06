@@ -1,5 +1,6 @@
 use crate::arch::csr;
 use crate::arch::sbi;
+use crate::task::HandleObject;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const TIMER_INTERVAL: u64 = 1_000_000; // 100ms at 10MHz
@@ -15,6 +16,8 @@ pub const SYS_CHAN_SEND: usize = 201;
 pub const SYS_CHAN_RECV: usize = 202;
 pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
+pub const SYS_SHM_CREATE: usize = 205;
+pub const SYS_SHM_DUP_RO: usize = 206;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 
@@ -116,6 +119,12 @@ fn handle_syscall(tf: &mut TrapFrame) {
         SYS_CHAN_RECV_BLOCKING => {
             sys_chan_recv_blocking(tf);
         }
+        SYS_SHM_CREATE => {
+            tf.regs[10] = sys_shm_create(a0);
+        }
+        SYS_SHM_DUP_RO => {
+            tf.regs[10] = sys_shm_dup_ro(a0);
+        }
         SYS_MMAP => {
             tf.regs[10] = sys_mmap(a0, a1);
         }
@@ -133,24 +142,36 @@ fn handle_syscall(tf: &mut TrapFrame) {
 /// Returns handle_a in a0, handle_b in a1.
 fn sys_chan_create(tf: &mut TrapFrame) {
     let (ep_a, ep_b) = crate::ipc::channel_create_pair();
-    let handle_a = crate::task::current_process_alloc_handle(ep_a);
-    let handle_b = crate::task::current_process_alloc_handle(ep_b);
+    let handle_a = match crate::task::current_process_alloc_handle(HandleObject::Channel(ep_a)) {
+        Some(h) => h,
+        None => {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
+    };
+    let handle_b = match crate::task::current_process_alloc_handle(HandleObject::Channel(ep_b)) {
+        Some(h) => h,
+        None => {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
+    };
     tf.regs[10] = handle_a;
     tf.regs[11] = handle_b;
 }
 
 /// SYS_CHAN_SEND: translate handle -> endpoint, copy message from user, send.
-/// If message has a cap, translate cap handle -> global endpoint too.
+/// If message has a cap, translate cap handle -> encoded capability.
 fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     let msg_pa = match validate_user_buffer(msg_ptr, core::mem::size_of::<crate::ipc::Message>()) {
         Some(pa) => pa,
         None => return usize::MAX,
     };
 
-    // Translate handle to global endpoint
+    // Translate handle to global endpoint (must be a channel)
     let endpoint = match crate::task::current_process_handle(handle) {
-        Some(ep) => ep,
-        None => return usize::MAX,
+        Some(HandleObject::Channel(ep)) => ep,
+        _ => return usize::MAX,
     };
 
     // Read message from user space via translated PA (kernel identity-maps all RAM)
@@ -159,10 +180,19 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     // Set sender PID
     msg.sender_pid = crate::task::current_pid();
 
-    // Translate cap if present: local handle -> global endpoint
+    // Translate cap if present: local handle -> encoded capability
     if msg.cap != crate::ipc::NO_CAP {
         match crate::task::current_process_handle(msg.cap) {
-            Some(global_ep) => msg.cap = global_ep,
+            Some(HandleObject::Channel(global_ep)) => {
+                msg.cap = crate::ipc::encode_cap_channel(global_ep);
+            }
+            Some(HandleObject::Shm { id, rw }) => {
+                // Increment ref_count for the SHM region being transferred
+                if !crate::ipc::shm_inc_ref(id) {
+                    return usize::MAX;
+                }
+                msg.cap = crate::ipc::encode_cap_shm(id, rw);
+            }
             None => return usize::MAX, // invalid cap handle
         }
     }
@@ -178,6 +208,30 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     0
 }
 
+/// Install a received capability into the current process's handle table.
+/// Returns the local handle index to write into msg.cap, or NO_CAP on failure.
+fn install_received_cap(encoded_cap: usize) -> usize {
+    match crate::ipc::decode_cap(encoded_cap) {
+        crate::ipc::DecodedCap::None => crate::ipc::NO_CAP,
+        crate::ipc::DecodedCap::Channel(global_ep) => {
+            match crate::task::current_process_alloc_handle(HandleObject::Channel(global_ep)) {
+                Some(h) => h,
+                None => crate::ipc::NO_CAP,
+            }
+        }
+        crate::ipc::DecodedCap::Shm { id, rw } => {
+            match crate::task::current_process_alloc_handle(HandleObject::Shm { id, rw }) {
+                Some(h) => h,
+                None => {
+                    // Failed to install; decrement ref_count since it was incremented on send
+                    crate::ipc::shm_dec_ref(id);
+                    crate::ipc::NO_CAP
+                }
+            }
+        }
+    }
+}
+
 /// SYS_CHAN_RECV (non-blocking): translate handle, try recv, translate cap in result.
 fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
     let msg_pa = match validate_user_buffer(msg_buf_ptr, core::mem::size_of::<crate::ipc::Message>()) {
@@ -186,16 +240,15 @@ fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
     };
 
     let endpoint = match crate::task::current_process_handle(handle) {
-        Some(ep) => ep,
-        None => return usize::MAX,
+        Some(HandleObject::Channel(ep)) => ep,
+        _ => return usize::MAX,
     };
 
     match crate::ipc::channel_recv(endpoint) {
         Some(mut msg) => {
-            // Translate cap: global endpoint -> new local handle in receiver
+            // Translate cap: encoded capability -> new local handle in receiver
             if msg.cap != crate::ipc::NO_CAP {
-                let local_handle = crate::task::current_process_alloc_handle(msg.cap);
-                msg.cap = local_handle;
+                msg.cap = install_received_cap(msg.cap);
             }
             // Write to user buffer via translated PA
             unsafe {
@@ -221,8 +274,8 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
     };
 
     let endpoint = match crate::task::current_process_handle(handle) {
-        Some(ep) => ep,
-        None => {
+        Some(HandleObject::Channel(ep)) => ep,
+        _ => {
             tf.regs[10] = usize::MAX;
             return;
         }
@@ -233,8 +286,7 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
             Some(mut msg) => {
                 // Translate cap
                 if msg.cap != crate::ipc::NO_CAP {
-                    let local_handle = crate::task::current_process_alloc_handle(msg.cap);
-                    msg.cap = local_handle;
+                    msg.cap = install_received_cap(msg.cap);
                 }
                 // Write to user buffer via translated PA
                 unsafe {
@@ -255,22 +307,107 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
     }
 }
 
-/// SYS_CHAN_CLOSE: translate handle, free it, close endpoint.
+/// SYS_CHAN_CLOSE: close a handle (channel or SHM).
 fn sys_chan_close(handle: usize) -> usize {
-    let endpoint = match crate::task::current_process_handle(handle) {
-        Some(ep) => ep,
-        None => return usize::MAX,
-    };
-    crate::task::current_process_free_handle(handle);
-    crate::ipc::channel_close(endpoint);
-    0
+    match crate::task::current_process_handle(handle) {
+        Some(HandleObject::Channel(ep)) => {
+            crate::task::current_process_free_handle(handle);
+            crate::ipc::channel_close(ep);
+            0
+        }
+        Some(HandleObject::Shm { id, .. }) => {
+            crate::task::current_process_free_handle(handle);
+            crate::ipc::shm_dec_ref(id);
+            0
+        }
+        None => usize::MAX,
+    }
 }
 
-fn sys_mmap(_hint: usize, length: usize) -> usize {
+/// SYS_SHM_CREATE: create a shared memory region and return a RW handle.
+fn sys_shm_create(size: usize) -> usize {
+    if size == 0 {
+        return usize::MAX;
+    }
+
+    let page_count = (size + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+
+    // Allocate contiguous physical frames
+    let ppn = match crate::mm::frame::frame_alloc_contiguous(page_count) {
+        Some(ppn) => ppn,
+        None => return usize::MAX,
+    };
+
+    // Zero the allocated pages
+    let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
+    unsafe {
+        core::ptr::write_bytes(base_pa as *mut u8, 0, page_count * crate::mm::address::PAGE_SIZE);
+    }
+
+    // Create SHM region in global table
+    let shm_id = match crate::ipc::shm_create(ppn, page_count) {
+        Some(id) => id,
+        None => {
+            // Table full, free the frames
+            for i in 0..page_count {
+                crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
+            }
+            return usize::MAX;
+        }
+    };
+
+    // Install RW handle in caller's handle table
+    match crate::task::current_process_alloc_handle(HandleObject::Shm { id: shm_id, rw: true }) {
+        Some(local_handle) => local_handle,
+        None => {
+            // Handle table full, clean up
+            crate::ipc::shm_dec_ref(shm_id);
+            usize::MAX
+        }
+    }
+}
+
+/// SYS_SHM_DUP_RO: duplicate a SHM handle as read-only.
+fn sys_shm_dup_ro(handle: usize) -> usize {
+    // Look up the handle - must be SHM
+    let shm_id = match crate::task::current_process_handle(handle) {
+        Some(HandleObject::Shm { id, .. }) => id,
+        _ => return usize::MAX,
+    };
+
+    // Increment ref_count
+    if !crate::ipc::shm_inc_ref(shm_id) {
+        return usize::MAX;
+    }
+
+    // Install RO handle
+    match crate::task::current_process_alloc_handle(HandleObject::Shm { id: shm_id, rw: false }) {
+        Some(local_handle) => local_handle,
+        None => {
+            crate::ipc::shm_dec_ref(shm_id);
+            usize::MAX
+        }
+    }
+}
+
+/// SYS_MMAP: map pages into process address space.
+/// a0 == 0: anonymous mapping (allocate fresh pages)
+/// a0 != 0: SHM handle mapping (map shared region)
+fn sys_mmap(shm_handle: usize, length: usize) -> usize {
     if length == 0 {
         return usize::MAX;
     }
 
+    if shm_handle == 0 {
+        // Anonymous mapping (existing behavior)
+        sys_mmap_anonymous(length)
+    } else {
+        // SHM-backed mapping
+        sys_mmap_shm(shm_handle, length)
+    }
+}
+
+fn sys_mmap_anonymous(length: usize) -> usize {
     let pages = (length + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
 
     // Allocate contiguous physical pages
@@ -281,7 +418,7 @@ fn sys_mmap(_hint: usize, length: usize) -> usize {
 
     let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
 
-    // Zero the allocated pages (user code expects zeroed memory from mmap)
+    // Zero the allocated pages
     unsafe {
         core::ptr::write_bytes(base_pa as *mut u8, 0, pages * crate::mm::address::PAGE_SIZE);
     }
@@ -314,13 +451,86 @@ fn sys_mmap(_hint: usize, length: usize) -> usize {
     // Don't drop the PageTable wrapper (it would free intermediate PT frames)
     core::mem::forget(pt);
 
-    // Record mmap region in process
-    crate::task::current_process_add_mmap(ppn.0, pages);
+    // Record mmap region in process (anonymous: shm_id = None)
+    if !crate::task::current_process_add_mmap(ppn.0, pages, None) {
+        // mmap region table full - unmap and free
+        let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
+        for i in 0..pages {
+            pt2.unmap(crate::mm::address::VirtPageNum(ppn.0 + i));
+            crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
+        }
+        core::mem::forget(pt2);
+        unsafe { core::arch::asm!("sfence.vma"); }
+        return usize::MAX;
+    }
 
     // Flush TLB
     unsafe { core::arch::asm!("sfence.vma"); }
 
     base_pa // VA = PA due to identity mapping
+}
+
+fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
+    // Look up the SHM handle
+    let (shm_id, rw) = match crate::task::current_process_handle(shm_handle) {
+        Some(HandleObject::Shm { id, rw }) => (id, rw),
+        _ => return usize::MAX,
+    };
+
+    // Get region info
+    let (base_ppn, region_page_count) = match crate::ipc::shm_get_info(shm_id) {
+        Some(info) => info,
+        None => return usize::MAX,
+    };
+
+    let map_pages = (length + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+
+    // Validate: requested length must not exceed region size
+    if map_pages > region_page_count {
+        return usize::MAX;
+    }
+
+    // Get current process's user_satp
+    let user_satp = crate::task::current_process_user_satp();
+    if user_satp == 0 {
+        return usize::MAX;
+    }
+
+    let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
+    let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
+
+    // Determine page table flags based on handle permission
+    let flags = if rw {
+        crate::mm::page_table::PTE_R | crate::mm::page_table::PTE_W | crate::mm::page_table::PTE_U
+    } else {
+        crate::mm::page_table::PTE_R | crate::mm::page_table::PTE_U
+    };
+
+    // Map the SHM pages into the process's page table (identity-mapped: VA == PA)
+    for i in 0..map_pages {
+        let vpn = crate::mm::address::VirtPageNum(base_ppn.0 + i);
+        let page_ppn = crate::mm::address::PhysPageNum(base_ppn.0 + i);
+        pt.map(vpn, page_ppn, flags);
+    }
+
+    core::mem::forget(pt);
+
+    // Record mmap region (SHM-backed: shm_id = Some(id))
+    if !crate::task::current_process_add_mmap(base_ppn.0, map_pages, Some(shm_id)) {
+        // Table full - unmap
+        let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
+        for i in 0..map_pages {
+            pt2.unmap(crate::mm::address::VirtPageNum(base_ppn.0 + i));
+        }
+        core::mem::forget(pt2);
+        unsafe { core::arch::asm!("sfence.vma"); }
+        return usize::MAX;
+    }
+
+    // Flush TLB
+    unsafe { core::arch::asm!("sfence.vma"); }
+
+    base_ppn.0 * crate::mm::address::PAGE_SIZE // VA = PA
 }
 
 fn sys_munmap(addr: usize, length: usize) -> usize {
@@ -332,9 +542,10 @@ fn sys_munmap(addr: usize, length: usize) -> usize {
     let base_ppn = addr / crate::mm::address::PAGE_SIZE;
 
     // Validate and remove from process tracking
-    if !crate::task::current_process_remove_mmap(base_ppn, pages) {
-        return usize::MAX;
-    }
+    let shm_id = match crate::task::current_process_remove_mmap(base_ppn, pages) {
+        Some(shm_id) => shm_id, // None = anonymous, Some(id) = SHM-backed
+        None => return usize::MAX, // Not found
+    };
 
     // Get user_satp
     let user_satp = crate::task::current_process_user_satp();
@@ -345,11 +556,15 @@ fn sys_munmap(addr: usize, length: usize) -> usize {
     let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
     let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
 
-    // Unmap and free pages
+    // Unmap pages
     for i in 0..pages {
         let vpn = crate::mm::address::VirtPageNum(base_ppn + i);
         pt.unmap(vpn);
-        crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(base_ppn + i));
+        if shm_id.is_none() {
+            // Anonymous: free the physical frame
+            crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(base_ppn + i));
+        }
+        // SHM-backed: do NOT free the physical frame
     }
 
     core::mem::forget(pt);
@@ -382,7 +597,7 @@ fn translate_user_va(va: usize) -> Option<usize> {
 }
 
 /// Validate a user buffer and return its physical address.
-/// Walks the user page table to translate VA→PA. Logs an error on failure.
+/// Walks the user page table to translate VA->PA. Logs an error on failure.
 fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
     if len == 0 {
         return None;

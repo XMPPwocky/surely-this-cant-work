@@ -1,4 +1,4 @@
-use crate::ipc::{self, Message, NO_CAP};
+use crate::ipc::{self, Message};
 use crate::drivers::tty;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -174,10 +174,12 @@ pub fn serial_console_server() {
     loop {
         match ipc::channel_recv(control_ep) {
             Some(msg) => {
-                if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
-                    client_eps[client_count] = msg.cap;
-                    client_count += 1;
-                    break;
+                if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
+                    if client_count < MAX_CONSOLE_CLIENTS {
+                        client_eps[client_count] = ep;
+                        client_count += 1;
+                        break;
+                    }
                 }
             }
             None => {
@@ -194,9 +196,11 @@ pub fn serial_console_server() {
     loop {
         // Check control channel for new client registrations
         while let Some(msg) = ipc::channel_recv(control_ep) {
-            if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
-                client_eps[client_count] = msg.cap;
-                client_count += 1;
+            if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
+                if client_count < MAX_CONSOLE_CLIENTS {
+                    client_eps[client_count] = ep;
+                    client_count += 1;
+                }
             }
         }
 
@@ -272,10 +276,12 @@ pub fn fb_console_server() {
     loop {
         match ipc::channel_recv(control_ep) {
             Some(msg) => {
-                if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
-                    client_eps[client_count] = msg.cap;
-                    client_count += 1;
-                    break;
+                if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
+                    if client_count < MAX_CONSOLE_CLIENTS {
+                        client_eps[client_count] = ep;
+                        client_count += 1;
+                        break;
+                    }
                 }
             }
             None => {
@@ -291,9 +297,11 @@ pub fn fb_console_server() {
     loop {
         // Check control channel for new clients
         while let Some(msg) = ipc::channel_recv(control_ep) {
-            if msg.cap != NO_CAP && client_count < MAX_CONSOLE_CLIENTS {
-                client_eps[client_count] = msg.cap;
-                client_count += 1;
+            if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
+                if client_count < MAX_CONSOLE_CLIENTS {
+                    client_eps[client_count] = ep;
+                    client_count += 1;
+                }
             }
         }
 
