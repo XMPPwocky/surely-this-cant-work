@@ -239,7 +239,7 @@ impl<'a> Reader<'a> {
 
 /// Serialize a value into a Writer.
 pub trait Serialize {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError>;
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError>;
 }
 
 /// Deserialize a value from a Reader.
@@ -252,7 +252,7 @@ pub trait Deserialize<'a>: Sized {
 // ---------------------------------------------------------------------------
 
 impl Serialize for bool {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_bool(*self)
     }
 }
@@ -263,7 +263,7 @@ impl<'a> Deserialize<'a> for bool {
 }
 
 impl Serialize for u8 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_u8(*self)
     }
 }
@@ -274,7 +274,7 @@ impl<'a> Deserialize<'a> for u8 {
 }
 
 impl Serialize for u16 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_u16(*self)
     }
 }
@@ -285,7 +285,7 @@ impl<'a> Deserialize<'a> for u16 {
 }
 
 impl Serialize for u32 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_u32(*self)
     }
 }
@@ -296,7 +296,7 @@ impl<'a> Deserialize<'a> for u32 {
 }
 
 impl Serialize for u64 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_u64(*self)
     }
 }
@@ -307,7 +307,7 @@ impl<'a> Deserialize<'a> for u64 {
 }
 
 impl Serialize for i8 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_i8(*self)
     }
 }
@@ -318,7 +318,7 @@ impl<'a> Deserialize<'a> for i8 {
 }
 
 impl Serialize for i16 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_i16(*self)
     }
 }
@@ -329,7 +329,7 @@ impl<'a> Deserialize<'a> for i16 {
 }
 
 impl Serialize for i32 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_i32(*self)
     }
 }
@@ -340,7 +340,7 @@ impl<'a> Deserialize<'a> for i32 {
 }
 
 impl Serialize for i64 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_i64(*self)
     }
 }
@@ -351,7 +351,7 @@ impl<'a> Deserialize<'a> for i64 {
 }
 
 impl Serialize for usize {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_usize(*self)
     }
 }
@@ -362,7 +362,7 @@ impl<'a> Deserialize<'a> for usize {
 }
 
 impl Serialize for isize {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_isize(*self)
     }
 }
@@ -373,7 +373,7 @@ impl<'a> Deserialize<'a> for isize {
 }
 
 impl Serialize for f32 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_f32(*self)
     }
 }
@@ -384,7 +384,7 @@ impl<'a> Deserialize<'a> for f32 {
 }
 
 impl Serialize for f64 {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_f64(*self)
     }
 }
@@ -396,20 +396,20 @@ impl<'a> Deserialize<'a> for f64 {
 
 // &[u8] and &str: Serialize only (deserialization returns borrows via Reader methods)
 impl Serialize for [u8] {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_bytes(self)
     }
 }
 
 impl Serialize for str {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_str(self)
     }
 }
 
 // Option<T>
 impl<T: Serialize> Serialize for Option<T> {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         match self {
             None => w.write_u8(0),
             Some(v) => {
@@ -618,7 +618,7 @@ mod tests {
         }
 
         impl Serialize for Point {
-            fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+            fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
                 w.write_i32(self.x)?;
                 w.write_i32(self.y)?;
                 w.write_u8(self.label)
@@ -662,7 +662,7 @@ mod tests {
         }
 
         impl Serialize for Shape {
-            fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+            fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
                 match self {
                     Shape::Circle(r) => {
                         w.write_u8(0)?;
@@ -718,7 +718,7 @@ mod tests {
         }
 
         impl Serialize for Status {
-            fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+            fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
                 match self {
                     Status::Ok => w.write_u8(0),
                     Status::Error(code) => {
@@ -746,7 +746,7 @@ mod tests {
         }
 
         impl Serialize for Response {
-            fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
+            fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
                 self.status.serialize(w)?;
                 self.count.serialize(w)
             }

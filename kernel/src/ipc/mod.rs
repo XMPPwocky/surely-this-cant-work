@@ -260,15 +260,35 @@ pub fn channel_set_blocked(endpoint: usize, pid: usize) {
     }
 }
 
-/// Close an endpoint. If both sides are closed, the channel is freed.
+/// Check if a channel endpoint is still active.
+pub fn channel_is_active(endpoint: usize) -> bool {
+    let (ch_idx, _) = ep_to_channel(endpoint);
+    let mgr = CHANNELS.lock();
+    if let Some(Some(ch)) = mgr.channels.get(ch_idx) {
+        ch.active
+    } else {
+        false
+    }
+}
+
+/// Close an endpoint. Wakes any blocked peer so it can detect the close.
 pub fn channel_close(endpoint: usize) {
-    let (ch_idx, _is_b) = ep_to_channel(endpoint);
+    let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
-    if let Some(slot) = mgr.channels.get_mut(ch_idx) {
-        // For simplicity, closing either endpoint deactivates the channel
-        if let Some(ref mut ch) = slot {
-            ch.active = false;
+    let wake_pid;
+    if let Some(Some(ref mut ch)) = mgr.channels.get_mut(ch_idx) {
+        ch.active = false;
+        // Wake the peer blocked on the other endpoint
+        wake_pid = if is_b { ch.blocked_a } else { ch.blocked_b };
+        if wake_pid != 0 {
+            if is_b { ch.blocked_a = 0; } else { ch.blocked_b = 0; }
         }
+    } else {
+        return;
+    }
+    drop(mgr);
+    if wake_pid != 0 {
+        crate::task::wake_process(wake_pid);
     }
 }
 

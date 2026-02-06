@@ -328,25 +328,29 @@ pub fn exit_current() -> ! {
 /// Mark current task as dead (called from syscall context, may return).
 /// Cleans up all handles (channel + SHM) and SHM-backed mmap regions.
 pub fn exit_current_from_syscall() {
+    // Collect handles and mmap cleanup info while holding the lock,
+    // then release the lock BEFORE calling channel_close (which may call
+    // wake_process, requiring the SCHEDULER lock — would deadlock otherwise).
+    let mut channel_eps: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
+    let mut shm_ids: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
     {
         let mut sched = SCHEDULER.lock();
         let pid = sched.current;
         if let Some(ref mut proc) = sched.processes[pid] {
-            // Clean up all handles
+            // Snapshot handles and clear them from the process
             for i in 0..crate::task::process::MAX_HANDLES {
                 if let Some(handle_obj) = proc.handles[i].take() {
                     match handle_obj {
                         HandleObject::Channel(ep) => {
-                            crate::ipc::channel_close(ep);
+                            channel_eps[i] = ep;
                         }
                         HandleObject::Shm { id, .. } => {
-                            crate::ipc::shm_dec_ref(id);
+                            shm_ids[i] = id;
                         }
                     }
                 }
             }
-            // Clean up mmap regions: for SHM-backed, unmap PTEs but don't free frames
-            // For anonymous, unmap and free frames
+            // Clean up mmap regions while holding the lock (no lock contention here)
             if proc.user_satp != 0 {
                 let root_ppn = crate::mm::address::PhysPageNum(proc.user_satp & ((1usize << 44) - 1));
                 let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
@@ -368,6 +372,15 @@ pub fn exit_current_from_syscall() {
                 core::mem::forget(pt);
             }
             proc.state = ProcessState::Dead;
+        }
+    }
+    // SCHEDULER lock released — now safe to call channel_close (which may wake_process)
+    for i in 0..crate::task::process::MAX_HANDLES {
+        if channel_eps[i] != usize::MAX {
+            crate::ipc::channel_close(channel_eps[i]);
+        }
+        if shm_ids[i] != usize::MAX {
+            crate::ipc::shm_dec_ref(shm_ids[i]);
         }
     }
     schedule();

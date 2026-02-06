@@ -296,6 +296,16 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
                 return;
             }
             None => {
+                // Check if the channel was closed by the peer
+                if !crate::ipc::channel_is_active(endpoint) {
+                    // Return a zero-length message to signal EOF
+                    let eof = crate::ipc::Message::new();
+                    unsafe {
+                        core::ptr::write(msg_pa as *mut crate::ipc::Message, eof);
+                    }
+                    tf.regs[10] = 0;
+                    return;
+                }
                 // Block and wait
                 let pid = crate::task::current_pid();
                 crate::ipc::channel_set_blocked(endpoint, pid);

@@ -752,7 +752,10 @@ fn do_open(client_handle: usize, flags: u8, path_bytes: &[u8]) {
         return;
     }
 
-    // Send Ok with the file handle as capability
+    // Send Ok with the file handle as capability.
+    // NOTE: client_file_handle leaks in our handle table (channel_close would
+    // deactivate the channel the client is using). This limits us to ~14 opens
+    // before the table fills. A proper fix needs per-endpoint ref-counting.
     send_ok(client_handle, client_file_handle);
 
     // Now serve this file channel until the client closes it
