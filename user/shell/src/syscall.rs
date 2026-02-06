@@ -102,3 +102,16 @@ pub fn sys_chan_recv_blocking(handle: usize, msg: &mut Message) -> usize {
     let (ret, _) = syscall2(204, handle, msg as *mut Message as usize);
     ret
 }
+
+pub const SYS_MMAP: usize = 222;
+pub const SYS_MUNMAP: usize = 215;
+
+pub fn sys_mmap(hint: usize, length: usize) -> usize {
+    let (ret, _) = syscall2(SYS_MMAP, hint, length);
+    ret
+}
+
+pub fn sys_munmap(addr: usize, length: usize) -> usize {
+    let (ret, _) = syscall2(SYS_MUNMAP, addr, length);
+    ret
+}

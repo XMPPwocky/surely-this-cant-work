@@ -15,6 +15,8 @@ pub const SYS_CHAN_SEND: usize = 201;
 pub const SYS_CHAN_RECV: usize = 202;
 pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
+pub const SYS_MUNMAP: usize = 215;
+pub const SYS_MMAP: usize = 222;
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -113,6 +115,12 @@ fn handle_syscall(tf: &mut TrapFrame) {
         }
         SYS_CHAN_RECV_BLOCKING => {
             sys_chan_recv_blocking(tf);
+        }
+        SYS_MMAP => {
+            tf.regs[10] = sys_mmap(a0, a1);
+        }
+        SYS_MUNMAP => {
+            tf.regs[10] = sys_munmap(a0, a1);
         }
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);
@@ -255,6 +263,95 @@ fn sys_chan_close(handle: usize) -> usize {
     };
     crate::task::current_process_free_handle(handle);
     crate::ipc::channel_close(endpoint);
+    0
+}
+
+fn sys_mmap(_hint: usize, length: usize) -> usize {
+    if length == 0 {
+        return usize::MAX;
+    }
+
+    let pages = (length + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+
+    // Allocate contiguous physical pages
+    let ppn = match crate::mm::frame::frame_alloc_contiguous(pages) {
+        Some(ppn) => ppn,
+        None => return usize::MAX,
+    };
+
+    let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
+
+    // Get current process's user_satp and map pages into its page table
+    let user_satp = crate::task::current_process_user_satp();
+    if user_satp == 0 {
+        // Not a user process
+        for i in 0..pages {
+            crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
+        }
+        return usize::MAX;
+    }
+
+    // Extract root PPN from satp (lower 44 bits)
+    let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
+
+    // Create a PageTable wrapper to map pages with U+R+W
+    let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
+
+    for i in 0..pages {
+        let vpn = crate::mm::address::VirtPageNum(ppn.0 + i);
+        let page_ppn = crate::mm::address::PhysPageNum(ppn.0 + i);
+        pt.map(vpn, page_ppn,
+            crate::mm::page_table::PTE_R |
+            crate::mm::page_table::PTE_W |
+            crate::mm::page_table::PTE_U);
+    }
+
+    // Don't drop the PageTable wrapper (it would free intermediate PT frames)
+    core::mem::forget(pt);
+
+    // Record mmap region in process
+    crate::task::current_process_add_mmap(ppn.0, pages);
+
+    // Flush TLB
+    unsafe { core::arch::asm!("sfence.vma"); }
+
+    base_pa // VA = PA due to identity mapping
+}
+
+fn sys_munmap(addr: usize, length: usize) -> usize {
+    if length == 0 || addr % crate::mm::address::PAGE_SIZE != 0 {
+        return usize::MAX;
+    }
+
+    let pages = (length + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+    let base_ppn = addr / crate::mm::address::PAGE_SIZE;
+
+    // Validate and remove from process tracking
+    if !crate::task::current_process_remove_mmap(base_ppn, pages) {
+        return usize::MAX;
+    }
+
+    // Get user_satp
+    let user_satp = crate::task::current_process_user_satp();
+    if user_satp == 0 {
+        return usize::MAX;
+    }
+
+    let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
+    let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
+
+    // Unmap and free pages
+    for i in 0..pages {
+        let vpn = crate::mm::address::VirtPageNum(base_ppn + i);
+        pt.unmap(vpn);
+        crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(base_ppn + i));
+    }
+
+    core::mem::forget(pt);
+
+    // Flush TLB
+    unsafe { core::arch::asm!("sfence.vma"); }
+
     0
 }
 

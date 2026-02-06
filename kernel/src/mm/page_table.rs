@@ -58,6 +58,17 @@ impl PageTable {
         }
     }
 
+    /// Wrap an existing page table root for runtime modifications.
+    /// The `frames` vec starts empty -- we don't track existing PT frames.
+    /// New PT frames allocated during map() are tracked but NOT freed on drop
+    /// because the page table outlives this wrapper (caller must mem::forget).
+    pub fn from_root(root_ppn: PhysPageNum) -> Self {
+        PageTable {
+            root_ppn,
+            frames: alloc::vec::Vec::new(),
+        }
+    }
+
     pub fn root_ppn(&self) -> PhysPageNum {
         self.root_ppn
     }
@@ -85,10 +96,9 @@ impl PageTable {
             current_ppn = pte_table[idx].ppn();
         }
 
-        // Level 0: set the leaf entry
+        // Level 0: set the leaf entry (allow overwriting, e.g. upgrading permissions for mmap)
         let pte_table = current_ppn.as_page_table();
         let idx = indices[0];
-        assert!(!pte_table[idx].is_valid(), "map: page already mapped at VPN {:#x}", vpn.0);
         pte_table[idx] = PageTableEntry::new(ppn, flags | PTE_V | PTE_A | PTE_D);
     }
 
