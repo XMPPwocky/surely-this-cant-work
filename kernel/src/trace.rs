@@ -1,4 +1,5 @@
 use crate::sync::SpinLock;
+use crate::mm::heap::TRAC_ALLOC;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -78,7 +79,7 @@ pub fn trace_kernel(label: &[u8]) {
 /// Snapshot all trace entries under the lock, then format without holding it.
 pub fn trace_read() -> String {
     // Snapshot under the lock — just copy the entries we need
-    let snapshot: Vec<TraceEntry>;
+    let snapshot: Vec<TraceEntry, _>;
     let start: usize;
     {
         let ring = TRACE_RING.lock();
@@ -87,7 +88,7 @@ pub fn trace_read() -> String {
         }
         let s = if ring.count < TRACE_CAPACITY { 0 } else { ring.head };
         let count = ring.count;
-        let mut v = Vec::with_capacity(count);
+        let mut v = Vec::with_capacity_in(count, TRAC_ALLOC);
         for i in 0..count {
             let idx = (s + i) % TRACE_CAPACITY;
             v.push(ring.entries[idx]);

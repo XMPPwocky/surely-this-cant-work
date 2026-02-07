@@ -2,6 +2,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use crate::sync::SpinLock;
 use crate::mm::address::PhysPageNum;
+use crate::mm::heap::{IpcAlloc, IPC_ALLOC};
 
 /// Maximum message payload size in bytes
 pub const MAX_MSG_SIZE: usize = 1024;
@@ -123,8 +124,8 @@ impl Message {
 /// recv(ep_a) pops from queue_a
 /// recv(ep_b) pops from queue_b
 struct Channel {
-    queue_a: VecDeque<Message>, // messages waiting for endpoint A to recv
-    queue_b: VecDeque<Message>, // messages waiting for endpoint B to recv
+    queue_a: VecDeque<Message, IpcAlloc>, // messages waiting for endpoint A to recv
+    queue_b: VecDeque<Message, IpcAlloc>, // messages waiting for endpoint B to recv
     blocked_a: usize, // PID blocked on recv(ep_a), 0 = none
     blocked_b: usize, // PID blocked on recv(ep_b), 0 = none
     send_blocked_a: usize, // PID blocked on send(ep_a) due to full queue, 0 = none
@@ -137,8 +138,8 @@ struct Channel {
 impl Channel {
     fn new() -> Self {
         Channel {
-            queue_a: VecDeque::new(),
-            queue_b: VecDeque::new(),
+            queue_a: VecDeque::new_in(IPC_ALLOC),
+            queue_b: VecDeque::new_in(IPC_ALLOC),
             blocked_a: 0,
             blocked_b: 0,
             send_blocked_a: 0,

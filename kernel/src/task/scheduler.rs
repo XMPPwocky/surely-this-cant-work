@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::SpinLock;
 use crate::task::context::TaskContext;
 use crate::task::process::{Process, ProcessState, HandleObject, MAX_PROCS};
+use crate::mm::heap::{SchdAlloc, SCHD_ALLOC};
 
 extern "C" {
     fn switch_context(old: *mut TaskContext, new: *const TaskContext);
@@ -36,8 +37,8 @@ fn pow_scaled(base: u32, mut exp: u32) -> u32 {
 }
 
 struct Scheduler {
-    processes: Vec<Option<Process>>,
-    ready_queue: VecDeque<usize>,
+    processes: Vec<Option<Process>, SchdAlloc>,
+    ready_queue: VecDeque<usize, SchdAlloc>,
     current: usize, // PID of current process
     initialized: bool,
     last_switch_rdtime: u64, // rdtime when we switched TO the current task
@@ -46,8 +47,8 @@ struct Scheduler {
 impl Scheduler {
     const fn new() -> Self {
         Scheduler {
-            processes: Vec::new(),
-            ready_queue: VecDeque::new(),
+            processes: Vec::new_in(SCHD_ALLOC),
+            ready_queue: VecDeque::new_in(SCHD_ALLOC),
             current: 0,
             initialized: false,
             last_switch_rdtime: 0,
@@ -55,7 +56,7 @@ impl Scheduler {
     }
 
     fn init(&mut self) {
-        self.processes = Vec::with_capacity(MAX_PROCS);
+        self.processes = Vec::with_capacity_in(MAX_PROCS, SCHD_ALLOC);
         for _ in 0..MAX_PROCS {
             self.processes.push(None);
         }

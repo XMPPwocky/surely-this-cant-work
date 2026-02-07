@@ -1,5 +1,6 @@
 use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
 use crate::mm::frame;
+use crate::mm::heap::{PgtbAlloc, PGTB_ALLOC};
 
 // PTE flag bits
 pub const PTE_V: usize = 1 << 0; // Valid
@@ -47,15 +48,17 @@ impl PageTableEntry {
 pub struct PageTable {
     root_ppn: PhysPageNum,
     /// Frames allocated for page table nodes (not including mapped pages)
-    frames: alloc::vec::Vec<PhysPageNum>,
+    frames: alloc::vec::Vec<PhysPageNum, PgtbAlloc>,
 }
 
 impl PageTable {
     pub fn new() -> Self {
         let root = frame::frame_alloc().expect("frame_alloc failed for page table root");
+        let mut frames = alloc::vec::Vec::new_in(PGTB_ALLOC);
+        frames.push(root);
         PageTable {
             root_ppn: root,
-            frames: alloc::vec![root],
+            frames,
         }
     }
 
@@ -64,7 +67,7 @@ impl PageTable {
     pub fn from_root(root_ppn: PhysPageNum) -> Self {
         PageTable {
             root_ppn,
-            frames: alloc::vec::Vec::new(),
+            frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
         }
     }
 

@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use crate::ipc::{self, Message, NO_CAP};
 use crate::sync::SpinLock;
+use crate::mm::heap::{InitAlloc, INIT_ALLOC};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -145,7 +146,7 @@ struct FsLaunchCtx {
     ctl_ep: usize,
     file_ep: usize,
     file_size: usize,
-    data: Vec<u8>,
+    data: Vec<u8, InitAlloc>,
     path: &'static [u8],
     name: &'static str,
     console_type: ConsoleType,
@@ -387,7 +388,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             ctl_ep: my_ctl_ep,
             file_ep: 0,
             file_size: 0,
-            data: Vec::new(),
+            data: Vec::new_in(INIT_ALLOC),
             path,
             name,
             console_type,
@@ -411,7 +412,7 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
                 }
                 // Ok response: u8(0) + u8(kind) + u64(size)
                 ctx.file_size = wire_read_u64(&resp.data, 2) as usize;
-                ctx.data = Vec::with_capacity(ctx.file_size);
+                ctx.data = Vec::with_capacity_in(ctx.file_size, INIT_ALLOC);
 
                 // Send Open request
                 let mut msg = Message::new();

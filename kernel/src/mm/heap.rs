@@ -370,7 +370,7 @@ unsafe impl<const TAG: u32> core::alloc::Allocator for TaggedAlloc<TAG> {
 }
 
 // ============================================================
-// Convenience type aliases
+// Convenience type aliases and const instances
 // ============================================================
 
 pub type IpcAlloc  = TaggedAlloc<{tag(b"IPC_")}>;
@@ -378,3 +378,10 @@ pub type SchdAlloc = TaggedAlloc<{tag(b"SCHD")}>;
 pub type PgtbAlloc = TaggedAlloc<{tag(b"PGTB")}>;
 pub type InitAlloc = TaggedAlloc<{tag(b"INIT")}>;
 pub type TracAlloc = TaggedAlloc<{tag(b"TRAC")}>;
+
+/// Const instances for use with `Vec::new_in()` / `VecDeque::new_in()`.
+pub const IPC_ALLOC:  IpcAlloc  = TaggedAlloc;
+pub const SCHD_ALLOC: SchdAlloc = TaggedAlloc;
+pub const PGTB_ALLOC: PgtbAlloc = TaggedAlloc;
+pub const INIT_ALLOC: InitAlloc = TaggedAlloc;
+pub const TRAC_ALLOC: TracAlloc = TaggedAlloc;
