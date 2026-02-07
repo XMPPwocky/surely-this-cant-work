@@ -6,7 +6,7 @@ OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 # build-std flags (moved out of .cargo/config.toml to avoid leaking into x.py)
 BUILD_STD = -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 
-.PHONY: build build-shell build-hello build-fs build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
+.PHONY: build build-shell build-hello build-fs build-window-server build-winclient build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
 
 build-shell:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
@@ -23,7 +23,18 @@ build-hello:
 		--manifest-path user/hello/Cargo.toml \
 		--target riscv64gc-unknown-rvos
 
-build-fs:
+build-window-server:
+	. $$HOME/.cargo/env && cargo +rvos build --release \
+		--manifest-path user/window-server/Cargo.toml \
+		--target riscv64gc-unknown-rvos
+
+build-winclient:
+	. $$HOME/.cargo/env && cargo +rvos build --release \
+		--manifest-path user/winclient/Cargo.toml \
+		--target riscv64gc-unknown-rvos
+
+# fs embeds window-server and winclient via include_bytes!, so build them first
+build-fs: build-window-server build-winclient
 	. $$HOME/.cargo/env && cargo +rvos build --release \
 		--manifest-path user/fs/Cargo.toml \
 		--target riscv64gc-unknown-rvos

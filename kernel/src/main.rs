@@ -122,11 +122,24 @@ pub extern "C" fn kmain() -> ! {
     let (init_serial_ep, serial_ctl_ep) = ipc::channel_create_pair();
     services::console::set_serial_control_ep(serial_ctl_ep);
 
-    // Init server <-> FB console: control channel (if GPU)
+    // Tell init server whether GPU is available (controls fs-loaded program launches)
+    services::init::set_gpu_present(gpu_present);
+
+    // Init server <-> FB console: control channel (only in non-compositor mode)
+    // When GPU is present, the window server replaces fb-con + shell-fb
     let init_fb_ep = if gpu_present {
-        let (init_fb_ep, fb_ctl_ep) = ipc::channel_create_pair();
-        services::console::set_fb_control_ep(fb_ctl_ep);
-        Some(init_fb_ep)
+        // GPU server kernel task
+        let (init_gpu_ep, gpu_ctl_ep) = ipc::channel_create_pair();
+        services::gpu_server::set_control_ep(gpu_ctl_ep);
+        services::init::register_service("gpu", init_gpu_ep);
+
+        // Keyboard server kernel task
+        let (init_kbd_ep, kbd_ctl_ep) = ipc::channel_create_pair();
+        services::kbd_server::set_control_ep(kbd_ctl_ep);
+        services::init::register_service("kbd", init_kbd_ep);
+
+        // No fb-con control channel — window server takes over the display
+        None
     } else {
         None
     };
@@ -149,13 +162,8 @@ pub extern "C" fn kmain() -> ! {
     let (shell_serial_boot_a, shell_serial_boot_b) = ipc::channel_create_pair();
     services::init::register_boot(shell_serial_boot_b, services::init::ConsoleType::Serial, true);
 
-    let shell_fb_boot_a = if gpu_present {
-        let (a, b) = ipc::channel_create_pair();
-        services::init::register_boot(b, services::init::ConsoleType::Framebuffer, true);
-        Some(a)
-    } else {
-        None
-    };
+    // FB shell only in non-GPU mode (when GPU present, window-server replaces it)
+    let shell_fb_boot_a: Option<usize> = None;
 
     // Register console service endpoints with init
     services::init::register_console(services::init::ConsoleType::Serial, init_serial_ep);
@@ -167,7 +175,10 @@ pub extern "C" fn kmain() -> ! {
     task::spawn_named(services::init::init_server, "init");
     task::spawn_named(services::console::serial_console_server, "serial-con");
     if gpu_present {
-        task::spawn_named(services::console::fb_console_server, "fb-con");
+        // GPU present: spawn gpu-server + kbd-server (window-server loaded from fs)
+        task::spawn_named(services::gpu_server::gpu_server, "gpu-server");
+        task::spawn_named(services::kbd_server::kbd_server, "kbd-server");
+        // fb-con and shell-fb are replaced by the window server
     }
     task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo");
     task::spawn_named(services::math::math_service, "math");

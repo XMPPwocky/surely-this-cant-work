@@ -414,3 +414,54 @@ pub fn framebuffer() -> Option<(*mut u32, u32, u32)> {
         })
     }
 }
+
+/// Get framebuffer physical page info: (base_ppn, page_count).
+/// Returns None if GPU is not initialised.
+pub fn framebuffer_phys() -> Option<(crate::mm::address::PhysPageNum, usize)> {
+    unsafe {
+        let ptr = core::ptr::addr_of!(GPU);
+        (*ptr).as_ref().map(|gpu| {
+            let fb_bytes = (gpu.width as usize) * (gpu.height as usize) * 4;
+            let pages = (fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+            (crate::mm::address::PhysPageNum(gpu.fb_addr / PAGE_SIZE), pages)
+        })
+    }
+}
+
+/// Flush a rectangular region of the framebuffer to the display.
+pub fn flush_rect(x: u32, y: u32, w: u32, h: u32) {
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(GPU);
+        if let Some(ref mut gpu) = *ptr {
+            transfer_to_host_2d_rect(gpu, x, y, w, h);
+            resource_flush_rect(gpu, x, y, w, h);
+        }
+    }
+}
+
+fn transfer_to_host_2d_rect(gpu: &mut Gpu, x: u32, y: u32, w: u32, h: u32) {
+    let buf = gpu.cmd_buf as *mut u8;
+    let cmd = VirtioGpuTransferToHost2d {
+        hdr: VirtioGpuCtrlHdr::new(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D),
+        r: VirtioGpuRect { x, y, width: w, height: h },
+        offset: 0,
+        resource_id: RESOURCE_ID,
+        padding: 0,
+    };
+    unsafe { core::ptr::write(buf as *mut VirtioGpuTransferToHost2d, cmd); }
+    let cmd_len = core::mem::size_of::<VirtioGpuTransferToHost2d>();
+    send_cmd_in_buf(gpu, 0, cmd_len, 256, core::mem::size_of::<VirtioGpuCtrlHdr>());
+}
+
+fn resource_flush_rect(gpu: &mut Gpu, x: u32, y: u32, w: u32, h: u32) {
+    let buf = gpu.cmd_buf as *mut u8;
+    let cmd = VirtioGpuResourceFlush {
+        hdr: VirtioGpuCtrlHdr::new(VIRTIO_GPU_CMD_RESOURCE_FLUSH),
+        r: VirtioGpuRect { x, y, width: w, height: h },
+        resource_id: RESOURCE_ID,
+        padding: 0,
+    };
+    unsafe { core::ptr::write(buf as *mut VirtioGpuResourceFlush, cmd); }
+    let cmd_len = core::mem::size_of::<VirtioGpuResourceFlush>();
+    send_cmd_in_buf(gpu, 0, cmd_len, 256, core::mem::size_of::<VirtioGpuCtrlHdr>());
+}

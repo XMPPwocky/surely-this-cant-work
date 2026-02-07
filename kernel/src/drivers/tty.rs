@@ -55,6 +55,74 @@ static SERIAL_WAKE_PID: SpinLock<usize> = SpinLock::new(0);
 /// PID of the FB console server to wake when keyboard input arrives (0 = none)
 static KBD_WAKE_PID: SpinLock<usize> = SpinLock::new(0);
 
+// ============================================================
+// Raw keyboard events (press + release, with Linux keycode)
+// ============================================================
+
+const RAW_KBD_BUF_SIZE: usize = 64;
+
+/// A raw keyboard event: keycode + press/release.
+#[derive(Clone, Copy)]
+pub struct RawKeyEvent {
+    pub code: u16,
+    pub pressed: bool,
+}
+
+/// Ring buffer for raw keyboard events.
+pub struct RawKeyRingBuffer {
+    buf: [RawKeyEvent; RAW_KBD_BUF_SIZE],
+    head: usize,
+    tail: usize,
+}
+
+impl RawKeyRingBuffer {
+    pub const fn new() -> Self {
+        RawKeyRingBuffer {
+            buf: [RawKeyEvent { code: 0, pressed: false }; RAW_KBD_BUF_SIZE],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    pub fn push(&mut self, event: RawKeyEvent) {
+        let next = (self.head + 1) % RAW_KBD_BUF_SIZE;
+        if next != self.tail {
+            self.buf[self.head] = event;
+            self.head = next;
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<RawKeyEvent> {
+        if self.head == self.tail {
+            None
+        } else {
+            let ev = self.buf[self.tail];
+            self.tail = (self.tail + 1) % RAW_KBD_BUF_SIZE;
+            Some(ev)
+        }
+    }
+}
+
+/// Raw keyboard events ring buffer — filled by VirtIO keyboard IRQ handler
+pub static RAW_KBD_EVENTS: SpinLock<RawKeyRingBuffer> = SpinLock::new(RawKeyRingBuffer::new());
+
+/// PID of the kbd server to wake when raw keyboard events arrive (0 = none)
+static RAW_KBD_WAKE_PID: SpinLock<usize> = SpinLock::new(0);
+
+/// Push a raw keyboard event from the IRQ handler.
+pub fn push_raw_kbd_event(code: u16, pressed: bool) {
+    RAW_KBD_EVENTS.lock().push(RawKeyEvent { code, pressed });
+    let pid = *RAW_KBD_WAKE_PID.lock();
+    if pid != 0 {
+        crate::task::wake_process(pid);
+    }
+}
+
+/// Set the PID to wake when raw keyboard events arrive.
+pub fn set_raw_kbd_wake_pid(pid: usize) {
+    *RAW_KBD_WAKE_PID.lock() = pid;
+}
+
 /// Push a character from UART IRQ handler.
 pub fn push_serial_char(ch: u8) {
     SERIAL_INPUT.lock().push(ch);

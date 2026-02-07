@@ -685,6 +685,14 @@ static HELLO_STD_ELF: &[u8] = include_bytes!(
     "../../../user/hello/target/riscv64gc-unknown-rvos/release/hello"
 );
 
+static WINDOW_SERVER_ELF: &[u8] = include_bytes!(
+    "../../../user/window-server/target/riscv64gc-unknown-rvos/release/window-server"
+);
+
+static WINCLIENT_ELF: &[u8] = include_bytes!(
+    "../../../user/winclient/target/riscv64gc-unknown-rvos/release/winclient"
+);
+
 fn main() {
     // Initialize filesystem
     unsafe {
@@ -693,6 +701,8 @@ fn main() {
 
     // Register read-only static files
     fs().add_static_file(b"/bin/hello-std", HELLO_STD_ELF);
+    fs().add_static_file(b"/bin/window-server", WINDOW_SERVER_ELF);
+    fs().add_static_file(b"/bin/winclient", WINCLIENT_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)

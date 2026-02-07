@@ -8,7 +8,11 @@ pub const SYS_CHAN_SEND: usize = 201;
 pub const SYS_CHAN_RECV: usize = 202;
 pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
+pub const SYS_SHM_CREATE: usize = 205;
+pub const SYS_SHM_DUP_RO: usize = 206;
 pub const SYS_CHAN_SEND_BLOCKING: usize = 207;
+pub const SYS_MUNMAP: usize = 215;
+pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
 pub const SYS_SHUTDOWN: usize = 231;
 
@@ -124,5 +128,32 @@ pub fn sys_chan_send_retry(handle: usize, msg: &Message) -> usize {
 pub fn sys_shutdown() -> ! {
     syscall0(SYS_SHUTDOWN);
     unreachable!()
+}
+
+/// Non-blocking receive on a channel handle.
+/// Returns 0 on success (message filled in), 1 if no message available.
+pub fn sys_chan_recv(handle: usize, msg: &mut Message) -> usize {
+    syscall2(SYS_CHAN_RECV, handle, msg as *mut Message as usize)
+}
+
+/// Create a shared memory region. Returns the SHM handle.
+pub fn sys_shm_create(size: usize) -> usize {
+    syscall1(SYS_SHM_CREATE, size)
+}
+
+/// Duplicate a SHM handle as read-only. Returns a new handle.
+pub fn sys_shm_dup_ro(handle: usize) -> usize {
+    syscall1(SYS_SHM_DUP_RO, handle)
+}
+
+/// Map an SHM handle (or anonymous pages if handle=0) into process address space.
+/// Returns the mapped virtual address, or usize::MAX on error.
+pub fn sys_mmap(shm_handle: usize, length: usize) -> usize {
+    syscall2(SYS_MMAP, shm_handle, length)
+}
+
+/// Unmap pages from process address space.
+pub fn sys_munmap(addr: usize, length: usize) -> usize {
+    syscall2(SYS_MUNMAP, addr, length)
 }
 

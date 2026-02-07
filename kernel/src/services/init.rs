@@ -127,6 +127,14 @@ pub fn register_console(console_type: ConsoleType, control_ep: usize) {
     panic!("Too many service registrations");
 }
 
+/// Whether a GPU is present (set by kmain before init starts).
+static GPU_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called by kmain to tell the init server whether a GPU is available.
+pub fn set_gpu_present(present: bool) {
+    GPU_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// State machine for loading a program from the filesystem.
 #[derive(Clone, Copy, PartialEq)]
 enum FsLaunchState {
@@ -150,9 +158,11 @@ struct FsLaunchCtx {
     path: &'static [u8],
     name: &'static str,
     console_type: ConsoleType,
+    /// If set, register this as a named service and give it a control channel as handle 1.
+    service_name: Option<&'static str>,
 }
 
-const MAX_FS_LAUNCHES: usize = 4;
+const MAX_FS_LAUNCHES: usize = 8;
 
 /// Init server kernel task.
 /// Polls boot channel endpoints for service discovery requests from user processes,
@@ -346,9 +356,11 @@ fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
 // ============================================================
 
 /// Programs to launch from the filesystem at boot time.
-/// Each entry: (path, process name, console type).
-const FS_PROGRAMS: &[(&[u8], &str, ConsoleType)] = &[
-    (b"/bin/hello-std", "hello-std", ConsoleType::Serial),
+/// (path, process name, console type, service_name, requires_gpu)
+const FS_PROGRAMS: &[(&[u8], &str, ConsoleType, Option<&str>, bool)] = &[
+    (b"/bin/hello-std", "hello-std", ConsoleType::Serial, None, false),
+    (b"/bin/window-server", "window-srv", ConsoleType::Serial, Some("window"), true),
+    (b"/bin/winclient", "winclient", ConsoleType::Serial, None, true),
 ];
 
 /// Initialize fs launch state machines. For each program, create a client
@@ -363,8 +375,11 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
         return;
     }
 
-    for (i, &(path, name, console_type)) in FS_PROGRAMS.iter().enumerate() {
-        if i >= MAX_FS_LAUNCHES { break; }
+    let gpu = GPU_PRESENT.load(core::sync::atomic::Ordering::Relaxed);
+    let mut slot_idx = 0;
+    for &(path, name, console_type, service_name, requires_gpu) in FS_PROGRAMS.iter() {
+        if slot_idx >= MAX_FS_LAUNCHES { break; }
+        if requires_gpu && !gpu { continue; }
 
         let (my_ctl_ep, server_ep) = ipc::channel_create_pair();
 
@@ -383,7 +398,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
         msg.sender_pid = my_pid;
         send_and_wake(my_ctl_ep, msg);
 
-        launches[i] = Some(FsLaunchCtx {
+        launches[slot_idx] = Some(FsLaunchCtx {
             state: FsLaunchState::WaitStat,
             ctl_ep: my_ctl_ep,
             file_ep: 0,
@@ -392,7 +407,9 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             path,
             name,
             console_type,
+            service_name,
         });
+        slot_idx += 1;
     }
 }
 
@@ -517,10 +534,19 @@ fn finish_fs_launch(ctx: &mut FsLaunchCtx, _my_pid: usize) {
 
     crate::println!("[init] Loaded {} from fs ({} bytes)", ctx.name, ctx.data.len());
 
-    // Create boot channel and spawn
+    // Create boot channel
     let (boot_a, boot_b) = ipc::channel_create_pair();
     register_boot(boot_b, ctx.console_type, false);
-    crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name, boot_a);
+
+    if let Some(svc_name) = ctx.service_name {
+        // This program is a named service: give it a control channel as handle 1
+        let (init_svc_ep, svc_ctl_ep) = ipc::channel_create_pair();
+        register_service(svc_name, init_svc_ep);
+        crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name, boot_a, svc_ctl_ep);
+    } else {
+        crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name, boot_a);
+    }
+
     ctx.state = FsLaunchState::Done;
 }
 

@@ -242,6 +242,9 @@ pub fn handle_irq() {
         if event.type_ == EV_KEY {
             let code = event.code as usize;
 
+            // Push raw event for ALL key presses and releases (for kbd-server)
+            tty::push_raw_kbd_event(event.code, event.value != 0);
+
             if code == 42 || code == 54 {
                 // Shift key
                 kbd.shift_pressed = event.value != 0; // 1=press, 0=release
