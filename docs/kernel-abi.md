@@ -70,6 +70,7 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 222    | `SYS_MMAP`            | `a0` = hint (ignored), `a1` = length | `a0` = address or `usize::MAX` | Allocates zeroed pages and maps them into the process. |
 | 215    | `SYS_MUNMAP`          | `a0` = address, `a1` = length | `a0` = 0 or `usize::MAX`  | Unmaps and frees previously mmap'd pages.                  |
 | 230    | `SYS_TRACE`           | `a0` = label_ptr, `a1` = label_len | `a0` = 0 or `usize::MAX` | Records a timestamped trace event in the kernel ring buffer. |
+| 231    | `SYS_SHUTDOWN`        | (none)                        | Does not return            | Shuts down the machine via SBI.                            |
 
 ### Detailed Syscall Descriptions
 
@@ -236,6 +237,12 @@ exposed as `trace` and `trace clear`.
 
 Returns 0 on success, `usize::MAX` on error (zero length, length > 32,
 invalid pointer).
+
+#### SYS_SHUTDOWN (231)
+
+Shuts down the machine. The kernel prints a shutdown message identifying the
+calling process, then invokes SBI legacy shutdown (EID=0x08). QEMU will exit
+with code 0. Does not return.
 
 ---
 

@@ -22,6 +22,7 @@ pub const SYS_SHM_DUP_RO: usize = 206;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
+pub const SYS_SHUTDOWN: usize = 231;
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -149,6 +150,10 @@ fn handle_syscall(tf: &mut TrapFrame) {
         }
         SYS_TRACE => {
             tf.regs[10] = sys_trace(a0, a1);
+        }
+        SYS_SHUTDOWN => {
+            crate::println!("System shutdown requested by PID {}", crate::task::current_pid());
+            sbi::sbi_shutdown();
         }
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);
@@ -614,6 +619,9 @@ fn sys_mmap_anonymous(length: usize) -> usize {
     // Flush TLB
     unsafe { core::arch::asm!("sfence.vma"); }
 
+    // Track memory pages
+    crate::task::current_process_adjust_mem_pages(pages as i32);
+
     base_pa // VA = PA due to identity mapping
 }
 
@@ -674,6 +682,9 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
     // Flush TLB
     unsafe { core::arch::asm!("sfence.vma"); }
 
+    // Track memory pages
+    crate::task::current_process_adjust_mem_pages(map_pages as i32);
+
     base_ppn.0 * crate::mm::address::PAGE_SIZE // VA = PA
 }
 
@@ -710,6 +721,9 @@ fn sys_munmap(addr: usize, length: usize) -> usize {
         }
         // SHM-backed: do NOT free the physical frame
     }
+
+    // Track memory pages
+    crate::task::current_process_adjust_mem_pages(-(pages as i32));
 
     // Flush TLB
     unsafe { core::arch::asm!("sfence.vma"); }

@@ -292,7 +292,7 @@ pub fn run() {
             "help" => cmd_help(),
             "shutdown" => {
                 println!("Shutting down...");
-                std::process::exit(0);
+                raw::sys_shutdown();
             }
             _ => {
                 println!("Unknown command: {cmd}");

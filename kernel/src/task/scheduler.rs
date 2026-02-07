@@ -11,11 +11,36 @@ extern "C" {
     fn switch_context(old: *mut TaskContext, new: *const TaskContext);
 }
 
+// EWMA constants
+const SCALE: u32 = 10000;       // 10000 = 100%
+const TIMER_INTERVAL: u64 = 1_000_000; // 100ms at 10MHz
+const DECAY_1S: u32 = 9048;     // e^(-0.1) ≈ 0.9048 (1-second window)
+const DECAY_1M: u32 = 9983;     // e^(-1/600) ≈ 0.9983 (1-minute window)
+
+/// Fixed-point multiply: (a * b) / SCALE
+fn mul_scaled(a: u32, b: u32) -> u32 {
+    ((a as u64 * b as u64) / SCALE as u64) as u32
+}
+
+/// Fixed-point exponentiation via repeated squaring: base^exp (in SCALE units)
+fn pow_scaled(base: u32, mut exp: u32) -> u32 {
+    if exp == 0 { return SCALE; }
+    let mut result = SCALE;
+    let mut b = base;
+    while exp > 0 {
+        if exp & 1 != 0 { result = mul_scaled(result, b); }
+        b = mul_scaled(b, b);
+        exp >>= 1;
+    }
+    result
+}
+
 struct Scheduler {
     processes: Vec<Option<Process>>,
     ready_queue: VecDeque<usize>,
     current: usize, // PID of current process
     initialized: bool,
+    last_switch_rdtime: u64, // rdtime when we switched TO the current task
 }
 
 impl Scheduler {
@@ -25,6 +50,7 @@ impl Scheduler {
             ready_queue: VecDeque::new(),
             current: 0,
             initialized: false,
+            last_switch_rdtime: 0,
         }
     }
 
@@ -39,6 +65,7 @@ impl Scheduler {
         self.processes[0] = Some(idle);
         self.current = 0;
         self.initialized = true;
+        self.last_switch_rdtime = crate::task::process::rdtime();
     }
 }
 
@@ -272,6 +299,35 @@ pub fn schedule() {
         return;
     }
 
+    // CPU accounting: update old task's EWMA before switching away
+    let now = crate::task::process::rdtime();
+    let prev_switch = sched.last_switch_rdtime;
+    if let Some(ref mut old_proc) = sched.processes[old_pid] {
+        let run_time = now.saturating_sub(prev_switch);
+        let idle_time = prev_switch.saturating_sub(old_proc.last_switched_away);
+
+        // Phase 1: decay EWMA for idle period (task wasn't running → decays toward 0)
+        let idle_ticks = (idle_time / TIMER_INTERVAL) as u32;
+        if idle_ticks > 0 {
+            let decay_1s = pow_scaled(DECAY_1S, idle_ticks);
+            let decay_1m = pow_scaled(DECAY_1M, idle_ticks);
+            old_proc.ewma_1s = mul_scaled(old_proc.ewma_1s, decay_1s);
+            old_proc.ewma_1m = mul_scaled(old_proc.ewma_1m, decay_1m);
+        }
+
+        // Phase 2: update EWMA for running period (task was running → approaches SCALE)
+        let run_ticks = (run_time / TIMER_INTERVAL) as u32;
+        if run_ticks > 0 {
+            let decay_1s = pow_scaled(DECAY_1S, run_ticks);
+            let decay_1m = pow_scaled(DECAY_1M, run_ticks);
+            old_proc.ewma_1s = SCALE - mul_scaled(SCALE - old_proc.ewma_1s, decay_1s);
+            old_proc.ewma_1m = SCALE - mul_scaled(SCALE - old_proc.ewma_1m, decay_1m);
+        }
+
+        old_proc.last_switched_away = now;
+    }
+    sched.last_switch_rdtime = now;
+
     // Put old task back in ready queue (if it's still running)
     if let Some(ref mut old_proc) = sched.processes[old_pid] {
         if old_proc.state == ProcessState::Running {
@@ -405,13 +461,50 @@ pub fn wake_process(pid: usize) {
     }
 }
 
+/// Compute effective EWMA for a process without writing back.
+/// For idle processes: just decay from last_switched_away.
+/// For the currently running process: idle decay + running update.
+fn effective_ewma(proc: &Process, now: u64, is_current: bool, last_switch_rdtime: u64) -> (u32, u32) {
+    let mut e1s = proc.ewma_1s;
+    let mut e1m = proc.ewma_1m;
+
+    if is_current {
+        // Currently running: idle time was before last_switch, run time is since then
+        let idle_time = last_switch_rdtime.saturating_sub(proc.last_switched_away);
+        let idle_ticks = (idle_time / TIMER_INTERVAL) as u32;
+        if idle_ticks > 0 {
+            e1s = mul_scaled(e1s, pow_scaled(DECAY_1S, idle_ticks));
+            e1m = mul_scaled(e1m, pow_scaled(DECAY_1M, idle_ticks));
+        }
+        let run_time = now.saturating_sub(last_switch_rdtime);
+        let run_ticks = (run_time / TIMER_INTERVAL) as u32;
+        if run_ticks > 0 {
+            e1s = SCALE - mul_scaled(SCALE - e1s, pow_scaled(DECAY_1S, run_ticks));
+            e1m = SCALE - mul_scaled(SCALE - e1m, pow_scaled(DECAY_1M, run_ticks));
+        }
+    } else {
+        // Not running: just decay since last switched away
+        let idle_time = now.saturating_sub(proc.last_switched_away);
+        let idle_ticks = (idle_time / TIMER_INTERVAL) as u32;
+        if idle_ticks > 0 {
+            e1s = mul_scaled(e1s, pow_scaled(DECAY_1S, idle_ticks));
+            e1m = mul_scaled(e1m, pow_scaled(DECAY_1M, idle_ticks));
+        }
+    }
+    (e1s, e1m)
+}
+
 /// Return a formatted string listing all processes
 pub fn process_list() -> String {
     crate::trace::trace_kernel(b"process_list-enter");
     let sched = SCHEDULER.lock();
+    let now = crate::task::process::rdtime();
+    let current_pid = sched.current;
+    let last_switch = sched.last_switch_rdtime;
+
     let mut out = String::new();
-    let _ = writeln!(out, "  PID  STATE     NAME");
-    let _ = writeln!(out, "  ---  --------  ----------------");
+    let _ = writeln!(out, "  PID  STATE     CPU1s  CPU1m  MEM     NAME");
+    let _ = writeln!(out, "  ---  --------  -----  -----  ------  ----------------");
     for (i, slot) in sched.processes.iter().enumerate() {
         if let Some(proc) = slot {
             let state = match proc.state {
@@ -420,12 +513,28 @@ pub fn process_list() -> String {
                 ProcessState::Blocked => "Blocked ",
                 ProcessState::Dead => "Dead    ",
             };
-            let _ = writeln!(out, "  {:3}  {}  {}", i, state, proc.name());
+            let (e1s, e1m) = effective_ewma(proc, now, i == current_pid, last_switch);
+            let mem_kb = proc.mem_pages as usize * 4; // 4 KiB per page
+            let _ = writeln!(out, "  {:3}  {}  {:2}.{:<1}%  {:2}.{:<1}%  {:>4}K  {}",
+                i, state,
+                e1s / 100, (e1s / 10) % 10,
+                e1m / 100, (e1m / 10) % 10,
+                mem_kb,
+                proc.name());
         }
     }
     drop(sched);
     crate::trace::trace_kernel(b"process_list-exit");
     out
+}
+
+/// Adjust mem_pages for the current process by `delta` pages.
+pub fn current_process_adjust_mem_pages(delta: i32) {
+    let mut sched = SCHEDULER.lock();
+    let pid = sched.current;
+    if let Some(ref mut proc) = sched.processes[pid] {
+        proc.mem_pages = (proc.mem_pages as i32 + delta) as u32;
+    }
 }
 
 /// Count alive (non-Dead) processes

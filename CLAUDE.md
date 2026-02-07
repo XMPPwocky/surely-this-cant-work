@@ -53,6 +53,11 @@ Useful when:
 Spawn a subagent (Explore type) to grep or read these files when you need to verify
 architectural behavior — the spec is the ground truth.
 
+## Testing Serial Console
+For interactive testing (sending commands to the shell and checking output),
+use `expect` scripts — **never pipe stdin** to `make run` (the shell won't be
+ready). See `docs/testing-serial.md` for patterns and examples.
+
 ## Key Addresses (QEMU virt)
 - RAM_BASE: 0x80000000
 - KERNEL_BASE: 0x80200000

@@ -28,6 +28,14 @@ pub struct MmapRegion {
     pub shm_id: Option<usize>, // None = anonymous, Some(id) = SHM-backed
 }
 
+/// Read the RISC-V `rdtime` counter (10 MHz on QEMU virt).
+#[inline(always)]
+pub fn rdtime() -> u64 {
+    let t: u64;
+    unsafe { core::arch::asm!("rdtime {}", out(reg) t) };
+    t
+}
+
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
 fn alloc_pid() -> usize {
@@ -57,6 +65,12 @@ pub struct Process {
     pub mmap_regions: [Option<MmapRegion>; MAX_MMAP_REGIONS],
     name: [u8; NAME_LEN],
     name_len: usize,
+    // CPU accounting (EWMA, scaled by 10000 = 100%)
+    pub ewma_1s: u32,
+    pub ewma_1m: u32,
+    pub last_switched_away: u64, // rdtime when last switched away
+    // Memory accounting
+    pub mem_pages: u32,          // total physical pages owned
 }
 
 impl Process {
@@ -85,6 +99,10 @@ impl Process {
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
+            ewma_1s: 0,
+            ewma_1m: 0,
+            last_switched_away: rdtime(),
+            mem_pages: KERNEL_STACK_PAGES as u32,
         }
     }
 
@@ -146,6 +164,10 @@ impl Process {
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
+            ewma_1s: 0,
+            ewma_1m: 0,
+            last_switched_away: rdtime(),
+            mem_pages: (KERNEL_STACK_PAGES + code_pages + USER_STACK_PAGES) as u32,
         }
     }
 
@@ -195,6 +217,10 @@ impl Process {
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
+            ewma_1s: 0,
+            ewma_1m: 0,
+            last_switched_away: rdtime(),
+            mem_pages: (KERNEL_STACK_PAGES + loaded.total_pages + USER_STACK_PAGES) as u32,
         }
     }
 
@@ -214,6 +240,10 @@ impl Process {
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
+            ewma_1s: 0,
+            ewma_1m: 0,
+            last_switched_away: rdtime(),
+            mem_pages: 0, // idle task doesn't own any pages
         };
         p.set_name("idle");
         p

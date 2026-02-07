@@ -10,6 +10,7 @@ pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
 pub const SYS_CHAN_SEND_BLOCKING: usize = 207;
 pub const SYS_TRACE: usize = 230;
+pub const SYS_SHUTDOWN: usize = 231;
 
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
@@ -117,5 +118,11 @@ pub fn sys_chan_send_blocking(handle: usize, msg: &Message) -> usize {
 /// Send a message, blocking if queue is full.
 pub fn sys_chan_send_retry(handle: usize, msg: &Message) -> usize {
     sys_chan_send_blocking(handle, msg)
+}
+
+/// Shut down the system. Does not return.
+pub fn sys_shutdown() -> ! {
+    syscall0(SYS_SHUTDOWN);
+    unreachable!()
 }
 
