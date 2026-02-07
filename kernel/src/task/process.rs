@@ -12,7 +12,7 @@ const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
 
 pub const MAX_PROCS: usize = 64;
 pub const MAX_HANDLES: usize = 32;
-pub const MAX_MMAP_REGIONS: usize = 32;
+pub const MAX_MMAP_REGIONS: usize = 256;
 const NAME_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
