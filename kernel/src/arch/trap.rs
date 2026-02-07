@@ -5,6 +5,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 const TIMER_INTERVAL: u64 = 1_000_000; // 100ms at 10MHz
 
+/// Set to true to log every syscall (except yield) to the trace ring buffer.
+/// Format: "name(a0,a1)=ret" with hex values.  Disabled by default.
+const TRACE_SYSCALLS: bool = false;
+
 static TICK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // Syscall numbers
@@ -95,16 +99,9 @@ fn handle_syscall(tf: &mut TrapFrame) {
     let a0 = tf.regs[10];
     let a1 = tf.regs[11];
 
-    // Trace non-trivial syscalls (skip yield/getpid/trace to reduce noise)
-    let trace_this = !matches!(syscall_num, SYS_YIELD | SYS_GETPID | SYS_TRACE
-        | SYS_CHAN_SEND | SYS_CHAN_SEND_BLOCKING | SYS_CHAN_RECV | SYS_CHAN_RECV_BLOCKING);
-    if trace_this {
-        let pid = crate::task::current_pid();
-        let mut label = [0u8; 16];
-        label[..4].copy_from_slice(b"sc=\0");
-        let n = fmt_usize(syscall_num, &mut label[3..]);
-        crate::trace::trace_push(pid, &label[..3 + n]);
-    }
+    // Capture args before dispatch (some handlers overwrite regs)
+    let saved_a0 = a0;
+    let saved_a1 = a1;
 
     match syscall_num {
         SYS_EXIT => {
@@ -161,26 +158,52 @@ fn handle_syscall(tf: &mut TrapFrame) {
         }
     }
 
-    if trace_this {
+    // Comprehensive syscall tracing (disabled by default; flip TRACE_SYSCALLS to enable)
+    if TRACE_SYSCALLS && syscall_num != SYS_YIELD {
         let pid = crate::task::current_pid();
-        let mut label = [0u8; 16];
-        label[..7].copy_from_slice(b"sc-end=");
-        let n = fmt_usize(syscall_num, &mut label[7..]);
-        crate::trace::trace_push(pid, &label[..7 + n]);
+        let ret = tf.regs[10];
+        trace_syscall(pid, syscall_num, saved_a0, saved_a1, ret);
     }
 }
 
-/// Format a usize as decimal into buf. Returns number of bytes written.
-fn fmt_usize(mut val: usize, buf: &mut [u8]) -> usize {
+// ============================================================
+// Syscall tracing helpers
+// ============================================================
+
+/// Short name for a syscall number (for trace output).
+fn syscall_name(num: usize) -> &'static [u8] {
+    match num {
+        SYS_EXIT => b"exit",
+        SYS_YIELD => b"yield",
+        SYS_GETPID => b"getpid",
+        SYS_CHAN_CREATE => b"create",
+        SYS_CHAN_SEND => b"send",
+        SYS_CHAN_RECV => b"recv",
+        SYS_CHAN_CLOSE => b"close",
+        SYS_CHAN_RECV_BLOCKING => b"recvb",
+        SYS_CHAN_SEND_BLOCKING => b"sendb",
+        SYS_SHM_CREATE => b"shmc",
+        SYS_SHM_DUP_RO => b"shmro",
+        SYS_MMAP => b"mmap",
+        SYS_MUNMAP => b"munmap",
+        SYS_TRACE => b"trace",
+        SYS_SHUTDOWN => b"shut",
+        _ => b"?",
+    }
+}
+
+/// Format a usize as lowercase hex into buf. Returns bytes written.
+fn fmt_hex(mut val: usize, buf: &mut [u8]) -> usize {
     if val == 0 {
         if !buf.is_empty() { buf[0] = b'0'; }
         return 1;
     }
-    let mut tmp = [0u8; 20];
+    let mut tmp = [0u8; 16];
     let mut i = 0;
-    while val > 0 {
-        tmp[i] = b'0' + (val % 10) as u8;
-        val /= 10;
+    while val > 0 && i < 16 {
+        let nibble = (val & 0xF) as u8;
+        tmp[i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        val >>= 4;
         i += 1;
     }
     let len = i.min(buf.len());
@@ -189,6 +212,30 @@ fn fmt_usize(mut val: usize, buf: &mut [u8]) -> usize {
     }
     len
 }
+
+/// Log one completed syscall to the trace ring buffer.
+/// Format: "name(a0,a1)=ret" with hex args, fitting in 32 bytes.
+fn trace_syscall(pid: usize, num: usize, a0: usize, a1: usize, ret: usize) {
+    let mut buf = [0u8; 32];
+    let name = syscall_name(num);
+    let mut p = 0;
+    // name
+    let n = name.len().min(6);
+    buf[p..p + n].copy_from_slice(&name[..n]);
+    p += n;
+    // (a0
+    if p < 31 { buf[p] = b'('; p += 1; }
+    p += fmt_hex(a0, &mut buf[p..]);
+    // ,a1
+    if p < 31 { buf[p] = b','; p += 1; }
+    p += fmt_hex(a1, &mut buf[p..]);
+    // )=ret
+    if p < 31 { buf[p] = b')'; p += 1; }
+    if p < 31 { buf[p] = b'='; p += 1; }
+    p += fmt_hex(ret, &mut buf[p..]);
+    crate::trace::trace_push(pid, &buf[..p.min(32)]);
+}
+
 
 /// SYS_CHAN_CREATE: create a bidirectional channel pair.
 /// Returns handle_a in a0, handle_b in a1.

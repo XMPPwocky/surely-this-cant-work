@@ -112,6 +112,7 @@ pub fn math_service() {
                         crate::task::wake_process(wake);
                     }
                 }
+                ipc::channel_close(client_ep);
                 continue;
             }
         };
@@ -128,5 +129,8 @@ pub fn math_service() {
                 crate::task::wake_process(wake);
             }
         }
+
+        // Close our endpoint so the channel can be freed once the client closes theirs.
+        ipc::channel_close(client_ep);
     }
 }

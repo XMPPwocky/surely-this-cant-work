@@ -68,8 +68,9 @@ pub fn sysinfo_service() {
             send_chunked(client_ep, my_pid, b"Unknown command\n");
         }
 
-        // Done with this client — go back to waiting for the next one
-        // (Don't close the channel; the client will close it)
+        // Done with this client — close our endpoint so the channel can be freed
+        // once the client closes their side too.
+        ipc::channel_close(client_ep);
     }
 }
 
