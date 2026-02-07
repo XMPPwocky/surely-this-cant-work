@@ -446,18 +446,28 @@ pub fn exit_current_from_syscall() {
 pub fn block_process(pid: usize) {
     let mut sched = SCHEDULER.lock();
     if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        // Check wakeup_pending: if a wake arrived between our poll and this
+        // block call, consume the pending wakeup and stay Ready (don't block).
+        if proc.wakeup_pending {
+            proc.wakeup_pending = false;
+            return;
+        }
         proc.state = ProcessState::Blocked;
     }
 }
 
 /// Wake a blocked process (set to Ready and add to FRONT of ready queue).
 /// Pushing to front gives woken receivers priority, enabling fast IPC round-trips.
+/// If the process is Running or Ready, set wakeup_pending so a subsequent
+/// block_process() call won't actually block.
 pub fn wake_process(pid: usize) {
     let mut sched = SCHEDULER.lock();
     if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
         if proc.state == ProcessState::Blocked {
             proc.state = ProcessState::Ready;
             sched.ready_queue.push_front(pid);
+        } else if proc.state == ProcessState::Running || proc.state == ProcessState::Ready {
+            proc.wakeup_pending = true;
         }
     }
 }

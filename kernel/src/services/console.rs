@@ -168,7 +168,7 @@ fn send_line(client_ep: usize, data: &[u8]) {
     }
 }
 
-const MAX_CONSOLE_CLIENTS: usize = 4;
+const MAX_CONSOLE_CLIENTS: usize = 8;
 
 /// Serial console server kernel task.
 /// Owns UART I/O. Accepts multiple client endpoints via its control channel.

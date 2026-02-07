@@ -71,6 +71,9 @@ pub struct Process {
     pub last_switched_away: u64, // rdtime when last switched away
     // Memory accounting
     pub mem_pages: u32,          // total physical pages owned
+    // Wakeup pending flag: set when wake_process is called on a Running/Ready process.
+    // Checked by block_process to avoid the "check-then-block" race.
+    pub wakeup_pending: bool,
 }
 
 impl Process {
@@ -103,6 +106,7 @@ impl Process {
             ewma_1m: 0,
             last_switched_away: rdtime(),
             mem_pages: KERNEL_STACK_PAGES as u32,
+            wakeup_pending: false,
         }
     }
 
@@ -168,6 +172,7 @@ impl Process {
             ewma_1m: 0,
             last_switched_away: rdtime(),
             mem_pages: (KERNEL_STACK_PAGES + code_pages + USER_STACK_PAGES) as u32,
+            wakeup_pending: false,
         }
     }
 
@@ -221,6 +226,7 @@ impl Process {
             ewma_1m: 0,
             last_switched_away: rdtime(),
             mem_pages: (KERNEL_STACK_PAGES + loaded.total_pages + USER_STACK_PAGES) as u32,
+            wakeup_pending: false,
         }
     }
 
@@ -244,6 +250,7 @@ impl Process {
             ewma_1m: 0,
             last_switched_away: rdtime(),
             mem_pages: 0, // idle task doesn't own any pages
+            wakeup_pending: false,
         };
         p.set_name("idle");
         p
