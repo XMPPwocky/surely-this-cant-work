@@ -15,6 +15,7 @@ mod panic;
 mod services;
 mod sync;
 mod task;
+mod trace;
 
 global_asm!(include_str!("arch/boot.S"));
 global_asm!(include_str!("arch/trap.S"));
@@ -145,11 +146,11 @@ pub extern "C" fn kmain() -> ! {
 
     // Boot channels for shells
     let (shell_serial_boot_a, shell_serial_boot_b) = ipc::channel_create_pair();
-    services::init::register_boot(shell_serial_boot_b, services::init::ConsoleType::Serial);
+    services::init::register_boot(shell_serial_boot_b, services::init::ConsoleType::Serial, true);
 
     let shell_fb_boot_a = if gpu_present {
         let (a, b) = ipc::channel_create_pair();
-        services::init::register_boot(b, services::init::ConsoleType::Framebuffer);
+        services::init::register_boot(b, services::init::ConsoleType::Framebuffer, true);
         Some(a)
     } else {
         None
@@ -172,7 +173,7 @@ pub extern "C" fn kmain() -> ! {
 
     // Spawn fs server as a user process with boot channel + control channel
     let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair();
-    services::init::register_boot(fs_boot_b, services::init::ConsoleType::Serial);
+    services::init::register_boot(fs_boot_b, services::init::ConsoleType::Serial, false);
     task::spawn_user_elf_with_handles(user_fs_code(), "fs", fs_boot_a, fs_ctl_ep);
 
     // hello-std is now loaded from the filesystem by init_server

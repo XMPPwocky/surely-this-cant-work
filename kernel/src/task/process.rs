@@ -152,6 +152,7 @@ impl Process {
     /// Create a user process from an ELF binary.
     /// Parses ELF, loads PT_LOAD segments, creates page table.
     pub fn new_user_elf(elf_data: &[u8]) -> Self {
+        crate::trace::trace_kernel(b"new_user_elf-enter");
         let pid = alloc_pid();
 
         // Allocate kernel stack
@@ -179,6 +180,7 @@ impl Process {
 
         let context = TaskContext::new_user_entry(kstack_top);
 
+        crate::trace::trace_kernel(b"new_user_elf-exit");
         Process {
             pid,
             state: ProcessState::Ready,

@@ -68,6 +68,7 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 204    | `SYS_CHAN_RECV_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking receive. Suspends the process until a message arrives. |
 | 222    | `SYS_MMAP`            | `a0` = hint (ignored), `a1` = length | `a0` = address or `usize::MAX` | Allocates zeroed pages and maps them into the process. |
 | 215    | `SYS_MUNMAP`          | `a0` = address, `a1` = length | `a0` = 0 or `usize::MAX`  | Unmaps and frees previously mmap'd pages.                  |
+| 230    | `SYS_TRACE`           | `a0` = label_ptr, `a1` = label_len | `a0` = 0 or `usize::MAX` | Records a timestamped trace event in the kernel ring buffer. |
 
 ### Detailed Syscall Descriptions
 
@@ -197,6 +198,24 @@ the page table entries, frees the physical frames, and flushes the TLB.
 
 Returns 0 on success, `usize::MAX` on error (unaligned address, zero length,
 region not found).
+
+#### SYS_TRACE (230)
+
+Records a timestamped trace event in the kernel's ring buffer.
+
+- `a0` = pointer to a label string in user memory (ASCII).
+- `a1` = length of the label string (1..32 bytes).
+
+The kernel reads `rdtime` (10 MHz, 0.1 us ticks) and stores the timestamp,
+calling process PID, and label in a 2048-entry ring buffer. When the buffer
+is full, the oldest entry is overwritten (and a warning is logged once).
+
+Trace entries can be read back through the sysinfo service by sending the
+`"TRACE"` command, or cleared with `"TRACECLR"`. In the shell, these are
+exposed as `trace` and `trace clear`.
+
+Returns 0 on success, `usize::MAX` on error (zero length, length > 32,
+invalid pointer).
 
 ---
 

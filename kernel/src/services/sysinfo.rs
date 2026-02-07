@@ -1,4 +1,4 @@
-use crate::ipc::{self, Message};
+use crate::ipc::{self, Message, MAX_MSG_SIZE};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Control endpoint for sysinfo service (set by kmain before spawn)
@@ -46,9 +46,16 @@ pub fn sysinfo_service() {
         // Handle the request
         let cmd = &msg.data[..msg.len];
         if cmd == b"PS" {
-            send_process_list(client_ep, my_pid);
+            let list = crate::task::process_list();
+            send_chunked(client_ep, my_pid, list.as_bytes());
+        } else if cmd == b"TRACE" {
+            let text = crate::trace::trace_read();
+            send_chunked(client_ep, my_pid, text.as_bytes());
+        } else if cmd == b"TRACECLR" {
+            crate::trace::trace_clear();
+            send_chunked(client_ep, my_pid, b"ok\n");
         } else {
-            send_error(client_ep, my_pid, b"Unknown command");
+            send_chunked(client_ep, my_pid, b"Unknown command\n");
         }
 
         // Done with this client — go back to waiting for the next one
@@ -56,48 +63,45 @@ pub fn sysinfo_service() {
     }
 }
 
-fn send_process_list(ep: usize, pid: usize) {
-    let list = crate::task::process_list();
-    let bytes = list.as_bytes();
-    let chunk_size = 63;
+/// Send a byte slice in MAX_MSG_SIZE-sized chunks, with yield-on-full backpressure,
+/// followed by a zero-length sentinel.
+fn send_chunked(ep: usize, pid: usize, data: &[u8]) {
+    let chunk_size = MAX_MSG_SIZE;
     let mut offset = 0;
 
-    while offset < bytes.len() {
-        let end = (offset + chunk_size).min(bytes.len());
-        let chunk = &bytes[offset..end];
+    while offset < data.len() {
+        let end = (offset + chunk_size).min(data.len());
+        let chunk = &data[offset..end];
 
         let mut msg = Message::new();
         msg.data[..chunk.len()].copy_from_slice(chunk);
         msg.len = chunk.len();
         msg.sender_pid = pid;
-        if let Ok(wake) = ipc::channel_send(ep, msg) {
-            if wake != 0 { crate::task::wake_process(wake); }
-        }
+        send_with_backpressure(ep, msg);
         offset = end;
     }
 
     // Send sentinel (len=0)
     let mut sentinel = Message::new();
     sentinel.sender_pid = pid;
-    if let Ok(wake) = ipc::channel_send(ep, sentinel) {
-        if wake != 0 { crate::task::wake_process(wake); }
-    }
+    send_with_backpressure(ep, sentinel);
 }
 
-fn send_error(ep: usize, pid: usize, err_msg: &[u8]) {
-    let mut msg = Message::new();
-    let copy_len = err_msg.len().min(64);
-    msg.data[..copy_len].copy_from_slice(&err_msg[..copy_len]);
-    msg.len = copy_len;
-    msg.sender_pid = pid;
-    if let Ok(wake) = ipc::channel_send(ep, msg) {
-        if wake != 0 { crate::task::wake_process(wake); }
-    }
-
-    // Sentinel
-    let mut sentinel = Message::new();
-    sentinel.sender_pid = pid;
-    if let Ok(wake) = ipc::channel_send(ep, sentinel) {
-        if wake != 0 { crate::task::wake_process(wake); }
+/// Send a message, yielding and retrying if the queue is full.
+/// If the send wakes a blocked receiver, yields immediately so it can drain.
+fn send_with_backpressure(ep: usize, msg: Message) {
+    loop {
+        match ipc::channel_send(ep, msg.clone()) {
+            Ok(wake) => {
+                if wake != 0 {
+                    crate::task::wake_process(wake);
+                }
+                return;
+            }
+            Err(ipc::SendError::QueueFull) => {
+                crate::task::schedule(); // yield to let receiver drain
+            }
+            Err(_) => return, // channel closed, give up
+        }
     }
 }

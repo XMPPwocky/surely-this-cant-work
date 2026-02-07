@@ -104,7 +104,9 @@ pub fn math_service() {
                 resp.len = err.len();
                 resp.sender_pid = my_pid;
                 if let Ok(wake) = ipc::channel_send(client_ep, resp) {
-                    if wake != 0 { crate::task::wake_process(wake); }
+                    if wake != 0 {
+                        crate::task::wake_process(wake);
+                    }
                 }
                 continue;
             }
@@ -118,7 +120,9 @@ pub fn math_service() {
         resp.len = writer.position();
         resp.sender_pid = my_pid;
         if let Ok(wake) = ipc::channel_send(client_ep, resp) {
-            if wake != 0 { crate::task::wake_process(wake); }
+            if wake != 0 {
+                crate::task::wake_process(wake);
+            }
         }
     }
 }

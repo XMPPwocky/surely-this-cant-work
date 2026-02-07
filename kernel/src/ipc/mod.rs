@@ -4,7 +4,7 @@ use crate::sync::SpinLock;
 use crate::mm::address::PhysPageNum;
 
 /// Maximum message payload size in bytes
-const MAX_MSG_SIZE: usize = 1024;
+pub const MAX_MSG_SIZE: usize = 1024;
 /// Maximum number of bidirectional channels
 const MAX_CHANNELS: usize = 64;
 /// Maximum number of shared memory regions
@@ -232,30 +232,32 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, SendError> {
 pub fn channel_send_ref(endpoint: usize, msg: &Message) -> Result<usize, SendError> {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
-    if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
+    let result = if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
         if !channel.active {
-            return Err(SendError::ChannelClosed);
-        }
-        if is_b {
+            Err(SendError::ChannelClosed)
+        } else if is_b {
             if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
-                return Err(SendError::QueueFull);
+                Err(SendError::QueueFull)
+            } else {
+                channel.queue_a.push_back(msg.clone());
+                let wake = channel.blocked_a;
+                if wake != 0 { channel.blocked_a = 0; }
+                Ok(wake)
             }
-            channel.queue_a.push_back(msg.clone());
-            let wake = channel.blocked_a;
-            if wake != 0 { channel.blocked_a = 0; }
-            Ok(wake)
         } else {
             if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
-                return Err(SendError::QueueFull);
+                Err(SendError::QueueFull)
+            } else {
+                channel.queue_b.push_back(msg.clone());
+                let wake = channel.blocked_b;
+                if wake != 0 { channel.blocked_b = 0; }
+                Ok(wake)
             }
-            channel.queue_b.push_back(msg.clone());
-            let wake = channel.blocked_b;
-            if wake != 0 { channel.blocked_b = 0; }
-            Ok(wake)
         }
     } else {
         Err(SendError::ChannelClosed)
-    }
+    };
+    result
 }
 
 /// Try to receive a message (non-blocking).

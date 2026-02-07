@@ -8,6 +8,7 @@ pub const SYS_CHAN_SEND: usize = 201;
 pub const SYS_CHAN_RECV: usize = 202;
 pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
+pub const SYS_TRACE: usize = 230;
 
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
@@ -100,6 +101,11 @@ pub fn sys_chan_close(handle: usize) {
 /// Yield the current time slice.
 pub fn sys_yield() {
     syscall0(SYS_YIELD);
+}
+
+/// Record a timestamped trace event in the kernel ring buffer.
+pub fn sys_trace(label: &[u8]) -> usize {
+    syscall2(SYS_TRACE, label.as_ptr() as usize, label.len())
 }
 
 /// Send a message, retrying with yield on queue-full (error code 5).

@@ -393,19 +393,21 @@ pub fn block_process(pid: usize) {
     }
 }
 
-/// Wake a blocked process (set to Ready and add to ready queue)
+/// Wake a blocked process (set to Ready and add to FRONT of ready queue).
+/// Pushing to front gives woken receivers priority, enabling fast IPC round-trips.
 pub fn wake_process(pid: usize) {
     let mut sched = SCHEDULER.lock();
     if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
         if proc.state == ProcessState::Blocked {
             proc.state = ProcessState::Ready;
-            sched.ready_queue.push_back(pid);
+            sched.ready_queue.push_front(pid);
         }
     }
 }
 
 /// Return a formatted string listing all processes
 pub fn process_list() -> String {
+    crate::trace::trace_kernel(b"process_list-enter");
     let sched = SCHEDULER.lock();
     let mut out = String::new();
     let _ = writeln!(out, "  PID  STATE     NAME");
@@ -421,6 +423,8 @@ pub fn process_list() -> String {
             let _ = writeln!(out, "  {:3}  {}  {}", i, state, proc.name());
         }
     }
+    drop(sched);
+    crate::trace::trace_kernel(b"process_list-exit");
     out
 }
 

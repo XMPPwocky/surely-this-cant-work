@@ -55,6 +55,7 @@ pub struct LoadedElf {
 /// PT_LOAD segments, and zeros .bss. The caller is responsible for
 /// mapping the returned pages into a user page table.
 pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, &'static str> {
+    crate::trace::trace_kernel(b"load_elf-enter");
     if elf_data.len() < 64 {
         return Err("ELF too small");
     }
@@ -146,6 +147,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, &'static str> {
     // Compute entry point PA
     let entry_pa = base_pa + ((ehdr.e_entry as usize) - base_va);
 
+    crate::trace::trace_kernel(b"load_elf-exit");
     Ok(LoadedElf {
         code_ppn,
         total_pages,

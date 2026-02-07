@@ -15,6 +15,7 @@ pub enum ConsoleType {
 struct BootRegistration {
     boot_ep_b: usize,        // init server's endpoint of the boot channel
     console_type: ConsoleType, // which console this process should use
+    is_shell: bool,           // true = primary stdin recipient
 }
 
 /// A service registration: maps a name to a console control endpoint.
@@ -101,11 +102,12 @@ impl InitConfig {
 static INIT_CONFIG: SpinLock<InitConfig> = SpinLock::new(InitConfig::new());
 
 /// Register a boot channel for a user process (called from kmain before spawning init).
-pub fn register_boot(boot_ep_b: usize, console_type: ConsoleType) {
+/// If `is_shell` is true, the console server will direct keyboard input to this client.
+pub fn register_boot(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool) {
     let mut config = INIT_CONFIG.lock();
     for slot in config.boot_regs.iter_mut() {
         if slot.is_none() {
-            *slot = Some(BootRegistration { boot_ep_b, console_type });
+            *slot = Some(BootRegistration { boot_ep_b, console_type, is_shell });
             return;
         }
     }
@@ -162,13 +164,13 @@ pub fn init_server() {
 
     loop {
         // Snapshot boot registrations under the lock
-        let mut endpoints = [(0usize, ConsoleType::Serial); MAX_BOOT_REGS];
+        let mut endpoints = [(0usize, ConsoleType::Serial, false); MAX_BOOT_REGS];
         let mut count = 0;
         {
             let config = INIT_CONFIG.lock();
             for i in 0..MAX_BOOT_REGS {
                 if let Some(ref reg) = config.boot_regs[i] {
-                    endpoints[count] = (reg.boot_ep_b, reg.console_type);
+                    endpoints[count] = (reg.boot_ep_b, reg.console_type, reg.is_shell);
                     count += 1;
                 }
             }
@@ -177,9 +179,9 @@ pub fn init_server() {
         // Poll all boot endpoints without holding the lock
         let mut handled = false;
         for i in 0..count {
-            let (boot_ep_b, console_type) = endpoints[i];
+            let (boot_ep_b, console_type, is_shell) = endpoints[i];
             if let Some(msg) = ipc::channel_recv(boot_ep_b) {
-                handle_request(boot_ep_b, console_type, &msg, my_pid);
+                handle_request(boot_ep_b, console_type, is_shell, &msg, my_pid);
                 handled = true;
             }
         }
@@ -217,11 +219,12 @@ pub fn init_server() {
     }
 }
 
-fn handle_request(boot_ep_b: usize, console_type: ConsoleType, msg: &Message, my_pid: usize) {
+fn handle_request(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, msg: &Message, my_pid: usize) {
+    crate::trace::trace_kernel(b"init-handle_req-enter");
     let request = &msg.data[..msg.len];
 
     if starts_with(request, b"stdio") {
-        handle_stdio_request(boot_ep_b, console_type, my_pid);
+        handle_stdio_request(boot_ep_b, console_type, is_shell, my_pid);
     } else if let Some(svc) = find_named_service(request) {
         handle_service_request(boot_ep_b, svc, my_pid);
     } else {
@@ -233,6 +236,7 @@ fn handle_request(boot_ep_b: usize, console_type: ConsoleType, msg: &Message, my
         resp.sender_pid = my_pid;
         send_and_wake(boot_ep_b, resp);
     }
+    crate::trace::trace_kernel(b"init-handle_req-exit");
 }
 
 /// Find a named service whose name matches the request prefix.
@@ -278,7 +282,7 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, my_pid: usize) {
     }
 }
 
-fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, my_pid: usize) {
+fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, my_pid: usize) {
     // Create a new bidirectional channel for the client <-> console server
     let (client_ep, server_ep) = ipc::channel_create_pair();
 
@@ -298,9 +302,12 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, my_pid: usi
     };
 
     if let Some(ctl_ep) = control_ep {
-        // Send server endpoint to console server via its control channel
+        // Send server endpoint to console server via its control channel.
+        // data[0] = 1 means this client wants stdin (is a shell).
         let mut ctl_msg = Message::new();
         ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.data[0] = if is_shell { 1 } else { 0 };
+        ctl_msg.len = 1;
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
 
@@ -316,10 +323,11 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, my_pid: usi
 }
 
 /// Send a message and wake the receiver if one was blocked.
-/// Ignores send errors (channel closed / queue full) since init is best-effort.
 fn send_and_wake(endpoint: usize, msg: Message) {
     if let Ok(wake) = ipc::channel_send(endpoint, msg) {
-        if wake != 0 { crate::task::wake_process(wake); }
+        if wake != 0 {
+            crate::task::wake_process(wake);
+        }
     }
 }
 
@@ -502,7 +510,7 @@ fn finish_fs_launch(ctx: &mut FsLaunchCtx, _my_pid: usize) {
 
     // Create boot channel and spawn
     let (boot_a, boot_b) = ipc::channel_create_pair();
-    register_boot(boot_b, ctx.console_type);
+    register_boot(boot_b, ctx.console_type, false);
     crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name, boot_a);
     ctx.state = FsLaunchState::Done;
 }

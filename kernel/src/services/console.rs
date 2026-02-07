@@ -148,7 +148,9 @@ fn send_line(client_ep: usize, data: &[u8]) {
         msg.len = chunk_len;
         msg.sender_pid = pid;
         if let Ok(wake) = ipc::channel_send(client_ep, msg) {
-            if wake != 0 { crate::task::wake_process(wake); }
+            if wake != 0 {
+                crate::task::wake_process(wake);
+            }
         }
         offset += chunk_len;
     }
@@ -158,7 +160,7 @@ const MAX_CONSOLE_CLIENTS: usize = 4;
 
 /// Serial console server kernel task.
 /// Owns UART I/O. Accepts multiple client endpoints via its control channel.
-/// All clients can write output; input goes to client 0 (the primary shell).
+/// All clients can write output; only the client marked is_shell receives stdin.
 pub fn serial_console_server() {
     let control_ep = SERIAL_CONTROL_EP.load(Ordering::Relaxed);
     let my_pid = crate::task::current_pid();
@@ -168,6 +170,7 @@ pub fn serial_console_server() {
 
     let mut client_eps: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
     let mut client_count: usize = 0;
+    let mut stdin_client: usize = usize::MAX; // index of the client that receives stdin
 
     // Wait for at least the first client endpoint via control channel
     loop {
@@ -175,6 +178,10 @@ pub fn serial_console_server() {
             Some(msg) => {
                 if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                     if client_count < MAX_CONSOLE_CLIENTS {
+                        let is_shell = msg.len >= 1 && msg.data[0] == 1;
+                        if is_shell {
+                            stdin_client = client_count;
+                        }
                         client_eps[client_count] = ep;
                         client_count += 1;
                         break;
@@ -197,6 +204,10 @@ pub fn serial_console_server() {
         while let Some(msg) = ipc::channel_recv(control_ep) {
             if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                 if client_count < MAX_CONSOLE_CLIENTS {
+                    let is_shell = msg.len >= 1 && msg.data[0] == 1;
+                    if is_shell {
+                        stdin_client = client_count;
+                    }
                     client_eps[client_count] = ep;
                     client_count += 1;
                 }
@@ -221,8 +232,8 @@ pub fn serial_console_server() {
                             buf[..len].copy_from_slice(src);
                             (buf, len)
                         };
-                        if client_count > 0 {
-                            send_line(client_eps[0], &data_copy.0[..data_copy.1]);
+                        if stdin_client != usize::MAX {
+                            send_line(client_eps[stdin_client], &data_copy.0[..data_copy.1]);
                         }
                     }
                 }
@@ -270,6 +281,7 @@ pub fn fb_console_server() {
 
     let mut client_eps: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
     let mut client_count: usize = 0;
+    let mut stdin_client: usize = usize::MAX;
 
     // Wait for at least the first client
     loop {
@@ -277,6 +289,10 @@ pub fn fb_console_server() {
             Some(msg) => {
                 if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                     if client_count < MAX_CONSOLE_CLIENTS {
+                        let is_shell = msg.len >= 1 && msg.data[0] == 1;
+                        if is_shell {
+                            stdin_client = client_count;
+                        }
                         client_eps[client_count] = ep;
                         client_count += 1;
                         break;
@@ -298,6 +314,10 @@ pub fn fb_console_server() {
         while let Some(msg) = ipc::channel_recv(control_ep) {
             if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                 if client_count < MAX_CONSOLE_CLIENTS {
+                    let is_shell = msg.len >= 1 && msg.data[0] == 1;
+                    if is_shell {
+                        stdin_client = client_count;
+                    }
                     client_eps[client_count] = ep;
                     client_count += 1;
                 }
@@ -319,8 +339,8 @@ pub fn fb_console_server() {
                             buf[..len].copy_from_slice(src);
                             (buf, len)
                         };
-                        if client_count > 0 {
-                            send_line(client_eps[0], &data_copy.0[..data_copy.1]);
+                        if stdin_client != usize::MAX {
+                            send_line(client_eps[stdin_client], &data_copy.0[..data_copy.1]);
                         }
                     }
                 }

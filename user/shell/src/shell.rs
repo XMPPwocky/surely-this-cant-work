@@ -55,6 +55,8 @@ fn cmd_help() {
     println!("  echo <text>           - Print text");
     println!("  math <op> <a> <b>     - Compute math (add/mul/sub)");
     println!("  ps                    - Show process list");
+    println!("  trace                 - Show trace ring buffer");
+    println!("  trace clear           - Clear trace ring buffer");
     println!("  ls [path]             - List directory");
     println!("  cat <path>            - Read file");
     println!("  write <path> <text>   - Write to file");
@@ -133,6 +135,28 @@ fn cmd_stat(args: &str) {
         }
         Err(e) => println!("Error: {}", e),
     }
+}
+
+fn cmd_trace(args: &str) {
+    let sysinfo_handle = request_service(b"sysinfo");
+
+    let cmd_str = if args.trim() == "clear" { b"TRACECLR" as &[u8] } else { b"TRACE" as &[u8] };
+    let mut msg = Message::new();
+    msg.data[..cmd_str.len()].copy_from_slice(cmd_str);
+    msg.len = cmd_str.len();
+    raw::sys_chan_send(sysinfo_handle, &msg);
+
+    loop {
+        let mut resp = Message::new();
+        raw::sys_chan_recv_blocking(sysinfo_handle, &mut resp);
+        if resp.len == 0 {
+            break;
+        }
+        io::stdout().write_all(&resp.data[..resp.len]).ok();
+    }
+    io::stdout().flush().ok();
+
+    raw::sys_chan_close(sysinfo_handle);
 }
 
 fn cmd_ps() {
@@ -245,6 +269,10 @@ pub fn run() {
                 }
             }
             "ps" => cmd_ps(),
+            "trace" => {
+                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                cmd_trace(args);
+            }
             "cat" | "read" => {
                 let args = line.splitn(2, ' ').nth(1).unwrap_or("");
                 cmd_cat(args);
