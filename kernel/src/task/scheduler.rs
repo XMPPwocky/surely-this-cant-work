@@ -529,6 +529,22 @@ pub fn process_list() -> String {
     out
 }
 
+/// Return a formatted string listing per-process memory usage.
+pub fn process_mem_list() -> String {
+    let sched = SCHEDULER.lock();
+    let mut out = String::new();
+    let _ = writeln!(out, "  PID  NAME              MEM");
+    let _ = writeln!(out, "  ---  ----------------  ------");
+    for (i, slot) in sched.processes.iter().enumerate() {
+        if let Some(proc) = slot {
+            if proc.state == ProcessState::Dead { continue; }
+            let mem_kb = proc.mem_pages as usize * 4;
+            let _ = writeln!(out, "  {:3}  {:<16}  {:>4}K", i, proc.name(), mem_kb);
+        }
+    }
+    out
+}
+
 /// Adjust mem_pages for the current process by `delta` pages.
 pub fn current_process_adjust_mem_pages(delta: i32) {
     let mut sched = SCHEDULER.lock();

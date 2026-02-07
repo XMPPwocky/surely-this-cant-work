@@ -55,6 +55,7 @@ fn cmd_help() {
     println!("  echo <text>           - Print text");
     println!("  math <op> <a> <b>     - Compute math (add/mul/sub)");
     println!("  ps                    - Show process list");
+    println!("  mem                   - Show kernel memory stats");
     println!("  trace                 - Show trace ring buffer");
     println!("  trace clear           - Clear trace ring buffer");
     println!("  ls [path]             - List directory");
@@ -181,6 +182,28 @@ fn cmd_ps() {
     raw::sys_chan_close(sysinfo_handle);
 }
 
+fn cmd_mem() {
+    let sysinfo_handle = request_service(b"sysinfo");
+
+    let mut msg = Message::new();
+    let cmd = b"MEMSTAT";
+    msg.data[..cmd.len()].copy_from_slice(cmd);
+    msg.len = cmd.len();
+    raw::sys_chan_send(sysinfo_handle, &msg);
+
+    loop {
+        let mut resp = Message::new();
+        raw::sys_chan_recv_blocking(sysinfo_handle, &mut resp);
+        if resp.len == 0 {
+            break;
+        }
+        io::stdout().write_all(&resp.data[..resp.len]).ok();
+    }
+    io::stdout().flush().ok();
+
+    raw::sys_chan_close(sysinfo_handle);
+}
+
 fn cmd_math(args: &str) {
     let parts: Vec<&str> = args.splitn(3, ' ').collect();
     if parts.len() < 3 {
@@ -269,6 +292,7 @@ pub fn run() {
                 }
             }
             "ps" => cmd_ps(),
+            "mem" => cmd_mem(),
             "trace" => {
                 let args = line.splitn(2, ' ').nth(1).unwrap_or("");
                 cmd_trace(args);

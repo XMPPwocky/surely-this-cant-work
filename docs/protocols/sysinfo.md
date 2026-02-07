@@ -76,6 +76,40 @@ Example output:
 | MEM    | Total physical pages owned, in KiB (pages × 4K) |
 | NAME   | Process name (max 16 chars) |
 
+### MEMSTAT — Kernel Memory Statistics
+
+Returns kernel heap statistics (per-tag breakdown) and per-process
+physical memory usage.
+
+**Request:**
+
+```
+msg.data = "MEMSTAT"
+msg.len  = 7
+```
+
+**Response:** Chunked text (see [Response Format](#response-format)).
+
+Example output:
+
+```
+Kernel heap: 1024K total, 312K used (30%), 712K free
+  Tag     Current    Peak  Allocs
+  ----  ---------  ------  ------
+  ????       96K   128K      38
+  IPC_      128K   256K      23
+  SCHD       32K    32K       2
+  PGTB       48K    48K      12
+
+Process memory:
+  PID  NAME              MEM
+  ---  ----------------  ------
+    0  idle                 0K
+    1  init               144K
+    5  fs                 476K
+    6  shell-serial       140K
+```
+
 ### TRACE — Read Trace Buffer
 
 Returns the contents of the kernel's trace ring buffer as formatted text.

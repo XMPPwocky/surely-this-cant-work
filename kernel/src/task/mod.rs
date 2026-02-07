@@ -10,7 +10,7 @@ pub use scheduler::{
     schedule, current_pid,
     exit_current_from_syscall,
     block_process, wake_process, save_kernel_satp,
-    process_list,
+    process_list, process_mem_list,
     current_process_handle, current_process_alloc_handle, current_process_free_handle,
     current_process_user_satp, current_process_add_mmap, current_process_remove_mmap,
     current_process_adjust_mem_pages,
