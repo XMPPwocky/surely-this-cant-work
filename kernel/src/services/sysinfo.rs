@@ -17,7 +17,9 @@ pub fn sysinfo_service() {
     loop {
         // Wait for a new client endpoint from init server
         let client_ep = loop {
-            match ipc::channel_recv(control_ep) {
+            let (msg, send_wake) = ipc::channel_recv(control_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            match msg {
                 Some(msg) => {
                     if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                         break ep;
@@ -33,7 +35,9 @@ pub fn sysinfo_service() {
 
         // Wait for one request from this client
         let msg = loop {
-            match ipc::channel_recv(client_ep) {
+            let (msg, send_wake) = ipc::channel_recv(client_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            match msg {
                 Some(msg) => break msg,
                 None => {
                     ipc::channel_set_blocked(client_ep, my_pid);
@@ -87,9 +91,9 @@ fn send_chunked(ep: usize, pid: usize, data: &[u8]) {
     send_with_backpressure(ep, sentinel);
 }
 
-/// Send a message, yielding and retrying if the queue is full.
-/// If the send wakes a blocked receiver, yields immediately so it can drain.
+/// Send a message, blocking if the queue is full.
 fn send_with_backpressure(ep: usize, msg: Message) {
+    let my_pid = crate::task::current_pid();
     loop {
         match ipc::channel_send(ep, msg.clone()) {
             Ok(wake) => {
@@ -99,7 +103,10 @@ fn send_with_backpressure(ep: usize, msg: Message) {
                 return;
             }
             Err(ipc::SendError::QueueFull) => {
-                crate::task::schedule(); // yield to let receiver drain
+                if !ipc::channel_is_active(ep) { return; }
+                ipc::channel_set_send_blocked(ep, my_pid);
+                crate::task::block_process(my_pid);
+                crate::task::schedule();
             }
             Err(_) => return, // channel closed, give up
         }

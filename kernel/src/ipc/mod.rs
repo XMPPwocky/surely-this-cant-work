@@ -127,6 +127,8 @@ struct Channel {
     queue_b: VecDeque<Message>, // messages waiting for endpoint B to recv
     blocked_a: usize, // PID blocked on recv(ep_a), 0 = none
     blocked_b: usize, // PID blocked on recv(ep_b), 0 = none
+    send_blocked_a: usize, // PID blocked on send(ep_a) due to full queue, 0 = none
+    send_blocked_b: usize, // PID blocked on send(ep_b) due to full queue, 0 = none
     ref_count_a: usize, // number of handles referencing endpoint A across all processes
     ref_count_b: usize, // number of handles referencing endpoint B across all processes
     active: bool,
@@ -139,6 +141,8 @@ impl Channel {
             queue_b: VecDeque::new(),
             blocked_a: 0,
             blocked_b: 0,
+            send_blocked_a: 0,
+            send_blocked_b: 0,
             ref_count_a: 1,
             ref_count_b: 1,
             active: true,
@@ -262,17 +266,38 @@ pub fn channel_send_ref(endpoint: usize, msg: &Message) -> Result<usize, SendErr
 
 /// Try to receive a message (non-blocking).
 /// recv(ep_a) pops from queue_a, recv(ep_b) pops from queue_b.
-pub fn channel_recv(endpoint: usize) -> Option<Message> {
+/// Returns (message, send_wake_pid) where send_wake_pid is the PID of a
+/// process blocked waiting to send on this channel (0 = none).
+pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
-        if is_b {
+        let msg = if is_b {
             channel.queue_b.pop_front()
         } else {
             channel.queue_a.pop_front()
+        };
+        if msg.is_some() {
+            // A slot freed up — check if a sender was blocked on this channel.
+            // send(ep_a) pushes to queue_b, so if we popped from queue_b (is_b),
+            // the blocked sender is on ep_a side (send_blocked_a).
+            // send(ep_b) pushes to queue_a, so if we popped from queue_a (!is_b),
+            // the blocked sender is on ep_b side (send_blocked_b).
+            let wake = if is_b {
+                let w = channel.send_blocked_a;
+                if w != 0 { channel.send_blocked_a = 0; }
+                w
+            } else {
+                let w = channel.send_blocked_b;
+                if w != 0 { channel.send_blocked_b = 0; }
+                w
+            };
+            (msg, wake)
+        } else {
+            (None, 0)
         }
     } else {
-        None
+        (None, 0)
     }
 }
 
@@ -289,12 +314,31 @@ pub fn channel_set_blocked(endpoint: usize, pid: usize) {
     }
 }
 
+/// Record that a PID is blocked waiting to send on this endpoint.
+/// send(ep_a) pushes to queue_b, so block is recorded as send_blocked_a.
+/// send(ep_b) pushes to queue_a, so block is recorded as send_blocked_b.
+pub fn channel_set_send_blocked(endpoint: usize, pid: usize) {
+    let (ch_idx, is_b) = ep_to_channel(endpoint);
+    let mut mgr = CHANNELS.lock();
+    if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
+        if is_b {
+            channel.send_blocked_b = pid;
+        } else {
+            channel.send_blocked_a = pid;
+        }
+    }
+}
+
 /// Blocking receive for kernel tasks. Blocks the calling kernel task until
 /// a message arrives or the channel is closed (returns None on close).
 #[allow(dead_code)]
 pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
     loop {
-        if let Some(msg) = channel_recv(endpoint) {
+        let (msg, send_wake) = channel_recv(endpoint);
+        if send_wake != 0 {
+            crate::task::wake_process(send_wake);
+        }
+        if let Some(msg) = msg {
             return Some(msg);
         }
         if !channel_is_active(endpoint) {
@@ -338,12 +382,14 @@ pub fn channel_inc_ref(endpoint: usize) -> bool {
 }
 
 /// Close an endpoint. Decrements the endpoint's ref count. Only deactivates
-/// the channel when the ref count reaches 0. Wakes any blocked peer so it
-/// can detect the close. Frees the channel slot when both ref counts are 0.
+/// the channel when the ref count reaches 0. Wakes any blocked peer (recv or
+/// send) so it can detect the close. Frees the channel slot when both ref
+/// counts are 0.
 pub fn channel_close(endpoint: usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
-    let wake_pid;
+    let wake_recv;
+    let wake_send;
     if let Some(Some(ref mut ch)) = mgr.channels.get_mut(ch_idx) {
         // Decrement the appropriate ref count
         let rc = if is_b { &mut ch.ref_count_b } else { &mut ch.ref_count_a };
@@ -359,10 +405,15 @@ pub fn channel_close(endpoint: usize) {
 
         // This endpoint's last handle is gone — deactivate the channel
         ch.active = false;
-        // Wake the peer blocked on the other endpoint
-        wake_pid = if is_b { ch.blocked_a } else { ch.blocked_b };
-        if wake_pid != 0 {
+        // Wake the peer blocked on recv on the other endpoint
+        wake_recv = if is_b { ch.blocked_a } else { ch.blocked_b };
+        if wake_recv != 0 {
             if is_b { ch.blocked_a = 0; } else { ch.blocked_b = 0; }
+        }
+        // Wake the peer blocked on send on the other endpoint
+        wake_send = if is_b { ch.send_blocked_a } else { ch.send_blocked_b };
+        if wake_send != 0 {
+            if is_b { ch.send_blocked_a = 0; } else { ch.send_blocked_b = 0; }
         }
 
         // Free the channel slot if both sides have zero refs
@@ -373,8 +424,11 @@ pub fn channel_close(endpoint: usize) {
         return;
     }
     drop(mgr);
-    if wake_pid != 0 {
-        crate::task::wake_process(wake_pid);
+    if wake_recv != 0 {
+        crate::task::wake_process(wake_recv);
+    }
+    if wake_send != 0 && wake_send != wake_recv {
+        crate::task::wake_process(wake_send);
     }
 }
 

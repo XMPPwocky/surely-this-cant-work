@@ -16,6 +16,7 @@ pub const SYS_CHAN_SEND: usize = 201;
 pub const SYS_CHAN_RECV: usize = 202;
 pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
+pub const SYS_CHAN_SEND_BLOCKING: usize = 207;
 pub const SYS_SHM_CREATE: usize = 205;
 pub const SYS_SHM_DUP_RO: usize = 206;
 pub const SYS_MUNMAP: usize = 215;
@@ -95,7 +96,7 @@ fn handle_syscall(tf: &mut TrapFrame) {
 
     // Trace non-trivial syscalls (skip yield/getpid/trace to reduce noise)
     let trace_this = !matches!(syscall_num, SYS_YIELD | SYS_GETPID | SYS_TRACE
-        | SYS_CHAN_SEND | SYS_CHAN_RECV | SYS_CHAN_RECV_BLOCKING);
+        | SYS_CHAN_SEND | SYS_CHAN_SEND_BLOCKING | SYS_CHAN_RECV | SYS_CHAN_RECV_BLOCKING);
     if trace_this {
         let pid = crate::task::current_pid();
         let mut label = [0u8; 16];
@@ -130,6 +131,9 @@ fn handle_syscall(tf: &mut TrapFrame) {
         }
         SYS_CHAN_RECV_BLOCKING => {
             sys_chan_recv_blocking(tf);
+        }
+        SYS_CHAN_SEND_BLOCKING => {
+            sys_chan_send_blocking(tf);
         }
         SYS_SHM_CREATE => {
             tf.regs[10] = sys_shm_create(a0);
@@ -295,7 +299,11 @@ fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
         _ => return usize::MAX,
     };
 
-    match crate::ipc::channel_recv(endpoint) {
+    let (msg, send_wake) = crate::ipc::channel_recv(endpoint);
+    if send_wake != 0 {
+        crate::task::wake_process(send_wake);
+    }
+    match msg {
         Some(mut msg) => {
             // Translate cap: encoded capability -> new local handle in receiver
             if msg.cap != crate::ipc::NO_CAP {
@@ -333,7 +341,11 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
 
     let cur_pid = crate::task::current_pid();
     loop {
-        match crate::ipc::channel_recv(endpoint) {
+        let (msg, send_wake) = crate::ipc::channel_recv(endpoint);
+        if send_wake != 0 {
+            crate::task::wake_process(send_wake);
+        }
+        match msg {
             Some(mut msg) => {
                 // Translate cap
                 if msg.cap != crate::ipc::NO_CAP {
@@ -362,6 +374,85 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
                 crate::task::block_process(cur_pid);
                 crate::task::schedule();
                 // Woken up — loop back and retry
+            }
+        }
+    }
+}
+
+/// SYS_CHAN_SEND_BLOCKING: like send but blocks if queue full.
+fn sys_chan_send_blocking(tf: &mut TrapFrame) {
+    let handle = tf.regs[10];
+    let msg_ptr = tf.regs[11];
+    let msg_pa = match validate_user_buffer(msg_ptr, core::mem::size_of::<crate::ipc::Message>()) {
+        Some(pa) => pa,
+        None => {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
+    };
+
+    // Translate handle to global endpoint
+    let endpoint = match crate::task::current_process_handle(handle) {
+        Some(HandleObject::Channel(ep)) => ep,
+        _ => {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
+    };
+
+    // Read message from user space
+    let mut msg = unsafe { core::ptr::read(msg_pa as *const crate::ipc::Message) };
+    msg.sender_pid = crate::task::current_pid();
+
+    // Translate cap if present
+    if msg.cap != crate::ipc::NO_CAP {
+        match crate::task::current_process_handle(msg.cap) {
+            Some(HandleObject::Channel(global_ep)) => {
+                if !crate::ipc::channel_inc_ref(global_ep) {
+                    tf.regs[10] = usize::MAX;
+                    return;
+                }
+                msg.cap = crate::ipc::encode_cap_channel(global_ep);
+            }
+            Some(HandleObject::Shm { id, rw }) => {
+                if !crate::ipc::shm_inc_ref(id) {
+                    tf.regs[10] = usize::MAX;
+                    return;
+                }
+                msg.cap = crate::ipc::encode_cap_shm(id, rw);
+            }
+            None => {
+                tf.regs[10] = usize::MAX;
+                return;
+            }
+        }
+    }
+
+    let cur_pid = crate::task::current_pid();
+    loop {
+        match crate::ipc::channel_send_ref(endpoint, &msg) {
+            Ok(wake) => {
+                if wake != 0 {
+                    crate::task::wake_process(wake);
+                }
+                tf.regs[10] = 0;
+                return;
+            }
+            Err(crate::ipc::SendError::QueueFull) => {
+                // Check if channel was closed
+                if !crate::ipc::channel_is_active(endpoint) {
+                    tf.regs[10] = usize::MAX;
+                    return;
+                }
+                // Block until a recv frees a slot
+                crate::ipc::channel_set_send_blocked(endpoint, cur_pid);
+                crate::task::block_process(cur_pid);
+                crate::task::schedule();
+                // Woken up — retry
+            }
+            Err(_) => {
+                tf.regs[10] = usize::MAX;
+                return;
             }
         }
     }

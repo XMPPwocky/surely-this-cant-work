@@ -136,7 +136,7 @@ fn write_fb(data: &[u8]) {
     crate::drivers::virtio::gpu::flush();
 }
 
-/// Send a line as a message to the client endpoint.
+/// Send a line as a message to the client endpoint, blocking if queue is full.
 fn send_line(client_ep: usize, data: &[u8]) {
     let pid = crate::task::current_pid();
     // Send in 64-byte chunks
@@ -147,9 +147,21 @@ fn send_line(client_ep: usize, data: &[u8]) {
         msg.data[..chunk_len].copy_from_slice(&data[offset..offset + chunk_len]);
         msg.len = chunk_len;
         msg.sender_pid = pid;
-        if let Ok(wake) = ipc::channel_send(client_ep, msg) {
-            if wake != 0 {
-                crate::task::wake_process(wake);
+        loop {
+            match ipc::channel_send(client_ep, msg.clone()) {
+                Ok(wake) => {
+                    if wake != 0 {
+                        crate::task::wake_process(wake);
+                    }
+                    break;
+                }
+                Err(ipc::SendError::QueueFull) => {
+                    if !ipc::channel_is_active(client_ep) { return; }
+                    ipc::channel_set_send_blocked(client_ep, pid);
+                    crate::task::block_process(pid);
+                    crate::task::schedule();
+                }
+                Err(_) => return, // channel closed
             }
         }
         offset += chunk_len;
@@ -174,7 +186,9 @@ pub fn serial_console_server() {
 
     // Wait for at least the first client endpoint via control channel
     loop {
-        match ipc::channel_recv(control_ep) {
+        let (msg, send_wake) = ipc::channel_recv(control_ep);
+        if send_wake != 0 { crate::task::wake_process(send_wake); }
+        match msg {
             Some(msg) => {
                 if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                     if client_count < MAX_CONSOLE_CLIENTS {
@@ -201,16 +215,23 @@ pub fn serial_console_server() {
     // Main loop
     loop {
         // Check control channel for new client registrations
-        while let Some(msg) = ipc::channel_recv(control_ep) {
-            if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                if client_count < MAX_CONSOLE_CLIENTS {
-                    let is_shell = msg.len >= 1 && msg.data[0] == 1;
-                    if is_shell {
-                        stdin_client = client_count;
+        loop {
+            let (msg, send_wake) = ipc::channel_recv(control_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            match msg {
+                Some(msg) => {
+                    if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
+                        if client_count < MAX_CONSOLE_CLIENTS {
+                            let is_shell = msg.len >= 1 && msg.data[0] == 1;
+                            if is_shell {
+                                stdin_client = client_count;
+                            }
+                            client_eps[client_count] = ep;
+                            client_count += 1;
+                        }
                     }
-                    client_eps[client_count] = ep;
-                    client_count += 1;
                 }
+                None => break,
             }
         }
 
@@ -245,7 +266,9 @@ pub fn serial_console_server() {
         let mut got_write = false;
         for i in 0..client_count {
             loop {
-                match ipc::channel_recv(client_eps[i]) {
+                let (msg, send_wake) = ipc::channel_recv(client_eps[i]);
+                if send_wake != 0 { crate::task::wake_process(send_wake); }
+                match msg {
                     Some(msg) => {
                         got_write = true;
                         if msg.len > 0 {
@@ -285,7 +308,9 @@ pub fn fb_console_server() {
 
     // Wait for at least the first client
     loop {
-        match ipc::channel_recv(control_ep) {
+        let (msg, send_wake) = ipc::channel_recv(control_ep);
+        if send_wake != 0 { crate::task::wake_process(send_wake); }
+        match msg {
             Some(msg) => {
                 if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                     if client_count < MAX_CONSOLE_CLIENTS {
@@ -311,16 +336,23 @@ pub fn fb_console_server() {
 
     loop {
         // Check control channel for new clients
-        while let Some(msg) = ipc::channel_recv(control_ep) {
-            if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                if client_count < MAX_CONSOLE_CLIENTS {
-                    let is_shell = msg.len >= 1 && msg.data[0] == 1;
-                    if is_shell {
-                        stdin_client = client_count;
+        loop {
+            let (msg, send_wake) = ipc::channel_recv(control_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            match msg {
+                Some(msg) => {
+                    if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
+                        if client_count < MAX_CONSOLE_CLIENTS {
+                            let is_shell = msg.len >= 1 && msg.data[0] == 1;
+                            if is_shell {
+                                stdin_client = client_count;
+                            }
+                            client_eps[client_count] = ep;
+                            client_count += 1;
+                        }
                     }
-                    client_eps[client_count] = ep;
-                    client_count += 1;
                 }
+                None => break,
             }
         }
 
@@ -352,7 +384,9 @@ pub fn fb_console_server() {
         let mut got_write = false;
         for i in 0..client_count {
             loop {
-                match ipc::channel_recv(client_eps[i]) {
+                let (msg, send_wake) = ipc::channel_recv(client_eps[i]);
+                if send_wake != 0 { crate::task::wake_process(send_wake); }
+                match msg {
                     Some(msg) => {
                         got_write = true;
                         if msg.len > 0 {

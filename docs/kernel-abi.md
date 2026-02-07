@@ -66,6 +66,7 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 202    | `SYS_CHAN_RECV`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 1, or `usize::MAX` | Non-blocking receive. 0=success, 1=empty, MAX=error.    |
 | 203    | `SYS_CHAN_CLOSE`       | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Closes a channel handle. Decrements the endpoint's ref count; deactivates only when the last handle is closed. |
 | 204    | `SYS_CHAN_RECV_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking receive. Suspends the process until a message arrives. |
+| 207    | `SYS_CHAN_SEND_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking send. Suspends the process if the queue is full until space is available. |
 | 222    | `SYS_MMAP`            | `a0` = hint (ignored), `a1` = length | `a0` = address or `usize::MAX` | Allocates zeroed pages and maps them into the process. |
 | 215    | `SYS_MUNMAP`          | `a0` = address, `a1` = length | `a0` = 0 or `usize::MAX`  | Unmaps and frees previously mmap'd pages.                  |
 | 230    | `SYS_TRACE`           | `a0` = label_ptr, `a1` = label_len | `a0` = 0 or `usize::MAX` | Records a timestamped trace event in the kernel ring buffer. |
@@ -150,6 +151,25 @@ if no message is available:
 4. The awakened process loops back and re-attempts the receive.
 
 Returns 0 on success, `usize::MAX` on error.
+
+#### SYS_CHAN_SEND_BLOCKING (207)
+
+Blocking send. Behaves like `SYS_CHAN_SEND` but suspends the calling process
+if the destination queue is full:
+
+1. Try to enqueue the message.
+2. If the queue is full, record this PID as "send-blocked" on the endpoint,
+   move the process to `Blocked` state, and invoke `schedule()`.
+3. When the receiver dequeues a message from this endpoint, `channel_recv`
+   detects the send-blocked PID and calls `wake_process()`, moving it back
+   to `Ready`.
+4. The awakened process loops back and re-attempts the send.
+
+This eliminates the yield-spin pattern of `SYS_CHAN_SEND` + `SYS_YIELD` retry
+loops, reducing context switches during bulk transfers.
+
+Returns 0 on success, `usize::MAX` on error (invalid handle, pointer, cap, or
+channel closed while blocked).
 
 #### SYS_CHAN_CLOSE (203)
 
@@ -354,10 +374,18 @@ Internally, endpoints are identified by global IDs:
 
 ### Blocking Semantics
 
-Each endpoint can have at most one blocked PID (`blocked_a` / `blocked_b`).
-When a process calls `SYS_CHAN_RECV_BLOCKING` on an empty queue, it records
-itself as blocked on that endpoint. When a sender enqueues a message, it
-checks for a blocked PID and wakes that process.
+Each endpoint can have at most one recv-blocked PID (`blocked_a` / `blocked_b`)
+and one send-blocked PID (`send_blocked_a` / `send_blocked_b`).
+
+**Recv blocking:** When a process calls `SYS_CHAN_RECV_BLOCKING` on an empty
+queue, it records itself as blocked on that endpoint. When a sender enqueues a
+message, it checks for a blocked PID and wakes that process.
+
+**Send blocking:** When a process calls `SYS_CHAN_SEND_BLOCKING` and the
+destination queue is full, it records itself as send-blocked on that endpoint.
+When a receiver dequeues a message, it checks for a send-blocked PID and wakes
+that process. A sender and receiver cannot both be blocked on the same channel
+simultaneously (that would require the queue to be both full and empty).
 
 ### Channel Closure
 

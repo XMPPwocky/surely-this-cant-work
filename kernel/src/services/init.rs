@@ -180,7 +180,9 @@ pub fn init_server() {
         let mut handled = false;
         for i in 0..count {
             let (boot_ep_b, console_type, is_shell) = endpoints[i];
-            if let Some(msg) = ipc::channel_recv(boot_ep_b) {
+            let (msg, send_wake) = ipc::channel_recv(boot_ep_b);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            if let Some(msg) = msg {
                 handle_request(boot_ep_b, console_type, is_shell, &msg, my_pid);
                 handled = true;
             }
@@ -397,7 +399,9 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
 fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
     match ctx.state {
         FsLaunchState::WaitStat => {
-            if let Some(resp) = ipc::channel_recv(ctx.ctl_ep) {
+            let (resp, send_wake) = ipc::channel_recv(ctx.ctl_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            if let Some(resp) = resp {
                 let tag = wire_read_u8(&resp.data, 0);
                 if tag != 0 {
                     crate::println!("[init] fs: stat {} failed", ctx.name);
@@ -423,7 +427,9 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
             }
         }
         FsLaunchState::WaitOpen => {
-            if let Some(resp) = ipc::channel_recv(ctx.ctl_ep) {
+            let (resp, send_wake) = ipc::channel_recv(ctx.ctl_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            if let Some(resp) = resp {
                 let tag = wire_read_u8(&resp.data, 0);
                 if tag != 0 || resp.cap == NO_CAP {
                     crate::println!("[init] fs: open {} failed", ctx.name);
@@ -459,7 +465,9 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
             let mut progress = false;
             // Drain all available chunks in one go for throughput
             loop {
-                match ipc::channel_recv(ctx.file_ep) {
+                let (resp, send_wake) = ipc::channel_recv(ctx.file_ep);
+                if send_wake != 0 { crate::task::wake_process(send_wake); }
+                match resp {
                     Some(resp) => {
                         progress = true;
                         if resp.len < 3 {

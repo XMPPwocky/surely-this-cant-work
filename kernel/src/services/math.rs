@@ -64,7 +64,9 @@ pub fn math_service() {
     loop {
         // Wait for a new client endpoint from init server
         let client_ep = loop {
-            match ipc::channel_recv(control_ep) {
+            let (msg, send_wake) = ipc::channel_recv(control_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            match msg {
                 Some(msg) => {
                     if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                         break ep;
@@ -80,7 +82,9 @@ pub fn math_service() {
 
         // Wait for one request from this client
         let msg = loop {
-            match ipc::channel_recv(client_ep) {
+            let (msg, send_wake) = ipc::channel_recv(client_ep);
+            if send_wake != 0 { crate::task::wake_process(send_wake); }
+            match msg {
                 Some(msg) => break msg,
                 None => {
                     ipc::channel_set_blocked(client_ep, my_pid);

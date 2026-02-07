@@ -8,6 +8,7 @@ pub const SYS_CHAN_SEND: usize = 201;
 pub const SYS_CHAN_RECV: usize = 202;
 pub const SYS_CHAN_CLOSE: usize = 203;
 pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
+pub const SYS_CHAN_SEND_BLOCKING: usize = 207;
 pub const SYS_TRACE: usize = 230;
 
 /// No capability sentinel value.
@@ -108,14 +109,13 @@ pub fn sys_trace(label: &[u8]) -> usize {
     syscall2(SYS_TRACE, label.as_ptr() as usize, label.len())
 }
 
-/// Send a message, retrying with yield on queue-full (error code 5).
+/// Blocking send on a channel handle. Blocks if queue is full.
+pub fn sys_chan_send_blocking(handle: usize, msg: &Message) -> usize {
+    syscall2(SYS_CHAN_SEND_BLOCKING, handle, msg as *const Message as usize)
+}
+
+/// Send a message, blocking if queue is full.
 pub fn sys_chan_send_retry(handle: usize, msg: &Message) -> usize {
-    loop {
-        let rc = sys_chan_send(handle, msg);
-        if rc != 5 {
-            return rc;
-        }
-        sys_yield();
-    }
+    sys_chan_send_blocking(handle, msg)
 }
 
