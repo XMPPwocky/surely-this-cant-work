@@ -19,13 +19,18 @@ The process handle is **not** a direct kernel-to-watcher channel. Instead:
 
 ## Wire Format
 
-All messages use `rvos-wire` serialization.
+All messages use `rvos-wire` serialization. The type is defined in
+`rvos-proto::process::ExitNotification`.
 
-### ExitNotification (init → watcher)
+### ExitNotification (kernel → init, init → watcher)
 
-| Field       | Type   | Description                     |
-|-------------|--------|---------------------------------|
-| exit_code   | `i32`  | Process exit code (0 = success) |
+```rust
+define_message! {
+    pub struct ExitNotification {
+        exit_code: i32,
+    }
+}
+```
 
 A single message is sent when the process exits, then the channel is closed
 from both sides.
@@ -50,13 +55,13 @@ from both sides.
 ```
 # Shell runs: run /bin/hello-std
 
-Shell → init (boot channel):  u8(1) + str("/bin/hello-std")
-Init  → shell (boot channel): u8(0), cap=<process handle>
+Shell → init (boot channel):  BootRequest::Spawn { path: "/bin/hello-std" }
+Init  → shell (boot channel): BootResponse::Ok {}, cap=<process handle>
 
 # ... hello-std runs and eventually calls sys_exit ...
 
-Kernel → init (notify channel): i32(0)
-Init   → shell (process handle): i32(0)
+Kernel → init (notify channel): ExitNotification { exit_code: 0 }
+Init   → shell (process handle): ExitNotification { exit_code: 0 }
 
 # Shell prints: "Process exited with code 0"
 ```

@@ -6,6 +6,14 @@ version = 4
 name = "rvos"
 version = "0.1.0"
 dependencies = [
+ "rvos-proto",
+ "rvos-wire",
+]
+
+[[package]]
+name = "rvos-proto"
+version = "0.1.0"
+dependencies = [
  "rvos-wire",
 ]
 

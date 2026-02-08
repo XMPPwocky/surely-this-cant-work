@@ -8,3 +8,6 @@
 
 pub mod math;
 pub mod fs;
+pub mod sysinfo;
+pub mod boot;
+pub mod process;

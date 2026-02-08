@@ -3,26 +3,24 @@ use std::io::{self, Read, Write};
 use rvos::raw;
 use rvos::Message;
 use rvos::UserTransport;
-use rvos::rvos_wire::Reader;
+use rvos::rvos_wire;
+use rvos::rvos_proto;
+use rvos_proto::boot::{BootRequest, BootResponse};
 use rvos_proto::math::MathClient;
+use rvos_proto::sysinfo::SysinfoCommand;
 
 /// Request a service from the init server via boot channel (handle 0).
-/// Uses the boot channel protocol (rvos-wire tagged format).
-fn request_service(name: &[u8]) -> usize {
-    let msg = Message::build(rvos::NO_CAP, |w| {
-        let _ = w.write_u8(0); // tag: ConnectService
-        let _ = w.write_bytes(name);
-    });
+fn request_service(name: &str) -> usize {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&BootRequest::ConnectService { name }, &mut msg.data)
+        .unwrap_or(0);
     raw::sys_chan_send(0, &msg);
     let mut reply = Message::new();
     raw::sys_chan_recv_blocking(0, &mut reply);
-    // Parse response: u8(tag). Tag 0 = Ok, 1 = Error.
-    let mut r = reply.reader();
-    let tag = r.read_u8().unwrap_or(1);
-    if tag != 0 {
-        return usize::MAX; // error
+    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+        Ok(BootResponse::Ok {}) => reply.cap,
+        _ => usize::MAX,
     }
-    reply.cap
 }
 
 fn cmd_echo(line: &str) {
@@ -123,17 +121,15 @@ fn cmd_stat(args: &str) {
     }
 }
 
-fn cmd_trace(args: &str) {
-    let sysinfo_handle = request_service(b"sysinfo");
+fn send_sysinfo_cmd(cmd: &SysinfoCommand) {
+    let sysinfo_handle = request_service("sysinfo");
     if sysinfo_handle == usize::MAX {
         println!("Error: could not connect to sysinfo");
         return;
     }
 
-    let cmd_str = if args.trim() == "clear" { b"TRACECLR" as &[u8] } else { b"TRACE" as &[u8] };
     let mut msg = Message::new();
-    msg.data[..cmd_str.len()].copy_from_slice(cmd_str);
-    msg.len = cmd_str.len();
+    msg.len = rvos_wire::to_bytes(cmd, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send(sysinfo_handle, &msg);
 
     loop {
@@ -147,58 +143,23 @@ fn cmd_trace(args: &str) {
     io::stdout().flush().ok();
 
     raw::sys_chan_close(sysinfo_handle);
+}
+
+fn cmd_trace(args: &str) {
+    let cmd = if args.trim() == "clear" {
+        SysinfoCommand::TraceClear {}
+    } else {
+        SysinfoCommand::Trace {}
+    };
+    send_sysinfo_cmd(&cmd);
 }
 
 fn cmd_ps() {
-    let sysinfo_handle = request_service(b"sysinfo");
-    if sysinfo_handle == usize::MAX {
-        println!("Error: could not connect to sysinfo");
-        return;
-    }
-
-    let mut msg = Message::new();
-    msg.data[0] = b'P';
-    msg.data[1] = b'S';
-    msg.len = 2;
-    raw::sys_chan_send(sysinfo_handle, &msg);
-
-    loop {
-        let mut resp = Message::new();
-        raw::sys_chan_recv_blocking(sysinfo_handle, &mut resp);
-        if resp.len == 0 {
-            break;
-        }
-        io::stdout().write_all(&resp.data[..resp.len]).ok();
-    }
-    io::stdout().flush().ok();
-
-    raw::sys_chan_close(sysinfo_handle);
+    send_sysinfo_cmd(&SysinfoCommand::Ps {});
 }
 
 fn cmd_mem() {
-    let sysinfo_handle = request_service(b"sysinfo");
-    if sysinfo_handle == usize::MAX {
-        println!("Error: could not connect to sysinfo");
-        return;
-    }
-
-    let mut msg = Message::new();
-    let cmd = b"MEMSTAT";
-    msg.data[..cmd.len()].copy_from_slice(cmd);
-    msg.len = cmd.len();
-    raw::sys_chan_send(sysinfo_handle, &msg);
-
-    loop {
-        let mut resp = Message::new();
-        raw::sys_chan_recv_blocking(sysinfo_handle, &mut resp);
-        if resp.len == 0 {
-            break;
-        }
-        io::stdout().write_all(&resp.data[..resp.len]).ok();
-    }
-    io::stdout().flush().ok();
-
-    raw::sys_chan_close(sysinfo_handle);
+    send_sysinfo_cmd(&SysinfoCommand::Memstat {});
 }
 
 fn cmd_math(args: &str) {
@@ -223,7 +184,7 @@ fn cmd_math(args: &str) {
         }
     };
 
-    let math_handle = request_service(b"math");
+    let math_handle = request_service("math");
     if math_handle == usize::MAX {
         println!("Error: could not connect to math");
         return;
@@ -257,23 +218,25 @@ fn cmd_run(args: &str) {
     }
 
     // Send Spawn request on boot channel (handle 0)
-    let msg = Message::build(rvos::NO_CAP, |w| {
-        let _ = w.write_u8(1); // tag: Spawn
-        let _ = w.write_str(path);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&BootRequest::Spawn { path }, &mut msg.data)
+        .unwrap_or(0);
     raw::sys_chan_send(0, &msg);
 
     // Wait for response
     let mut reply = Message::new();
     raw::sys_chan_recv_blocking(0, &mut reply);
 
-    let mut r = reply.reader();
-    let tag = r.read_u8().unwrap_or(1);
-    if tag != 0 {
-        // Error response
-        let err_msg = r.read_str().unwrap_or("unknown error");
-        println!("Spawn failed: {}", err_msg);
-        return;
+    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+        Ok(BootResponse::Ok {}) => {}
+        Ok(BootResponse::Error { message }) => {
+            println!("Spawn failed: {}", message);
+            return;
+        }
+        _ => {
+            println!("Spawn failed: bad response");
+            return;
+        }
     }
 
     if reply.cap == rvos::NO_CAP {
@@ -287,9 +250,13 @@ fn cmd_run(args: &str) {
     let mut exit_msg = Message::new();
     raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
 
-    // Parse exit notification: i32(exit_code)
-    let mut r = Reader::new(&exit_msg.data[..exit_msg.len]);
-    let exit_code = r.read_i32().unwrap_or(-1);
+    // Parse exit notification
+    let exit_code = match rvos_wire::from_bytes::<rvos_proto::process::ExitNotification>(
+        &exit_msg.data[..exit_msg.len],
+    ) {
+        Ok(notif) => notif.exit_code,
+        Err(_) => -1,
+    };
     println!("Process exited with code {}", exit_code);
 
     raw::sys_chan_close(proc_handle);

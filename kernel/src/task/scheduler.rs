@@ -436,8 +436,8 @@ pub fn exit_current_from_syscall() {
     // Send exit notification before closing handles (so the receiver wakes up)
     if notify_ep != 0 {
         let mut msg = crate::ipc::Message::new();
-        msg.data[0] = 0; // exit code (always 0 for now)
-        msg.len = 1;
+        let notif = rvos_proto::process::ExitNotification { exit_code: 0 };
+        msg.len = rvos_wire::to_bytes(&notif, &mut msg.data).unwrap_or(0);
         if let Ok(wake) = crate::ipc::channel_send(notify_ep, msg) {
             if wake != 0 {
                 crate::task::wake_process(wake);

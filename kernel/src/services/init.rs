@@ -4,13 +4,7 @@ use crate::sync::SpinLock;
 use crate::mm::heap::{InitAlloc, INIT_ALLOC};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use rvos_wire::{Reader, Writer};
-
-// Boot channel protocol tags (must match lib/rvos/src/service.rs)
-const REQ_CONNECT_SERVICE: u8 = 0;
-const REQ_SPAWN: u8 = 1;
-const RESP_OK: u8 = 0;
-const RESP_ERROR: u8 = 1;
+use rvos_proto::boot::{BootRequest, BootResponse};
 
 /// Console type for routing stdio requests
 #[derive(Clone, Copy, PartialEq)]
@@ -274,11 +268,11 @@ pub fn init_server() {
                 if let Some(msg) = msg {
                     handled = true;
                     // Forward exit code to watcher
-                    let exit_code = if msg.len >= 1 { msg.data[0] as i32 } else { -1 };
+                    let notif: rvos_proto::process::ExitNotification =
+                        rvos_wire::from_bytes(&msg.data[..msg.len])
+                            .unwrap_or(rvos_proto::process::ExitNotification { exit_code: -1 });
                     let mut fwd = Message::new();
-                    let mut w = Writer::new(&mut fwd.data);
-                    let _ = w.write_i32(exit_code);
-                    fwd.len = w.position();
+                    fwd.len = rvos_wire::to_bytes(&notif, &mut fwd.data).unwrap_or(0);
                     fwd.sender_pid = my_pid;
                     send_and_wake(ds.watcher_ep, fwd);
                     ipc::channel_close(ds.notify_ep);
@@ -324,9 +318,8 @@ fn handle_request(
 ) {
     crate::trace::trace_kernel(b"init-handle_req-enter");
 
-    let mut r = Reader::new(&msg.data[..msg.len]);
-    let tag = match r.read_u8() {
-        Ok(t) => t,
+    let req: BootRequest = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
+        Ok(r) => r,
         Err(_) => {
             send_error(boot_ep_b, "bad request", my_pid);
             crate::trace::trace_kernel(b"init-handle_req-exit");
@@ -334,16 +327,8 @@ fn handle_request(
         }
     };
 
-    match tag {
-        REQ_CONNECT_SERVICE => {
-            let name = match r.read_str() {
-                Ok(s) => s,
-                Err(_) => {
-                    send_error(boot_ep_b, "bad request", my_pid);
-                    crate::trace::trace_kernel(b"init-handle_req-exit");
-                    return;
-                }
-            };
+    match req {
+        BootRequest::ConnectService { name } => {
             if name == "stdio" {
                 handle_stdio_request(boot_ep_b, console_type, is_shell, my_pid);
             } else if let Some(svc) = find_named_service_by_name(name) {
@@ -352,19 +337,8 @@ fn handle_request(
                 send_error(boot_ep_b, "unknown service", my_pid);
             }
         }
-        REQ_SPAWN => {
-            let path = match r.read_str() {
-                Ok(s) => s,
-                Err(_) => {
-                    send_error(boot_ep_b, "bad request", my_pid);
-                    crate::trace::trace_kernel(b"init-handle_req-exit");
-                    return;
-                }
-            };
+        BootRequest::Spawn { path } => {
             handle_spawn_request(boot_ep_b, console_type, path, msg.cap, fs_launches, my_pid);
-        }
-        _ => {
-            send_error(boot_ep_b, "unknown request tag", my_pid);
         }
     }
 
@@ -574,9 +548,7 @@ fn handle_spawn_request(
 /// Send an Ok response with a capability on the boot channel.
 fn send_ok_with_cap(endpoint: usize, cap_ep: usize, my_pid: usize) {
     let mut resp = Message::new();
-    let mut w = Writer::new(&mut resp.data);
-    let _ = w.write_u8(RESP_OK);
-    resp.len = w.position();
+    resp.len = rvos_wire::to_bytes(&BootResponse::Ok {}, &mut resp.data).unwrap_or(0);
     resp.cap = ipc::encode_cap_channel(cap_ep);
     resp.sender_pid = my_pid;
     send_and_wake(endpoint, resp);
@@ -585,10 +557,7 @@ fn send_ok_with_cap(endpoint: usize, cap_ep: usize, my_pid: usize) {
 /// Send an Error response on the boot channel.
 fn send_error(endpoint: usize, error_msg: &str, my_pid: usize) {
     let mut resp = Message::new();
-    let mut w = Writer::new(&mut resp.data);
-    let _ = w.write_u8(RESP_ERROR);
-    let _ = w.write_str(error_msg);
-    resp.len = w.position();
+    resp.len = rvos_wire::to_bytes(&BootResponse::Error { message: error_msg }, &mut resp.data).unwrap_or(0);
     resp.sender_pid = my_pid;
     send_and_wake(endpoint, resp);
 }

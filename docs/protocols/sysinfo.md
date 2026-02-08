@@ -40,17 +40,26 @@ All subsequent operations use `sysinfo_handle`.
 
 ## Commands
 
-### PS — Process List
+Commands use the `SysinfoCommand` enum from `rvos-proto::sysinfo`, serialized
+with `rvos-wire`:
+
+```rust
+define_message! {
+    pub enum SysinfoCommand {
+        Ps(0) {},
+        Memstat(1) {},
+        Trace(2) {},
+        TraceClear(3) {},
+    }
+}
+```
+
+### Ps — Process List
 
 Returns a formatted text table of all processes with their PID, state,
 CPU usage (1-second and 1-minute EWMA), memory usage, and name.
 
-**Request:**
-
-```
-msg.data = "PS"
-msg.len  = 2
-```
+**Request:** `SysinfoCommand::Ps {}`
 
 **Response:** Chunked text (see [Response Format](#response-format)).
 
@@ -76,17 +85,12 @@ Example output:
 | MEM    | Total physical pages owned, in KiB (pages × 4K) |
 | NAME   | Process name (max 16 chars) |
 
-### MEMSTAT — Kernel Memory Statistics
+### Memstat — Kernel Memory Statistics
 
 Returns kernel heap statistics (per-tag breakdown) and per-process
 physical memory usage.
 
-**Request:**
-
-```
-msg.data = "MEMSTAT"
-msg.len  = 7
-```
+**Request:** `SysinfoCommand::Memstat {}`
 
 **Response:** Chunked text (see [Response Format](#response-format)).
 
@@ -110,30 +114,20 @@ Process memory:
     6  shell-serial       140K
 ```
 
-### TRACE — Read Trace Buffer
+### Trace — Read Trace Buffer
 
 Returns the contents of the kernel's trace ring buffer as formatted text.
 Each line contains a timestamp, PID, and trace label.
 
-**Request:**
-
-```
-msg.data = "TRACE"
-msg.len  = 5
-```
+**Request:** `SysinfoCommand::Trace {}`
 
 **Response:** Chunked text (see [Response Format](#response-format)).
 
-### TRACECLR — Clear Trace Buffer
+### TraceClear — Clear Trace Buffer
 
 Clears the kernel trace ring buffer and responds with `"ok\n"`.
 
-**Request:**
-
-```
-msg.data = "TRACECLR"
-msg.len  = 8
-```
+**Request:** `SysinfoCommand::TraceClear {}`
 
 **Response:** Chunked text containing `"ok\n"`.
 
@@ -163,7 +157,7 @@ No capabilities are transferred in sysinfo responses (`msg.cap = NO_CAP`).
 
 ## Connection Lifecycle
 
-1. Send a service name `"sysinfo"` on handle 0 to get a sysinfo channel.
+1. Send `BootRequest::ConnectService { name: "sysinfo" }` on handle 0 to get a sysinfo channel.
 2. Send exactly **one** command on the sysinfo channel.
 3. Read the chunked response until the zero-length sentinel.
 4. Close the sysinfo handle with `SYS_CHAN_CLOSE`.

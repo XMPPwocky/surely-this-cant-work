@@ -8,14 +8,19 @@ user process. The other end is held by the init server. It serves two purposes:
 
 ## Wire Format
 
-All messages use `rvos-wire` serialization.
+All messages use `rvos-wire` serialization. Types are defined in
+`rvos-proto::boot`.
 
 ### Request (client → init)
 
-| Tag | Name             | Payload          | Cap     |
-|-----|------------------|------------------|---------|
-| 0   | ConnectService   | `str(name)`      | NO_CAP  |
-| 1   | Spawn            | `str(path)`      | NO_CAP  |
+```rust
+define_message! {
+    pub enum BootRequest<'a> {
+        ConnectService(0) { name: &'a str },
+        Spawn(1) { path: &'a str },
+    }
+}
+```
 
 **ConnectService** requests a connection to a named service. `name` is an ASCII
 string like `"stdio"`, `"sysinfo"`, `"math"`, or `"fs"`. Init creates a fresh
@@ -28,12 +33,16 @@ handle channel the client can wait on.
 
 ### Response (init → client)
 
-| Tag | Name   | Payload          | Cap                          |
-|-----|--------|------------------|------------------------------|
-| 0   | Ok     | (empty)          | service channel or proc handle |
-| 1   | Error  | `str(message)`   | NO_CAP                       |
+```rust
+define_message! {
+    pub enum BootResponse<'a> {
+        Ok(0) {},
+        Error(1) { message: &'a str },
+    }
+}
+```
 
-**Ok** indicates success. The `cap` field contains a channel handle:
+**Ok** indicates success. The message `cap` field contains a channel handle:
 - For ConnectService: the client endpoint of the service channel
 - For Spawn: a process handle channel (see [process-handle.md](process-handle.md))
 
@@ -52,20 +61,20 @@ request/response format is identical to any other ConnectService.
 ### Connect to sysinfo
 
 ```
-Request:  u8(0) + str("sysinfo")     → tag=ConnectService, name="sysinfo"
-Response: u8(0)                        → tag=Ok, cap=<sysinfo channel handle>
+Request:  BootRequest::ConnectService { name: "sysinfo" }
+Response: BootResponse::Ok {}, cap=<sysinfo channel handle>
 ```
 
 ### Spawn a process
 
 ```
-Request:  u8(1) + str("/bin/hello-std") → tag=Spawn, path="/bin/hello-std"
-Response: u8(0)                          → tag=Ok, cap=<process handle channel>
+Request:  BootRequest::Spawn { path: "/bin/hello-std" }
+Response: BootResponse::Ok {}, cap=<process handle channel>
 ```
 
 ### Spawn error
 
 ```
-Request:  u8(1) + str("/bin/nonexistent")
-Response: u8(1) + str("not found")       → tag=Error
+Request:  BootRequest::Spawn { path: "/bin/nonexistent" }
+Response: BootResponse::Error { message: "not found" }
 ```

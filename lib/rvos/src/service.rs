@@ -4,14 +4,7 @@ use crate::channel::Channel;
 use crate::error::{SysError, SysResult};
 use crate::message::Message;
 use crate::raw;
-
-// Boot channel request tags
-const TAG_CONNECT_SERVICE: u8 = 0;
-const TAG_SPAWN: u8 = 1;
-
-// Boot channel response tags
-const TAG_OK: u8 = 0;
-const TAG_ERROR: u8 = 1;
+use rvos_proto::boot::{BootRequest, BootResponse};
 
 /// Connect to a named service via the boot channel (handle 0).
 ///
@@ -23,10 +16,9 @@ pub fn connect_to_service(name: &str) -> SysResult<Channel> {
 
 /// Connect to a named service via a specific boot handle.
 pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<Channel> {
-    let msg = Message::build(raw::NO_CAP, |w| {
-        let _ = w.write_u8(TAG_CONNECT_SERVICE);
-        let _ = w.write_str(name);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&BootRequest::ConnectService { name }, &mut msg.data)
+        .map_err(|_| SysError::BadAddress)?;
     let ret = raw::syscall2(
         raw::SYS_CHAN_SEND,
         boot_handle,
@@ -47,10 +39,9 @@ pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<Channe
     }
 
     // Parse response
-    let mut r = reply.reader();
-    let tag = r.read_u8().unwrap_or(TAG_ERROR);
-    if tag != TAG_OK {
-        return Err(SysError::NoResources);
+    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+        Ok(BootResponse::Ok {}) => {}
+        _ => return Err(SysError::NoResources),
     }
 
     if reply.cap() == raw::NO_CAP {
@@ -70,10 +61,9 @@ pub fn spawn_process(path: &str) -> SysResult<Channel> {
 
 /// Spawn a process via a specific boot handle.
 pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
-    let msg = Message::build(raw::NO_CAP, |w| {
-        let _ = w.write_u8(TAG_SPAWN);
-        let _ = w.write_str(path);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&BootRequest::Spawn { path }, &mut msg.data)
+        .map_err(|_| SysError::BadAddress)?;
     let ret = raw::syscall2(
         raw::SYS_CHAN_SEND,
         boot_handle,
@@ -94,11 +84,9 @@ pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
     }
 
     // Parse response
-    let mut r = reply.reader();
-    let tag = r.read_u8().unwrap_or(TAG_ERROR);
-    if tag != TAG_OK {
-        // Try to read error message for the caller
-        return Err(SysError::NoResources);
+    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+        Ok(BootResponse::Ok {}) => {}
+        _ => return Err(SysError::NoResources),
     }
 
     if reply.cap() == raw::NO_CAP {
@@ -118,10 +106,10 @@ pub fn spawn_process_with_cap(path: &str, cap_handle: usize) -> SysResult<Channe
 
 /// Spawn a process with an extra capability via a specific boot handle.
 pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usize) -> SysResult<Channel> {
-    let msg = Message::build(cap_handle, |w| {
-        let _ = w.write_u8(TAG_SPAWN);
-        let _ = w.write_str(path);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&BootRequest::Spawn { path }, &mut msg.data)
+        .map_err(|_| SysError::BadAddress)?;
+    msg.set_cap(cap_handle);
     let ret = raw::syscall2(
         raw::SYS_CHAN_SEND,
         boot_handle,
@@ -142,10 +130,9 @@ pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usi
     }
 
     // Parse response
-    let mut r = reply.reader();
-    let tag = r.read_u8().unwrap_or(TAG_ERROR);
-    if tag != TAG_OK {
-        return Err(SysError::NoResources);
+    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+        Ok(BootResponse::Ok {}) => {}
+        _ => return Err(SysError::NoResources),
     }
 
     if reply.cap() == raw::NO_CAP {
@@ -158,11 +145,8 @@ pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usi
 /// Read the error message from a boot channel Error response.
 /// Returns the error string from msg.data, or "unknown" if parsing fails.
 pub fn read_error_response(msg: &Message) -> &str {
-    let mut r = msg.reader();
-    let tag = r.read_u8().unwrap_or(0);
-    if tag == TAG_ERROR {
-        r.read_str().unwrap_or("unknown")
-    } else {
-        "unknown"
+    match rvos_wire::from_bytes::<BootResponse>(&msg.data[..msg.len]) {
+        Ok(BootResponse::Error { message }) => message,
+        _ => "unknown",
     }
 }

@@ -20,3 +20,4 @@ pub use raw::NO_CAP;
 pub use transport::UserTransport;
 
 pub use rvos_wire;
+pub use rvos_proto;

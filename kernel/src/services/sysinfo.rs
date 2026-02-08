@@ -3,6 +3,7 @@ use crate::mm::heap;
 use alloc::string::String;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use rvos_proto::sysinfo::SysinfoCommand;
 
 /// Control endpoint for sysinfo service (set by kmain before spawn)
 static SYSINFO_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -26,22 +27,32 @@ pub fn sysinfo_service() {
             None => continue, // client disconnected
         };
 
-        // Handle the request
-        let cmd = &msg.data[..msg.len];
-        if cmd == b"PS" {
-            let list = crate::task::process_list();
-            send_chunked(client.raw(), my_pid, list.as_bytes());
-        } else if cmd == b"TRACE" {
-            let text = crate::trace::trace_read();
-            send_chunked(client.raw(), my_pid, text.as_bytes());
-        } else if cmd == b"TRACECLR" {
-            crate::trace::trace_clear();
-            send_chunked(client.raw(), my_pid, b"ok\n");
-        } else if cmd == b"MEMSTAT" {
-            let text = format_memstat();
-            send_chunked(client.raw(), my_pid, text.as_bytes());
-        } else {
-            send_chunked(client.raw(), my_pid, b"Unknown command\n");
+        // Deserialize command
+        let cmd = match rvos_wire::from_bytes::<SysinfoCommand>(&msg.data[..msg.len]) {
+            Ok(cmd) => cmd,
+            Err(_) => {
+                send_chunked(client.raw(), my_pid, b"Unknown command\n");
+                continue;
+            }
+        };
+
+        match cmd {
+            SysinfoCommand::Ps {} => {
+                let list = crate::task::process_list();
+                send_chunked(client.raw(), my_pid, list.as_bytes());
+            }
+            SysinfoCommand::Memstat {} => {
+                let text = format_memstat();
+                send_chunked(client.raw(), my_pid, text.as_bytes());
+            }
+            SysinfoCommand::Trace {} => {
+                let text = crate::trace::trace_read();
+                send_chunked(client.raw(), my_pid, text.as_bytes());
+            }
+            SysinfoCommand::TraceClear {} => {
+                crate::trace::trace_clear();
+                send_chunked(client.raw(), my_pid, b"ok\n");
+            }
         }
         // OwnedEndpoint closes on drop at end of loop iteration
     }
