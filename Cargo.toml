@@ -1,6 +1,6 @@
 [workspace]
 members = ["kernel"]
-exclude = ["lib/rvos-wire", "vendor/rust"]
+exclude = ["lib/rvos-wire", "lib/rvos-proto", "vendor/rust"]
 resolver = "2"
 
 [profile.release]

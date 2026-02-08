@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvos-proto"
+version = "0.1.0"
+dependencies = [
+ "rvos-wire",
+]
+
+[[package]]
 name = "rvos-rt"
 version = "0.1.0"
 
@@ -22,5 +29,6 @@ name = "shell"
 version = "0.1.0"
 dependencies = [
  "rvos",
+ "rvos-proto",
  "rvos-rt",
 ]

@@ -2,35 +2,9 @@ use std::io::{self, Read, Write};
 
 use rvos::raw;
 use rvos::Message;
-use rvos::rvos_wire::{Deserialize, Reader, Serialize, WireError, Writer};
-
-// --- Math protocol types ---
-
-enum MathOp {
-    Add(u32, u32),
-    Mul(u32, u32),
-    Sub(u32, u32),
-}
-
-struct MathResponse {
-    answer: u32,
-}
-
-impl Serialize for MathOp {
-    fn serialize(&self, w: &mut Writer) -> Result<(), WireError> {
-        match self {
-            MathOp::Add(a, b) => { w.write_u8(0)?; w.write_u32(*a)?; w.write_u32(*b) }
-            MathOp::Mul(a, b) => { w.write_u8(1)?; w.write_u32(*a)?; w.write_u32(*b) }
-            MathOp::Sub(a, b) => { w.write_u8(2)?; w.write_u32(*a)?; w.write_u32(*b) }
-        }
-    }
-}
-
-impl<'a> Deserialize<'a> for MathResponse {
-    fn deserialize(r: &mut Reader<'a>) -> Result<Self, WireError> {
-        Ok(MathResponse { answer: r.read_u32()? })
-    }
-}
+use rvos::UserTransport;
+use rvos::rvos_wire::Reader;
+use rvos_proto::math::MathClient;
 
 /// Request a service from the init server via boot channel (handle 0).
 /// Uses the boot channel protocol (rvos-wire tagged format).
@@ -249,38 +223,26 @@ fn cmd_math(args: &str) {
         }
     };
 
-    let op = match parts[0] {
-        "add" => MathOp::Add(a, b),
-        "mul" => MathOp::Mul(a, b),
-        "sub" => MathOp::Sub(a, b),
-        _ => {
-            println!("Unknown op. Use add, mul, or sub.");
-            return;
-        }
-    };
-
     let math_handle = request_service(b"math");
     if math_handle == usize::MAX {
         println!("Error: could not connect to math");
         return;
     }
 
-    let mut msg = Message::new();
-    let mut writer = Writer::new(&mut msg.data);
-    if op.serialize(&mut writer).is_err() {
-        println!("Serialize error");
-        raw::sys_chan_close(math_handle);
-        return;
-    }
-    msg.len = writer.position();
-    raw::sys_chan_send(math_handle, &msg);
+    let mut client = MathClient::new(UserTransport::new(math_handle));
+    let result = match parts[0] {
+        "add" => client.add(a, b),
+        "mul" => client.mul(a, b),
+        "sub" => client.sub(a, b),
+        _ => {
+            println!("Unknown op. Use add, mul, or sub.");
+            raw::sys_chan_close(math_handle);
+            return;
+        }
+    };
 
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(math_handle, &mut resp);
-
-    let mut reader = Reader::new(&resp.data[..resp.len]);
-    match MathResponse::deserialize(&mut reader) {
-        Ok(r) => println!("{}", r.answer),
+    match result {
+        Ok(resp) => println!("{}", resp.answer),
         Err(_) => println!("Bad response from math service"),
     }
 

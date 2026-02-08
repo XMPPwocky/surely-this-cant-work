@@ -394,16 +394,28 @@ impl<'a> Deserialize<'a> for f64 {
     }
 }
 
-// &[u8] and &str: Serialize only (deserialization returns borrows via Reader methods)
+// &[u8] and &str: Serialize + Deserialize (zero-copy borrows)
 impl Serialize for [u8] {
     fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_bytes(self)
     }
 }
 
+impl<'a> Deserialize<'a> for &'a [u8] {
+    fn deserialize(r: &mut Reader<'a>) -> Result<Self, WireError> {
+        r.read_bytes()
+    }
+}
+
 impl Serialize for str {
     fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
         w.write_str(self)
+    }
+}
+
+impl<'a> Deserialize<'a> for &'a str {
+    fn deserialize(r: &mut Reader<'a>) -> Result<Self, WireError> {
+        r.read_str()
     }
 }
 
@@ -445,6 +457,614 @@ pub fn to_bytes<T: Serialize>(val: &T, buf: &mut [u8]) -> Result<usize, WireErro
 pub fn from_bytes<'a, T: Deserialize<'a>>(buf: &'a [u8]) -> Result<T, WireError> {
     let mut r = Reader::new(buf);
     T::deserialize(&mut r)
+}
+
+// ---------------------------------------------------------------------------
+// Transport trait and RPC helpers
+// ---------------------------------------------------------------------------
+
+/// Sentinel value meaning "no capability attached".
+pub const NO_CAP: usize = usize::MAX;
+
+/// Maximum message payload size in bytes.
+pub const MAX_MSG_SIZE: usize = 1024;
+
+/// Errors from RPC operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcError {
+    /// The underlying channel was closed.
+    ChannelClosed,
+    /// Serialization/deserialization error.
+    Wire(WireError),
+    /// The response had an unexpected variant or format.
+    Protocol,
+    /// Raw transport/syscall error code.
+    Transport(usize),
+}
+
+/// Abstraction over kernel-side and user-side IPC transports.
+///
+/// Implementors wrap a channel endpoint and provide send/recv.
+pub trait Transport {
+    /// Send `data` bytes with an optional capability.
+    /// Use `cap = NO_CAP` when no capability is attached.
+    fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError>;
+
+    /// Receive into `buf`. Returns `(bytes_received, cap)`.
+    fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError>;
+}
+
+/// Send a request and receive a response (no capabilities).
+///
+/// Serializes `req`, sends it, waits for a response, and deserializes it.
+pub fn rpc_call<'buf, T, Req, Resp>(
+    transport: &mut T,
+    req: &Req,
+    buf: &'buf mut [u8],
+) -> Result<Resp, RpcError>
+where
+    T: Transport,
+    Req: Serialize,
+    Resp: Deserialize<'buf>,
+{
+    // Serialize the request into a scratch area
+    let mut send_buf = [0u8; MAX_MSG_SIZE];
+    let n = to_bytes(req, &mut send_buf).map_err(RpcError::Wire)?;
+    transport.send(&send_buf[..n], NO_CAP)?;
+
+    // Receive the response
+    let (len, _cap) = transport.recv(buf)?;
+    let resp = from_bytes::<Resp>(&buf[..len]).map_err(RpcError::Wire)?;
+    Ok(resp)
+}
+
+/// Send a request with a capability and receive a response with a capability.
+///
+/// Like `rpc_call` but passes `cap` on send and returns the received cap.
+pub fn rpc_call_with_cap<'buf, T, Req, Resp>(
+    transport: &mut T,
+    req: &Req,
+    cap: usize,
+    buf: &'buf mut [u8],
+) -> Result<(Resp, usize), RpcError>
+where
+    T: Transport,
+    Req: Serialize,
+    Resp: Deserialize<'buf>,
+{
+    let mut send_buf = [0u8; MAX_MSG_SIZE];
+    let n = to_bytes(req, &mut send_buf).map_err(RpcError::Wire)?;
+    transport.send(&send_buf[..n], cap)?;
+
+    let (len, recv_cap) = transport.recv(buf)?;
+    let resp = from_bytes::<Resp>(&buf[..len]).map_err(RpcError::Wire)?;
+    Ok((resp, recv_cap))
+}
+
+/// Receive and deserialize a request (server side).
+///
+/// Returns `(request, cap)` where cap is the capability from the message.
+pub fn rpc_recv<'buf, T, Req>(
+    transport: &mut T,
+    buf: &'buf mut [u8],
+) -> Result<(Req, usize), RpcError>
+where
+    T: Transport,
+    Req: Deserialize<'buf>,
+{
+    let (len, cap) = transport.recv(buf)?;
+    let req = from_bytes::<Req>(&buf[..len]).map_err(RpcError::Wire)?;
+    Ok((req, cap))
+}
+
+/// Serialize and send a response (server side).
+pub fn rpc_reply<T, Resp>(
+    transport: &mut T,
+    resp: &Resp,
+    cap: usize,
+) -> Result<(), RpcError>
+where
+    T: Transport,
+    Resp: Serialize,
+{
+    let mut send_buf = [0u8; MAX_MSG_SIZE];
+    let n = to_bytes(resp, &mut send_buf).map_err(RpcError::Wire)?;
+    transport.send(&send_buf[..n], cap)
+}
+
+// ---------------------------------------------------------------------------
+// define_message! macro
+// ---------------------------------------------------------------------------
+
+/// Generate message structs/enums with `Serialize` and `Deserialize` impls.
+///
+/// # Struct form
+/// ```ignore
+/// define_message! {
+///     pub struct Point { x: u32, y: u32 }
+/// }
+/// ```
+///
+/// # Enum form (with explicit u8 tags)
+/// ```ignore
+/// define_message! {
+///     pub enum Shape {
+///         Circle(0) { radius: u32 },
+///         Rect(1) { w: u32, h: u32 },
+///         Empty(2) {},
+///     }
+/// }
+/// ```
+///
+/// # Lifetime-parameterized enum (for borrowed fields)
+/// ```ignore
+/// define_message! {
+///     pub enum FsRequest<'a> {
+///         Open(0) { flags: u8, path: &'a str },
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! define_message {
+    // ── Struct form (no lifetime) ────────────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $($field:ident : $fty:ty),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis struct $name {
+            $(pub $field: $fty),*
+        }
+
+        impl $crate::Serialize for $name {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                $(self.$field.serialize(w)?;)*
+                Ok(())
+            }
+        }
+
+        impl<'__de> $crate::Deserialize<'__de> for $name {
+            fn deserialize(r: &mut $crate::Reader<'__de>) -> Result<Self, $crate::WireError> {
+                Ok(Self {
+                    $($field: <$fty as $crate::Deserialize<'__de>>::deserialize(r)?),*
+                })
+            }
+        }
+    };
+
+    // ── Enum form (no lifetime) ──────────────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident ($tag:expr) { $($field:ident : $fty:ty),* $(,)? }
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis enum $name {
+            $(
+                $(#[$vmeta])*
+                $variant { $($field: $fty),* }
+            ),*
+        }
+
+        impl $crate::Serialize for $name {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                match self {
+                    $(
+                        $name::$variant { $($field),* } => {
+                            w.write_u8($tag)?;
+                            $($field.serialize(w)?;)*
+                            Ok(())
+                        }
+                    ),*
+                }
+            }
+        }
+
+        impl<'__de> $crate::Deserialize<'__de> for $name {
+            fn deserialize(r: &mut $crate::Reader<'__de>) -> Result<Self, $crate::WireError> {
+                let tag = r.read_u8()?;
+                match tag {
+                    $(
+                        $tag => {
+                            $(let $field = <$fty as $crate::Deserialize<'__de>>::deserialize(r)?;)*
+                            Ok($name::$variant { $($field),* })
+                        }
+                    ),*
+                    _ => Err($crate::WireError::InvalidTag(tag)),
+                }
+            }
+        }
+    };
+
+    // ── Enum form (with lifetime) ────────────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident <$lt:lifetime> {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident ($tag:expr) { $($field:ident : $fty:ty),* $(,)? }
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $vis enum $name<$lt> {
+            $(
+                $(#[$vmeta])*
+                $variant { $($field: $fty),* }
+            ),*
+        }
+
+        impl<$lt> $crate::Serialize for $name<$lt> {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                match self {
+                    $(
+                        $name::$variant { $($field),* } => {
+                            w.write_u8($tag)?;
+                            $($field.serialize(w)?;)*
+                            Ok(())
+                        }
+                    ),*
+                }
+            }
+        }
+
+        impl<$lt> $crate::Deserialize<$lt> for $name<$lt> {
+            fn deserialize(r: &mut $crate::Reader<$lt>) -> Result<Self, $crate::WireError> {
+                let tag = r.read_u8()?;
+                match tag {
+                    $(
+                        $tag => {
+                            $(let $field = <$fty as $crate::Deserialize<$lt>>::deserialize(r)?;)*
+                            Ok($name::$variant { $($field),* })
+                        }
+                    ),*
+                    _ => Err($crate::WireError::InvalidTag(tag)),
+                }
+            }
+        }
+    };
+
+    // ── Struct form (with lifetime) ──────────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident <$lt:lifetime> {
+            $($field:ident : $fty:ty),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy)]
+        $vis struct $name<$lt> {
+            $(pub $field: $fty),*
+        }
+
+        impl<$lt> $crate::Serialize for $name<$lt> {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                $(self.$field.serialize(w)?;)*
+                Ok(())
+            }
+        }
+
+        impl<$lt> $crate::Deserialize<$lt> for $name<$lt> {
+            fn deserialize(r: &mut $crate::Reader<$lt>) -> Result<Self, $crate::WireError> {
+                Ok(Self {
+                    $($field: <$fty as $crate::Deserialize<$lt>>::deserialize(r)?),*
+                })
+            }
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// define_protocol! macro
+// ---------------------------------------------------------------------------
+
+/// Generate a typed RPC client, server handler trait, and dispatch function
+/// from a protocol definition.
+///
+/// # Syntax
+///
+/// ```ignore
+/// define_protocol! {
+///     /// Math service protocol.
+///     pub protocol Math => MathClient, MathHandler, math_dispatch {
+///         type Request = MathRequest;
+///         type Response = MathResponse;
+///
+///         rpc add as Add(a: u32, b: u32) -> MathResponse;
+///         rpc mul as Mul(a: u32, b: u32) -> MathResponse;
+///     }
+/// }
+/// ```
+///
+/// The `=> ClientName, HandlerName, dispatch_fn` syntax provides the names
+/// of the generated items explicitly (since `macro_rules!` cannot concatenate
+/// or capitalize identifiers).
+///
+/// Each `rpc` line maps to one variant of the Request enum. The `as Variant`
+/// syntax provides the enum variant name.
+///
+/// Append `[+cap]` to a method to indicate it carries a capability:
+/// - Client method returns `Result<(Response, usize), RpcError>`
+/// - Uses `rpc_call_with_cap` instead of `rpc_call`
+///
+/// Without `[+cap]`, client method returns `Result<Response, RpcError>`.
+///
+/// The handler trait always returns `(Response, usize)` so handlers can
+/// attach capabilities on any method.
+#[macro_export]
+macro_rules! define_protocol {
+    // ── Arm 1: Request without lifetime, Response without lifetime ──
+    (
+        $(#[$meta:meta])*
+        $vis:vis protocol $name:ident =>
+            $client:ident, $handler:ident, $dispatch:ident
+        {
+            type Request = $req_ty:ident;
+            type Response = $resp_ty:ident;
+
+            $(
+                $(#[$method_meta:meta])*
+                rpc $method:ident as $variant:ident ($($arg:ident : $arg_ty:ty),* $(,)?)
+                    -> $ret_ty:ty $([$cap_ann:tt $cap_plus:tt])?;
+            )*
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $client<T: $crate::Transport> {
+            transport: T,
+            buf: [u8; $crate::MAX_MSG_SIZE],
+        }
+
+        impl<T: $crate::Transport> $client<T> {
+            pub fn new(transport: T) -> Self {
+                Self { transport, buf: [0u8; $crate::MAX_MSG_SIZE] }
+            }
+
+            pub fn into_inner(self) -> T {
+                self.transport
+            }
+
+            $(
+                $(#[$method_meta])*
+                $crate::__define_protocol_client_method!(
+                    $method, $variant, ($($arg : $arg_ty),*), $ret_ty, $req_ty
+                    $(, [$cap_ann $cap_plus])?
+                );
+            )*
+        }
+
+        $vis trait $handler {
+            $(
+                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+            )*
+        }
+
+        $vis fn $dispatch<T: $crate::Transport, H: $handler>(
+            transport: &mut T,
+            handler: &mut H,
+        ) -> Result<(), $crate::RpcError> {
+            let mut buf = [0u8; $crate::MAX_MSG_SIZE];
+            let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
+            let (resp, resp_cap) = match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            };
+            $crate::rpc_reply(transport, &resp, resp_cap)
+        }
+    };
+
+    // ── Arm 2: Request with lifetime, Response without lifetime ──
+    (
+        $(#[$meta:meta])*
+        $vis:vis protocol $name:ident =>
+            $client:ident, $handler:ident, $dispatch:ident
+        {
+            type Request<$lt:lifetime> = $req_ty:ident;
+            type Response = $resp_ty:ident;
+
+            $(
+                $(#[$method_meta:meta])*
+                rpc $method:ident as $variant:ident ($($arg:ident : $arg_ty:ty),* $(,)?)
+                    -> $ret_ty:ty $([$cap_ann:tt $cap_plus:tt])?;
+            )*
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $client<T: $crate::Transport> {
+            transport: T,
+            buf: [u8; $crate::MAX_MSG_SIZE],
+        }
+
+        impl<T: $crate::Transport> $client<T> {
+            pub fn new(transport: T) -> Self {
+                Self { transport, buf: [0u8; $crate::MAX_MSG_SIZE] }
+            }
+
+            pub fn into_inner(self) -> T {
+                self.transport
+            }
+
+            $(
+                $(#[$method_meta])*
+                $crate::__define_protocol_client_method!(
+                    $method, $variant, ($($arg : $arg_ty),*), $ret_ty, $req_ty
+                    $(, [$cap_ann $cap_plus])?
+                );
+            )*
+        }
+
+        $vis trait $handler {
+            $(
+                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+            )*
+        }
+
+        $vis fn $dispatch<T: $crate::Transport, H: $handler>(
+            transport: &mut T,
+            handler: &mut H,
+        ) -> Result<(), $crate::RpcError> {
+            let mut buf = [0u8; $crate::MAX_MSG_SIZE];
+            let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
+            let (resp, resp_cap) = match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            };
+            $crate::rpc_reply(transport, &resp, resp_cap)
+        }
+    };
+
+    // ── Arm 3: Request with lifetime, Response with lifetime ──
+    (
+        $(#[$meta:meta])*
+        $vis:vis protocol $name:ident =>
+            $client:ident, $handler:ident, $dispatch:ident
+        {
+            type Request<$lt:lifetime> = $req_ty:ident;
+            type Response<$lt2:lifetime> = $resp_ty:ident;
+
+            $(
+                $(#[$method_meta:meta])*
+                rpc $method:ident as $variant:ident ($($arg:ident : $arg_ty:ty),* $(,)?)
+                    -> $ret_ty:ty $([$cap_ann:tt $cap_plus:tt])?;
+            )*
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $client<T: $crate::Transport> {
+            transport: T,
+            buf: [u8; $crate::MAX_MSG_SIZE],
+        }
+
+        impl<T: $crate::Transport> $client<T> {
+            pub fn new(transport: T) -> Self {
+                Self { transport, buf: [0u8; $crate::MAX_MSG_SIZE] }
+            }
+
+            pub fn into_inner(self) -> T {
+                self.transport
+            }
+
+            $(
+                $(#[$method_meta])*
+                $crate::__define_protocol_client_method!(
+                    $method, $variant, ($($arg : $arg_ty),*), $ret_ty, $req_ty
+                    $(, [$cap_ann $cap_plus])?
+                );
+            )*
+        }
+
+        $vis trait $handler {
+            $(
+                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+            )*
+        }
+
+        $vis fn $dispatch<T: $crate::Transport, H: $handler>(
+            transport: &mut T,
+            handler: &mut H,
+        ) -> Result<(), $crate::RpcError> {
+            let mut buf = [0u8; $crate::MAX_MSG_SIZE];
+            let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
+            let (resp, resp_cap) = match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            };
+            $crate::rpc_reply(transport, &resp, resp_cap)
+        }
+    };
+
+    // ── Arm 4: Request without lifetime, Response with lifetime ──
+    (
+        $(#[$meta:meta])*
+        $vis:vis protocol $name:ident =>
+            $client:ident, $handler:ident, $dispatch:ident
+        {
+            type Request = $req_ty:ty;
+            type Response<$lt:lifetime> = $resp_ty:ident;
+
+            $(
+                $(#[$method_meta:meta])*
+                rpc $method:ident as $variant:ident ($($arg:ident : $arg_ty:ty),* $(,)?)
+                    -> $ret_ty:ty $([$cap_ann:tt $cap_plus:tt])?;
+            )*
+        }
+    ) => {
+        $(#[$meta])*
+        $vis struct $client<T: $crate::Transport> {
+            transport: T,
+            buf: [u8; $crate::MAX_MSG_SIZE],
+        }
+
+        impl<T: $crate::Transport> $client<T> {
+            pub fn new(transport: T) -> Self {
+                Self { transport, buf: [0u8; $crate::MAX_MSG_SIZE] }
+            }
+
+            pub fn into_inner(self) -> T {
+                self.transport
+            }
+
+            $(
+                $(#[$method_meta])*
+                $crate::__define_protocol_client_method!(
+                    $method, $variant, ($($arg : $arg_ty),*), $ret_ty, $req_ty
+                    $(, [$cap_ann $cap_plus])?
+                );
+            )*
+        }
+
+        $vis trait $handler {
+            $(
+                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+            )*
+        }
+
+        $vis fn $dispatch<T: $crate::Transport, H: $handler>(
+            transport: &mut T,
+            handler: &mut H,
+        ) -> Result<(), $crate::RpcError> {
+            let mut buf = [0u8; $crate::MAX_MSG_SIZE];
+            let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
+            let (resp, resp_cap) = match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            };
+            $crate::rpc_reply(transport, &resp, resp_cap)
+        }
+    };
+}
+
+// ── Internal: single client method, dispatch by [+cap] presence ──
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __define_protocol_client_method {
+    // With [+cap]
+    ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident, [+ cap]) => {
+        pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<($ret_ty, usize), $crate::RpcError> {
+            let req = $req_ty::$variant { $($arg),* };
+            $crate::rpc_call_with_cap(&mut self.transport, &req, $crate::NO_CAP, &mut self.buf)
+        }
+    };
+    // Without [+cap]
+    ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident) => {
+        pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<$ret_ty, $crate::RpcError> {
+            let req = $req_ty::$variant { $($arg),* };
+            $crate::rpc_call(&mut self.transport, &req, &mut self.buf)
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -942,5 +1562,527 @@ mod tests {
         r.read_u64().unwrap();
         assert_eq!(r.position(), 13);
         assert_eq!(r.remaining(), 0);
+    }
+
+    // --- Tests for new Deserialize impls ---
+
+    // 21. Deserialize &str
+    #[test]
+    fn test_deserialize_str() {
+        let mut buf = [0u8; 64];
+        // Serialize via str (unsized), then deserialize back to &str
+        let mut w = Writer::new(&mut buf);
+        "hello world".serialize(&mut w).unwrap();
+        let n = w.position();
+        let s: &str = from_bytes(&buf[..n]).unwrap();
+        assert_eq!(s, "hello world");
+    }
+
+    // 22. Deserialize &[u8]
+    #[test]
+    fn test_deserialize_bytes() {
+        let mut buf = [0u8; 64];
+        let data: &[u8] = &[1, 2, 3, 4, 5];
+        let mut w = Writer::new(&mut buf);
+        data.serialize(&mut w).unwrap();
+        let n = w.position();
+        let result: &[u8] = from_bytes(&buf[..n]).unwrap();
+        assert_eq!(result, &[1, 2, 3, 4, 5]);
+    }
+
+    // --- Tests for define_message! macro ---
+
+    // 23. define_message! struct
+    #[test]
+    fn test_define_message_struct() {
+        define_message! {
+            pub struct Point { x: u32, y: u32 }
+        }
+
+        let p = Point { x: 10, y: 20 };
+        let mut buf = [0u8; 32];
+        let n = to_bytes(&p, &mut buf).unwrap();
+        assert_eq!(n, 8); // 4 + 4
+
+        let p2: Point = from_bytes(&buf[..n]).unwrap();
+        assert_eq!(p2.x, 10);
+        assert_eq!(p2.y, 20);
+    }
+
+    // 24. define_message! enum with multiple variants
+    #[test]
+    fn test_define_message_enum() {
+        define_message! {
+            pub enum Shape {
+                Circle(0) { radius: u32 },
+                Rect(1) { w: u32, h: u32 },
+            }
+        }
+
+        let circle = Shape::Circle { radius: 5 };
+        let mut buf = [0u8; 32];
+        let n = to_bytes(&circle, &mut buf).unwrap();
+        assert_eq!(n, 5); // 1 tag + 4
+
+        let s: Shape = from_bytes(&buf[..n]).unwrap();
+        match s {
+            Shape::Circle { radius } => assert_eq!(radius, 5),
+            _ => panic!("wrong variant"),
+        }
+
+        let rect = Shape::Rect { w: 3, h: 4 };
+        let n = to_bytes(&rect, &mut buf).unwrap();
+        let s: Shape = from_bytes(&buf[..n]).unwrap();
+        match s {
+            Shape::Rect { w, h } => { assert_eq!(w, 3); assert_eq!(h, 4); }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // 25. define_message! unit variant (empty fields)
+    #[test]
+    fn test_define_message_unit_variant() {
+        define_message! {
+            pub enum Status {
+                Ok(0) {},
+                Error(1) { code: u32 },
+            }
+        }
+
+        let ok = Status::Ok {};
+        let mut buf = [0u8; 32];
+        let n = to_bytes(&ok, &mut buf).unwrap();
+        assert_eq!(n, 1); // just the tag
+
+        let s: Status = from_bytes(&buf[..n]).unwrap();
+        match s {
+            Status::Ok {} => {}
+            _ => panic!("wrong variant"),
+        }
+
+        let err = Status::Error { code: 404 };
+        let n = to_bytes(&err, &mut buf).unwrap();
+        let s: Status = from_bytes(&buf[..n]).unwrap();
+        match s {
+            Status::Error { code } => assert_eq!(code, 404),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // 26. define_message! with borrowed fields
+    #[test]
+    fn test_define_message_borrowed() {
+        define_message! {
+            pub enum Cmd<'a> {
+                Open(0) { flags: u8, path: &'a str },
+                Data(1) { chunk: &'a [u8] },
+            }
+        }
+
+        let open = Cmd::Open { flags: 3, path: "/foo" };
+        let mut buf = [0u8; 64];
+        let n = to_bytes(&open, &mut buf).unwrap();
+        // 1 tag + 1 flags + 2 len + 4 path = 8
+        assert_eq!(n, 8);
+
+        let cmd: Cmd = from_bytes(&buf[..n]).unwrap();
+        match cmd {
+            Cmd::Open { flags, path } => {
+                assert_eq!(flags, 3);
+                assert_eq!(path, "/foo");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let data = Cmd::Data { chunk: &[10, 20, 30] };
+        let n = to_bytes(&data, &mut buf).unwrap();
+        let cmd: Cmd = from_bytes(&buf[..n]).unwrap();
+        match cmd {
+            Cmd::Data { chunk } => assert_eq!(chunk, &[10, 20, 30]),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // 27. define_message! invalid tag returns error
+    #[test]
+    fn test_define_message_invalid_tag() {
+        define_message! {
+            pub enum Op {
+                Add(0) { a: u32, b: u32 },
+            }
+        }
+
+        let buf = [99u8]; // invalid tag
+        let result: Result<Op, _> = from_bytes(&buf);
+        assert_eq!(result, Err(WireError::InvalidTag(99)));
+    }
+
+    // --- Tests for RPC helpers ---
+
+    // 28. MockTransport + rpc_call roundtrip
+    #[test]
+    fn test_rpc_roundtrip() {
+        define_message! {
+            pub enum MathReq {
+                Add(0) { a: u32, b: u32 },
+            }
+        }
+
+        define_message! {
+            pub struct MathResp { answer: u32 }
+        }
+
+        // MockTransport stores sent data and returns pre-loaded response
+        struct MockTransport {
+            sent_buf: [u8; MAX_MSG_SIZE],
+            sent_len: usize,
+            sent_cap: usize,
+            recv_buf: [u8; MAX_MSG_SIZE],
+            recv_len: usize,
+            recv_cap: usize,
+        }
+
+        impl Transport for MockTransport {
+            fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
+                self.sent_buf[..data.len()].copy_from_slice(data);
+                self.sent_len = data.len();
+                self.sent_cap = cap;
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
+                Ok((self.recv_len, self.recv_cap))
+            }
+        }
+
+        // Pre-compute the response bytes
+        let resp = MathResp { answer: 42 };
+        let mut recv_buf = [0u8; MAX_MSG_SIZE];
+        let resp_len = to_bytes(&resp, &mut recv_buf).unwrap();
+
+        let mut transport = MockTransport {
+            sent_buf: [0u8; MAX_MSG_SIZE],
+            sent_len: 0,
+            sent_cap: 0,
+            recv_buf,
+            recv_len: resp_len,
+            recv_cap: NO_CAP,
+        };
+
+        let req = MathReq::Add { a: 3, b: 4 };
+        let mut buf = [0u8; MAX_MSG_SIZE];
+        let result: MathResp = rpc_call(&mut transport, &req, &mut buf).unwrap();
+        assert_eq!(result.answer, 42);
+
+        // Verify the request was serialized correctly
+        let sent_req: MathReq = from_bytes(&transport.sent_buf[..transport.sent_len]).unwrap();
+        match sent_req {
+            MathReq::Add { a, b } => { assert_eq!(a, 3); assert_eq!(b, 4); }
+            _ => panic!("wrong variant sent"),
+        }
+    }
+
+    // 29. RPC with capability passthrough
+    #[test]
+    fn test_rpc_with_cap() {
+        define_message! {
+            pub struct Ping { val: u32 }
+        }
+        define_message! {
+            pub struct Pong { val: u32 }
+        }
+
+        struct CapTransport {
+            recv_buf: [u8; 32],
+            recv_len: usize,
+            recv_cap: usize,
+            last_cap: usize,
+        }
+
+        impl Transport for CapTransport {
+            fn send(&mut self, _data: &[u8], cap: usize) -> Result<(), RpcError> {
+                self.last_cap = cap;
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
+                Ok((self.recv_len, self.recv_cap))
+            }
+        }
+
+        let mut recv_buf = [0u8; 32];
+        let resp = Pong { val: 99 };
+        let resp_len = to_bytes(&resp, &mut recv_buf).unwrap();
+
+        let mut transport = CapTransport {
+            recv_buf,
+            recv_len: resp_len,
+            recv_cap: 42,
+            last_cap: 0,
+        };
+
+        let req = Ping { val: 1 };
+        let mut buf = [0u8; MAX_MSG_SIZE];
+        let (result, cap): (Pong, usize) =
+            rpc_call_with_cap(&mut transport, &req, 7, &mut buf).unwrap();
+
+        assert_eq!(result.val, 99);
+        assert_eq!(cap, 42);         // received cap
+        assert_eq!(transport.last_cap, 7); // sent cap
+    }
+
+    // 30. rpc_recv + rpc_reply server-side roundtrip
+    #[test]
+    fn test_rpc_recv_reply() {
+        define_message! {
+            pub struct Req { x: u32 }
+        }
+        define_message! {
+            pub struct Resp { y: u32 }
+        }
+
+        struct BufTransport {
+            data: [u8; MAX_MSG_SIZE],
+            len: usize,
+            cap: usize,
+        }
+
+        impl Transport for BufTransport {
+            fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
+                self.data[..data.len()].copy_from_slice(data);
+                self.len = data.len();
+                self.cap = cap;
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.len].copy_from_slice(&self.data[..self.len]);
+                Ok((self.len, self.cap))
+            }
+        }
+
+        // Simulate client sending a request
+        let req = Req { x: 10 };
+        let mut data = [0u8; MAX_MSG_SIZE];
+        let req_len = to_bytes(&req, &mut data).unwrap();
+
+        let mut transport = BufTransport {
+            data,
+            len: req_len,
+            cap: NO_CAP,
+        };
+
+        // Server receives
+        let mut buf = [0u8; MAX_MSG_SIZE];
+        let (received, _cap): (Req, _) = rpc_recv(&mut transport, &mut buf).unwrap();
+        assert_eq!(received.x, 10);
+
+        // Server replies
+        let resp = Resp { y: 20 };
+        rpc_reply(&mut transport, &resp, NO_CAP).unwrap();
+
+        // Verify reply was stored
+        let reply: Resp = from_bytes(&transport.data[..transport.len]).unwrap();
+        assert_eq!(reply.y, 20);
+    }
+
+    // --- Tests for define_protocol! macro ---
+
+    // 31. define_protocol! client sends correct request
+    #[test]
+    fn test_define_protocol_client() {
+        define_message! {
+            pub enum CalcReq {
+                Add(0) { a: u32, b: u32 },
+                Neg(1) { a: u32 },
+            }
+        }
+
+        define_message! {
+            pub struct CalcResp { result: u32 }
+        }
+
+        // MockTransport captures sent request and returns pre-loaded response
+        struct MockTransport {
+            sent_buf: [u8; MAX_MSG_SIZE],
+            sent_len: usize,
+            recv_buf: [u8; MAX_MSG_SIZE],
+            recv_len: usize,
+        }
+
+        impl Transport for MockTransport {
+            fn send(&mut self, data: &[u8], _cap: usize) -> Result<(), RpcError> {
+                self.sent_buf[..data.len()].copy_from_slice(data);
+                self.sent_len = data.len();
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
+                Ok((self.recv_len, NO_CAP))
+            }
+        }
+
+        define_protocol! {
+            pub protocol Calc => CalcClient, CalcHandler, calc_dispatch {
+                type Request = CalcReq;
+                type Response = CalcResp;
+
+                rpc add as Add(a: u32, b: u32) -> CalcResp;
+                rpc neg as Neg(a: u32) -> CalcResp;
+            }
+        }
+
+        // Pre-load a response
+        let resp = CalcResp { result: 7 };
+        let mut recv_buf = [0u8; MAX_MSG_SIZE];
+        let recv_len = to_bytes(&resp, &mut recv_buf).unwrap();
+
+        let transport = MockTransport {
+            sent_buf: [0u8; MAX_MSG_SIZE],
+            sent_len: 0,
+            recv_buf,
+            recv_len,
+        };
+
+        let mut client = CalcClient::new(transport);
+        let result = client.add(3, 4).unwrap();
+        assert_eq!(result.result, 7);
+
+        // Verify the request was serialized correctly
+        let sent_req: CalcReq = from_bytes(
+            &client.transport.sent_buf[..client.transport.sent_len]
+        ).unwrap();
+        match sent_req {
+            CalcReq::Add { a, b } => { assert_eq!(a, 3); assert_eq!(b, 4); }
+            _ => panic!("wrong variant sent"),
+        }
+    }
+
+    // 32. define_protocol! handler dispatch roundtrip
+    #[test]
+    fn test_define_protocol_handler_dispatch() {
+        define_message! {
+            pub enum OpReq {
+                Double(0) { val: u32 },
+                Inc(1) { val: u32 },
+            }
+        }
+
+        define_message! {
+            pub struct OpResp { out: u32 }
+        }
+
+        define_protocol! {
+            pub protocol Op => OpClient, OpHandler, op_dispatch {
+                type Request = OpReq;
+                type Response = OpResp;
+
+                rpc double as Double(val: u32) -> OpResp;
+                rpc inc as Inc(val: u32) -> OpResp;
+            }
+        }
+
+        struct OpImpl;
+        impl OpHandler for OpImpl {
+            fn double(&mut self, val: u32) -> (OpResp, usize) {
+                (OpResp { out: val * 2 }, NO_CAP)
+            }
+            fn inc(&mut self, val: u32) -> (OpResp, usize) {
+                (OpResp { out: val + 1 }, NO_CAP)
+            }
+        }
+
+        // Loopback transport: recv returns request, send captures response
+        struct LoopbackTransport {
+            req_buf: [u8; MAX_MSG_SIZE],
+            req_len: usize,
+            resp_buf: [u8; MAX_MSG_SIZE],
+            resp_len: usize,
+            resp_cap: usize,
+        }
+
+        impl Transport for LoopbackTransport {
+            fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
+                self.resp_buf[..data.len()].copy_from_slice(data);
+                self.resp_len = data.len();
+                self.resp_cap = cap;
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.req_len].copy_from_slice(&self.req_buf[..self.req_len]);
+                Ok((self.req_len, NO_CAP))
+            }
+        }
+
+        // Serialize a request
+        let req = OpReq::Double { val: 21 };
+        let mut req_buf = [0u8; MAX_MSG_SIZE];
+        let req_len = to_bytes(&req, &mut req_buf).unwrap();
+
+        let mut transport = LoopbackTransport {
+            req_buf,
+            req_len,
+            resp_buf: [0u8; MAX_MSG_SIZE],
+            resp_len: 0,
+            resp_cap: 0,
+        };
+
+        let mut handler = OpImpl;
+        op_dispatch(&mut transport, &mut handler).unwrap();
+
+        // Verify the response
+        let resp: OpResp = from_bytes(&transport.resp_buf[..transport.resp_len]).unwrap();
+        assert_eq!(resp.out, 42);
+        assert_eq!(transport.resp_cap, NO_CAP);
+    }
+
+    // 33. define_protocol! with [+cap] annotation
+    #[test]
+    fn test_define_protocol_cap() {
+        define_message! {
+            pub enum FileReq {
+                Open(0) { flags: u8 },
+            }
+        }
+
+        define_message! {
+            pub struct FileResp { ok: u8 }
+        }
+
+        define_protocol! {
+            pub protocol File => FileClient, FileHandler, file_dispatch {
+                type Request = FileReq;
+                type Response = FileResp;
+
+                rpc open as Open(flags: u8) -> FileResp [+cap];
+            }
+        }
+
+        // MockTransport returns response with a capability
+        struct MockTransport {
+            recv_buf: [u8; MAX_MSG_SIZE],
+            recv_len: usize,
+        }
+
+        impl Transport for MockTransport {
+            fn send(&mut self, _data: &[u8], _cap: usize) -> Result<(), RpcError> {
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
+                Ok((self.recv_len, 42)) // cap = 42
+            }
+        }
+
+        let resp = FileResp { ok: 1 };
+        let mut recv_buf = [0u8; MAX_MSG_SIZE];
+        let recv_len = to_bytes(&resp, &mut recv_buf).unwrap();
+
+        let transport = MockTransport { recv_buf, recv_len };
+        let mut client = FileClient::new(transport);
+
+        // [+cap] method returns (Response, cap)
+        let (result, cap) = client.open(0x01).unwrap();
+        assert_eq!(result.ok, 1);
+        assert_eq!(cap, 42);
     }
 }
