@@ -16,6 +16,7 @@ const MAX_OPEN_FILES: usize = 16;
 const FLAG_CREATE: u8 = 0x01;
 const FLAG_TRUNCATE: u8 = 0x02;
 const FLAG_EXCL: u8 = 0x04;
+const FLAG_APPEND: u8 = 0x08;
 
 // Error codes
 const ERR_NOT_FOUND: u8 = 1;
@@ -148,6 +149,7 @@ struct OpenFile {
     endpoint_handle: usize,
     inode: usize,
     active: bool,
+    append: bool,
 }
 
 struct Filesystem {
@@ -160,7 +162,7 @@ impl Filesystem {
     fn new() -> Self {
         let mut fs = Filesystem {
             inodes: [const { Inode::new_empty() }; MAX_FILES],
-            open_files: [const { OpenFile { endpoint_handle: 0, inode: 0, active: false } }; MAX_OPEN_FILES],
+            open_files: [const { OpenFile { endpoint_handle: 0, inode: 0, active: false, append: false } }; MAX_OPEN_FILES],
             open_count: 0,
         };
         // Inode 0 is the root directory
@@ -346,12 +348,21 @@ impl Filesystem {
         );
     }
 
-    fn register_open_file(&mut self, endpoint_handle: usize, inode: usize) -> bool {
+    fn register_open_file(&mut self, endpoint_handle: usize, inode: usize, append: bool) -> bool {
         for i in 0..MAX_OPEN_FILES {
             if !self.open_files[i].active {
-                self.open_files[i] = OpenFile { endpoint_handle, inode, active: true };
+                self.open_files[i] = OpenFile { endpoint_handle, inode, active: true, append };
                 self.open_count += 1;
                 return true;
+            }
+        }
+        false
+    }
+
+    fn is_append(&self, endpoint_handle: usize) -> bool {
+        for i in 0..MAX_OPEN_FILES {
+            if self.open_files[i].active && self.open_files[i].endpoint_handle == endpoint_handle {
+                return self.open_files[i].append;
             }
         }
         false
@@ -549,7 +560,7 @@ fn handle_read(file_handle: usize, inode_idx: usize, r: &mut Reader) {
 }
 
 fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
-    let offset = match r.read_u64() {
+    let client_offset = match r.read_u64() {
         Ok(v) => v as usize,
         Err(_) => {
             send_file_error(file_handle, ERR_IO);
@@ -566,7 +577,11 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
     };
 
     let fs = fs();
+    let is_append_mode = fs.is_append(file_handle);
     let inode = &mut fs.inodes[inode_idx];
+
+    // In append mode, always write at the end of the file
+    let offset = if is_append_mode { inode.data_len } else { client_offset };
 
     if inode.read_only {
         send_file_error(file_handle, ERR_READ_ONLY);
@@ -889,6 +904,7 @@ fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
     let create = flags & FLAG_CREATE != 0;
     let truncate = flags & FLAG_TRUNCATE != 0;
     let excl = flags & FLAG_EXCL != 0;
+    let append = flags & FLAG_APPEND != 0;
 
     let client_handle = client.ctl_handle;
     let fs = fs();
@@ -970,7 +986,7 @@ fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
     // Create channel pair for file I/O
     let (my_handle, client_file_handle) = raw::sys_chan_create();
 
-    if !fs.register_open_file(my_handle, inode_idx) {
+    if !fs.register_open_file(my_handle, inode_idx, append) {
         raw::sys_chan_close(my_handle);
         raw::sys_chan_close(client_file_handle);
         send_error(client_handle, ERR_IO);

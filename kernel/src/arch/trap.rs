@@ -254,7 +254,13 @@ fn trace_syscall(pid: usize, num: usize, a0: usize, a1: usize, ret: usize) {
 /// SYS_CHAN_CREATE: create a bidirectional channel pair.
 /// Returns handle_a in a0, handle_b in a1.
 fn sys_chan_create(tf: &mut TrapFrame) {
-    let (ep_a, ep_b) = crate::ipc::channel_create_pair();
+    let (ep_a, ep_b) = match crate::ipc::channel_create_pair() {
+        Some(pair) => pair,
+        None => {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
+    };
     let handle_a = match crate::task::current_process_alloc_handle(HandleObject::Channel(ep_a)) {
         Some(h) => h,
         None => {
@@ -289,6 +295,9 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
 
     // Read message from user space via translated PA (kernel identity-maps all RAM)
     let mut msg = unsafe { core::ptr::read(msg_pa as *const crate::ipc::Message) };
+
+    // Clamp msg.len to prevent OOB slicing on untrusted user data
+    msg.len = msg.len.min(crate::ipc::MAX_MSG_SIZE);
 
     // Set sender PID
     msg.sender_pid = crate::task::current_pid();
@@ -470,6 +479,8 @@ fn sys_chan_send_blocking(tf: &mut TrapFrame) {
 
     // Read message from user space
     let mut msg = unsafe { core::ptr::read(msg_pa as *const crate::ipc::Message) };
+    // Clamp msg.len to prevent OOB slicing on untrusted user data
+    msg.len = msg.len.min(crate::ipc::MAX_MSG_SIZE);
     msg.sender_pid = crate::task::current_pid();
 
     // Translate cap if present

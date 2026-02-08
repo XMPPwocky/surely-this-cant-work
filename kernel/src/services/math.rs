@@ -62,36 +62,12 @@ pub fn math_service() {
     let my_pid = crate::task::current_pid();
 
     loop {
-        // Wait for a new client endpoint from init server
-        let client_ep = loop {
-            let (msg, send_wake) = ipc::channel_recv(control_ep);
-            if send_wake != 0 { crate::task::wake_process(send_wake); }
-            match msg {
-                Some(msg) => {
-                    if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                        break ep;
-                    }
-                }
-                None => {
-                    ipc::channel_set_blocked(control_ep, my_pid);
-                    crate::task::block_process(my_pid);
-                    crate::task::schedule();
-                }
-            }
-        };
+        let client = ipc::OwnedEndpoint::new(ipc::accept_client(control_ep, my_pid));
 
         // Wait for one request from this client
-        let msg = loop {
-            let (msg, send_wake) = ipc::channel_recv(client_ep);
-            if send_wake != 0 { crate::task::wake_process(send_wake); }
-            match msg {
-                Some(msg) => break msg,
-                None => {
-                    ipc::channel_set_blocked(client_ep, my_pid);
-                    crate::task::block_process(my_pid);
-                    crate::task::schedule();
-                }
-            }
+        let msg = match ipc::channel_recv_blocking(client.raw(), my_pid) {
+            Some(msg) => msg,
+            None => continue, // client disconnected
         };
 
         // Deserialize MathOp
@@ -101,19 +77,13 @@ pub fn math_service() {
             Ok(MathOp::Mul(a, b)) => a.wrapping_mul(b),
             Ok(MathOp::Sub(a, b)) => a.wrapping_sub(b),
             Err(_) => {
-                // Send error response
                 let mut resp = Message::new();
                 let err = b"bad request";
                 resp.data[..err.len()].copy_from_slice(err);
                 resp.len = err.len();
                 resp.sender_pid = my_pid;
-                if let Ok(wake) = ipc::channel_send(client_ep, resp) {
-                    if wake != 0 {
-                        crate::task::wake_process(wake);
-                    }
-                }
-                ipc::channel_close(client_ep);
-                continue;
+                let _ = ipc::channel_send_blocking(client.raw(), &resp, my_pid);
+                continue; // OwnedEndpoint closes on drop
             }
         };
 
@@ -124,13 +94,7 @@ pub fn math_service() {
         let _ = response.serialize(&mut writer);
         resp.len = writer.position();
         resp.sender_pid = my_pid;
-        if let Ok(wake) = ipc::channel_send(client_ep, resp) {
-            if wake != 0 {
-                crate::task::wake_process(wake);
-            }
-        }
-
-        // Close our endpoint so the channel can be freed once the client closes theirs.
-        ipc::channel_close(client_ep);
+        let _ = ipc::channel_send_blocking(client.raw(), &resp, my_pid);
+        // OwnedEndpoint closes on drop at end of loop iteration
     }
 }

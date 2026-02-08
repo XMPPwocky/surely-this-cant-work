@@ -183,16 +183,18 @@ fn ep_to_channel(endpoint: usize) -> (usize, bool) {
 }
 
 /// Create a bidirectional channel pair.
-/// Returns (ep_a, ep_b) — two global endpoint IDs.
-pub fn channel_create_pair() -> (usize, usize) {
+/// Returns Some((ep_a, ep_b)) — two global endpoint IDs, or None if all
+/// channel slots are exhausted.
+pub fn channel_create_pair() -> Option<(usize, usize)> {
     let mut mgr = CHANNELS.lock();
     for (i, slot) in mgr.channels.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(Channel::new());
-            return (i * 2, i * 2 + 1);
+            return Some((i * 2, i * 2 + 1));
         }
     }
-    panic!("No free channels");
+    crate::println!("[ipc] channel_create_pair: all {} slots exhausted", MAX_CHANNELS);
+    None
 }
 
 /// Send a message on an endpoint.
@@ -330,9 +332,33 @@ pub fn channel_set_send_blocked(endpoint: usize, pid: usize) {
     }
 }
 
+/// Blocking send for kernel tasks. Blocks the calling kernel task until the
+/// message is sent or the channel is closed. Returns Ok(()) on success, or
+/// Err(SendError::ChannelClosed) if the channel closed before sending.
+pub fn channel_send_blocking(endpoint: usize, msg: &Message, pid: usize) -> Result<(), SendError> {
+    loop {
+        match channel_send_ref(endpoint, msg) {
+            Ok(wake) => {
+                if wake != 0 {
+                    crate::task::wake_process(wake);
+                }
+                return Ok(());
+            }
+            Err(SendError::QueueFull) => {
+                if !channel_is_active(endpoint) {
+                    return Err(SendError::ChannelClosed);
+                }
+                channel_set_send_blocked(endpoint, pid);
+                crate::task::block_process(pid);
+                crate::task::schedule();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Blocking receive for kernel tasks. Blocks the calling kernel task until
 /// a message arrives or the channel is closed (returns None on close).
-#[allow(dead_code)]
 pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
     loop {
         let (msg, send_wake) = channel_recv(endpoint);
@@ -348,6 +374,46 @@ pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
         channel_set_blocked(endpoint, pid);
         crate::task::block_process(pid);
         crate::task::schedule();
+    }
+}
+
+/// Wait for a client endpoint from a service's control channel.
+/// Blocks until a message carrying a channel capability arrives.
+pub fn accept_client(control_ep: usize, pid: usize) -> usize {
+    loop {
+        match channel_recv_blocking(control_ep, pid) {
+            Some(msg) => {
+                if let Some(ep) = decode_cap_channel(msg.cap) {
+                    return ep;
+                }
+                // Message without channel cap — ignore and keep waiting
+            }
+            None => {
+                // Control channel closed (shouldn't happen for kernel services)
+                crate::task::block_process(pid);
+                crate::task::schedule();
+            }
+        }
+    }
+}
+
+/// RAII wrapper around a channel endpoint. Calls `channel_close` on drop.
+/// Prevents the leak bug class where services forget to close client endpoints.
+pub struct OwnedEndpoint(usize);
+
+impl OwnedEndpoint {
+    pub fn new(ep: usize) -> Self {
+        OwnedEndpoint(ep)
+    }
+
+    pub fn raw(&self) -> usize {
+        self.0
+    }
+}
+
+impl Drop for OwnedEndpoint {
+    fn drop(&mut self) {
+        channel_close(self.0);
     }
 }
 

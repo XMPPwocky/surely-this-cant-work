@@ -139,32 +139,15 @@ fn write_fb(data: &[u8]) {
 /// Send a line as a message to the client endpoint, blocking if queue is full.
 fn send_line(client_ep: usize, data: &[u8]) {
     let pid = crate::task::current_pid();
-    // Send in 64-byte chunks
-    let mut offset = 0;
-    while offset < data.len() {
-        let chunk_len = (data.len() - offset).min(64);
+    // Send in MAX_MSG_SIZE-byte chunks with blocking backpressure
+    for chunk in data.chunks(ipc::MAX_MSG_SIZE) {
         let mut msg = Message::new();
-        msg.data[..chunk_len].copy_from_slice(&data[offset..offset + chunk_len]);
-        msg.len = chunk_len;
+        msg.data[..chunk.len()].copy_from_slice(chunk);
+        msg.len = chunk.len();
         msg.sender_pid = pid;
-        loop {
-            match ipc::channel_send(client_ep, msg.clone()) {
-                Ok(wake) => {
-                    if wake != 0 {
-                        crate::task::wake_process(wake);
-                    }
-                    break;
-                }
-                Err(ipc::SendError::QueueFull) => {
-                    if !ipc::channel_is_active(client_ep) { return; }
-                    ipc::channel_set_send_blocked(client_ep, pid);
-                    crate::task::block_process(pid);
-                    crate::task::schedule();
-                }
-                Err(_) => return, // channel closed
-            }
+        if ipc::channel_send_blocking(client_ep, &msg, pid).is_err() {
+            return; // channel closed
         }
-        offset += chunk_len;
     }
 }
 

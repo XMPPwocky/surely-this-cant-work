@@ -410,7 +410,13 @@ fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
 /// Creates a channel pair, sends the server endpoint to the service's control channel,
 /// and responds to the client with the client endpoint.
 fn handle_service_request(boot_ep_b: usize, svc: &NamedService, my_pid: usize) {
-    let (client_ep, server_ep) = ipc::channel_create_pair();
+    let (client_ep, server_ep) = match ipc::channel_create_pair() {
+        Some(pair) => pair,
+        None => {
+            send_error(boot_ep_b, "no channels", my_pid);
+            return;
+        }
+    };
 
     let ctl_ep = svc.control_ep.load(Ordering::Relaxed);
     if ctl_ep != usize::MAX {
@@ -429,7 +435,13 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, my_pid: usize) {
 
 fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, my_pid: usize) {
     // Create a new bidirectional channel for the client <-> console server
-    let (client_ep, server_ep) = ipc::channel_create_pair();
+    let (client_ep, server_ep) = match ipc::channel_create_pair() {
+        Some(pair) => pair,
+        None => {
+            send_error(boot_ep_b, "no channels", my_pid);
+            return;
+        }
+    };
 
     // Find the control endpoint for the appropriate console server
     let control_ep = {
@@ -501,7 +513,13 @@ fn handle_spawn_request(
         return;
     }
 
-    let (my_ctl_ep, server_ep) = ipc::channel_create_pair();
+    let (my_ctl_ep, server_ep) = match ipc::channel_create_pair() {
+        Some(pair) => pair,
+        None => {
+            send_error(boot_ep_b, "no channels", my_pid);
+            return;
+        }
+    };
 
     // Send the server endpoint to the fs service via its control channel
     let mut ctl_msg = Message::new();
@@ -575,13 +593,11 @@ fn send_error(endpoint: usize, error_msg: &str, my_pid: usize) {
     send_and_wake(endpoint, resp);
 }
 
-/// Send a message and wake the receiver if one was blocked.
+/// Send a message, blocking if the queue is full. Uses the kernel-side
+/// blocking send to prevent silent drops on critical control messages.
 fn send_and_wake(endpoint: usize, msg: Message) {
-    if let Ok(wake) = ipc::channel_send(endpoint, msg) {
-        if wake != 0 {
-            crate::task::wake_process(wake);
-        }
-    }
+    let my_pid = crate::task::current_pid();
+    let _ = ipc::channel_send_blocking(endpoint, &msg, my_pid);
 }
 
 fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
@@ -621,7 +637,13 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
         if slot_idx >= MAX_FS_LAUNCHES { break; }
         if requires_gpu && !gpu { continue; }
 
-        let (my_ctl_ep, server_ep) = ipc::channel_create_pair();
+        let (my_ctl_ep, server_ep) = match ipc::channel_create_pair() {
+            Some(pair) => pair,
+            None => {
+                crate::println!("[init] no channels for fs launch of {}", name);
+                continue;
+            }
+        };
 
         // Send the server endpoint to the fs service via its control channel
         let mut ctl_msg = Message::new();
@@ -839,12 +861,29 @@ fn finish_fs_launch(
     crate::println!("[init] Loaded {} from fs ({} bytes)", ctx.name(), ctx.data.len());
 
     // Create boot channel
-    let (boot_a, boot_b) = ipc::channel_create_pair();
+    let (boot_a, boot_b) = match ipc::channel_create_pair() {
+        Some(pair) => pair,
+        None => {
+            crate::println!("[init] no channels for boot of {}", ctx.name());
+            if ctx.requester_ep != 0 {
+                send_error(ctx.requester_ep, "no channels", my_pid);
+            }
+            ctx.state = FsLaunchState::Done;
+            return;
+        }
+    };
     register_boot(boot_b, ctx.console_type, false);
 
     let pid = if let Some(svc_name) = ctx.service_name {
         // This program is a named service: give it a control channel as handle 1
-        let (init_svc_ep, svc_ctl_ep) = ipc::channel_create_pair();
+        let (init_svc_ep, svc_ctl_ep) = match ipc::channel_create_pair() {
+            Some(pair) => pair,
+            None => {
+                crate::println!("[init] no channels for service {}", svc_name);
+                ctx.state = FsLaunchState::Done;
+                return;
+            }
+        };
         register_service(svc_name, init_svc_ep);
         crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, svc_ctl_ep)
     } else if ctx.extra_cap != 0 {
@@ -856,11 +895,29 @@ fn finish_fs_launch(
     // If this is a dynamic spawn, set up exit notification and respond to requester
     if ctx.requester_ep != 0 {
         // Kernel notification channel: kernel sends exit code here
-        let (init_notify_ep, kernel_ep) = ipc::channel_create_pair();
+        let (init_notify_ep, kernel_ep) = match ipc::channel_create_pair() {
+            Some(pair) => pair,
+            None => {
+                crate::println!("[init] no channels for exit notify");
+                send_error(ctx.requester_ep, "no channels", my_pid);
+                ctx.state = FsLaunchState::Done;
+                return;
+            }
+        };
         crate::task::set_exit_notify_ep(pid, kernel_ep);
 
         // Watcher channel: init forwards exit code to the requester
-        let (client_handle_ep, init_watcher_ep) = ipc::channel_create_pair();
+        let (client_handle_ep, init_watcher_ep) = match ipc::channel_create_pair() {
+            Some(pair) => pair,
+            None => {
+                crate::println!("[init] no channels for watcher");
+                ipc::channel_close(init_notify_ep);
+                ipc::channel_close(kernel_ep);
+                send_error(ctx.requester_ep, "no channels", my_pid);
+                ctx.state = FsLaunchState::Done;
+                return;
+            }
+        };
 
         // Register in dyn_spawns table
         let mut registered = false;

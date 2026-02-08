@@ -37,41 +37,17 @@ pub fn gpu_server() {
         width, height, fb_pages, shm_id);
 
     // Wait for a client endpoint from init (via control channel)
-    let client_ep = loop {
-        let (msg, send_wake) = ipc::channel_recv(control_ep);
-        if send_wake != 0 { crate::task::wake_process(send_wake); }
-        match msg {
-            Some(msg) => {
-                if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                    break ep;
-                }
-            }
-            None => {
-                ipc::channel_set_blocked(control_ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
-            }
-        }
-    };
+    let client_ep = ipc::accept_client(control_ep, my_pid);
 
     crate::println!("[gpu-server] client connected");
 
     // Main loop: serve requests from the single client
     loop {
-        let msg = loop {
-            let (msg, send_wake) = ipc::channel_recv(client_ep);
-            if send_wake != 0 { crate::task::wake_process(send_wake); }
-            match msg {
-                Some(msg) => break msg,
-                None => {
-                    if !ipc::channel_is_active(client_ep) {
-                        crate::println!("[gpu-server] client disconnected");
-                        return;
-                    }
-                    ipc::channel_set_blocked(client_ep, my_pid);
-                    crate::task::block_process(my_pid);
-                    crate::task::schedule();
-                }
+        let msg = match ipc::channel_recv_blocking(client_ep, my_pid) {
+            Some(msg) => msg,
+            None => {
+                crate::println!("[gpu-server] client disconnected");
+                return;
             }
         };
 
@@ -126,19 +102,5 @@ pub fn gpu_server() {
 
 fn send_msg(ep: usize, msg: Message) {
     let my_pid = crate::task::current_pid();
-    loop {
-        match ipc::channel_send(ep, msg.clone()) {
-            Ok(wake) => {
-                if wake != 0 { crate::task::wake_process(wake); }
-                return;
-            }
-            Err(ipc::SendError::QueueFull) => {
-                if !ipc::channel_is_active(ep) { return; }
-                ipc::channel_set_send_blocked(ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
-            }
-            Err(_) => return,
-        }
-    }
+    let _ = ipc::channel_send_blocking(ep, &msg, my_pid);
 }

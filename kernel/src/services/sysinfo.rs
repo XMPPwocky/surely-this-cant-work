@@ -18,59 +18,32 @@ pub fn sysinfo_service() {
     let my_pid = crate::task::current_pid();
 
     loop {
-        // Wait for a new client endpoint from init server
-        let client_ep = loop {
-            let (msg, send_wake) = ipc::channel_recv(control_ep);
-            if send_wake != 0 { crate::task::wake_process(send_wake); }
-            match msg {
-                Some(msg) => {
-                    if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                        break ep;
-                    }
-                }
-                None => {
-                    ipc::channel_set_blocked(control_ep, my_pid);
-                    crate::task::block_process(my_pid);
-                    crate::task::schedule();
-                }
-            }
-        };
+        let client = ipc::OwnedEndpoint::new(ipc::accept_client(control_ep, my_pid));
 
         // Wait for one request from this client
-        let msg = loop {
-            let (msg, send_wake) = ipc::channel_recv(client_ep);
-            if send_wake != 0 { crate::task::wake_process(send_wake); }
-            match msg {
-                Some(msg) => break msg,
-                None => {
-                    ipc::channel_set_blocked(client_ep, my_pid);
-                    crate::task::block_process(my_pid);
-                    crate::task::schedule();
-                }
-            }
+        let msg = match ipc::channel_recv_blocking(client.raw(), my_pid) {
+            Some(msg) => msg,
+            None => continue, // client disconnected
         };
 
         // Handle the request
         let cmd = &msg.data[..msg.len];
         if cmd == b"PS" {
             let list = crate::task::process_list();
-            send_chunked(client_ep, my_pid, list.as_bytes());
+            send_chunked(client.raw(), my_pid, list.as_bytes());
         } else if cmd == b"TRACE" {
             let text = crate::trace::trace_read();
-            send_chunked(client_ep, my_pid, text.as_bytes());
+            send_chunked(client.raw(), my_pid, text.as_bytes());
         } else if cmd == b"TRACECLR" {
             crate::trace::trace_clear();
-            send_chunked(client_ep, my_pid, b"ok\n");
+            send_chunked(client.raw(), my_pid, b"ok\n");
         } else if cmd == b"MEMSTAT" {
             let text = format_memstat();
-            send_chunked(client_ep, my_pid, text.as_bytes());
+            send_chunked(client.raw(), my_pid, text.as_bytes());
         } else {
-            send_chunked(client_ep, my_pid, b"Unknown command\n");
+            send_chunked(client.raw(), my_pid, b"Unknown command\n");
         }
-
-        // Done with this client — close our endpoint so the channel can be freed
-        // once the client closes their side too.
-        ipc::channel_close(client_ep);
+        // OwnedEndpoint closes on drop at end of loop iteration
     }
 }
 
@@ -130,21 +103,5 @@ fn format_memstat() -> String {
 /// Send a message, blocking if the queue is full.
 fn send_with_backpressure(ep: usize, msg: Message) {
     let my_pid = crate::task::current_pid();
-    loop {
-        match ipc::channel_send(ep, msg.clone()) {
-            Ok(wake) => {
-                if wake != 0 {
-                    crate::task::wake_process(wake);
-                }
-                return;
-            }
-            Err(ipc::SendError::QueueFull) => {
-                if !ipc::channel_is_active(ep) { return; }
-                ipc::channel_set_send_blocked(ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
-            }
-            Err(_) => return, // channel closed, give up
-        }
-    }
+    let _ = ipc::channel_send_blocking(ep, &msg, my_pid);
 }

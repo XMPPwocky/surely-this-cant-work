@@ -119,7 +119,7 @@ pub extern "C" fn kmain() -> ! {
     // ---- Phase 5: Create channels and spawn services ----
 
     // Init server <-> serial console: control channel
-    let (init_serial_ep, serial_ctl_ep) = ipc::channel_create_pair();
+    let (init_serial_ep, serial_ctl_ep) = ipc::channel_create_pair().expect("boot: serial channel");
     services::console::set_serial_control_ep(serial_ctl_ep);
 
     // Tell init server whether GPU is available (controls fs-loaded program launches)
@@ -129,12 +129,12 @@ pub extern "C" fn kmain() -> ! {
     // When GPU is present, the window server replaces fb-con + shell-fb
     let init_fb_ep = if gpu_present {
         // GPU server kernel task
-        let (init_gpu_ep, gpu_ctl_ep) = ipc::channel_create_pair();
+        let (init_gpu_ep, gpu_ctl_ep) = ipc::channel_create_pair().expect("boot: gpu channel");
         services::gpu_server::set_control_ep(gpu_ctl_ep);
         services::init::register_service("gpu", init_gpu_ep);
 
         // Keyboard server kernel task
-        let (init_kbd_ep, kbd_ctl_ep) = ipc::channel_create_pair();
+        let (init_kbd_ep, kbd_ctl_ep) = ipc::channel_create_pair().expect("boot: kbd channel");
         services::kbd_server::set_control_ep(kbd_ctl_ep);
         services::init::register_service("kbd", init_kbd_ep);
 
@@ -145,21 +145,21 @@ pub extern "C" fn kmain() -> ! {
     };
 
     // Sysinfo control channel
-    let (init_sysinfo_ep, sysinfo_ctl_ep) = ipc::channel_create_pair();
+    let (init_sysinfo_ep, sysinfo_ctl_ep) = ipc::channel_create_pair().expect("boot: sysinfo channel");
     services::sysinfo::set_control_ep(sysinfo_ctl_ep);
     services::init::set_sysinfo_control_ep(init_sysinfo_ep);
 
     // Math service control channel
-    let (init_math_ep, math_ctl_ep) = ipc::channel_create_pair();
+    let (init_math_ep, math_ctl_ep) = ipc::channel_create_pair().expect("boot: math channel");
     services::math::set_control_ep(math_ctl_ep);
     services::init::set_math_control_ep(init_math_ep);
 
     // Filesystem service: control channel goes to a user-space fs server
-    let (init_fs_ep, fs_ctl_ep) = ipc::channel_create_pair();
+    let (init_fs_ep, fs_ctl_ep) = ipc::channel_create_pair().expect("boot: fs channel");
     services::init::set_fs_control_ep(init_fs_ep);
 
     // Boot channels for shells
-    let (shell_serial_boot_a, shell_serial_boot_b) = ipc::channel_create_pair();
+    let (shell_serial_boot_a, shell_serial_boot_b) = ipc::channel_create_pair().expect("boot: shell channel");
     services::init::register_boot(shell_serial_boot_b, services::init::ConsoleType::Serial, true);
 
     // FB shell only in non-GPU mode (when GPU present, window-server replaces it)
@@ -184,7 +184,7 @@ pub extern "C" fn kmain() -> ! {
     task::spawn_named(services::math::math_service, "math");
 
     // Spawn fs server as a user process with boot channel + control channel
-    let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair();
+    let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair().expect("boot: fs-boot channel");
     services::init::register_boot(fs_boot_b, services::init::ConsoleType::Serial, false);
     task::spawn_user_elf_with_handles(user_fs_code(), "fs", fs_boot_a, fs_ctl_ep);
 
