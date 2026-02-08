@@ -6,6 +6,7 @@
 use crate::ipc::{self, Message};
 use crate::drivers::tty;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use rvos_proto::kbd::KbdEvent;
 
 /// Control endpoint for kbd service (set by kmain before spawn)
 static KBD_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -13,10 +14,6 @@ static KBD_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
 pub fn set_control_ep(ep: usize) {
     KBD_CONTROL_EP.store(ep, Ordering::Relaxed);
 }
-
-// Protocol tags (server → client push)
-const TAG_KEY_DOWN: u8 = 0;
-const TAG_KEY_UP: u8 = 1;
 
 pub fn kbd_server() {
     let control_ep = KBD_CONTROL_EP.load(Ordering::Relaxed);
@@ -56,13 +53,14 @@ pub fn kbd_server() {
             let event = tty::RAW_KBD_EVENTS.lock().pop();
             match event {
                 Some(ev) => {
-                    let tag = if ev.pressed { TAG_KEY_DOWN } else { TAG_KEY_UP };
+                    let kbd_event = if ev.pressed {
+                        KbdEvent::KeyDown { code: ev.code }
+                    } else {
+                        KbdEvent::KeyUp { code: ev.code }
+                    };
                     let mut msg = Message::new();
                     msg.sender_pid = my_pid;
-                    msg.data[0] = tag;
-                    msg.data[1] = (ev.code & 0xFF) as u8;
-                    msg.data[2] = (ev.code >> 8) as u8;
-                    msg.len = 3;
+                    msg.len = rvos_wire::to_bytes(&kbd_event, &mut msg.data).unwrap_or(0);
                     match ipc::channel_send(client_ep, msg) {
                         Ok(wake) => {
                             if wake != 0 { crate::task::wake_process(wake); }

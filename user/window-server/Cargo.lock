@@ -30,5 +30,6 @@ name = "window-server"
 version = "0.1.0"
 dependencies = [
  "rvos",
+ "rvos-proto",
  "rvos-rt",
 ]

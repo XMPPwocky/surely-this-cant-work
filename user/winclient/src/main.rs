@@ -1,24 +1,12 @@
 extern crate rvos_rt;
 
-use rvos::raw::{self, NO_CAP};
+use rvos::raw::{self};
 use rvos::Message;
-
-// Window control channel tags
-const WIN_CREATE_WINDOW: u8 = 0;
-
-// Window channel: client → server
-const WIN_GET_INFO: u8 = 0;
-const WIN_GET_FRAMEBUFFER: u8 = 1;
-const WIN_SWAP_BUFFERS: u8 = 2;
-
-// Window channel: server → client (replies)
-const WIN_INFO_REPLY: u8 = 128;
-const WIN_FB_REPLY: u8 = 129;
-const WIN_SWAP_REPLY: u8 = 130;
-
-// Window channel: server → client (events)
-const WIN_KEY_DOWN: u8 = 192;
-const WIN_KEY_UP: u8 = 193;
+use rvos::rvos_wire;
+use rvos_proto::window::{
+    CreateWindowRequest, CreateWindowResponse,
+    WindowRequest, WindowServerMsg,
+};
 
 fn main() {
     println!("[winclient] starting");
@@ -29,11 +17,11 @@ fn main() {
         .into_raw_handle();
 
     // 2. Send CreateWindow request
-    let req = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(WIN_CREATE_WINDOW);
-        let _ = w.write_u32(0); // width (ignored, fullscreen)
-        let _ = w.write_u32(0); // height (ignored, fullscreen)
-    });
+    let mut req = Message::new();
+    req.len = rvos_wire::to_bytes(
+        &CreateWindowRequest { width: 0, height: 0 }, // ignored, fullscreen
+        &mut req.data,
+    ).unwrap_or(0);
     raw::sys_chan_send_blocking(win_ctl, &req);
 
     // 3. Receive CreateWindow reply with window channel capability
@@ -41,35 +29,29 @@ fn main() {
     raw::sys_chan_recv_blocking(win_ctl, &mut resp);
     let win_chan = resp.cap; // window channel handle
 
-    let mut r = resp.reader();
-    let _tag = r.read_u8().unwrap_or(255);
-    let _win_id = r.read_u32().unwrap_or(0);
-    let _width = r.read_u32().unwrap_or(0);
-    let _height = r.read_u32().unwrap_or(0);
+    let _create_resp = rvos_wire::from_bytes::<CreateWindowResponse>(&resp.data[..resp.len]);
 
     // 4. GetInfo on window channel
-    let req = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(WIN_GET_INFO);
-        let _ = w.write_u32(1); // seq
-    });
+    let mut req = Message::new();
+    req.len = rvos_wire::to_bytes(
+        &WindowRequest::GetInfo { seq: 1 },
+        &mut req.data,
+    ).unwrap_or(0);
     raw::sys_chan_send_blocking(win_chan, &req);
 
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(win_chan, &mut resp);
-    let mut r = resp.reader();
-    let _reply_tag = r.read_u8().unwrap_or(255);
-    let _seq = r.read_u32().unwrap_or(0);
-    let _win_id = r.read_u32().unwrap_or(0);
-    let width = r.read_u32().unwrap_or(1024);
-    let height = r.read_u32().unwrap_or(768);
-    let stride = r.read_u32().unwrap_or(width);
-    let _format = r.read_u8().unwrap_or(0);
+    let (width, height, stride) = match rvos_wire::from_bytes::<WindowServerMsg>(&resp.data[..resp.len]) {
+        Ok(WindowServerMsg::InfoReply { width, height, stride, .. }) => (width, height, stride),
+        _ => (1024, 768, 1024),
+    };
 
     // 5. GetFramebuffer → receive SHM handle
-    let req = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(WIN_GET_FRAMEBUFFER);
-        let _ = w.write_u32(2); // seq
-    });
+    let mut req = Message::new();
+    req.len = rvos_wire::to_bytes(
+        &WindowRequest::GetFramebuffer { seq: 2 },
+        &mut req.data,
+    ).unwrap_or(0);
     raw::sys_chan_send_blocking(win_chan, &req);
 
     let mut resp = Message::new();
@@ -95,10 +77,11 @@ fn main() {
         draw_gradient(fb_base, back_offset, width, height, stride, frame);
 
         // SwapBuffers
-        let req = Message::build(NO_CAP, |w| {
-            let _ = w.write_u8(WIN_SWAP_BUFFERS);
-            let _ = w.write_u32(frame);
-        });
+        let mut req = Message::new();
+        req.len = rvos_wire::to_bytes(
+            &WindowRequest::SwapBuffers { seq: frame },
+            &mut req.data,
+        ).unwrap_or(0);
         raw::sys_chan_send_blocking(win_chan, &req);
 
         // Wait for swap reply, handling any key events that arrive first
@@ -106,9 +89,10 @@ fn main() {
             let mut resp = Message::new();
             raw::sys_chan_recv_blocking(win_chan, &mut resp);
             if resp.len == 0 { break; }
-            match resp.data[0] {
-                WIN_SWAP_REPLY => break,
-                WIN_KEY_DOWN | WIN_KEY_UP => print_key_event(&resp),
+            match rvos_wire::from_bytes::<WindowServerMsg>(&resp.data[..resp.len]) {
+                Ok(WindowServerMsg::SwapReply { .. }) => break,
+                Ok(WindowServerMsg::KeyDown { code }) => print_key_event("down", code),
+                Ok(WindowServerMsg::KeyUp { code }) => print_key_event("up", code),
                 _ => {}
             }
         }
@@ -122,8 +106,12 @@ fn main() {
             let mut msg = Message::new();
             let ret = raw::sys_chan_recv(win_chan, &mut msg);
             if ret != 0 { break; }
-            if msg.len > 0 && (msg.data[0] == WIN_KEY_DOWN || msg.data[0] == WIN_KEY_UP) {
-                print_key_event(&msg);
+            if msg.len > 0 {
+                match rvos_wire::from_bytes::<WindowServerMsg>(&msg.data[..msg.len]) {
+                    Ok(WindowServerMsg::KeyDown { code }) => print_key_event("down", code),
+                    Ok(WindowServerMsg::KeyUp { code }) => print_key_event("up", code),
+                    _ => {}
+                }
             }
         }
 
@@ -134,11 +122,7 @@ fn main() {
     }
 }
 
-fn print_key_event(msg: &Message) {
-    let mut r = msg.reader();
-    let tag = r.read_u8().unwrap_or(255);
-    let code = r.read_u16().unwrap_or(0);
-    let action = if tag == WIN_KEY_DOWN { "down" } else { "up" };
+fn print_key_event(action: &str, code: u16) {
     let name = keycode_name(code);
     println!("[winclient] key {}: {} ({})", action, name, code);
 }

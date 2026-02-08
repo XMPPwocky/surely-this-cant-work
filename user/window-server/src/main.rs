@@ -2,35 +2,13 @@ extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
-use rvos::rvos_wire::Reader;
-
-// --- Protocol tags ---
-
-// GPU protocol
-const GPU_GET_DISPLAY_INFO: u8 = 0;
-const GPU_FLUSH: u8 = 1;
-
-// KBD protocol (server → us)
-const KBD_KEY_DOWN: u8 = 0;
-const KBD_KEY_UP: u8 = 1;
-
-// Window control channel (client → server)
-const WIN_CREATE_WINDOW: u8 = 0;
-
-// Window channel: client → server
-const WIN_GET_INFO: u8 = 0;
-const WIN_GET_FRAMEBUFFER: u8 = 1;
-const WIN_SWAP_BUFFERS: u8 = 2;
-const WIN_CLOSE_WINDOW: u8 = 3;
-
-// Window channel: server → client (replies)
-const WIN_INFO_REPLY: u8 = 128;
-const WIN_FB_REPLY: u8 = 129;
-const WIN_SWAP_REPLY: u8 = 130;
-
-// Window channel: server → client (events)
-const WIN_KEY_DOWN: u8 = 192;
-const WIN_KEY_UP: u8 = 193;
+use rvos::rvos_wire;
+use rvos_proto::gpu::{GpuRequest, GpuResponse};
+use rvos_proto::kbd::KbdEvent;
+use rvos_proto::window::{
+    CreateWindowRequest, CreateWindowResponse,
+    WindowRequest, WindowServerMsg,
+};
 
 // --- Constants ---
 const CONTROL_HANDLE: usize = 1; // window service control channel
@@ -74,20 +52,17 @@ fn main() {
         .into_raw_handle();
 
     // Get display info from GPU server
-    let mut msg = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(GPU_GET_DISPLAY_INFO);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&GpuRequest::GetDisplayInfo {}, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_blocking(gpu_handle, &msg);
 
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(gpu_handle, &mut resp);
 
-    let mut r = resp.reader();
-    let _tag = r.read_u8().unwrap_or(255);
-    let width = r.read_u32().unwrap_or(1024);
-    let height = r.read_u32().unwrap_or(768);
-    let stride = r.read_u32().unwrap_or(width);
-    let _format = r.read_u8().unwrap_or(0);
+    let (width, height, stride) = match rvos_wire::from_bytes::<GpuResponse>(&resp.data[..resp.len]) {
+        Ok(GpuResponse::DisplayInfo { width, height, stride, .. }) => (width, height, stride),
+        _ => (1024, 768, 1024),
+    };
 
     // The response should carry an SHM capability for the framebuffer
     let gpu_shm_handle = resp.cap;
@@ -168,7 +143,8 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
     let mut msg = Message::new();
     raw::sys_chan_recv_blocking(per_client_handle, &mut msg);
 
-    if msg.len == 0 || msg.data[0] != WIN_CREATE_WINDOW {
+    // Verify it's a CreateWindowRequest
+    if rvos_wire::from_bytes::<CreateWindowRequest>(&msg.data[..msg.len]).is_err() {
         raw::sys_chan_close(per_client_handle);
         return;
     }
@@ -223,13 +199,12 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
     server.foreground = slot;
 
     // Reply on the per-client channel with window channel cap + window info
-    let mut resp = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(WIN_CREATE_WINDOW);
-        let _ = w.write_u32(win_id);
-        let _ = w.write_u32(width);
-        let _ = w.write_u32(height);
-    });
-    // Attach the client endpoint as a capability (local handle → kernel translates on send)
+    let resp_data = CreateWindowResponse {
+        window_id: win_id, width, height,
+    };
+    let mut resp = Message::new();
+    resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
+    // Attach the client endpoint as a capability
     resp.cap = client_ep;
     raw::sys_chan_send_blocking(per_client_handle, &resp);
 
@@ -238,32 +213,34 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
 }
 
 fn handle_kbd_event(server: &mut Server, msg: &Message) {
-    if msg.len < 3 { return; }
-    let tag = msg.data[0];
-    let code = (msg.data[1] as u16) | ((msg.data[2] as u16) << 8);
+    if msg.len < 1 { return; }
 
-    // Forward to foreground window
+    let event: KbdEvent = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    // Convert kbd event to window event and forward to foreground window
     let fg = server.foreground;
     if let Some(ref win) = server.windows[fg] {
         if !win.active { return; }
-        let win_tag = if tag == KBD_KEY_DOWN { WIN_KEY_DOWN } else { WIN_KEY_UP };
-        let evt = Message::build(NO_CAP, |w| {
-            let _ = w.write_u8(win_tag);
-            let _ = w.write_u16(code);
-        });
+        let win_event = match event {
+            KbdEvent::KeyDown { code } => WindowServerMsg::KeyDown { code },
+            KbdEvent::KeyUp { code } => WindowServerMsg::KeyUp { code },
+        };
+        let mut fwd = Message::new();
+        fwd.len = rvos_wire::to_bytes(&win_event, &mut fwd.data).unwrap_or(0);
         // Non-blocking send: drop event if queue full
-        let _ = raw::sys_chan_send(win.channel_handle, &evt);
+        let _ = raw::sys_chan_send(win.channel_handle, &fwd);
     }
 }
 
 fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
     if msg.len == 0 { return; }
-    let tag = msg.data[0];
-    let seq = if msg.len >= 5 {
-        let mut r = Reader::new(&msg.data[1..5]);
-        r.read_u32().unwrap_or(0)
-    } else {
-        0
+
+    let req: WindowRequest = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
+        Ok(r) => r,
+        Err(_) => return,
     };
 
     let win = match server.windows[slot].as_mut() {
@@ -271,47 +248,43 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
         None => return,
     };
 
-    match tag {
-        WIN_GET_INFO => {
-            let resp = Message::build(NO_CAP, |w| {
-                let _ = w.write_u8(WIN_INFO_REPLY);
-                let _ = w.write_u32(seq);
-                let _ = w.write_u32(win.id);
-                let _ = w.write_u32(win.width);
-                let _ = w.write_u32(win.height);
-                let _ = w.write_u32(win.stride);
-                let _ = w.write_u8(0); // format BGRA32
-            });
+    match req {
+        WindowRequest::GetInfo { seq } => {
+            let reply = WindowServerMsg::InfoReply {
+                seq,
+                window_id: win.id,
+                width: win.width,
+                height: win.height,
+                stride: win.stride,
+                format: 0, // BGRA32
+            };
+            let mut resp = Message::new();
+            resp.len = rvos_wire::to_bytes(&reply, &mut resp.data).unwrap_or(0);
             raw::sys_chan_send_blocking(win.channel_handle, &resp);
         }
-        WIN_GET_FRAMEBUFFER => {
-            // Send SHM capability to the client
-            let mut resp = Message::build(NO_CAP, |w| {
-                let _ = w.write_u8(WIN_FB_REPLY);
-                let _ = w.write_u32(seq);
-            });
+        WindowRequest::GetFramebuffer { seq } => {
+            let reply = WindowServerMsg::FbReply { seq };
+            let mut resp = Message::new();
+            resp.len = rvos_wire::to_bytes(&reply, &mut resp.data).unwrap_or(0);
             // Attach SHM handle (kernel translates local handle -> encoded cap on send)
             resp.cap = win.shm_handle;
             raw::sys_chan_send_blocking(win.channel_handle, &resp);
         }
-        WIN_SWAP_BUFFERS => {
+        WindowRequest::SwapBuffers { seq } => {
             // Toggle front buffer
             win.front_buffer = 1 - win.front_buffer;
             win.dirty = true;
 
-            let resp = Message::build(NO_CAP, |w| {
-                let _ = w.write_u8(WIN_SWAP_REPLY);
-                let _ = w.write_u32(seq);
-                let _ = w.write_u8(0); // ok
-            });
+            let reply = WindowServerMsg::SwapReply { seq, ok: 0 };
+            let mut resp = Message::new();
+            resp.len = rvos_wire::to_bytes(&reply, &mut resp.data).unwrap_or(0);
             raw::sys_chan_send_blocking(win.channel_handle, &resp);
         }
-        WIN_CLOSE_WINDOW => {
+        WindowRequest::CloseWindow {} => {
             raw::sys_chan_close(win.channel_handle);
             win.active = false;
             // Don't unmap/free SHM yet - just mark inactive
         }
-        _ => {}
     }
 }
 
@@ -356,13 +329,15 @@ fn composite(server: &mut Server) {
 
 fn flush_display(server: &Server) {
     // Send flush command to GPU server
-    let msg = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(GPU_FLUSH);
-        let _ = w.write_u32(0); // x
-        let _ = w.write_u32(0); // y
-        let _ = w.write_u32(server.display_width);
-        let _ = w.write_u32(server.display_height);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(
+        &GpuRequest::Flush {
+            x: 0, y: 0,
+            w: server.display_width,
+            h: server.display_height,
+        },
+        &mut msg.data,
+    ).unwrap_or(0);
     raw::sys_chan_send_blocking(server.gpu_handle, &msg);
 
     // Wait for flush response

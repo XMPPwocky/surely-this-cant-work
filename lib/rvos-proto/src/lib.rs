@@ -11,3 +11,6 @@ pub mod fs;
 pub mod sysinfo;
 pub mod boot;
 pub mod process;
+pub mod gpu;
+pub mod kbd;
+pub mod window;
