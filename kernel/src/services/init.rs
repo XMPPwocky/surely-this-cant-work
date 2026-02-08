@@ -4,6 +4,13 @@ use crate::sync::SpinLock;
 use crate::mm::heap::{InitAlloc, INIT_ALLOC};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use rvos_wire::{Reader, Writer};
+
+// Boot channel protocol tags (must match lib/rvos/src/service.rs)
+const REQ_CONNECT_SERVICE: u8 = 0;
+const REQ_SPAWN: u8 = 1;
+const RESP_OK: u8 = 0;
+const RESP_ERROR: u8 = 1;
 
 /// Console type for routing stdio requests
 #[derive(Clone, Copy, PartialEq)]
@@ -148,6 +155,9 @@ enum FsLaunchState {
     Done,
 }
 
+const PATH_BUF_LEN: usize = 64;
+const NAME_BUF_LEN: usize = 16;
+
 /// Tracks an in-progress fs-based program launch.
 struct FsLaunchCtx {
     state: FsLaunchState,
@@ -155,14 +165,38 @@ struct FsLaunchCtx {
     file_ep: usize,
     file_size: usize,
     data: Vec<u8, InitAlloc>,
-    path: &'static [u8],
-    name: &'static str,
+    path_buf: [u8; PATH_BUF_LEN],
+    path_len: usize,
+    name_buf: [u8; NAME_BUF_LEN],
+    name_len: usize,
     console_type: ConsoleType,
     /// If set, register this as a named service and give it a control channel as handle 1.
     service_name: Option<&'static str>,
+    /// If nonzero, this is a dynamic spawn — send response on this endpoint when done.
+    requester_ep: usize,
+}
+
+impl FsLaunchCtx {
+    fn path(&self) -> &[u8] {
+        &self.path_buf[..self.path_len]
+    }
+
+    fn name(&self) -> &str {
+        core::str::from_utf8(&self.name_buf[..self.name_len]).unwrap_or("???")
+    }
 }
 
 const MAX_FS_LAUNCHES: usize = 8;
+
+/// Tracks a dynamically spawned process awaiting exit notification.
+struct DynSpawn {
+    /// Init's end of the kernel notification channel (receives exit code from kernel).
+    notify_ep: usize,
+    /// Init's end of the watcher channel (forwards exit code to whoever requested the spawn).
+    watcher_ep: usize,
+}
+
+const MAX_DYN_SPAWNS: usize = 8;
 
 /// Init server kernel task.
 /// Polls boot channel endpoints for service discovery requests from user processes,
@@ -171,6 +205,7 @@ pub fn init_server() {
     let my_pid = crate::task::current_pid();
     // Set up fs launch state machines (non-blocking)
     let mut fs_launches: [Option<FsLaunchCtx>; MAX_FS_LAUNCHES] = [const { None }; MAX_FS_LAUNCHES];
+    let mut dyn_spawns: [Option<DynSpawn>; MAX_DYN_SPAWNS] = [const { None }; MAX_DYN_SPAWNS];
     init_fs_launches(&mut fs_launches, my_pid);
 
     loop {
@@ -194,7 +229,8 @@ pub fn init_server() {
             let (msg, send_wake) = ipc::channel_recv(boot_ep_b);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             if let Some(msg) = msg {
-                handle_request(boot_ep_b, console_type, is_shell, &msg, my_pid);
+                handle_request(boot_ep_b, console_type, is_shell, &msg, my_pid,
+                               &mut fs_launches);
                 handled = true;
             }
         }
@@ -202,7 +238,7 @@ pub fn init_server() {
         // Poll fs launch endpoints
         for slot in fs_launches.iter_mut() {
             if let Some(ref mut ctx) = slot {
-                if poll_fs_launch(ctx, my_pid) {
+                if poll_fs_launch(ctx, my_pid, &mut dyn_spawns) {
                     handled = true;
                 }
                 if ctx.state == FsLaunchState::Done {
@@ -211,8 +247,30 @@ pub fn init_server() {
             }
         }
 
+        // Poll exit notifications from dynamic spawns
+        for slot in dyn_spawns.iter_mut() {
+            if let Some(ref ds) = slot {
+                let (msg, send_wake) = ipc::channel_recv(ds.notify_ep);
+                if send_wake != 0 { crate::task::wake_process(send_wake); }
+                if let Some(msg) = msg {
+                    handled = true;
+                    // Forward exit code to watcher
+                    let exit_code = if msg.len >= 1 { msg.data[0] as i32 } else { -1 };
+                    let mut fwd = Message::new();
+                    let mut w = Writer::new(&mut fwd.data);
+                    let _ = w.write_i32(exit_code);
+                    fwd.len = w.position();
+                    fwd.sender_pid = my_pid;
+                    send_and_wake(ds.watcher_ep, fwd);
+                    ipc::channel_close(ds.notify_ep);
+                    ipc::channel_close(ds.watcher_ep);
+                    *slot = None;
+                }
+            }
+        }
+
         if !handled {
-            // Register as blocked on ALL boot endpoints and fs launch endpoints
+            // Register as blocked on ALL boot endpoints, fs launch endpoints, and dyn spawn notify endpoints
             for i in 0..count {
                 ipc::channel_set_blocked(endpoints[i].0, my_pid);
             }
@@ -226,33 +284,93 @@ pub fn init_server() {
                     ipc::channel_set_blocked(ep, my_pid);
                 }
             }
+            for slot in dyn_spawns.iter() {
+                if let Some(ref ds) = slot {
+                    ipc::channel_set_blocked(ds.notify_ep, my_pid);
+                }
+            }
             crate::task::block_process(my_pid);
             crate::task::schedule();
         }
     }
 }
 
-fn handle_request(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, msg: &Message, my_pid: usize) {
+fn handle_request(
+    boot_ep_b: usize,
+    console_type: ConsoleType,
+    is_shell: bool,
+    msg: &Message,
+    my_pid: usize,
+    fs_launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
+) {
     crate::trace::trace_kernel(b"init-handle_req-enter");
-    let request = &msg.data[..msg.len];
 
-    if starts_with(request, b"stdio") {
-        handle_stdio_request(boot_ep_b, console_type, is_shell, my_pid);
-    } else if let Some(svc) = find_named_service(request) {
-        handle_service_request(boot_ep_b, svc, my_pid);
-    } else {
-        // Unknown request - send error response
-        let mut resp = Message::new();
-        let err = b"unknown";
-        resp.data[..err.len()].copy_from_slice(err);
-        resp.len = err.len();
-        resp.sender_pid = my_pid;
-        send_and_wake(boot_ep_b, resp);
+    let mut r = Reader::new(&msg.data[..msg.len]);
+    let tag = match r.read_u8() {
+        Ok(t) => t,
+        Err(_) => {
+            send_error(boot_ep_b, "bad request", my_pid);
+            crate::trace::trace_kernel(b"init-handle_req-exit");
+            return;
+        }
+    };
+
+    match tag {
+        REQ_CONNECT_SERVICE => {
+            let name = match r.read_str() {
+                Ok(s) => s,
+                Err(_) => {
+                    send_error(boot_ep_b, "bad request", my_pid);
+                    crate::trace::trace_kernel(b"init-handle_req-exit");
+                    return;
+                }
+            };
+            if name == "stdio" {
+                handle_stdio_request(boot_ep_b, console_type, is_shell, my_pid);
+            } else if let Some(svc) = find_named_service_by_name(name) {
+                handle_service_request(boot_ep_b, svc, my_pid);
+            } else {
+                send_error(boot_ep_b, "unknown service", my_pid);
+            }
+        }
+        REQ_SPAWN => {
+            let path = match r.read_str() {
+                Ok(s) => s,
+                Err(_) => {
+                    send_error(boot_ep_b, "bad request", my_pid);
+                    crate::trace::trace_kernel(b"init-handle_req-exit");
+                    return;
+                }
+            };
+            handle_spawn_request(boot_ep_b, console_type, path, fs_launches, my_pid);
+        }
+        _ => {
+            send_error(boot_ep_b, "unknown request tag", my_pid);
+        }
     }
+
     crate::trace::trace_kernel(b"init-handle_req-exit");
 }
 
-/// Find a named service whose name matches the request prefix.
+/// Find a named service by exact name match.
+fn find_named_service_by_name(name: &str) -> Option<&'static NamedService> {
+    let count = NAMED_SERVICE_COUNT.load(Ordering::Relaxed);
+    let name_bytes = name.as_bytes();
+    for i in 0..count {
+        let svc = &NAMED_SERVICES[i];
+        let nlen = svc.name_len.load(Ordering::Relaxed);
+        if nlen > 0 && nlen == name_bytes.len() {
+            // SAFETY: name was written during boot before init_server started.
+            let svc_name = unsafe { &(&*svc.name.get())[..nlen] };
+            if svc_name == name_bytes {
+                return Some(svc);
+            }
+        }
+    }
+    None
+}
+
+/// Find a named service whose name matches the request prefix (used by fs launch).
 fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
     let count = NAMED_SERVICE_COUNT.load(Ordering::Relaxed);
     for i in 0..count {
@@ -260,7 +378,6 @@ fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
         let nlen = svc.name_len.load(Ordering::Relaxed);
         if nlen > 0 {
             // SAFETY: name was written during boot before init_server started.
-            // After boot, it is only read here. name_len acts as synchronization.
             let name_slice = unsafe { &(&*svc.name.get())[..nlen] };
             if starts_with(request, name_slice) {
                 return Some(svc);
@@ -284,14 +401,10 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, my_pid: usize) {
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
 
-        // Respond to client with client endpoint
-        let mut resp = Message::new();
-        resp.cap = ipc::encode_cap_channel(client_ep);
-        resp.sender_pid = my_pid;
-        let ok = b"ok";
-        resp.data[..ok.len()].copy_from_slice(ok);
-        resp.len = ok.len();
-        send_and_wake(boot_ep_b, resp);
+        // Respond to client with Ok + client endpoint
+        send_ok_with_cap(boot_ep_b, client_ep, my_pid);
+    } else {
+        send_error(boot_ep_b, "service not ready", my_pid);
     }
 }
 
@@ -324,15 +437,112 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, is_shell: b
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
 
-        // Respond to client with client endpoint as capability
-        let mut resp = Message::new();
-        resp.cap = ipc::encode_cap_channel(client_ep);
-        resp.sender_pid = my_pid;
-        let ok = b"ok";
-        resp.data[..ok.len()].copy_from_slice(ok);
-        resp.len = ok.len();
-        send_and_wake(boot_ep_b, resp);
+        // Respond to client with Ok + client endpoint
+        send_ok_with_cap(boot_ep_b, client_ep, my_pid);
+    } else {
+        send_error(boot_ep_b, "no console", my_pid);
     }
+}
+
+/// Handle a spawn request: load an ELF from the filesystem and spawn it.
+fn handle_spawn_request(
+    boot_ep_b: usize,
+    console_type: ConsoleType,
+    path: &str,
+    fs_launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
+    my_pid: usize,
+) {
+    let path_bytes = path.as_bytes();
+    if path_bytes.is_empty() || path_bytes.len() > PATH_BUF_LEN {
+        send_error(boot_ep_b, "bad path", my_pid);
+        return;
+    }
+
+    // Find a free fs_launch slot
+    let slot_idx = match fs_launches.iter().position(|s| s.is_none()) {
+        Some(i) => i,
+        None => {
+            send_error(boot_ep_b, "busy", my_pid);
+            return;
+        }
+    };
+
+    // Connect to fs service
+    let fs_svc = match find_named_service(b"fs") {
+        Some(svc) => svc,
+        None => {
+            send_error(boot_ep_b, "no fs", my_pid);
+            return;
+        }
+    };
+    let fs_ctl_ep = fs_svc.control_ep.load(Ordering::Relaxed);
+    if fs_ctl_ep == usize::MAX {
+        send_error(boot_ep_b, "no fs", my_pid);
+        return;
+    }
+
+    let (my_ctl_ep, server_ep) = ipc::channel_create_pair();
+
+    // Send the server endpoint to the fs service via its control channel
+    let mut ctl_msg = Message::new();
+    ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+    ctl_msg.sender_pid = my_pid;
+    send_and_wake(fs_ctl_ep, ctl_msg);
+
+    // Send the initial Stat request
+    let mut msg = Message::new();
+    let mut pos = 0;
+    pos = wire_write_u8(&mut msg.data, pos, 2); // tag: Stat
+    pos = wire_write_str(&mut msg.data, pos, path_bytes);
+    msg.len = pos;
+    msg.sender_pid = my_pid;
+    send_and_wake(my_ctl_ep, msg);
+
+    // Derive name from path (everything after last '/')
+    let name_start = path_bytes.iter().rposition(|&b| b == b'/').map(|i| i + 1).unwrap_or(0);
+    let name_bytes = &path_bytes[name_start..];
+    let name_len = name_bytes.len().min(NAME_BUF_LEN);
+
+    let mut ctx = FsLaunchCtx {
+        state: FsLaunchState::WaitStat,
+        ctl_ep: my_ctl_ep,
+        file_ep: 0,
+        file_size: 0,
+        data: Vec::new_in(INIT_ALLOC),
+        path_buf: [0u8; PATH_BUF_LEN],
+        path_len: path_bytes.len(),
+        name_buf: [0u8; NAME_BUF_LEN],
+        name_len,
+        console_type,
+        service_name: None,
+        requester_ep: boot_ep_b,
+    };
+    ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
+    ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
+
+    fs_launches[slot_idx] = Some(ctx);
+}
+
+/// Send an Ok response with a capability on the boot channel.
+fn send_ok_with_cap(endpoint: usize, cap_ep: usize, my_pid: usize) {
+    let mut resp = Message::new();
+    let mut w = Writer::new(&mut resp.data);
+    let _ = w.write_u8(RESP_OK);
+    resp.len = w.position();
+    resp.cap = ipc::encode_cap_channel(cap_ep);
+    resp.sender_pid = my_pid;
+    send_and_wake(endpoint, resp);
+}
+
+/// Send an Error response on the boot channel.
+fn send_error(endpoint: usize, error_msg: &str, my_pid: usize) {
+    let mut resp = Message::new();
+    let mut w = Writer::new(&mut resp.data);
+    let _ = w.write_u8(RESP_ERROR);
+    let _ = w.write_str(error_msg);
+    resp.len = w.position();
+    resp.sender_pid = my_pid;
+    send_and_wake(endpoint, resp);
 }
 
 /// Send a message and wake the receiver if one was blocked.
@@ -398,23 +608,38 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
         msg.sender_pid = my_pid;
         send_and_wake(my_ctl_ep, msg);
 
+        let mut path_buf = [0u8; PATH_BUF_LEN];
+        let plen = path.len().min(PATH_BUF_LEN);
+        path_buf[..plen].copy_from_slice(&path[..plen]);
+
+        let mut name_buf = [0u8; NAME_BUF_LEN];
+        let nlen = name.len().min(NAME_BUF_LEN);
+        name_buf[..nlen].copy_from_slice(&name.as_bytes()[..nlen]);
+
         launches[slot_idx] = Some(FsLaunchCtx {
             state: FsLaunchState::WaitStat,
             ctl_ep: my_ctl_ep,
             file_ep: 0,
             file_size: 0,
             data: Vec::new_in(INIT_ALLOC),
-            path,
-            name,
+            path_buf,
+            path_len: plen,
+            name_buf,
+            name_len: nlen,
             console_type,
             service_name,
+            requester_ep: 0, // boot-time launch, no requester
         });
         slot_idx += 1;
     }
 }
 
 /// Poll a single fs launch state machine. Returns true if progress was made.
-fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
+fn poll_fs_launch(
+    ctx: &mut FsLaunchCtx,
+    my_pid: usize,
+    dyn_spawns: &mut [Option<DynSpawn>; MAX_DYN_SPAWNS],
+) -> bool {
     match ctx.state {
         FsLaunchState::WaitStat => {
             let (resp, send_wake) = ipc::channel_recv(ctx.ctl_ep);
@@ -422,7 +647,10 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
             if let Some(resp) = resp {
                 let tag = wire_read_u8(&resp.data, 0);
                 if tag != 0 {
-                    crate::println!("[init] fs: stat {} failed", ctx.name);
+                    crate::println!("[init] fs: stat {} failed", ctx.name());
+                    if ctx.requester_ep != 0 {
+                        send_error(ctx.requester_ep, "not found", my_pid);
+                    }
                     ipc::channel_close(ctx.ctl_ep);
                     ctx.state = FsLaunchState::Done;
                     return true;
@@ -436,7 +664,7 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
                 let mut pos = 0;
                 pos = wire_write_u8(&mut msg.data, pos, 0); // tag: Open
                 pos = wire_write_u8(&mut msg.data, pos, 0); // flags: 0
-                pos = wire_write_str(&mut msg.data, pos, ctx.path);
+                pos = wire_write_str(&mut msg.data, pos, ctx.path());
                 msg.len = pos;
                 msg.sender_pid = my_pid;
                 send_and_wake(ctx.ctl_ep, msg);
@@ -450,7 +678,10 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
             if let Some(resp) = resp {
                 let tag = wire_read_u8(&resp.data, 0);
                 if tag != 0 || resp.cap == NO_CAP {
-                    crate::println!("[init] fs: open {} failed", ctx.name);
+                    crate::println!("[init] fs: open {} failed", ctx.name());
+                    if ctx.requester_ep != 0 {
+                        send_error(ctx.requester_ep, "open failed", my_pid);
+                    }
                     ipc::channel_close(ctx.ctl_ep);
                     ctx.state = FsLaunchState::Done;
                     return true;
@@ -459,7 +690,10 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
                 match ipc::decode_cap_channel(resp.cap) {
                     Some(ep) => ctx.file_ep = ep,
                     None => {
-                        crate::println!("[init] fs: open {} bad cap", ctx.name);
+                        crate::println!("[init] fs: open {} bad cap", ctx.name());
+                        if ctx.requester_ep != 0 {
+                            send_error(ctx.requester_ep, "bad cap", my_pid);
+                        }
                         ipc::channel_close(ctx.ctl_ep);
                         ctx.state = FsLaunchState::Done;
                         return true;
@@ -490,13 +724,16 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
                         progress = true;
                         if resp.len < 3 {
                             // Sentinel or malformed — end of data
-                            finish_fs_launch(ctx, my_pid);
+                            finish_fs_launch(ctx, my_pid, dyn_spawns);
                             return true;
                         }
                         let tag = wire_read_u8(&resp.data, 0);
                         if tag == 2 {
                             // Error response
-                            crate::println!("[init] fs: read {} error", ctx.name);
+                            crate::println!("[init] fs: read {} error", ctx.name());
+                            if ctx.requester_ep != 0 {
+                                send_error(ctx.requester_ep, "read error", my_pid);
+                            }
                             ipc::channel_close(ctx.file_ep);
                             ipc::channel_close(ctx.ctl_ep);
                             ctx.state = FsLaunchState::Done;
@@ -506,7 +743,7 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
                         let chunk_len = wire_read_u16(&resp.data, 1) as usize;
                         if chunk_len == 0 {
                             // Sentinel — all data received
-                            finish_fs_launch(ctx, my_pid);
+                            finish_fs_launch(ctx, my_pid, dyn_spawns);
                             return true;
                         }
                         ctx.data.extend_from_slice(&resp.data[3..3 + chunk_len]);
@@ -522,35 +759,78 @@ fn poll_fs_launch(ctx: &mut FsLaunchCtx, my_pid: usize) -> bool {
 }
 
 /// Complete an fs launch: close channels, spawn the process.
-fn finish_fs_launch(ctx: &mut FsLaunchCtx, _my_pid: usize) {
+fn finish_fs_launch(
+    ctx: &mut FsLaunchCtx,
+    my_pid: usize,
+    dyn_spawns: &mut [Option<DynSpawn>; MAX_DYN_SPAWNS],
+) {
     ipc::channel_close(ctx.file_ep);
     ipc::channel_close(ctx.ctl_ep);
 
     if ctx.data.is_empty() {
-        crate::println!("[init] fs: {} empty, skipping", ctx.name);
+        crate::println!("[init] fs: {} empty, skipping", ctx.name());
+        if ctx.requester_ep != 0 {
+            send_error(ctx.requester_ep, "empty", my_pid);
+        }
         ctx.state = FsLaunchState::Done;
         return;
     }
 
-    crate::println!("[init] Loaded {} from fs ({} bytes)", ctx.name, ctx.data.len());
+    crate::println!("[init] Loaded {} from fs ({} bytes)", ctx.name(), ctx.data.len());
 
     // Create boot channel
     let (boot_a, boot_b) = ipc::channel_create_pair();
     register_boot(boot_b, ctx.console_type, false);
 
-    if let Some(svc_name) = ctx.service_name {
+    let pid = if let Some(svc_name) = ctx.service_name {
         // This program is a named service: give it a control channel as handle 1
         let (init_svc_ep, svc_ctl_ep) = ipc::channel_create_pair();
         register_service(svc_name, init_svc_ep);
-        crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name, boot_a, svc_ctl_ep);
+        crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, svc_ctl_ep)
     } else {
-        crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name, boot_a);
+        crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name(), boot_a)
+    };
+
+    // If this is a dynamic spawn, set up exit notification and respond to requester
+    if ctx.requester_ep != 0 {
+        // Kernel notification channel: kernel sends exit code here
+        let (init_notify_ep, kernel_ep) = ipc::channel_create_pair();
+        crate::task::set_exit_notify_ep(pid, kernel_ep);
+
+        // Watcher channel: init forwards exit code to the requester
+        let (client_handle_ep, init_watcher_ep) = ipc::channel_create_pair();
+
+        // Register in dyn_spawns table
+        let mut registered = false;
+        for slot in dyn_spawns.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(DynSpawn {
+                    notify_ep: init_notify_ep,
+                    watcher_ep: init_watcher_ep,
+                });
+                registered = true;
+                break;
+            }
+        }
+        if !registered {
+            crate::println!("[init] dyn_spawns full, cannot track process exit");
+            ipc::channel_close(init_notify_ep);
+            ipc::channel_close(kernel_ep);
+            ipc::channel_close(client_handle_ep);
+            ipc::channel_close(init_watcher_ep);
+            send_error(ctx.requester_ep, "busy", my_pid);
+            ctx.state = FsLaunchState::Done;
+            return;
+        }
+
+        // Send Ok response with process handle capability
+        send_ok_with_cap(ctx.requester_ep, client_handle_ep, my_pid);
     }
 
     ctx.state = FsLaunchState::Done;
 }
 
-// --- Wire protocol helpers (manual byte packing, no rvos-wire dependency) ---
+// --- Wire protocol helpers (manual byte packing for fs protocol — NOT boot channel) ---
 
 /// Write a u16 little-endian length-prefixed string into buf at pos.
 /// Returns the new position.
@@ -598,4 +878,3 @@ fn wire_read_u64(buf: &[u8], pos: usize) -> u64 {
     bytes.copy_from_slice(&buf[pos..pos + 8]);
     u64::from_le_bytes(bytes)
 }
-

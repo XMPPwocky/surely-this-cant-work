@@ -390,10 +390,14 @@ pub fn exit_current_from_syscall() {
     // wake_process, requiring the SCHEDULER lock — would deadlock otherwise).
     let mut channel_eps: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
     let mut shm_ids: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
+    let mut notify_ep = 0usize;
     {
         let mut sched = SCHEDULER.lock();
         let pid = sched.current;
         if let Some(ref mut proc) = sched.processes[pid] {
+            // Snapshot exit_notify_ep before cleanup
+            notify_ep = proc.exit_notify_ep;
+            proc.exit_notify_ep = 0;
             // Snapshot handles and clear them from the process
             for i in 0..crate::task::process::MAX_HANDLES {
                 if let Some(handle_obj) = proc.handles[i].take() {
@@ -431,6 +435,20 @@ pub fn exit_current_from_syscall() {
         }
     }
     // SCHEDULER lock released — now safe to call channel_close (which may wake_process)
+
+    // Send exit notification before closing handles (so the receiver wakes up)
+    if notify_ep != 0 {
+        let mut msg = crate::ipc::Message::new();
+        msg.data[0] = 0; // exit code (always 0 for now)
+        msg.len = 1;
+        if let Ok(wake) = crate::ipc::channel_send(notify_ep, msg) {
+            if wake != 0 {
+                crate::task::wake_process(wake);
+            }
+        }
+        crate::ipc::channel_close(notify_ep);
+    }
+
     for i in 0..crate::task::process::MAX_HANDLES {
         if channel_eps[i] != usize::MAX {
             crate::ipc::channel_close(channel_eps[i]);
@@ -440,6 +458,15 @@ pub fn exit_current_from_syscall() {
         }
     }
     schedule();
+}
+
+/// Set the exit notification endpoint for a process.
+/// When the process exits, the kernel will send the exit code on this endpoint.
+pub fn set_exit_notify_ep(pid: usize, ep: usize) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.exit_notify_ep = ep;
+    }
 }
 
 /// Set a process to Blocked state

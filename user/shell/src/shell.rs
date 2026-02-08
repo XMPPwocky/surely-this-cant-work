@@ -33,13 +33,22 @@ impl<'a> Deserialize<'a> for MathResponse {
 }
 
 /// Request a service from the init server via boot channel (handle 0).
+/// Uses the boot channel protocol (rvos-wire tagged format).
 fn request_service(name: &[u8]) -> usize {
-    let mut msg = Message::new();
-    msg.data[..name.len()].copy_from_slice(name);
-    msg.len = name.len();
+    let msg = Message::build(rvos::NO_CAP, |w| {
+        let _ = w.write_u8(0); // tag: ConnectService
+        let _ = w.write_bytes(name);
+    });
     raw::sys_chan_send(0, &msg);
-    raw::sys_chan_recv_blocking(0, &mut msg);
-    msg.cap
+    let mut reply = Message::new();
+    raw::sys_chan_recv_blocking(0, &mut reply);
+    // Parse response: u8(tag). Tag 0 = Ok, 1 = Error.
+    let mut r = reply.reader();
+    let tag = r.read_u8().unwrap_or(1);
+    if tag != 0 {
+        return usize::MAX; // error
+    }
+    reply.cap
 }
 
 fn cmd_echo(line: &str) {
@@ -62,6 +71,7 @@ fn cmd_help() {
     println!("  cat <path>            - Read file");
     println!("  write <path> <text>   - Write to file");
     println!("  stat <path>           - Show file metadata");
+    println!("  run <path>            - Run a program and wait for it to exit");
     println!("  help                  - Show this help");
     println!("  shutdown              - Shut down the system");
 }
@@ -140,6 +150,10 @@ fn cmd_stat(args: &str) {
 
 fn cmd_trace(args: &str) {
     let sysinfo_handle = request_service(b"sysinfo");
+    if sysinfo_handle == usize::MAX {
+        println!("Error: could not connect to sysinfo");
+        return;
+    }
 
     let cmd_str = if args.trim() == "clear" { b"TRACECLR" as &[u8] } else { b"TRACE" as &[u8] };
     let mut msg = Message::new();
@@ -162,6 +176,10 @@ fn cmd_trace(args: &str) {
 
 fn cmd_ps() {
     let sysinfo_handle = request_service(b"sysinfo");
+    if sysinfo_handle == usize::MAX {
+        println!("Error: could not connect to sysinfo");
+        return;
+    }
 
     let mut msg = Message::new();
     msg.data[0] = b'P';
@@ -184,6 +202,10 @@ fn cmd_ps() {
 
 fn cmd_mem() {
     let sysinfo_handle = request_service(b"sysinfo");
+    if sysinfo_handle == usize::MAX {
+        println!("Error: could not connect to sysinfo");
+        return;
+    }
 
     let mut msg = Message::new();
     let cmd = b"MEMSTAT";
@@ -237,6 +259,10 @@ fn cmd_math(args: &str) {
     };
 
     let math_handle = request_service(b"math");
+    if math_handle == usize::MAX {
+        println!("Error: could not connect to math");
+        return;
+    }
 
     let mut msg = Message::new();
     let mut writer = Writer::new(&mut msg.data);
@@ -258,6 +284,52 @@ fn cmd_math(args: &str) {
     }
 
     raw::sys_chan_close(math_handle);
+}
+
+fn cmd_run(args: &str) {
+    let path = args.trim();
+    if path.is_empty() {
+        println!("Usage: run <path>");
+        return;
+    }
+
+    // Send Spawn request on boot channel (handle 0)
+    let msg = Message::build(rvos::NO_CAP, |w| {
+        let _ = w.write_u8(1); // tag: Spawn
+        let _ = w.write_str(path);
+    });
+    raw::sys_chan_send(0, &msg);
+
+    // Wait for response
+    let mut reply = Message::new();
+    raw::sys_chan_recv_blocking(0, &mut reply);
+
+    let mut r = reply.reader();
+    let tag = r.read_u8().unwrap_or(1);
+    if tag != 0 {
+        // Error response
+        let err_msg = r.read_str().unwrap_or("unknown error");
+        println!("Spawn failed: {}", err_msg);
+        return;
+    }
+
+    if reply.cap == rvos::NO_CAP {
+        println!("Spawn failed: no process handle returned");
+        return;
+    }
+
+    let proc_handle = reply.cap;
+
+    // Wait for the child process to exit
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+
+    // Parse exit notification: i32(exit_code)
+    let mut r = Reader::new(&exit_msg.data[..exit_msg.len]);
+    let exit_code = r.read_i32().unwrap_or(-1);
+    println!("Process exited with code {}", exit_code);
+
+    raw::sys_chan_close(proc_handle);
 }
 
 pub fn run() {
@@ -312,6 +384,10 @@ pub fn run() {
             "stat" => {
                 let args = line.splitn(2, ' ').nth(1).unwrap_or("");
                 cmd_stat(args);
+            }
+            "run" => {
+                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                cmd_run(args);
             }
             "help" => cmd_help(),
             "shutdown" => {

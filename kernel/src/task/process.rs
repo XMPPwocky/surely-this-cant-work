@@ -74,6 +74,9 @@ pub struct Process {
     // Wakeup pending flag: set when wake_process is called on a Running/Ready process.
     // Checked by block_process to avoid the "check-then-block" race.
     pub wakeup_pending: bool,
+    // Exit notification endpoint: if nonzero, kernel sends exit code on this
+    // endpoint when the process exits, then closes it. NOT in the handle table.
+    pub exit_notify_ep: usize,
 }
 
 impl Process {
@@ -107,6 +110,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: KERNEL_STACK_PAGES as u32,
             wakeup_pending: false,
+            exit_notify_ep: 0,
         }
     }
 
@@ -173,6 +177,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: (KERNEL_STACK_PAGES + code_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
+            exit_notify_ep: 0,
         }
     }
 
@@ -227,6 +232,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: (KERNEL_STACK_PAGES + loaded.total_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
+            exit_notify_ep: 0,
         }
     }
 
@@ -251,6 +257,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: 0, // idle task doesn't own any pages
             wakeup_pending: false,
+            exit_notify_ep: 0,
         };
         p.set_name("idle");
         p
