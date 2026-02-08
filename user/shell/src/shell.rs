@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
 
 use rvos::raw;
 use rvos::Message;
@@ -72,6 +72,7 @@ fn cmd_help() {
     println!("  write <path> <text>   - Write to file");
     println!("  stat <path>           - Show file metadata");
     println!("  run <path>            - Run a program and wait for it to exit");
+    println!("  clear                 - Clear screen");
     println!("  help                  - Show this help");
     println!("  shutdown              - Shut down the system");
 }
@@ -332,30 +333,172 @@ fn cmd_run(args: &str) {
     raw::sys_chan_close(proc_handle);
 }
 
+// --- Tab completion ---
+
+const COMMANDS: &[&str] = &[
+    "cat", "clear", "echo", "help", "ls", "math", "mem",
+    "ps", "read", "run", "shutdown", "stat", "trace", "write",
+];
+
+enum Completion {
+    Single(String, usize),
+    Multiple(Vec<String>),
+    None,
+}
+
+fn try_complete(line: &str) -> Completion {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let trailing_space = line.ends_with(' ');
+
+    // Completing first word (command name)
+    if words.is_empty() || (words.len() == 1 && !trailing_space) {
+        let prefix = words.first().copied().unwrap_or("");
+        let matches: Vec<&str> = COMMANDS.iter()
+            .copied()
+            .filter(|c| c.starts_with(prefix))
+            .collect();
+        let replace_from = line.len() - prefix.len();
+        return match matches.len() {
+            0 => Completion::None,
+            1 => Completion::Single(matches[0].to_string(), replace_from),
+            _ => Completion::Multiple(matches.iter().map(|s| s.to_string()).collect()),
+        };
+    }
+
+    // Completing argument: file paths for commands that take paths
+    let cmd = words[0];
+    if matches!(cmd, "run" | "cat" | "read" | "stat" | "ls" | "write") {
+        let prefix = if trailing_space { "" } else { words.last().copied().unwrap_or("") };
+        let default_dir = if cmd == "run" { "/bin" } else { "/" };
+
+        let (dir, fname_prefix) = if prefix.is_empty() {
+            (default_dir, "")
+        } else if prefix.starts_with('/') {
+            match prefix.rfind('/') {
+                Some(0) => ("/", &prefix[1..]),
+                Some(pos) => (&prefix[..pos], &prefix[pos + 1..]),
+                None => (default_dir, prefix),
+            }
+        } else {
+            (default_dir, prefix)
+        };
+
+        let mut matches = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(fname_prefix) {
+                    if dir == "/" {
+                        matches.push(format!("/{}", name));
+                    } else {
+                        matches.push(format!("{}/{}", dir, name));
+                    }
+                }
+            }
+        }
+        matches.sort();
+
+        let replace_from = line.len() - prefix.len();
+        return match matches.len() {
+            0 => Completion::None,
+            1 => Completion::Single(matches.into_iter().next().unwrap(), replace_from),
+            _ => Completion::Multiple(matches),
+        };
+    }
+
+    Completion::None
+}
+
+fn handle_tab(buf: &mut String) {
+    match try_complete(buf) {
+        Completion::Single(text, replace_from) => {
+            let old_len = buf.len() - replace_from;
+            for _ in 0..old_len {
+                print!("\x08 \x08");
+            }
+            buf.truncate(replace_from);
+            buf.push_str(&text);
+            buf.push(' ');
+            print!("{} ", text);
+            io::stdout().flush().ok();
+        }
+        Completion::Multiple(matches) => {
+            print!("\r\n");
+            for m in &matches {
+                print!("{}  ", m);
+            }
+            print!("\r\nrvos> {}", buf);
+            io::stdout().flush().ok();
+        }
+        Completion::None => {}
+    }
+}
+
+// --- Console raw mode control ---
+
+fn set_raw_mode(enable: bool) {
+    io::stdout().flush().ok();
+    io::stdout().write_all(&[0, if enable { 1 } else { 0 }]).ok();
+    io::stdout().flush().ok();
+}
+
+// --- Main shell loop ---
+
 pub fn run() {
     println!("\nrvOS shell v0.1");
     println!("Type 'help' for available commands.\n");
 
-    let stdin = io::stdin();
-    let mut line = String::new();
+    set_raw_mode(true);
+
+    let mut buf = String::new();
+    let mut byte = [0u8; 1];
 
     loop {
         print!("rvos> ");
         io::stdout().flush().ok();
+        buf.clear();
 
-        line.clear();
-        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
-            continue;
+        loop {
+            if io::stdin().lock().read(&mut byte).unwrap_or(0) == 0 {
+                continue;
+            }
+            match byte[0] {
+                b'\r' | b'\n' => {
+                    print!("\r\n");
+                    io::stdout().flush().ok();
+                    break;
+                }
+                0x7F | 0x08 => {
+                    if !buf.is_empty() {
+                        buf.pop();
+                        print!("\x08 \x08");
+                        io::stdout().flush().ok();
+                    }
+                }
+                0x09 => handle_tab(&mut buf),
+                0x03 => {
+                    print!("^C\r\n");
+                    io::stdout().flush().ok();
+                    buf.clear();
+                    break;
+                }
+                ch if ch >= 0x20 && ch < 0x7F => {
+                    buf.push(ch as char);
+                    io::stdout().write_all(&[ch]).ok();
+                    io::stdout().flush().ok();
+                }
+                _ => {}
+            }
         }
-        let line = line.trim();
+
+        let line = buf.trim().to_string();
         if line.is_empty() {
             continue;
         }
 
         let cmd = line.split_whitespace().next().unwrap_or("");
-
         match cmd {
-            "echo" => cmd_echo(line),
+            "echo" => cmd_echo(&line),
             "math" => {
                 if let Some(args) = line.strip_prefix("math ") {
                     cmd_math(args);
@@ -390,6 +533,10 @@ pub fn run() {
                 cmd_run(args);
             }
             "help" => cmd_help(),
+            "clear" => {
+                print!("\x1b[2J\x1b[H");
+                io::stdout().flush().ok();
+            }
             "shutdown" => {
                 println!("Shutting down...");
                 raw::sys_shutdown();

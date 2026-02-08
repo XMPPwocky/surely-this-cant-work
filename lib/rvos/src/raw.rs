@@ -11,6 +11,8 @@ pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
 pub const SYS_SHM_CREATE: usize = 205;
 pub const SYS_SHM_DUP_RO: usize = 206;
 pub const SYS_CHAN_SEND_BLOCKING: usize = 207;
+pub const SYS_CHAN_POLL_ADD: usize = 208;
+pub const SYS_BLOCK: usize = 209;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
@@ -155,5 +157,18 @@ pub fn sys_mmap(shm_handle: usize, length: usize) -> usize {
 /// Unmap pages from process address space.
 pub fn sys_munmap(addr: usize, length: usize) -> usize {
     syscall2(SYS_MUNMAP, addr, length)
+}
+
+/// Register interest in a channel handle for poll-style multiplexing.
+/// After calling this for each handle of interest, call `sys_block()` to sleep.
+/// The process will be woken when any registered channel receives a message.
+pub fn sys_chan_poll_add(handle: usize) -> usize {
+    syscall1(SYS_CHAN_POLL_ADD, handle)
+}
+
+/// Block the calling process until woken by a channel event.
+/// Typically used after one or more `sys_chan_poll_add()` calls.
+pub fn sys_block() {
+    syscall0(SYS_BLOCK);
 }
 

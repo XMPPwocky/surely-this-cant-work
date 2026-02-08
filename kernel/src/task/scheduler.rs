@@ -94,24 +94,48 @@ pub fn save_kernel_satp() {
     }
 }
 
+/// Find a free process slot: prefer Dead slots for reuse, then None slots.
+/// Returns the PID (slot index). Panics if no slots available.
+/// When reusing a Dead slot, frees the old process's kernel stack (which
+/// could not be freed during exit because the dying process was still on it).
+fn find_free_slot(sched: &mut Scheduler) -> usize {
+    // First pass: look for Dead slots to reuse (skip idle at 0)
+    for i in 1..sched.processes.len() {
+        if let Some(ref p) = sched.processes[i] {
+            if p.state == ProcessState::Dead {
+                // Free old kernel stack before reusing the slot
+                let kstack_base = p.kernel_stack_base;
+                if kstack_base != 0 {
+                    let kstack_ppn = kstack_base / crate::mm::address::PAGE_SIZE;
+                    for j in 0..4 { // KERNEL_STACK_PAGES
+                        crate::mm::frame::frame_dealloc(
+                            crate::mm::address::PhysPageNum(kstack_ppn + j),
+                        );
+                    }
+                }
+                sched.processes[i] = None;
+                return i;
+            }
+        }
+    }
+    // Second pass: look for None slots
+    for i in 1..sched.processes.len() {
+        if sched.processes[i].is_none() {
+            return i;
+        }
+    }
+    panic!("No free process slots (max {})", MAX_PROCS);
+}
+
 /// Spawn a new kernel task. Returns the PID.
 #[allow(dead_code)]
 pub fn spawn(entry: fn()) -> usize {
     let mut sched = SCHEDULER.lock();
-    let proc = Process::new_kernel(entry);
-    let pid = proc.pid;
+    let pid = find_free_slot(&mut sched);
+    let proc = Process::new_kernel(pid, entry);
 
-    if pid < MAX_PROCS {
-        if sched.processes.len() <= pid {
-            while sched.processes.len() <= pid {
-                sched.processes.push(None);
-            }
-        }
-        sched.processes[pid] = Some(proc);
-        sched.ready_queue.push_back(pid);
-    } else {
-        panic!("Too many processes (max {})", MAX_PROCS);
-    }
+    sched.processes[pid] = Some(proc);
+    sched.ready_queue.push_back(pid);
 
     pid
 }
@@ -131,21 +155,12 @@ pub fn spawn_named(entry: fn(), name: &str) -> usize {
 #[allow(dead_code)]
 pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
     let mut sched = SCHEDULER.lock();
-    let mut proc = Process::new_user(user_code);
-    let pid = proc.pid;
+    let pid = find_free_slot(&mut sched);
+    let mut proc = Process::new_user(pid, user_code);
     proc.set_name(name);
 
-    if pid < MAX_PROCS {
-        if sched.processes.len() <= pid {
-            while sched.processes.len() <= pid {
-                sched.processes.push(None);
-            }
-        }
-        sched.processes[pid] = Some(proc);
-        sched.ready_queue.push_back(pid);
-    } else {
-        panic!("Too many processes (max {})", MAX_PROCS);
-    }
+    sched.processes[pid] = Some(proc);
+    sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {})", pid, name, pid);
     pid
@@ -155,22 +170,13 @@ pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
 #[allow(dead_code)]
 pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize) -> usize {
     let mut sched = SCHEDULER.lock();
-    let mut proc = Process::new_user(user_code);
-    let pid = proc.pid;
+    let pid = find_free_slot(&mut sched);
+    let mut proc = Process::new_user(pid, user_code);
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
-    if pid < MAX_PROCS {
-        if sched.processes.len() <= pid {
-            while sched.processes.len() <= pid {
-                sched.processes.push(None);
-            }
-        }
-        sched.processes[pid] = Some(proc);
-        sched.ready_queue.push_back(pid);
-    } else {
-        panic!("Too many processes (max {})", MAX_PROCS);
-    }
+    sched.processes[pid] = Some(proc);
+    sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
     pid
@@ -180,21 +186,12 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
 #[allow(dead_code)]
 pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
     let mut sched = SCHEDULER.lock();
-    let mut proc = Process::new_user_elf(elf_data);
-    let pid = proc.pid;
+    let pid = find_free_slot(&mut sched);
+    let mut proc = Process::new_user_elf(pid, elf_data);
     proc.set_name(name);
 
-    if pid < MAX_PROCS {
-        if sched.processes.len() <= pid {
-            while sched.processes.len() <= pid {
-                sched.processes.push(None);
-            }
-        }
-        sched.processes[pid] = Some(proc);
-        sched.ready_queue.push_back(pid);
-    } else {
-        panic!("Too many processes (max {})", MAX_PROCS);
-    }
+    sched.processes[pid] = Some(proc);
+    sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {})", pid, name, pid);
     pid
@@ -203,22 +200,13 @@ pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
 /// Spawn a user ELF process with handle 0 pre-set to boot_ep (boot channel).
 pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: usize) -> usize {
     let mut sched = SCHEDULER.lock();
-    let mut proc = Process::new_user_elf(elf_data);
-    let pid = proc.pid;
+    let pid = find_free_slot(&mut sched);
+    let mut proc = Process::new_user_elf(pid, elf_data);
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
-    if pid < MAX_PROCS {
-        if sched.processes.len() <= pid {
-            while sched.processes.len() <= pid {
-                sched.processes.push(None);
-            }
-        }
-        sched.processes[pid] = Some(proc);
-        sched.ready_queue.push_back(pid);
-    } else {
-        panic!("Too many processes (max {})", MAX_PROCS);
-    }
+    sched.processes[pid] = Some(proc);
+    sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
     pid
@@ -227,23 +215,14 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: us
 /// Spawn a user ELF process with handle 0 = boot_ep and handle 1 = extra_ep.
 pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, extra_ep: usize) -> usize {
     let mut sched = SCHEDULER.lock();
-    let mut proc = Process::new_user_elf(elf_data);
-    let pid = proc.pid;
+    let pid = find_free_slot(&mut sched);
+    let mut proc = Process::new_user_elf(pid, elf_data);
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
     proc.handles[1] = Some(HandleObject::Channel(extra_ep));
 
-    if pid < MAX_PROCS {
-        if sched.processes.len() <= pid {
-            while sched.processes.len() <= pid {
-                sched.processes.push(None);
-            }
-        }
-        sched.processes[pid] = Some(proc);
-        sched.ready_queue.push_back(pid);
-    } else {
-        panic!("Too many processes (max {})", MAX_PROCS);
-    }
+    sched.processes[pid] = Some(proc);
+    sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={}, extra_ep={})", pid, name, pid, boot_ep, extra_ep);
     pid
@@ -383,14 +362,24 @@ pub fn exit_current() -> ! {
 }
 
 /// Mark current task as dead (called from syscall context, may return).
-/// Cleans up all handles (channel + SHM) and SHM-backed mmap regions.
+/// Cleans up all handles (channel + SHM), mmap regions, and physical frames.
 pub fn exit_current_from_syscall() {
-    // Collect handles and mmap cleanup info while holding the lock,
+    use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
+    use crate::mm::heap::PGTB_ALLOC;
+
+    // Collect handles and cleanup info while holding the lock,
     // then release the lock BEFORE calling channel_close (which may call
     // wake_process, requiring the SCHEDULER lock — would deadlock otherwise).
     let mut channel_eps: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
     let mut shm_ids: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
     let mut notify_ep = 0usize;
+
+    // Frame cleanup info
+    let mut pt_frames: alloc::vec::Vec<PhysPageNum, crate::mm::heap::PgtbAlloc> = alloc::vec::Vec::new_in(PGTB_ALLOC);
+    let mut code_ppn: usize = 0;
+    let mut code_pages: usize = 0;
+    let mut ustack_ppn: usize = 0;
+    let mut ustack_pages: usize = 0;
     {
         let mut sched = SCHEDULER.lock();
         let pid = sched.current;
@@ -411,26 +400,34 @@ pub fn exit_current_from_syscall() {
                     }
                 }
             }
-            // Clean up mmap regions while holding the lock (no lock contention here)
+            // Clean up mmap regions (unmap and free anonymous frames)
             if proc.user_satp != 0 {
-                let root_ppn = crate::mm::address::PhysPageNum(proc.user_satp & ((1usize << 44) - 1));
+                let root_ppn = PhysPageNum(proc.user_satp & ((1usize << 44) - 1));
                 let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
                 for slot in proc.mmap_regions.iter_mut() {
                     if let Some(region) = slot.take() {
                         for j in 0..region.page_count {
-                            let vpn = crate::mm::address::VirtPageNum(region.base_ppn + j);
+                            let vpn = VirtPageNum(region.base_ppn + j);
                             pt.unmap(vpn);
                             if region.shm_id.is_none() {
-                                // Anonymous: free the frame
                                 crate::mm::frame::frame_dealloc(
-                                    crate::mm::address::PhysPageNum(region.base_ppn + j),
+                                    PhysPageNum(region.base_ppn + j),
                                 );
                             }
-                            // SHM-backed: do NOT free the frame
                         }
                     }
                 }
             }
+
+            // Snapshot frame cleanup info
+            pt_frames = core::mem::replace(&mut proc.pt_frames, alloc::vec::Vec::new_in(PGTB_ALLOC));
+            code_ppn = proc.code_ppn;
+            code_pages = proc.code_pages;
+            if proc.is_user && proc.user_stack_top != 0 {
+                ustack_pages = 8; // USER_STACK_PAGES
+                ustack_ppn = (proc.user_stack_top / PAGE_SIZE) - ustack_pages;
+            }
+
             proc.state = ProcessState::Dead;
         }
     }
@@ -457,6 +454,29 @@ pub fn exit_current_from_syscall() {
             crate::ipc::shm_dec_ref(shm_ids[i]);
         }
     }
+
+    // Free physical frames (code, user stack, page table nodes).
+    // NOTE: Do NOT free kernel stack here — we're still executing on it!
+    // Kernel stack is freed when the Dead slot is reused by a new process.
+    if code_pages > 0 {
+        for i in 0..code_pages {
+            crate::mm::frame::frame_dealloc(PhysPageNum(code_ppn + i));
+        }
+    }
+    if ustack_pages > 0 {
+        for i in 0..ustack_pages {
+            crate::mm::frame::frame_dealloc(PhysPageNum(ustack_ppn + i));
+        }
+    }
+    // Free page table node frames last (mmap unmap above needed the page table)
+    for &frame in &pt_frames {
+        crate::mm::frame::frame_dealloc(frame);
+    }
+    // Explicitly drop the Vec before schedule() — schedule() never returns for
+    // Dead processes (switch_context saves context that will never be restored),
+    // so local variables with heap allocations would leak their backing storage.
+    drop(pt_frames);
+
     schedule();
 }
 

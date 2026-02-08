@@ -108,6 +108,53 @@ pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
     Ok(Channel::from_raw_handle(reply.cap()))
 }
 
+/// Spawn a process with an extra capability channel passed as handle 1.
+///
+/// Like `spawn_process`, but additionally sends `cap_handle` as a capability
+/// with the Spawn request. The spawned process receives this as handle 1.
+pub fn spawn_process_with_cap(path: &str, cap_handle: usize) -> SysResult<Channel> {
+    spawn_process_with_cap_on(0, path, cap_handle)
+}
+
+/// Spawn a process with an extra capability via a specific boot handle.
+pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usize) -> SysResult<Channel> {
+    let msg = Message::build(cap_handle, |w| {
+        let _ = w.write_u8(TAG_SPAWN);
+        let _ = w.write_str(path);
+    });
+    let ret = raw::syscall2(
+        raw::SYS_CHAN_SEND,
+        boot_handle,
+        &msg as *const Message as usize,
+    );
+    if ret != 0 {
+        return Err(SysError::from_code(ret).unwrap_err());
+    }
+
+    let mut reply = Message::new();
+    let ret = raw::syscall2(
+        raw::SYS_CHAN_RECV_BLOCKING,
+        boot_handle,
+        &mut reply as *mut Message as usize,
+    );
+    if ret != 0 {
+        return Err(SysError::from_code(ret).unwrap_err());
+    }
+
+    // Parse response
+    let mut r = reply.reader();
+    let tag = r.read_u8().unwrap_or(TAG_ERROR);
+    if tag != TAG_OK {
+        return Err(SysError::NoResources);
+    }
+
+    if reply.cap() == raw::NO_CAP {
+        return Err(SysError::NoResources);
+    }
+
+    Ok(Channel::from_raw_handle(reply.cap()))
+}
+
 /// Read the error message from a boot channel Error response.
 /// Returns the error string from msg.data, or "unknown" if parsing fails.
 pub fn read_error_response(msg: &Message) -> &str {

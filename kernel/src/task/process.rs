@@ -2,6 +2,7 @@ use crate::task::context::TaskContext;
 use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
 use crate::mm::frame;
 use crate::mm::page_table::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U};
+use crate::mm::heap::{PgtbAlloc, PGTB_ALLOC};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 const KERNEL_STACK_PAGES: usize = 4; // 16 KiB
@@ -38,7 +39,8 @@ pub fn rdtime() -> u64 {
 
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
 
-fn alloc_pid() -> usize {
+/// Allocate a monotonically increasing PID (fallback when no dead slots available).
+pub fn alloc_pid() -> usize {
     NEXT_PID.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -77,13 +79,18 @@ pub struct Process {
     // Exit notification endpoint: if nonzero, kernel sends exit code on this
     // endpoint when the process exits, then closes it. NOT in the handle table.
     pub exit_notify_ep: usize,
+    // --- Resource cleanup fields (used by exit_current_from_syscall) ---
+    /// Page table node frames to free on exit (empty for kernel tasks)
+    pub pt_frames: alloc::vec::Vec<PhysPageNum, PgtbAlloc>,
+    /// PPN of first code page (0 for kernel tasks)
+    pub code_ppn: usize,
+    /// Number of code pages (0 for kernel tasks)
+    pub code_pages: usize,
 }
 
 impl Process {
     /// Create a new kernel task with the given entry function
-    pub fn new_kernel(entry: fn()) -> Self {
-        let pid = alloc_pid();
-
+    pub fn new_kernel(pid: usize, entry: fn()) -> Self {
         let stack_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_PAGES)
             .expect("Failed to allocate kernel stack");
         let stack_base = stack_ppn.0 * PAGE_SIZE;
@@ -111,6 +118,9 @@ impl Process {
             mem_pages: KERNEL_STACK_PAGES as u32,
             wakeup_pending: false,
             exit_notify_ep: 0,
+            pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
+            code_ppn: 0,
+            code_pages: 0,
         }
     }
 
@@ -119,9 +129,7 @@ impl Process {
     /// User code and stack are identity-mapped (VA=PA) in a per-process
     /// page table, so addresses work under both kernel and user page tables.
     #[allow(dead_code)]
-    pub fn new_user(user_code: &[u8]) -> Self {
-        let pid = alloc_pid();
-
+    pub fn new_user(pid: usize, user_code: &[u8]) -> Self {
         // Allocate kernel stack for this process (used during traps)
         let kstack_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_PAGES)
             .expect("Failed to allocate kernel stack for user process");
@@ -129,9 +137,9 @@ impl Process {
         let kstack_top = kstack_base + KERNEL_STACK_SIZE;
 
         // Allocate user code pages
-        let code_pages = (user_code.len() + PAGE_SIZE - 1) / PAGE_SIZE;
-        let code_pages = if code_pages == 0 { 1 } else { code_pages };
-        let code_ppn = frame::frame_alloc_contiguous(code_pages)
+        let n_code_pages = (user_code.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+        let n_code_pages = if n_code_pages == 0 { 1 } else { n_code_pages };
+        let code_ppn = frame::frame_alloc_contiguous(n_code_pages)
             .expect("Failed to allocate user code pages");
         let code_phys = code_ppn.0 * PAGE_SIZE;
 
@@ -152,9 +160,10 @@ impl Process {
 
         // Create user page table with identity-mapped user pages
         let pt = create_user_page_table_identity(
-            code_ppn, code_pages, stack_ppn, USER_STACK_PAGES,
+            code_ppn, n_code_pages, stack_ppn, USER_STACK_PAGES,
         );
         let satp = pt.satp();
+        let pt_frames = pt.take_frames();
 
         let context = TaskContext::new_user_entry(kstack_top);
 
@@ -175,17 +184,19 @@ impl Process {
             ewma_1s: 0,
             ewma_1m: 0,
             last_switched_away: rdtime(),
-            mem_pages: (KERNEL_STACK_PAGES + code_pages + USER_STACK_PAGES) as u32,
+            mem_pages: (KERNEL_STACK_PAGES + n_code_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
             exit_notify_ep: 0,
+            pt_frames,
+            code_ppn: code_ppn.0,
+            code_pages: n_code_pages,
         }
     }
 
     /// Create a user process from an ELF binary.
     /// Parses ELF, loads PT_LOAD segments, creates page table.
-    pub fn new_user_elf(elf_data: &[u8]) -> Self {
+    pub fn new_user_elf(pid: usize, elf_data: &[u8]) -> Self {
         crate::trace::trace_kernel(b"new_user_elf-enter");
-        let pid = alloc_pid();
 
         // Allocate kernel stack
         let kstack_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_PAGES)
@@ -209,6 +220,7 @@ impl Process {
             stack_ppn, USER_STACK_PAGES,
         );
         let satp = pt.satp();
+        let pt_frames = pt.take_frames();
 
         let context = TaskContext::new_user_entry(kstack_top);
 
@@ -233,6 +245,9 @@ impl Process {
             mem_pages: (KERNEL_STACK_PAGES + loaded.total_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
             exit_notify_ep: 0,
+            pt_frames,
+            code_ppn: loaded.code_ppn.0,
+            code_pages: loaded.total_pages,
         }
     }
 
@@ -258,6 +273,9 @@ impl Process {
             mem_pages: 0, // idle task doesn't own any pages
             wakeup_pending: false,
             exit_notify_ep: 0,
+            pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
+            code_ppn: 0,
+            code_pages: 0,
         };
         p.set_name("idle");
         p

@@ -2,10 +2,10 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{self, NonNull};
 use crate::sync::SpinLock;
 
-const HEAP_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+const HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 const MIN_ORDER: usize = 5;   // 32 bytes
-const MAX_ORDER: usize = 21;  // 2 MiB
-const NUM_ORDERS: usize = MAX_ORDER - MIN_ORDER + 1; // 16
+const MAX_ORDER: usize = 22;  // 4 MiB
+const NUM_ORDERS: usize = MAX_ORDER - MIN_ORDER + 1; // 18
 
 static mut HEAP_SPACE: [u8; HEAP_SIZE] = [0u8; HEAP_SIZE];
 
@@ -58,7 +58,7 @@ impl TagStats {
 struct BuddyAllocator {
     base: usize,
     free_lists: [*mut usize; NUM_ORDERS],
-    bitmap: [u8; 8192],
+    bitmap: [u8; 16384],
     // Tag accounting
     tag_stats: [TagStats; MAX_TAGS],
     tag_count: usize,
@@ -79,7 +79,7 @@ impl BuddyAllocator {
         BuddyAllocator {
             base: 0,
             free_lists: [ptr::null_mut(); NUM_ORDERS],
-            bitmap: [0u8; 8192],
+            bitmap: [0u8; 16384],
             tag_stats: [TagStats::empty(); MAX_TAGS],
             tag_count: 0,
             total_used: 0,

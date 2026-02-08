@@ -693,6 +693,21 @@ static WINCLIENT_ELF: &[u8] = include_bytes!(
     "../../../user/winclient/target/riscv64gc-unknown-rvos/release/winclient"
 );
 
+static IPC_TORTURE_ELF: &[u8] = include_bytes!(
+    "../../../user/ipc-torture/target/riscv64gc-unknown-rvos/release/ipc-torture"
+);
+
+// --- Multiplexed client state ---
+
+const MAX_CLIENTS: usize = 8;
+
+struct ClientState {
+    ctl_handle: usize,     // client's control channel handle
+    file_handle: usize,    // 0 = no file open, otherwise handle to open file channel
+    file_inode: usize,     // inode of the open file (valid when file_handle != 0)
+    active: bool,
+}
+
 fn main() {
     // Initialize filesystem
     unsafe {
@@ -703,141 +718,179 @@ fn main() {
     fs().add_static_file(b"/bin/hello-std", HELLO_STD_ELF);
     fs().add_static_file(b"/bin/window-server", WINDOW_SERVER_ELF);
     fs().add_static_file(b"/bin/winclient", WINCLIENT_ELF);
+    fs().add_static_file(b"/bin/ipc-torture", IPC_TORTURE_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)
     // Handle 1: fs control channel (receives new client endpoints from init)
 
-    // Main event loop: poll control channel and all open file channels
+    let mut clients: [ClientState; MAX_CLIENTS] = [const { ClientState {
+        ctl_handle: 0, file_handle: 0, file_inode: 0, active: false,
+    } }; MAX_CLIENTS];
+
+    // Multiplexed event loop: poll control channel + all active client channels
     loop {
         let mut handled = false;
 
-        // Check control channel for new client requests
-        {
+        // Accept new clients from control channel (non-blocking)
+        loop {
             let mut msg = Message::new();
-            // Try non-blocking recv on control channel first
-            // Since we don't have non-blocking recv in user mode, we need a different approach.
-            // The fs server's design: block waiting for ANY message.
-            // We'll prioritize the control channel, then serve file requests.
-            //
-            // Simple approach: serve one control request, then serve all pending file requests,
-            // then block on control channel again.
-            //
-            // But we need to also respond to file channel messages while waiting.
-            // Since we can only block on one channel at a time, we'll poll:
-            // 1. Block on control channel
-            // 2. When woken, handle control request
-            // 3. Serve file requests round-robin (non-blocking would be ideal but we only have blocking)
-            //
-            // Actually, the simplest correct approach for now:
-            // We block on the control channel. When a new client comes in, we handle its
-            // Open request and create a file channel. Then we serve that file channel
-            // until the client closes it, then go back to control channel.
-            //
-            // But this is sequential - only one client at a time. That's OK for a simple tmpfs.
-            // The sysinfo and math services also work this way.
-
-            // Wait for a new client endpoint from init
-            raw::sys_chan_recv_blocking(CONTROL_HANDLE, &mut msg);
-
+            let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut msg);
+            if ret != 0 { break; }
+            handled = true;
             if msg.cap != NO_CAP {
-                let client_ctl_handle = msg.cap;
-                // Serve this client until they disconnect
-                serve_client(client_ctl_handle);
-                handled = true;
+                // Find a free client slot (or reclaim an inactive one)
+                let slot = clients.iter_mut().find(|c| !c.active);
+                if let Some(slot) = slot {
+                    *slot = ClientState {
+                        ctl_handle: msg.cap,
+                        file_handle: 0,
+                        file_inode: 0,
+                        active: true,
+                    };
+                } else {
+                    // No free slots — close the endpoint
+                    raw::sys_chan_close(msg.cap);
+                }
+            }
+        }
+
+        // Poll each active client
+        for i in 0..MAX_CLIENTS {
+            if !clients[i].active { continue; }
+
+            // If a file channel is open, poll it
+            if clients[i].file_handle != 0 {
+                let mut msg = Message::new();
+                let ret = raw::sys_chan_recv(clients[i].file_handle, &mut msg);
+                if ret == 0 {
+                    handled = true;
+                    if msg.len == 0 {
+                        close_client_file(&mut clients[i]);
+                    } else {
+                        let fh = clients[i].file_handle;
+                        let inode = clients[i].file_inode;
+                        let mut r = Reader::new(&msg.data[..msg.len]);
+                        let tag = r.read_u8().unwrap_or(0xFF);
+                        match tag {
+                            0 => handle_read(fh, inode, &mut r),
+                            1 => handle_write(fh, inode, &mut r),
+                            _ => send_file_error(fh, ERR_IO),
+                        }
+                    }
+                } else if ret == 2 {
+                    // Channel closed by peer
+                    close_client_file(&mut clients[i]);
+                }
+            }
+
+            // Poll client control channel
+            {
+                let mut msg = Message::new();
+                let ret = raw::sys_chan_recv(clients[i].ctl_handle, &mut msg);
+                if ret == 0 {
+                    handled = true;
+                    if msg.len == 0 {
+                        close_client_full(&mut clients[i]);
+                    } else {
+                        handle_ctl_msg(&mut clients[i], &msg);
+                    }
+                } else if ret == 2 {
+                    // Client disconnected
+                    close_client_full(&mut clients[i]);
+                }
             }
         }
 
         if !handled {
-            // Nothing to do, will block on next recv
-        }
-    }
-}
-
-fn serve_client(client_handle: usize) {
-    // Serve control channel requests from this client
-    // The client can send multiple Open/Delete requests on the same control channel
-    // For each Open, we also need to serve the resulting file channel
-
-    // We'll handle requests in a loop. For each Open, we serve the file channel
-    // until it closes, then return to waiting on the control channel.
-    loop {
-        let mut msg = Message::new();
-        raw::sys_chan_recv_blocking(client_handle, &mut msg);
-
-        if msg.len == 0 {
-            // Client probably closed the control channel
-            break;
-        }
-
-        let mut r = Reader::new(&msg.data[..msg.len]);
-        let tag = match r.read_u8() {
-            Ok(t) => t,
-            Err(_) => {
-                send_error(client_handle, ERR_IO);
-                continue;
-            }
-        };
-
-        match tag {
-            0 => {
-                // Open - handle it and then serve the file channel
-                let flags = match r.read_u8() {
-                    Ok(f) => f,
-                    Err(_) => {
-                        send_error(client_handle, ERR_IO);
-                        continue;
-                    }
-                };
-
-                let path = match r.read_str() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        send_error(client_handle, ERR_INVALID_PATH);
-                        continue;
-                    }
-                };
-
-                let path_bytes = path.as_bytes();
-
-                if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
-                    send_error(client_handle, ERR_INVALID_PATH);
-                    continue;
+            // Register interest on all active channels, then block until
+            // any of them receives a message. This eliminates busy-wait
+            // polling (sys_yield) and lets the scheduler skip us entirely
+            // when there's nothing to do.
+            raw::sys_chan_poll_add(CONTROL_HANDLE);
+            for i in 0..MAX_CLIENTS {
+                if !clients[i].active { continue; }
+                raw::sys_chan_poll_add(clients[i].ctl_handle);
+                if clients[i].file_handle != 0 {
+                    raw::sys_chan_poll_add(clients[i].file_handle);
                 }
-
-                do_open(client_handle, flags, path_bytes);
             }
-            1 => {
-                // Delete
-                let path = match r.read_str() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        send_error(client_handle, ERR_INVALID_PATH);
-                        continue;
-                    }
-                };
-                do_delete(client_handle, path.as_bytes());
-            }
-            2 => {
-                // Stat
-                do_stat(client_handle, &mut r);
-            }
-            3 => {
-                // Readdir
-                do_readdir(client_handle, &mut r);
-            }
-            _ => {
-                send_error(client_handle, ERR_IO);
-            }
+            raw::sys_block();
         }
     }
 }
 
-fn do_open(client_handle: usize, flags: u8, path_bytes: &[u8]) {
+fn close_client_file(client: &mut ClientState) {
+    if client.file_handle != 0 {
+        fs().close_open_file(client.file_handle);
+        raw::sys_chan_close(client.file_handle);
+        client.file_handle = 0;
+        client.file_inode = 0;
+    }
+}
+
+fn close_client_full(client: &mut ClientState) {
+    close_client_file(client);
+    raw::sys_chan_close(client.ctl_handle);
+    client.active = false;
+}
+
+fn handle_ctl_msg(client: &mut ClientState, msg: &Message) {
+    let mut r = Reader::new(&msg.data[..msg.len]);
+    let tag = match r.read_u8() {
+        Ok(t) => t,
+        Err(_) => {
+            send_error(client.ctl_handle, ERR_IO);
+            return;
+        }
+    };
+
+    match tag {
+        0 => {
+            // Open
+            let flags = match r.read_u8() {
+                Ok(f) => f,
+                Err(_) => { send_error(client.ctl_handle, ERR_IO); return; }
+            };
+            let path = match r.read_str() {
+                Ok(p) => p,
+                Err(_) => { send_error(client.ctl_handle, ERR_INVALID_PATH); return; }
+            };
+            let path_bytes = path.as_bytes();
+            if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
+                send_error(client.ctl_handle, ERR_INVALID_PATH);
+                return;
+            }
+            do_open(client, flags, path_bytes);
+        }
+        1 => {
+            // Delete
+            let path = match r.read_str() {
+                Ok(p) => p,
+                Err(_) => { send_error(client.ctl_handle, ERR_INVALID_PATH); return; }
+            };
+            do_delete(client.ctl_handle, path.as_bytes());
+        }
+        2 => {
+            // Stat
+            do_stat(client.ctl_handle, &mut r);
+        }
+        3 => {
+            // Readdir
+            do_readdir(client.ctl_handle, &mut r);
+        }
+        _ => {
+            send_error(client.ctl_handle, ERR_IO);
+        }
+    }
+}
+
+fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
     let create = flags & FLAG_CREATE != 0;
     let truncate = flags & FLAG_TRUNCATE != 0;
     let excl = flags & FLAG_EXCL != 0;
 
+    let client_handle = client.ctl_handle;
     let fs = fs();
 
     let inode_idx = match fs.resolve_path(path_bytes) {
@@ -911,6 +964,9 @@ fn do_open(client_handle: usize, flags: u8, path_bytes: &[u8]) {
         }
     };
 
+    // Close any existing file channel for this client first
+    close_client_file(client);
+
     // Create channel pair for file I/O
     let (my_handle, client_file_handle) = raw::sys_chan_create();
 
@@ -921,46 +977,16 @@ fn do_open(client_handle: usize, flags: u8, path_bytes: &[u8]) {
         return;
     }
 
-    // Send Ok with the file handle as capability.
+    // Send Ok with the file handle as capability
     send_ok(client_handle, client_file_handle);
     // Close our local handle for the client's file endpoint. The channel
     // stays alive because the client still holds a reference (ref counting
     // was incremented when the capability was sent via IPC).
     raw::sys_chan_close(client_file_handle);
 
-    // Now serve this file channel until the client closes it
-    serve_file_channel(my_handle, inode_idx);
-
-    // Clean up
-    fs.close_open_file(my_handle);
-    raw::sys_chan_close(my_handle);
-}
-
-fn serve_file_channel(file_handle: usize, inode_idx: usize) {
-    loop {
-        let mut msg = Message::new();
-        raw::sys_chan_recv_blocking(file_handle, &mut msg);
-
-        // If recv returns with len=0, the channel may be closed
-        if msg.len == 0 {
-            break;
-        }
-
-        let mut r = Reader::new(&msg.data[..msg.len]);
-        let tag = match r.read_u8() {
-            Ok(t) => t,
-            Err(_) => {
-                send_file_error(file_handle, ERR_IO);
-                continue;
-            }
-        };
-
-        match tag {
-            0 => handle_read(file_handle, inode_idx, &mut r),
-            1 => handle_write(file_handle, inode_idx, &mut r),
-            _ => send_file_error(file_handle, ERR_IO),
-        }
-    }
+    // Store file channel in client state for multiplexed serving
+    client.file_handle = my_handle;
+    client.file_inode = inode_idx;
 }
 
 fn do_delete(client_handle: usize, path_bytes: &[u8]) {

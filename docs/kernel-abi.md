@@ -63,10 +63,12 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 172    | `SYS_GETPID`          | (none)                        | `a0` = PID                | Returns the calling process's PID.                         |
 | 200    | `SYS_CHAN_CREATE`      | (none)                        | `a0` = handle_a, `a1` = handle_b | Creates a bidirectional channel pair. Returns two handles. |
 | 201    | `SYS_CHAN_SEND`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 5, or `usize::MAX` | Sends a message on a channel. Non-blocking. 0=success, 5=queue full, MAX=error. |
-| 202    | `SYS_CHAN_RECV`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 1, or `usize::MAX` | Non-blocking receive. 0=success, 1=empty, MAX=error.    |
+| 202    | `SYS_CHAN_RECV`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 1, 2, or `usize::MAX` | Non-blocking receive. 0=success, 1=empty, 2=channel closed, MAX=error. |
 | 203    | `SYS_CHAN_CLOSE`       | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Closes a channel handle. Decrements the endpoint's ref count; deactivates only when the last handle is closed. |
 | 204    | `SYS_CHAN_RECV_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking receive. Suspends the process until a message arrives. |
 | 207    | `SYS_CHAN_SEND_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking send. Suspends the process if the queue is full until space is available. |
+| 208    | `SYS_CHAN_POLL_ADD`    | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Registers the calling process as waiting on this channel. Use with `SYS_BLOCK` for multiplexed I/O. |
+| 209    | `SYS_BLOCK`           | (none)                        | `a0` = 0                  | Blocks the calling process until woken by a channel event. |
 | 222    | `SYS_MMAP`            | `a0` = hint (ignored), `a1` = length | `a0` = address or `usize::MAX` | Allocates zeroed pages and maps them into the process. |
 | 215    | `SYS_MUNMAP`          | `a0` = address, `a1` = length | `a0` = 0 or `usize::MAX`  | Unmaps and frees previously mmap'd pages.                  |
 | 230    | `SYS_TRACE`           | `a0` = label_ptr, `a1` = label_len | `a0` = 0 or `usize::MAX` | Records a timestamped trace event in the kernel ring buffer. |
@@ -136,7 +138,8 @@ and rewrites `msg.cap` to the new local handle index.
 
 Returns:
 - `0` -- message received and written to buffer.
-- `1` -- no message available (queue empty).
+- `1` -- no message available (queue empty, channel still active).
+- `2` -- channel closed (peer's last handle was closed).
 - `usize::MAX` -- error (invalid handle or pointer).
 
 #### SYS_CHAN_RECV_BLOCKING (204)
@@ -190,6 +193,36 @@ eventually closes that handle via `SYS_CHAN_CLOSE`, the ref count is
 decremented back.
 
 Returns 0 on success, `usize::MAX` if the handle is invalid.
+
+#### SYS_CHAN_POLL_ADD (208)
+
+Registers the calling process as "blocked-waiting" on the channel identified by
+`handle` (`a0`). This does **not** block the process -- it only records the
+process's PID so that a future `channel_send` to that endpoint will wake it.
+
+Typical usage pattern for multiplexed I/O:
+
+1. Call `SYS_CHAN_POLL_ADD` for each channel handle of interest.
+2. Call `SYS_BLOCK` to go to sleep.
+3. When any registered channel receives a message, the sender wakes the process.
+4. The process polls all channels (non-blocking) to find which one(s) have data.
+5. Repeat.
+
+The `wakeup_pending` flag in the scheduler prevents races: if a message arrives
+between the last `poll_add` and the `block` call, `block_process` will notice
+that `wakeup_pending` is set and return the process to `Ready` immediately
+instead of sleeping.
+
+Returns 0 on success, `usize::MAX` if the handle is invalid.
+
+#### SYS_BLOCK (209)
+
+Blocks the calling process until it is woken by a channel event (or any other
+`wake_process` call). The process is moved to `Blocked` state and removed from
+the scheduler's ready queue.
+
+This syscall is designed to be used after one or more `SYS_CHAN_POLL_ADD` calls.
+It always returns 0.
 
 #### SYS_MMAP (222)
 

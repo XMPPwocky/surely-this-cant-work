@@ -174,6 +174,8 @@ struct FsLaunchCtx {
     service_name: Option<&'static str>,
     /// If nonzero, this is a dynamic spawn — send response on this endpoint when done.
     requester_ep: usize,
+    /// If nonzero, global endpoint ID to give spawned process as handle 1.
+    extra_cap: usize,
 }
 
 impl FsLaunchCtx {
@@ -232,6 +234,23 @@ pub fn init_server() {
                 handle_request(boot_ep_b, console_type, is_shell, &msg, my_pid,
                                &mut fs_launches);
                 handled = true;
+            }
+        }
+
+        // Clean up dead boot registrations (child process exited, boot_a closed)
+        for i in 0..count {
+            let (boot_ep_b, _, _) = endpoints[i];
+            if !ipc::channel_is_active(boot_ep_b) {
+                ipc::channel_close(boot_ep_b);
+                let mut config = INIT_CONFIG.lock();
+                for slot in config.boot_regs.iter_mut() {
+                    if let Some(ref reg) = slot {
+                        if reg.boot_ep_b == boot_ep_b {
+                            *slot = None;
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -342,7 +361,7 @@ fn handle_request(
                     return;
                 }
             };
-            handle_spawn_request(boot_ep_b, console_type, path, fs_launches, my_pid);
+            handle_spawn_request(boot_ep_b, console_type, path, msg.cap, fs_launches, my_pid);
         }
         _ => {
             send_error(boot_ep_b, "unknown request tag", my_pid);
@@ -449,6 +468,7 @@ fn handle_spawn_request(
     boot_ep_b: usize,
     console_type: ConsoleType,
     path: &str,
+    spawn_cap: usize,
     fs_launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
     my_pid: usize,
 ) {
@@ -503,6 +523,15 @@ fn handle_spawn_request(
     let name_bytes = &path_bytes[name_start..];
     let name_len = name_bytes.len().min(NAME_BUF_LEN);
 
+    let extra_cap = if spawn_cap != NO_CAP {
+        match ipc::decode_cap_channel(spawn_cap) {
+            Some(ep) => ep,
+            None => 0,
+        }
+    } else {
+        0
+    };
+
     let mut ctx = FsLaunchCtx {
         state: FsLaunchState::WaitStat,
         ctl_ep: my_ctl_ep,
@@ -516,6 +545,7 @@ fn handle_spawn_request(
         console_type,
         service_name: None,
         requester_ep: boot_ep_b,
+        extra_cap,
     };
     ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
     ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
@@ -629,6 +659,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             console_type,
             service_name,
             requester_ep: 0, // boot-time launch, no requester
+            extra_cap: 0,
         });
         slot_idx += 1;
     }
@@ -669,6 +700,14 @@ fn poll_fs_launch(
                 msg.sender_pid = my_pid;
                 send_and_wake(ctx.ctl_ep, msg);
                 ctx.state = FsLaunchState::WaitOpen;
+                return true;
+            } else if !ipc::channel_is_active(ctx.ctl_ep) {
+                crate::println!("[init] fs: connection closed for {}", ctx.name());
+                if ctx.requester_ep != 0 {
+                    send_error(ctx.requester_ep, "fs error", my_pid);
+                }
+                ipc::channel_close(ctx.ctl_ep);
+                ctx.state = FsLaunchState::Done;
                 return true;
             }
         }
@@ -711,6 +750,14 @@ fn poll_fs_launch(
                 send_and_wake(ctx.file_ep, msg);
                 ctx.state = FsLaunchState::WaitRead;
                 return true;
+            } else if !ipc::channel_is_active(ctx.ctl_ep) {
+                crate::println!("[init] fs: connection closed for {}", ctx.name());
+                if ctx.requester_ep != 0 {
+                    send_error(ctx.requester_ep, "fs error", my_pid);
+                }
+                ipc::channel_close(ctx.ctl_ep);
+                ctx.state = FsLaunchState::Done;
+                return true;
             }
         }
         FsLaunchState::WaitRead => {
@@ -748,7 +795,20 @@ fn poll_fs_launch(
                         }
                         ctx.data.extend_from_slice(&resp.data[3..3 + chunk_len]);
                     }
-                    None => break,
+                    None => {
+                        // Check if the file channel was closed
+                        if !ipc::channel_is_active(ctx.file_ep) {
+                            crate::println!("[init] fs: file channel closed for {}", ctx.name());
+                            if ctx.requester_ep != 0 {
+                                send_error(ctx.requester_ep, "read error", my_pid);
+                            }
+                            ipc::channel_close(ctx.file_ep);
+                            ipc::channel_close(ctx.ctl_ep);
+                            ctx.state = FsLaunchState::Done;
+                            return true;
+                        }
+                        break;
+                    }
                 }
             }
             return progress;
@@ -787,6 +847,8 @@ fn finish_fs_launch(
         let (init_svc_ep, svc_ctl_ep) = ipc::channel_create_pair();
         register_service(svc_name, init_svc_ep);
         crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, svc_ctl_ep)
+    } else if ctx.extra_cap != 0 {
+        crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, ctx.extra_cap)
     } else {
         crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name(), boot_a)
     };

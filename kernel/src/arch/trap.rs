@@ -23,6 +23,8 @@ pub const SYS_CHAN_RECV_BLOCKING: usize = 204;
 pub const SYS_CHAN_SEND_BLOCKING: usize = 207;
 pub const SYS_SHM_CREATE: usize = 205;
 pub const SYS_SHM_DUP_RO: usize = 206;
+pub const SYS_CHAN_POLL_ADD: usize = 208;
+pub const SYS_BLOCK: usize = 209;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
@@ -133,6 +135,15 @@ fn handle_syscall(tf: &mut TrapFrame) {
         SYS_CHAN_SEND_BLOCKING => {
             sys_chan_send_blocking(tf);
         }
+        SYS_CHAN_POLL_ADD => {
+            tf.regs[10] = sys_chan_poll_add(a0);
+        }
+        SYS_BLOCK => {
+            let pid = crate::task::current_pid();
+            crate::task::block_process(pid);
+            crate::task::schedule();
+            tf.regs[10] = 0;
+        }
         SYS_SHM_CREATE => {
             tf.regs[10] = sys_shm_create(a0);
         }
@@ -164,6 +175,7 @@ fn handle_syscall(tf: &mut TrapFrame) {
         let ret = tf.regs[10];
         trace_syscall(pid, syscall_num, saved_a0, saved_a1, ret);
     }
+
 }
 
 // ============================================================
@@ -182,6 +194,8 @@ fn syscall_name(num: usize) -> &'static [u8] {
         SYS_CHAN_CLOSE => b"close",
         SYS_CHAN_RECV_BLOCKING => b"recvb",
         SYS_CHAN_SEND_BLOCKING => b"sendb",
+        SYS_CHAN_POLL_ADD => b"polladd",
+        SYS_BLOCK => b"block",
         SYS_SHM_CREATE => b"shmc",
         SYS_SHM_DUP_RO => b"shmro",
         SYS_MMAP => b"mmap",
@@ -367,7 +381,14 @@ fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
             }
             0
         }
-        None => 1, // Nothing available
+        None => {
+            // Distinguish "no message yet" from "channel closed"
+            if !crate::ipc::channel_is_active(endpoint) {
+                2 // ChannelClosed
+            } else {
+                1 // Nothing available
+            }
+        }
     }
 }
 
@@ -413,12 +434,7 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
             None => {
                 // Check if the channel was closed by the peer
                 if !crate::ipc::channel_is_active(endpoint) {
-                    // Return a zero-length message to signal EOF
-                    let eof = crate::ipc::Message::new();
-                    unsafe {
-                        core::ptr::write(msg_pa as *mut crate::ipc::Message, eof);
-                    }
-                    tf.regs[10] = 0;
+                    tf.regs[10] = 2; // ChannelClosed
                     return;
                 }
                 // Block and wait
@@ -508,6 +524,20 @@ fn sys_chan_send_blocking(tf: &mut TrapFrame) {
             }
         }
     }
+}
+
+/// SYS_CHAN_POLL_ADD: register the calling process as blocked-waiting on a
+/// channel handle so that any future send to that endpoint will wake us.
+/// Call this for every handle of interest, then call SYS_BLOCK to sleep.
+/// The wakeup_pending flag prevents races between the last poll_add and block.
+fn sys_chan_poll_add(handle: usize) -> usize {
+    let endpoint = match crate::task::current_process_handle(handle) {
+        Some(HandleObject::Channel(ep)) => ep,
+        _ => return usize::MAX,
+    };
+    let pid = crate::task::current_pid();
+    crate::ipc::channel_set_blocked(endpoint, pid);
+    0
 }
 
 /// SYS_CHAN_CLOSE: close a handle (channel or SHM).

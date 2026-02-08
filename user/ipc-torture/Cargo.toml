@@ -1,0 +1,15 @@
+[package]
+name = "ipc-torture"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+rvos-rt = { path = "../rvos-rt" }
+rvos = { path = "../../lib/rvos" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true

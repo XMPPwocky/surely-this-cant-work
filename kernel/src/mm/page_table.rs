@@ -185,4 +185,10 @@ impl PageTable {
         }
         // self is dropped here, but Drop is a no-op
     }
+
+    /// Consume the PageTable and return its tracked frames.
+    /// Caller is responsible for eventually calling frame_dealloc on each.
+    pub fn take_frames(mut self) -> alloc::vec::Vec<PhysPageNum, PgtbAlloc> {
+        core::mem::replace(&mut self.frames, alloc::vec::Vec::new_in(PGTB_ALLOC))
+    }
 }

@@ -170,6 +170,34 @@ fn send_line(client_ep: usize, data: &[u8]) {
 
 const MAX_CONSOLE_CLIENTS: usize = 8;
 
+/// Remove dead (inactive) client channels and compact the array.
+fn cleanup_dead_clients(
+    client_eps: &mut [usize; MAX_CONSOLE_CLIENTS],
+    client_count: &mut usize,
+    stdin_client: &mut usize,
+) {
+    let mut i = 0;
+    while i < *client_count {
+        if !ipc::channel_is_active(client_eps[i]) {
+            ipc::channel_close(client_eps[i]);
+            // Shift remaining clients down
+            for j in i..*client_count - 1 {
+                client_eps[j] = client_eps[j + 1];
+            }
+            client_eps[*client_count - 1] = usize::MAX;
+            *client_count -= 1;
+            // Adjust stdin_client index
+            if *stdin_client == i {
+                *stdin_client = usize::MAX; // stdin client died
+            } else if *stdin_client != usize::MAX && *stdin_client > i {
+                *stdin_client -= 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Serial console server kernel task.
 /// Owns UART I/O. Accepts multiple client endpoints via its control channel.
 /// All clients can write output; only the client marked is_shell receives stdin.
@@ -211,6 +239,7 @@ pub fn serial_console_server() {
     }
 
     let mut line_disc = LineDiscipline::new();
+    let mut raw_mode = false;
 
     // Main loop
     loop {
@@ -242,19 +271,24 @@ pub fn serial_console_server() {
             match ch {
                 Some(ch) => {
                     got_input = true;
-                    echo_serial(ch);
-                    // Also echo to FB if active
-                    echo_fb(ch);
-                    if let Some(len) = line_disc.push_char(ch) {
-                        // Complete line — send to primary client (client 0)
-                        let data_copy = {
-                            let src = line_disc.line_data(len);
-                            let mut buf = [0u8; LINE_BUF_SIZE];
-                            buf[..len].copy_from_slice(src);
-                            (buf, len)
-                        };
+                    if raw_mode {
+                        // Raw mode: no echo, no line discipline, send each byte directly
                         if stdin_client != usize::MAX {
-                            send_line(client_eps[stdin_client], &data_copy.0[..data_copy.1]);
+                            send_line(client_eps[stdin_client], &[ch]);
+                        }
+                    } else {
+                        echo_serial(ch);
+                        echo_fb(ch);
+                        if let Some(len) = line_disc.push_char(ch) {
+                            let data_copy = {
+                                let src = line_disc.line_data(len);
+                                let mut buf = [0u8; LINE_BUF_SIZE];
+                                buf[..len].copy_from_slice(src);
+                                (buf, len)
+                            };
+                            if stdin_client != usize::MAX {
+                                send_line(client_eps[stdin_client], &data_copy.0[..data_copy.1]);
+                            }
                         }
                     }
                 }
@@ -271,7 +305,10 @@ pub fn serial_console_server() {
                 match msg {
                     Some(msg) => {
                         got_write = true;
-                        if msg.len > 0 {
+                        // Check for raw mode control from stdin client
+                        if i == stdin_client && msg.len == 2 && msg.data[0] == 0 {
+                            raw_mode = msg.data[1] == 1;
+                        } else if msg.len > 0 {
                             write_serial(&msg.data[..msg.len]);
                             write_fb(&msg.data[..msg.len]);
                         }
@@ -280,6 +317,9 @@ pub fn serial_console_server() {
                 }
             }
         }
+
+        // Clean up dead clients (process exited, channel closed on their side)
+        cleanup_dead_clients(&mut client_eps, &mut client_count, &mut stdin_client);
 
         if !got_input && !got_write {
             // Register blocked on control channel + all client endpoints
@@ -397,6 +437,9 @@ pub fn fb_console_server() {
                 }
             }
         }
+
+        // Clean up dead clients
+        cleanup_dead_clients(&mut client_eps, &mut client_count, &mut stdin_client);
 
         if !got_input && !got_write {
             ipc::channel_set_blocked(control_ep, my_pid);
