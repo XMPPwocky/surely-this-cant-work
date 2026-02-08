@@ -482,16 +482,23 @@ pub enum RpcError {
     Transport(usize),
 }
 
+/// A shared memory region handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShmHandle(pub usize);
+
 /// Abstraction over kernel-side and user-side IPC transports.
 ///
 /// Implementors wrap a channel endpoint and provide send/recv.
-pub trait Transport {
+pub trait Transport: Sized {
     /// Send `data` bytes with an optional capability.
     /// Use `cap = NO_CAP` when no capability is attached.
     fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError>;
 
     /// Receive into `buf`. Returns `(bytes_received, cap)`.
     fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError>;
+
+    /// Create a new transport for a child capability received on this transport.
+    fn from_cap(&self, cap: usize) -> Self;
 }
 
 /// Send a request and receive a response (no capabilities).
@@ -1047,18 +1054,37 @@ macro_rules! define_protocol {
     };
 }
 
-// ── Internal: single client method, dispatch by [+cap] presence ──
+// ── Internal: single client method, dispatch by annotation ──
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __define_protocol_client_method {
-    // With [+cap]
+    // With [+cap] — raw untyped capability
     ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident, [+ cap]) => {
         pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<($ret_ty, usize), $crate::RpcError> {
             let req = $req_ty::$variant { $($arg),* };
             $crate::rpc_call_with_cap(&mut self.transport, &req, $crate::NO_CAP, &mut self.buf)
         }
     };
-    // Without [+cap]
+    // With [-> shm] — shared memory handle
+    ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident, [-> shm]) => {
+        pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<($ret_ty, $crate::ShmHandle), $crate::RpcError> {
+            let req = $req_ty::$variant { $($arg),* };
+            let (resp, cap) = $crate::rpc_call_with_cap(
+                &mut self.transport, &req, $crate::NO_CAP, &mut self.buf)?;
+            Ok((resp, $crate::ShmHandle(cap)))
+        }
+    };
+    // With [-> ClientType] — typed channel capability
+    ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident, [-> $child:ident]) => {
+        pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<($ret_ty, $child<T>), $crate::RpcError> {
+            let req = $req_ty::$variant { $($arg),* };
+            let (resp, cap) = $crate::rpc_call_with_cap(
+                &mut self.transport, &req, $crate::NO_CAP, &mut self.buf)?;
+            let child = $child::new(self.transport.from_cap(cap));
+            Ok((resp, child))
+        }
+    };
+    // Without annotation — no capability
     ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident) => {
         pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<$ret_ty, $crate::RpcError> {
             let req = $req_ty::$variant { $($arg),* };
@@ -1753,6 +1779,16 @@ mod tests {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
                 Ok((self.recv_len, self.recv_cap))
             }
+            fn from_cap(&self, _cap: usize) -> Self {
+                Self {
+                    sent_buf: [0u8; MAX_MSG_SIZE],
+                    sent_len: 0,
+                    sent_cap: 0,
+                    recv_buf: [0u8; MAX_MSG_SIZE],
+                    recv_len: 0,
+                    recv_cap: NO_CAP,
+                }
+            }
         }
 
         // Pre-compute the response bytes
@@ -1808,6 +1844,14 @@ mod tests {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
                 Ok((self.recv_len, self.recv_cap))
             }
+            fn from_cap(&self, _cap: usize) -> Self {
+                Self {
+                    recv_buf: [0u8; 32],
+                    recv_len: 0,
+                    recv_cap: NO_CAP,
+                    last_cap: 0,
+                }
+            }
         }
 
         let mut recv_buf = [0u8; 32];
@@ -1857,6 +1901,13 @@ mod tests {
             fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
                 buf[..self.len].copy_from_slice(&self.data[..self.len]);
                 Ok((self.len, self.cap))
+            }
+            fn from_cap(&self, _cap: usize) -> Self {
+                Self {
+                    data: [0u8; MAX_MSG_SIZE],
+                    len: 0,
+                    cap: NO_CAP,
+                }
             }
         }
 
@@ -1918,6 +1969,14 @@ mod tests {
             fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
                 Ok((self.recv_len, NO_CAP))
+            }
+            fn from_cap(&self, _cap: usize) -> Self {
+                Self {
+                    sent_buf: [0u8; MAX_MSG_SIZE],
+                    sent_len: 0,
+                    recv_buf: [0u8; MAX_MSG_SIZE],
+                    recv_len: 0,
+                }
             }
         }
 
@@ -2011,6 +2070,15 @@ mod tests {
                 buf[..self.req_len].copy_from_slice(&self.req_buf[..self.req_len]);
                 Ok((self.req_len, NO_CAP))
             }
+            fn from_cap(&self, _cap: usize) -> Self {
+                Self {
+                    req_buf: [0u8; MAX_MSG_SIZE],
+                    req_len: 0,
+                    resp_buf: [0u8; MAX_MSG_SIZE],
+                    resp_len: 0,
+                    resp_cap: 0,
+                }
+            }
         }
 
         // Serialize a request
@@ -2071,6 +2139,12 @@ mod tests {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
                 Ok((self.recv_len, 42)) // cap = 42
             }
+            fn from_cap(&self, _cap: usize) -> Self {
+                Self {
+                    recv_buf: [0u8; MAX_MSG_SIZE],
+                    recv_len: 0,
+                }
+            }
         }
 
         let resp = FileResp { ok: 1 };
@@ -2084,5 +2158,153 @@ mod tests {
         let (result, cap) = client.open(0x01).unwrap();
         assert_eq!(result.ok, 1);
         assert_eq!(cap, 42);
+    }
+
+    // 34. define_protocol! with [-> ChildClient] typed capability
+    #[test]
+    fn test_define_protocol_typed_cap() {
+        define_message! {
+            pub enum ParentReq {
+                Connect(0) { name: u8 },
+            }
+        }
+
+        define_message! {
+            pub struct ParentResp { ok: u8 }
+        }
+
+        define_message! {
+            pub enum ChildReq {
+                Ping(0) { val: u32 },
+            }
+        }
+
+        define_message! {
+            pub struct ChildResp { val: u32 }
+        }
+
+        // Child protocol (defined first so ChildClient exists)
+        define_protocol! {
+            pub protocol Child => ChildClient, ChildHandler, child_dispatch {
+                type Request = ChildReq;
+                type Response = ChildResp;
+
+                rpc ping as Ping(val: u32) -> ChildResp;
+            }
+        }
+
+        // MockTransport that tracks from_cap calls
+        struct MockTransport {
+            handle: usize,
+            recv_buf: [u8; MAX_MSG_SIZE],
+            recv_len: usize,
+            recv_cap: usize,
+        }
+
+        impl Transport for MockTransport {
+            fn send(&mut self, _data: &[u8], _cap: usize) -> Result<(), RpcError> {
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
+                Ok((self.recv_len, self.recv_cap))
+            }
+            fn from_cap(&self, cap: usize) -> Self {
+                Self {
+                    handle: cap,
+                    recv_buf: [0u8; MAX_MSG_SIZE],
+                    recv_len: 0,
+                    recv_cap: NO_CAP,
+                }
+            }
+        }
+
+        // Parent protocol uses [-> ChildClient]
+        define_protocol! {
+            pub protocol Parent => ParentClient, ParentHandler, parent_dispatch {
+                type Request = ParentReq;
+                type Response = ParentResp;
+
+                rpc connect as Connect(name: u8) -> ParentResp [-> ChildClient];
+            }
+        }
+
+        let resp = ParentResp { ok: 1 };
+        let mut recv_buf = [0u8; MAX_MSG_SIZE];
+        let recv_len = to_bytes(&resp, &mut recv_buf).unwrap();
+
+        let transport = MockTransport {
+            handle: 0,
+            recv_buf,
+            recv_len,
+            recv_cap: 99, // the child cap
+        };
+
+        let mut client = ParentClient::new(transport);
+        let (result, child) = client.connect(5).unwrap();
+        assert_eq!(result.ok, 1);
+        // Verify the child was created via from_cap with cap=99
+        assert_eq!(child.transport.handle, 99);
+    }
+
+    // 35. define_protocol! with [-> shm] shared memory handle
+    #[test]
+    fn test_define_protocol_shm() {
+        define_message! {
+            pub enum BufReq {
+                Create(0) { size: u32 },
+            }
+        }
+
+        define_message! {
+            pub struct BufResp { ok: u8 }
+        }
+
+        struct MockTransport {
+            recv_buf: [u8; MAX_MSG_SIZE],
+            recv_len: usize,
+            recv_cap: usize,
+        }
+
+        impl Transport for MockTransport {
+            fn send(&mut self, _data: &[u8], _cap: usize) -> Result<(), RpcError> {
+                Ok(())
+            }
+            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+                buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
+                Ok((self.recv_len, self.recv_cap))
+            }
+            fn from_cap(&self, _cap: usize) -> Self {
+                Self {
+                    recv_buf: [0u8; MAX_MSG_SIZE],
+                    recv_len: 0,
+                    recv_cap: NO_CAP,
+                }
+            }
+        }
+
+        define_protocol! {
+            pub protocol Buf => BufClient, BufHandler, buf_dispatch {
+                type Request = BufReq;
+                type Response = BufResp;
+
+                rpc create as Create(size: u32) -> BufResp [-> shm];
+            }
+        }
+
+        let resp = BufResp { ok: 1 };
+        let mut recv_buf = [0u8; MAX_MSG_SIZE];
+        let recv_len = to_bytes(&resp, &mut recv_buf).unwrap();
+
+        let transport = MockTransport {
+            recv_buf,
+            recv_len,
+            recv_cap: 77,
+        };
+
+        let mut client = BufClient::new(transport);
+        let (result, shm) = client.create(4096).unwrap();
+        assert_eq!(result.ok, 1);
+        assert_eq!(shm, ShmHandle(77));
     }
 }

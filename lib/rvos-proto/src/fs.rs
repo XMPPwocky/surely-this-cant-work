@@ -97,22 +97,8 @@ define_message! {
 
 use rvos_wire::define_protocol;
 
-define_protocol! {
-    /// Filesystem control channel protocol.
-    pub protocol FsControl => FsControlClient, FsControlHandler, fs_control_dispatch {
-        type Request<'a> = FsRequest;
-        type Response = FsResponse;
-
-        /// Open/create a file. Returns (response, file_channel_cap).
-        rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse [+cap];
-        /// Delete a file or empty directory.
-        rpc delete as Delete(path: &str) -> FsResponse;
-        /// Get file metadata.
-        rpc stat as Stat(path: &str) -> FsResponse;
-        /// List directory entries (streaming response).
-        rpc readdir as Readdir(path: &str) -> FsResponse;
-    }
-}
+// FileOps must be defined before FsControl so that FileOpsClient
+// is available for the [-> FileOpsClient] typed capability annotation.
 
 define_protocol! {
     /// Per-file data channel protocol.
@@ -124,5 +110,22 @@ define_protocol! {
         rpc read as Read(offset: u64, len: u32) -> FileResponse;
         /// Write data at offset.
         rpc write as Write(offset: u64, data: &[u8]) -> FileResponse;
+    }
+}
+
+define_protocol! {
+    /// Filesystem control channel protocol.
+    pub protocol FsControl => FsControlClient, FsControlHandler, fs_control_dispatch {
+        type Request<'a> = FsRequest;
+        type Response = FsResponse;
+
+        /// Open/create a file. Returns (response, FileOpsClient).
+        rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse [-> FileOpsClient];
+        /// Delete a file or empty directory.
+        rpc delete as Delete(path: &str) -> FsResponse;
+        /// Get file metadata.
+        rpc stat as Stat(path: &str) -> FsResponse;
+        /// List directory entries (streaming response).
+        rpc readdir as Readdir(path: &str) -> FsResponse;
     }
 }

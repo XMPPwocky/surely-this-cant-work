@@ -25,6 +25,10 @@ impl KernelTransport {
 }
 
 impl Transport for KernelTransport {
+    fn from_cap(&self, cap: usize) -> Self {
+        Self::new(cap, self.pid)
+    }
+
     fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
         let mut msg = Message::new();
         let copy_len = data.len().min(msg.data.len());

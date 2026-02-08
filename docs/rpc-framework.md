@@ -229,17 +229,79 @@ For the protocol above:
 - **`math_dispatch<T, H>()`** -- free function that receives a request, dispatches to
   the handler, and sends the response
 
-### Capability Annotation `[+cap]`
+### Capability Annotations
 
-Append `[+cap]` to a method to indicate it carries a capability:
+Three annotations control how capabilities are returned from client methods:
+
+#### `[+cap]` — Raw untyped capability
+
+Append `[+cap]` to return the raw `usize` capability handle:
 
 ```rust
 rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse [+cap];
 ```
 
-- Client method returns `Result<(Response, usize), RpcError>` (the `usize` is the received cap)
-- Without `[+cap]`, client method returns `Result<Response, RpcError>`
-- The handler trait always returns `(Response, usize)` so handlers can attach caps on any method
+- Client method returns `Result<(Response, usize), RpcError>`
+- The caller must manually wrap the handle in the appropriate client type
+
+#### `[-> ClientType]` — Typed channel capability
+
+Append `[-> ClientType]` to automatically wrap the received capability in a
+typed client. The referenced client type must be defined before the current
+protocol (so the macro can see it):
+
+```rust
+// FileOpsClient must be defined first
+define_protocol! { pub protocol FileOps => FileOpsClient, ... { ... } }
+
+define_protocol! {
+    pub protocol FsControl => FsControlClient, FsControlHandler, fs_control_dispatch {
+        type Request<'a> = FsRequest;
+        type Response = FsResponse;
+
+        rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse [-> FileOpsClient];
+    }
+}
+```
+
+- Client method returns `Result<(FsResponse, FileOpsClient<T>), RpcError>`
+- The child client's transport is created via `Transport::from_cap(cap)`
+- No manual wrapping needed — the returned `FileOpsClient` is ready to use
+
+#### `[-> shm]` — Shared memory handle
+
+Append `[-> shm]` to wrap the capability in a `ShmHandle` newtype:
+
+```rust
+rpc create_buffer as CreateBuffer(size: u32) -> Response [-> shm];
+```
+
+- Client method returns `Result<(Response, ShmHandle), RpcError>`
+- `ShmHandle(pub usize)` is a newtype for type safety
+
+#### No annotation
+
+Without any annotation, the client method returns `Result<Response, RpcError>`.
+
+#### Handler trait
+
+The handler trait always returns `(Response, usize)` regardless of annotation.
+Typing is a client-side concern; handlers deal in raw capability handles.
+
+### `Transport::from_cap`
+
+The `Transport` trait includes a `from_cap` method for creating child transports:
+
+```rust
+pub trait Transport: Sized {
+    fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError>;
+    fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError>;
+    fn from_cap(&self, cap: usize) -> Self;
+}
+```
+
+- `UserTransport::from_cap(cap)` returns `UserTransport::new(cap)`
+- `KernelTransport::from_cap(cap)` returns `KernelTransport::new(cap, self.pid)`
 
 ### Lifetime-Parameterized Types
 
@@ -251,7 +313,7 @@ define_protocol! {
         type Request<'a> = FsRequest;
         type Response = FsResponse;
 
-        rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse [+cap];
+        rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse [-> FileOpsClient];
         rpc delete as Delete(path: &str) -> FsResponse;
     }
 }
