@@ -242,10 +242,11 @@ const MAX_DYN_SPAWNS: usize = 8;
 /// and concurrently loads programs from the filesystem.
 pub fn init_server() {
     let my_pid = crate::task::current_pid();
-    // Set up fs launch state machines (non-blocking)
-    let mut fs_launches: [Option<FsLaunchCtx>; MAX_FS_LAUNCHES] = [const { None }; MAX_FS_LAUNCHES];
+    // Heap-allocate fs launch state machines to avoid ~7K stack usage
+    let mut fs_launches = alloc::boxed::Box::new_in(
+        [const { None::<FsLaunchCtx> }; MAX_FS_LAUNCHES], INIT_ALLOC);
     let mut dyn_spawns: [Option<DynSpawn>; MAX_DYN_SPAWNS] = [const { None }; MAX_DYN_SPAWNS];
-    init_fs_launches(&mut fs_launches, my_pid);
+    init_fs_launches(&mut *fs_launches, my_pid);
 
     let mut gpu_shell_launched = false;
 
@@ -779,7 +780,6 @@ fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
 /// Programs to launch from the filesystem at boot time.
 /// (path, name, console_type, service_name, requires_gpu, provides_console)
 const FS_PROGRAMS: &[(&[u8], &str, ConsoleType, Option<&str>, bool, Option<ConsoleType>)] = &[
-    (b"/bin/hello-std", "hello-std", ConsoleType::Serial, None, false, None),
     (b"/bin/window-server", "window-srv", ConsoleType::Serial, Some("window"), true, None),
     (b"/bin/fbcon", "fbcon", ConsoleType::Serial, None, true, Some(ConsoleType::GpuConsole)),
 ];

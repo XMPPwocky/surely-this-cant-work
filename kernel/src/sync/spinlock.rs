@@ -20,6 +20,25 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Try to acquire the lock without spinning. Returns None if already held.
+    pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
+        let was_enabled = csr::interrupts_enabled();
+        csr::disable_interrupts();
+
+        match self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => Some(SpinLockGuard {
+                lock: self,
+                irq_was_enabled: was_enabled,
+            }),
+            Err(_) => {
+                if was_enabled {
+                    csr::enable_interrupts();
+                }
+                None
+            }
+        }
+    }
+
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         // Save and disable interrupts
         let was_enabled = csr::interrupts_enabled();

@@ -15,6 +15,11 @@ fn panic(info: &PanicInfo) -> ! {
     println!("sepc:    {:#x}", sepc);
     println!("sstatus: {:#x}", sstatus);
 
+    // Walk frame pointer chain from the current stack frame
+    let fp: usize;
+    unsafe { core::arch::asm!("mv {}, s0", out(reg) fp) };
+    crate::arch::trap::print_backtrace(fp);
+
     loop {
         unsafe { core::arch::asm!("wfi"); }
     }

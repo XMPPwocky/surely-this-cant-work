@@ -11,15 +11,38 @@ _trap_entry:
     csrrw   sp, sscratch, sp
 
 _from_kernel:
-    # Allocate TrapFrame on kernel stack: 32 regs + sstatus + sepc = 34 * 8 = 272 bytes
+    # Switch to the dedicated trap stack. This ensures the trap handler
+    # always has a known-good stack, even during kernel stack overflow.
+    #
+    # We need t0 and t1 for the stack switch, but must preserve their
+    # original values for the trap frame. Pre-save them on the task stack
+    # (below current sp), then recover them after switching.
+    sd      t0, -8(sp)
+    sd      t1, -16(sp)
+
+    # Save original sp in t0, then switch sp to trap stack
+    mv      t0, sp
+1:  auipc   t1, %pcrel_hi(KERNEL_TRAP_STACK_TOP)
+    ld      sp, %pcrel_lo(1b)(t1)
+
+    # Allocate TrapFrame on trap stack: 32 regs + sstatus + sepc = 34 * 8 = 272 bytes
     addi    sp, sp, -272
 
-    # Save x1-x31
+    # Save original sp into regs[2]
+    sd      t0,  16(sp)
+
+    # Recover and save the original t0/t1 from the task stack
+    ld      t1, -8(t0)
+    sd      t1,  40(sp)     # regs[5] = original x5/t0
+    ld      t1, -16(t0)
+    sd      t1,  48(sp)     # regs[6] = original x6/t1
+
+    # Save the rest of x1-x31 (x2/sp and x5/t0 and x6/t1 already done)
     sd      x1,   8(sp)
     sd      x3,  24(sp)
     sd      x4,  32(sp)
-    sd      x5,  40(sp)
-    sd      x6,  48(sp)
+    # x5 (t0) already saved above
+    # x6 (t1) already saved above
     sd      x7,  56(sp)
     sd      x8,  64(sp)
     sd      x9,  72(sp)
@@ -46,10 +69,6 @@ _from_kernel:
     sd      x30,240(sp)
     sd      x31,248(sp)
 
-    # Save the original sp (before adjustment) into regs[2]
-    addi    t0, sp, 272
-    sd      t0,  16(sp)
-
     # Store zero into regs[0]
     sd      zero, 0(sp)
 
@@ -69,7 +88,7 @@ _from_kernel:
     ld      t0, 264(sp)
     csrw    sepc, t0
 
-    # Restore x1, x3-x31
+    # Restore all registers except sp
     ld      x1,   8(sp)
     ld      x3,  24(sp)
     ld      x4,  32(sp)
@@ -101,8 +120,8 @@ _from_kernel:
     ld      x30,240(sp)
     ld      x31,248(sp)
 
-    # Restore sp and return to S-mode
-    addi    sp, sp, 272
+    # Restore the task's original sp from regs[2] and return
+    ld      sp, 16(sp)
     sret
 
 _from_user:

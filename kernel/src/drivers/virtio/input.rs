@@ -165,7 +165,6 @@ pub fn init() -> bool {
 
     let irq = 1 + slot as u32;
     crate::println!("[keyboard] Found VirtIO input at {:#x} (slot {}, IRQ {})", base, slot, irq);
-    crate::println!("[keyboard] NOTE: next allocs are kbd virtq + event_bufs");
 
     if !mmio::init_device(base) {
         crate::println!("[keyboard] Device init failed");
@@ -185,6 +184,13 @@ pub fn init() -> bool {
     // Zero the buffer
     unsafe {
         core::ptr::write_bytes(event_bufs as *mut u8, 0, buf_size);
+    }
+
+    // Write canary at offset 4080 (well past the 128 bytes used by events)
+    const CANARY_OFFSET: usize = 4080;
+    const CANARY_VALUE: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    unsafe {
+        core::ptr::write_volatile((event_bufs + CANARY_OFFSET) as *mut u64, CANARY_VALUE);
     }
 
     // Pre-fill eventq with device-writable descriptors
@@ -217,7 +223,8 @@ pub fn init() -> bool {
         }));
     }
 
-    crate::println!("[keyboard] Initialized, event_bufs={:#x} (page {:#x})", event_bufs, event_bufs >> 12);
+    crate::println!("[keyboard] Initialized, event_bufs={:#x}", event_bufs);
+
     true
 }
 
@@ -231,35 +238,18 @@ pub fn handle_irq() {
     };
 
     // Acknowledge interrupt
-    let status = mmio::read_reg(kbd.base, mmio::REG_INTERRUPT_STATUS);
-    mmio::write_reg(kbd.base, mmio::REG_INTERRUPT_ACK, status);
+    let intr_status = mmio::read_reg(kbd.base, mmio::REG_INTERRUPT_STATUS);
+    mmio::write_reg(kbd.base, mmio::REG_INTERRUPT_ACK, intr_status);
 
     // Process all used descriptors
     while let Some((desc_idx, _len)) = kbd.eventq.pop_used() {
         // Read the event from the buffer
         let buf_addr = kbd.event_bufs + (desc_idx as usize) * core::mem::size_of::<VirtioInputEvent>();
-
-        // Corruption check: read the descriptor's addr field and compare with expected
-        let expected_addr = buf_addr as u64;
-        let desc = unsafe { &*(kbd.eventq.desc.add(desc_idx as usize)) };
-        if desc.addr != expected_addr {
-            crate::println!("[irq] CORRUPTION: desc[{}].addr={:#x} expected={:#x}",
-                desc_idx, desc.addr, expected_addr);
-        }
-
         let event = unsafe { &*(buf_addr as *const VirtioInputEvent) };
-
-        crate::println!("[irq] desc={} addr={:#x} type={:#x} code={:#x} val={:#x}",
-            desc_idx, buf_addr, event.type_, event.code, event.value);
 
         if event.type_ == EV_KEY {
             let code = event.code as usize;
             let pressed = event.value != 0;
-            if pressed {
-                crate::println!("[irq] EV_KEY D{}", event.code);
-            } else {
-                crate::println!("[irq] EV_KEY U{}", event.code);
-            }
 
             // Push raw event for ALL key presses and releases (for kbd-server)
             tty::push_raw_kbd_event(event.code, pressed);
@@ -300,4 +290,20 @@ pub fn handle_irq() {
 /// Return the IRQ number if the keyboard is initialized.
 pub fn irq_number() -> Option<u32> {
     unsafe { (*core::ptr::addr_of!(KEYBOARD)).as_ref().map(|k| k.irq) }
+}
+
+/// Check keyboard DMA buffer canary (call from timer to detect corruption).
+pub fn check_canary() {
+    let kbd = unsafe {
+        match (*core::ptr::addr_of!(KEYBOARD)).as_ref() {
+            Some(k) => k,
+            None => return,
+        }
+    };
+    const CANARY_OFFSET: usize = 4080;
+    const CANARY_VALUE: u64 = 0xDEAD_BEEF_CAFE_F00D;
+    let canary = unsafe { core::ptr::read_volatile((kbd.event_bufs + CANARY_OFFSET) as *const u64) };
+    if canary != CANARY_VALUE {
+        crate::println!("[KBD CANARY CORRUPT] at {:#x}: got {:#x}", kbd.event_bufs + CANARY_OFFSET, canary);
+    }
 }

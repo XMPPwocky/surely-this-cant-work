@@ -82,8 +82,23 @@ static KERNEL_SATP: AtomicUsize = AtomicUsize::new(0);
 #[no_mangle]
 static mut KERNEL_SATP_RAW: usize = 0;
 
+/// Dedicated trap stack for kernel-mode traps. When a trap occurs from
+/// S-mode, _from_kernel switches sp to this stack before saving the trap
+/// frame. This ensures the trap handler always has a known-good stack,
+/// even during kernel stack overflow. 8 KiB is ample for trap handling.
+const TRAP_STACK_SIZE: usize = 8192;
+#[no_mangle]
+static mut KERNEL_TRAP_STACK: [u8; TRAP_STACK_SIZE] = [0; TRAP_STACK_SIZE];
+/// Points to the top of KERNEL_TRAP_STACK. Initialized in init().
+#[no_mangle]
+static mut KERNEL_TRAP_STACK_TOP: usize = 0;
+
 pub fn init() {
     SCHEDULER.lock().init();
+    unsafe {
+        KERNEL_TRAP_STACK_TOP =
+            core::ptr::addr_of!(KERNEL_TRAP_STACK) as usize + TRAP_STACK_SIZE;
+    }
     crate::println!("Scheduler initialized (max {} processes)", MAX_PROCS);
 }
 
@@ -105,13 +120,17 @@ fn find_free_slot(sched: &mut Scheduler) -> usize {
     for i in 1..sched.processes.len() {
         if let Some(ref p) = sched.processes[i] {
             if p.state == ProcessState::Dead {
-                // Free old kernel stack before reusing the slot
+                // Free old kernel stack before reusing the slot (includes guard page)
                 let kstack_base = p.kernel_stack_base;
                 if kstack_base != 0 {
-                    let kstack_ppn = kstack_base / crate::mm::address::PAGE_SIZE;
-                    for j in 0..4 { // KERNEL_STACK_PAGES
+                    let guard_addr = kstack_base - super::process::KERNEL_GUARD_PAGES * crate::mm::address::PAGE_SIZE;
+                    // Restore the guard page's PTE before freeing — otherwise the
+                    // page has an empty PTE and will fault when reallocated.
+                    super::process::restore_guard_page(guard_addr);
+                    let alloc_ppn = guard_addr / crate::mm::address::PAGE_SIZE;
+                    for j in 0..super::process::KERNEL_STACK_ALLOC_PAGES {
                         crate::mm::frame::frame_dealloc(
-                            crate::mm::address::PhysPageNum(kstack_ppn + j),
+                            crate::mm::address::PhysPageNum(alloc_ppn + j),
                         );
                     }
                 }
@@ -260,6 +279,12 @@ pub fn current_process_free_handle(handle: usize) {
 /// Get current PID
 pub fn current_pid() -> usize {
     SCHEDULER.lock().current
+}
+
+/// Non-blocking version of current_pid for use in fault handlers
+/// where the SCHEDULER lock may already be held.
+pub fn try_current_pid() -> Option<usize> {
+    SCHEDULER.try_lock().map(|s| s.current)
 }
 
 /// Return (wall_ticks, global_cpu_ticks) for the SYS_CLOCK syscall.

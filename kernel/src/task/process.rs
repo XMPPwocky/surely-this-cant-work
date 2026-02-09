@@ -5,8 +5,11 @@ use crate::mm::page_table::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U};
 use crate::mm::heap::{PgtbAlloc, PGTB_ALLOC};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const KERNEL_STACK_PAGES: usize = 4; // 16 KiB
+const KERNEL_STACK_PAGES: usize = 16; // 64 KiB
 const KERNEL_STACK_SIZE: usize = KERNEL_STACK_PAGES * PAGE_SIZE;
+pub const KERNEL_GUARD_PAGES: usize = 1; // guard page at bottom of each kernel stack
+/// Total pages allocated per kernel stack (guard + usable)
+pub const KERNEL_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + KERNEL_GUARD_PAGES;
 
 const USER_STACK_PAGES: usize = 8; // 32 KiB
 const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
@@ -88,13 +91,62 @@ pub struct Process {
     pub code_pages: usize,
 }
 
+/// Unmap a guard page in the kernel page table so any access causes a fault.
+fn setup_guard_page(guard_addr: usize) {
+    let satp: usize = crate::read_csr!("satp");
+    let root_ppn = PhysPageNum(satp & ((1usize << 44) - 1));
+    let vpn = VirtPageNum(guard_addr / PAGE_SIZE);
+    let indices = vpn.indices();
+
+    // Walk L2 → L1 → L0 and clear the leaf PTE
+    let l2_table = root_ppn.as_page_table();
+    if !l2_table[indices[2]].is_valid() { return; }
+    let l1_ppn = l2_table[indices[2]].ppn();
+    let l1_table = l1_ppn.as_page_table();
+    if !l1_table[indices[1]].is_valid() || l1_table[indices[1]].is_leaf() { return; }
+    let l0_ppn = l1_table[indices[1]].ppn();
+    let l0_table = l0_ppn.as_page_table();
+    // Clear PTE (V=0) — any access faults
+    l0_table[indices[0]] = crate::mm::page_table::PageTableEntry::empty();
+    unsafe { core::arch::asm!("sfence.vma {}, zero", in(reg) guard_addr); }
+}
+
+/// Restore a guard page's PTE in the kernel page table.
+/// Must be called before freeing the guard page back to the frame allocator,
+/// otherwise the page will have an empty PTE and any future allocation that
+/// reuses it will fault when the kernel tries to access (e.g. memset) it.
+pub fn restore_guard_page(guard_addr: usize) {
+    use crate::mm::page_table::{PageTableEntry, PTE_V, PTE_R, PTE_W, PTE_A, PTE_D};
+
+    let satp: usize = crate::read_csr!("satp");
+    let root_ppn = PhysPageNum(satp & ((1usize << 44) - 1));
+    let vpn = VirtPageNum(guard_addr / PAGE_SIZE);
+    let ppn = PhysPageNum(guard_addr / PAGE_SIZE); // identity-mapped
+    let indices = vpn.indices();
+
+    let l2_table = root_ppn.as_page_table();
+    if !l2_table[indices[2]].is_valid() { return; }
+    let l1_ppn = l2_table[indices[2]].ppn();
+    let l1_table = l1_ppn.as_page_table();
+    if !l1_table[indices[1]].is_valid() || l1_table[indices[1]].is_leaf() { return; }
+    let l0_ppn = l1_table[indices[1]].ppn();
+    let l0_table = l0_ppn.as_page_table();
+    // Restore as kernel R+W identity-mapped page
+    l0_table[indices[0]] = PageTableEntry::new(ppn, PTE_V | PTE_R | PTE_W | PTE_A | PTE_D);
+    unsafe { core::arch::asm!("sfence.vma {}, zero", in(reg) guard_addr); }
+}
+
 impl Process {
     /// Create a new kernel task with the given entry function
     pub fn new_kernel(pid: usize, entry: fn()) -> Self {
-        let stack_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_PAGES)
+        let alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
             .expect("Failed to allocate kernel stack");
-        let stack_base = stack_ppn.0 * PAGE_SIZE;
+        let alloc_base = alloc_ppn.0 * PAGE_SIZE;
+        // Guard page at bottom, usable stack above it
+        let guard_addr = alloc_base;
+        let stack_base = alloc_base + KERNEL_GUARD_PAGES * PAGE_SIZE;
         let stack_top = stack_base + KERNEL_STACK_SIZE;
+        setup_guard_page(guard_addr);
 
         let context = TaskContext::new(entry as usize, stack_top);
 
@@ -115,7 +167,7 @@ impl Process {
             ewma_1s: 0,
             ewma_1m: 0,
             last_switched_away: rdtime(),
-            mem_pages: KERNEL_STACK_PAGES as u32,
+            mem_pages: KERNEL_STACK_ALLOC_PAGES as u32,
             wakeup_pending: false,
             exit_notify_ep: 0,
             pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
@@ -131,10 +183,12 @@ impl Process {
     #[allow(dead_code)]
     pub fn new_user(pid: usize, user_code: &[u8]) -> Self {
         // Allocate kernel stack for this process (used during traps)
-        let kstack_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_PAGES)
+        let kstack_alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
             .expect("Failed to allocate kernel stack for user process");
-        let kstack_base = kstack_ppn.0 * PAGE_SIZE;
+        let kstack_alloc_base = kstack_alloc_ppn.0 * PAGE_SIZE;
+        let kstack_base = kstack_alloc_base + KERNEL_GUARD_PAGES * PAGE_SIZE;
         let kstack_top = kstack_base + KERNEL_STACK_SIZE;
+        setup_guard_page(kstack_alloc_base);
 
         // Allocate user code pages
         let n_code_pages = (user_code.len() + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -184,7 +238,7 @@ impl Process {
             ewma_1s: 0,
             ewma_1m: 0,
             last_switched_away: rdtime(),
-            mem_pages: (KERNEL_STACK_PAGES + n_code_pages + USER_STACK_PAGES) as u32,
+            mem_pages: (KERNEL_STACK_ALLOC_PAGES + n_code_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
             exit_notify_ep: 0,
             pt_frames,
@@ -199,10 +253,12 @@ impl Process {
         crate::trace::trace_kernel(b"new_user_elf-enter");
 
         // Allocate kernel stack
-        let kstack_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_PAGES)
+        let kstack_alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
             .expect("Failed to allocate kernel stack for user process");
-        let kstack_base = kstack_ppn.0 * PAGE_SIZE;
+        let kstack_alloc_base = kstack_alloc_ppn.0 * PAGE_SIZE;
+        let kstack_base = kstack_alloc_base + KERNEL_GUARD_PAGES * PAGE_SIZE;
         let kstack_top = kstack_base + KERNEL_STACK_SIZE;
+        setup_guard_page(kstack_alloc_base);
 
         // Load ELF
         let loaded = crate::mm::elf::load_elf(elf_data)
@@ -242,7 +298,7 @@ impl Process {
             ewma_1s: 0,
             ewma_1m: 0,
             last_switched_away: rdtime(),
-            mem_pages: (KERNEL_STACK_PAGES + loaded.total_pages + USER_STACK_PAGES) as u32,
+            mem_pages: (KERNEL_STACK_ALLOC_PAGES + loaded.total_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
             exit_notify_ep: 0,
             pt_frames,

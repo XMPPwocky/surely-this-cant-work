@@ -189,7 +189,7 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
     unsafe {
         let total_pixels = (stride as usize) * (height as usize) * 2;
         for i in 0..total_pixels {
-            *fb_ptr.add(i) = 0xFF222222; // dark gray BGRA
+            *fb_ptr.add(i) = 0xFF333333; // dark gray
         }
     }
 

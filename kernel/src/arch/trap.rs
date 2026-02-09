@@ -81,7 +81,20 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     sstatus_val, tf.regs[1], tf.regs[2]);
                 crate::println!("  s0={:#x} s1={:#x} s2={:#x}",
                     tf.regs[8], tf.regs[9], tf.regs[10]);
-                crate::println!("  current_pid={}", crate::task::current_pid());
+                // Detect kernel stack overflow: S-mode store fault near sp
+                let sp = tf.regs[2];
+                let is_stack_overflow = spp == 1 && code == 15
+                    && stval < sp.wrapping_add(2 * crate::mm::address::PAGE_SIZE);
+                if is_stack_overflow {
+                    crate::println!("  >>> KERNEL STACK OVERFLOW <<<");
+                }
+                // current_pid() acquires SCHEDULER lock — skip if the fault
+                // occurred while that lock was held (e.g. during spawn) to
+                // avoid deadlock. try_current_pid returns None on lock failure.
+                if let Some(pid) = crate::task::try_current_pid() {
+                    crate::println!("  current_pid={}", pid);
+                }
+                print_backtrace(tf.regs[8]);
                 panic!("Unhandled page fault");
             }
             _ => {
@@ -92,6 +105,37 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 panic!("Unhandled exception");
             }
         }
+    }
+}
+
+/// Walk the frame pointer chain and print a backtrace.
+///
+/// Requires `-C force-frame-pointers=yes`. RISC-V frame layout:
+///   [fp - 8]  = saved ra (return address)
+///   [fp - 16] = saved previous fp (s0)
+///
+/// `start_fp` should be the s0 register value from a trap frame,
+/// or the current s0 for a live backtrace.
+pub fn print_backtrace(start_fp: usize) {
+    const KERN_LO: usize = 0x8020_0000;
+    const KERN_HI: usize = 0x8800_0000;
+    const MAX_DEPTH: usize = 32;
+
+    crate::println!("  Backtrace:");
+    let mut fp = start_fp;
+    let mut depth = 0;
+    while fp >= KERN_LO && fp < KERN_HI && fp % 8 == 0 && depth < MAX_DEPTH {
+        let ra = unsafe { *((fp - 8) as *const usize) };
+        let prev_fp = unsafe { *((fp - 16) as *const usize) };
+        crate::println!("    #{}: ra={:#x} fp={:#x}", depth, ra, fp);
+        if prev_fp == 0 || prev_fp == fp {
+            break;
+        }
+        fp = prev_fp;
+        depth += 1;
+    }
+    if depth == 0 {
+        crate::println!("    (no frames — frame pointers may not be enabled)");
     }
 }
 
@@ -612,6 +656,7 @@ fn sys_shm_create(size: usize) -> usize {
     crate::println!("[shm_create] PID {} pages={} range={:#x}..{:#x} (ppn {:#x}..{:#x})",
         crate::task::current_pid(), page_count, base_pa, base_pa + page_count * crate::mm::address::PAGE_SIZE,
         ppn.0, ppn.0 + page_count);
+
     unsafe {
         core::ptr::write_bytes(base_pa as *mut u8, 0, page_count * crate::mm::address::PAGE_SIZE);
     }
@@ -927,6 +972,8 @@ fn timer_tick() {
     if count <= 3 {
         crate::println!("[timer] tick {}", count);
     }
+    // Check keyboard DMA buffer canary every tick
+    crate::drivers::virtio::input::check_canary();
     let time: u64;
     unsafe {
         core::arch::asm!("rdtime {}", out(reg) time);

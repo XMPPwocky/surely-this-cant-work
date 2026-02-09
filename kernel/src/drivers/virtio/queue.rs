@@ -54,7 +54,7 @@ pub struct Virtqueue {
     free_head: u16,
     free_count: u16,
     /// Our shadow of the last used idx we've consumed
-    last_used_idx: u16,
+    pub last_used_idx: u16,
 }
 
 impl Virtqueue {
