@@ -2,10 +2,10 @@ extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
-use rvos::rvos_wire::{self, Writer};
+use rvos::rvos_wire::{self};
 use rvos_proto::fs::{
     FsRequest, FsResponse, FsEntryKind, FsError, OpenFlags,
-    FileRequest, FileResponse, FileOffset,
+    FileRequest, FileResponse, FileOffset, ReaddirResponse,
 };
 
 // --- Constants ---
@@ -452,24 +452,19 @@ fn send_stat_ok(handle: usize, kind: FsEntryKind, size: u64) {
     raw::sys_chan_send(handle, &msg);
 }
 
-fn send_dir_entry(handle: usize, kind: u8, size: u64, name: &[u8]) {
+fn send_dir_entry(handle: usize, kind: FsEntryKind, size: u64, name: &str) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0);    // tag: Entry
-    let _ = w.write_u8(kind);
-    let _ = w.write_u64(size);
-    let _ = w.write_bytes(name);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(
+        &ReaddirResponse::Entry { kind, size, name },
+        &mut msg.data,
+    ).unwrap_or(0);
     msg.set_cap(NO_CAP);
     raw::sys_chan_send(handle, &msg);
 }
 
 fn send_dir_sentinel(handle: usize) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0);    // tag: Entry
-    let _ = w.write_u8(0xFF); // sentinel kind
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&ReaddirResponse::End {}, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -675,13 +670,18 @@ fn do_readdir(client_handle: usize, path: &str) {
     for i in 0..MAX_CHILDREN {
         if let Some(ref entry) = fs.inodes[idx].children[i] {
             let child_inode = entry.inode;
-            let kind = if fs.inodes[child_inode].kind == InodeKind::Dir { 1u8 } else { 0u8 };
+            let kind = if fs.inodes[child_inode].kind == InodeKind::Dir {
+                FsEntryKind::Directory {}
+            } else {
+                FsEntryKind::File {}
+            };
             let size = if fs.inodes[child_inode].kind == InodeKind::File {
                 fs.inodes[child_inode].data_len as u64
             } else {
                 0u64
             };
-            send_dir_entry(client_handle, kind, size, entry.name_bytes());
+            let name = core::str::from_utf8(entry.name_bytes()).unwrap_or("");
+            send_dir_entry(client_handle, kind, size, name);
         }
     }
 

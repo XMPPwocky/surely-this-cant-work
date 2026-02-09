@@ -2,6 +2,7 @@
 
 use crate::message::Message;
 use crate::raw;
+use rvos_proto::fs::{FileRequest, FileResponse, FileOffset};
 
 /// Send a FileRequest::Ioctl on the given handle and wait for the response.
 /// Returns the result field from IoctlOk, or -1 on error.
@@ -9,12 +10,11 @@ pub fn ioctl(handle: usize, cmd: u32, arg: u32) -> i32 {
     if handle == 0 {
         return -1;
     }
-    // Build FileRequest::Ioctl: u8(2) + u32(cmd) + u32(arg)
-    let msg = Message::build(raw::NO_CAP, |w| {
-        let _ = w.write_u8(2); // tag: Ioctl
-        let _ = w.write_u32(cmd);
-        let _ = w.write_u32(arg);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(
+        &FileRequest::Ioctl { cmd, arg },
+        &mut msg.data,
+    ).unwrap_or(0);
     raw::sys_chan_send_blocking(handle, &msg);
 
     // Receive response
@@ -24,13 +24,8 @@ pub fn ioctl(handle: usize, cmd: u32, arg: u32) -> i32 {
         return -1;
     }
 
-    let mut r = rvos_wire::Reader::new(&resp.data[..resp.len]);
-    let tag = r.read_u8().unwrap_or(0xFF);
-    match tag {
-        3 => {
-            // IoctlOk: u32(result)
-            r.read_u32().unwrap_or(0) as i32
-        }
+    match rvos_wire::from_bytes::<FileResponse>(&resp.data[..resp.len]) {
+        Ok(FileResponse::IoctlOk { result }) => result as i32,
         _ => -1,
     }
 }

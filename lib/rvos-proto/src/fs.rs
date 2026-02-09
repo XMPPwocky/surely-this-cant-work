@@ -77,6 +77,21 @@ define_message! {
     }
 }
 
+// ── Readdir streaming responses ──────────────────────────────────
+
+define_message! {
+    /// Individual messages in a readdir response stream.
+    /// Sent on the control channel after a Readdir request.
+    pub enum ReaddirResponse<'a> {
+        /// A directory entry.
+        Entry(0) { kind: FsEntryKind, size: u64, name: &'a str },
+        /// Error (same codes as FsResponse::Error).
+        Error(1) { code: FsError },
+        /// End of listing sentinel.
+        End(2) {},
+    }
+}
+
 // ── File offset ─────────────────────────────────────────────────
 
 define_message! {
