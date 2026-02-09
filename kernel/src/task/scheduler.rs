@@ -276,17 +276,34 @@ pub fn global_clock() -> (u64, u64) {
 }
 
 /// Yield the current task and schedule the next one.
+///
+/// Idle (PID 0) is NEVER placed in the ready queue.  It is the fallback
+/// task: when the queue is empty and the current task cannot continue
+/// (Blocked or Dead), we switch directly to idle.  This prevents idle
+/// from stealing timeslices when real work is available.
 pub fn schedule() {
     let mut sched = SCHEDULER.lock();
-    if !sched.initialized || sched.ready_queue.is_empty() {
+    if !sched.initialized {
         return;
     }
 
     let old_pid = sched.current;
 
+    // Pick next task from ready queue, or fall back to idle (PID 0).
     let next_pid = match sched.ready_queue.pop_front() {
         Some(pid) => pid,
-        None => return,
+        None => {
+            // Queue is empty.  If the current task is still Running
+            // (timer preemption or yield with nothing else to run), let
+            // it keep running.  Otherwise (Blocked/Dead) fall back to idle.
+            let still_running = sched.processes[old_pid]
+                .as_ref()
+                .map_or(false, |p| p.state == ProcessState::Running);
+            if still_running {
+                return;
+            }
+            0 // fall back to idle
+        }
     };
 
     if next_pid == old_pid {
@@ -328,11 +345,14 @@ pub fn schedule() {
     }
     sched.last_switch_rdtime = now;
 
-    // Put old task back in ready queue (if it's still running)
-    if let Some(ref mut old_proc) = sched.processes[old_pid] {
-        if old_proc.state == ProcessState::Running {
-            old_proc.state = ProcessState::Ready;
-            sched.ready_queue.push_back(old_pid);
+    // Put old task back in ready queue if still Running.
+    // NEVER put idle (PID 0) in the ready queue — it is the fallback task.
+    if old_pid != 0 {
+        if let Some(ref mut old_proc) = sched.processes[old_pid] {
+            if old_proc.state == ProcessState::Running {
+                old_proc.state = ProcessState::Ready;
+                sched.ready_queue.push_back(old_pid);
+            }
         }
     }
 

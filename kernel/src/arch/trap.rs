@@ -337,7 +337,6 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     };
     if wake_pid != 0 {
         crate::task::wake_process(wake_pid);
-        crate::task::schedule(); // yield so woken receiver runs immediately
     }
     0
 }
@@ -521,7 +520,6 @@ fn sys_chan_send_blocking(tf: &mut TrapFrame) {
             Ok(wake) => {
                 if wake != 0 {
                     crate::task::wake_process(wake);
-                    crate::task::schedule(); // yield so woken receiver runs immediately
                 }
                 tf.regs[10] = 0;
                 return;

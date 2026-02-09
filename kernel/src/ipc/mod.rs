@@ -202,6 +202,13 @@ pub fn channel_create_pair() -> Option<(usize, usize)> {
 /// Send a message on an endpoint.
 /// send(ep_a) delivers to queue_b, send(ep_b) delivers to queue_a.
 /// Returns Ok(wake_pid) where wake_pid is the PID of a blocked receiver to wake (0 = none).
+///
+/// The blocked field is NOT cleared here — it persists until the receiver
+/// re-registers via poll_add or the channel is closed.  This ensures that
+/// rapid-fire sends (e.g., client sends request, server is still in its
+/// event loop and hasn't re-registered yet) still trigger a wake.  Redundant
+/// wakes are harmless: wake_process on a Ready/Running process just sets
+/// wakeup_pending.
 pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, SendError> {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
@@ -215,22 +222,14 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, SendError> {
                 return Err(SendError::QueueFull);
             }
             channel.queue_a.push_back(msg);
-            let wake = channel.blocked_a;
-            if wake != 0 {
-                channel.blocked_a = 0;
-            }
-            Ok(wake)
+            Ok(channel.blocked_a)
         } else {
             // Sending from A side -> push to queue_b (for B to recv)
             if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
                 return Err(SendError::QueueFull);
             }
             channel.queue_b.push_back(msg);
-            let wake = channel.blocked_b;
-            if wake != 0 {
-                channel.blocked_b = 0;
-            }
-            Ok(wake)
+            Ok(channel.blocked_b)
         }
     } else {
         Err(SendError::ChannelClosed)
@@ -238,6 +237,7 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, SendError> {
 }
 
 /// Send by reference (for syscall path). Returns Ok(wake_pid) or Err(SendError).
+/// See channel_send for why blocked is not cleared here.
 pub fn channel_send_ref(endpoint: usize, msg: &Message) -> Result<usize, SendError> {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
@@ -249,18 +249,14 @@ pub fn channel_send_ref(endpoint: usize, msg: &Message) -> Result<usize, SendErr
                 Err(SendError::QueueFull)
             } else {
                 channel.queue_a.push_back(msg.clone());
-                let wake = channel.blocked_a;
-                if wake != 0 { channel.blocked_a = 0; }
-                Ok(wake)
+                Ok(channel.blocked_a)
             }
         } else {
             if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
                 Err(SendError::QueueFull)
             } else {
                 channel.queue_b.push_back(msg.clone());
-                let wake = channel.blocked_b;
-                if wake != 0 { channel.blocked_b = 0; }
-                Ok(wake)
+                Ok(channel.blocked_b)
             }
         }
     } else {
@@ -343,7 +339,6 @@ pub fn channel_send_blocking(endpoint: usize, msg: &Message, pid: usize) -> Resu
             Ok(wake) => {
                 if wake != 0 {
                     crate::task::wake_process(wake);
-                    crate::task::schedule(); // yield so woken receiver runs immediately
                 }
                 return Ok(());
             }
