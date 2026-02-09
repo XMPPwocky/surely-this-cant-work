@@ -29,6 +29,7 @@ pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
 pub const SYS_SHUTDOWN: usize = 231;
+pub const SYS_CLOCK: usize = 232;
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -163,6 +164,11 @@ fn handle_syscall(tf: &mut TrapFrame) {
             crate::println!("System shutdown requested by PID {}", crate::task::current_pid());
             sbi::sbi_shutdown();
         }
+        SYS_CLOCK => {
+            let (wall, cpu) = crate::task::global_clock();
+            tf.regs[10] = wall as usize;
+            tf.regs[11] = cpu as usize;
+        }
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);
             tf.regs[10] = usize::MAX;
@@ -202,6 +208,7 @@ fn syscall_name(num: usize) -> &'static [u8] {
         SYS_MUNMAP => b"munmap",
         SYS_TRACE => b"trace",
         SYS_SHUTDOWN => b"shut",
+        SYS_CLOCK => b"clock",
         _ => b"?",
     }
 }

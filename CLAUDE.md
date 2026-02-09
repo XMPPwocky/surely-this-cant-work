@@ -6,6 +6,7 @@ A from-scratch RISC-V 64-bit microkernel OS written in Rust, targeting qemu-syst
 - `make build` — build kernel binary
 - `make run` — boot in QEMU with serial
 - `make run-gui` — boot with virtio-gpu display
+- `make bench` — build and run benchmark suite (boots QEMU, runs /bin/bench, shuts down)
 - `make debug` — QEMU with GDB attach
 
 ## Conventions

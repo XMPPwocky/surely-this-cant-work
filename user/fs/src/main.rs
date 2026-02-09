@@ -6,10 +6,10 @@ use rvos::rvos_wire::{Reader, Writer};
 
 // --- Constants ---
 
-const MAX_FILES: usize = 32;
+const MAX_FILES: usize = 160;
 const MAX_FILE_SIZE: usize = 4096;
 const MAX_NAME_LEN: usize = 32;
-const MAX_CHILDREN: usize = 16;
+const MAX_CHILDREN: usize = 128;
 const MAX_OPEN_FILES: usize = 16;
 
 // Open flags
@@ -720,6 +720,10 @@ static SHELL_ELF: &[u8] = include_bytes!(
     "../../../user/shell/target/riscv64gc-unknown-rvos/release/shell"
 );
 
+static BENCH_ELF: &[u8] = include_bytes!(
+    "../../../user/bench/target/riscv64gc-unknown-rvos/release/bench"
+);
+
 // --- Multiplexed client state ---
 
 const MAX_CLIENTS: usize = 8;
@@ -744,6 +748,7 @@ fn main() {
     fs().add_static_file(b"/bin/ipc-torture", IPC_TORTURE_ELF);
     fs().add_static_file(b"/bin/fbcon", FBCON_ELF);
     fs().add_static_file(b"/bin/shell", SHELL_ELF);
+    fs().add_static_file(b"/bin/bench", BENCH_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)

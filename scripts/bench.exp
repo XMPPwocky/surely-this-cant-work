@@ -1,0 +1,30 @@
+#!/usr/bin/expect -f
+# Run the rvOS benchmark suite via serial console.
+# Usage: expect scripts/bench.exp
+
+set timeout 120
+log_user 1
+
+cd [file dirname [file dirname [file normalize [info script]]]]
+
+spawn make run
+
+# Wait for the serial shell prompt (may have timer ticks interleaved)
+expect {
+    "rvos>" {}
+    timeout { puts "TIMEOUT waiting for shell prompt"; exit 1 }
+}
+
+# Give a moment for any remaining boot output
+sleep 1
+
+send "run /bin/bench\r"
+
+# Wait for benchmark completion marker (may take ~60s)
+expect {
+    "=== Benchmark Complete ===" {}
+    timeout { puts "TIMEOUT waiting for benchmarks"; exit 1 }
+}
+
+# QEMU will exit via sys_shutdown
+expect eof

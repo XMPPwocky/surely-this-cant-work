@@ -73,6 +73,7 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 215    | `SYS_MUNMAP`          | `a0` = address, `a1` = length | `a0` = 0 or `usize::MAX`  | Unmaps and frees previously mmap'd pages.                  |
 | 230    | `SYS_TRACE`           | `a0` = label_ptr, `a1` = label_len | `a0` = 0 or `usize::MAX` | Records a timestamped trace event in the kernel ring buffer. |
 | 231    | `SYS_SHUTDOWN`        | (none)                        | Does not return            | Shuts down the machine via SBI.                            |
+| 232    | `SYS_CLOCK`           | (none)                        | `a0` = wall_ticks, `a1` = cpu_ticks | Returns wall-clock and global CPU ticks.           |
 
 ### Detailed Syscall Descriptions
 
@@ -276,6 +277,18 @@ invalid pointer).
 Shuts down the machine. The kernel prints a shutdown message identifying the
 calling process, then invokes SBI legacy shutdown (EID=0x08). QEMU will exit
 with code 0. Does not return.
+
+#### SYS_CLOCK (232)
+
+Returns timing information for benchmarking and profiling.
+
+- `a0` = wall-clock ticks (`rdtime` value, 10 MHz).
+- `a1` = global CPU ticks -- the total non-idle CPU time across all processes
+  since boot. This is the sum of all `run_time` values accumulated at each
+  context switch, plus the current task's in-progress slice (if non-idle).
+
+The ratio `cpu_ticks / wall_ticks` indicates overall CPU utilization. A value
+near 1.0 means the system was fully busy; lower values indicate idle time.
 
 ---
 

@@ -7,7 +7,7 @@ pub use scheduler::{
     init, spawn_named,
     spawn_user_elf_with_boot_channel,
     spawn_user_elf_with_handles,
-    schedule, current_pid,
+    schedule, current_pid, global_clock,
     exit_current_from_syscall,
     block_process, wake_process, save_kernel_satp,
     process_list, process_mem_list,

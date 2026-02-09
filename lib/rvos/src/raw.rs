@@ -17,6 +17,7 @@ pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
 pub const SYS_SHUTDOWN: usize = 231;
+pub const SYS_CLOCK: usize = 232;
 
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
@@ -130,6 +131,12 @@ pub fn sys_chan_send_retry(handle: usize, msg: &Message) -> usize {
 pub fn sys_shutdown() -> ! {
     syscall0(SYS_SHUTDOWN);
     unreachable!()
+}
+
+/// Read wall-clock and global CPU ticks. Returns (wall_ticks, global_cpu_ticks).
+pub fn sys_clock() -> (u64, u64) {
+    let (a0, a1) = syscall0(SYS_CLOCK);
+    (a0 as u64, a1 as u64)
 }
 
 /// Non-blocking receive on a channel handle.

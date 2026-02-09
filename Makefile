@@ -6,7 +6,7 @@ OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 # build-std flags (moved out of .cargo/config.toml to avoid leaking into x.py)
 BUILD_STD = -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 
-.PHONY: build build-shell build-hello build-fs build-fbcon build-window-server build-winclient build-ipc-torture build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
+.PHONY: build build-shell build-hello build-bench build-fs build-fbcon build-window-server build-winclient build-ipc-torture build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench
 
 build-shell:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
@@ -21,6 +21,11 @@ build-std-lib:
 build-hello:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
 		--manifest-path user/hello/Cargo.toml \
+		--target riscv64gc-unknown-rvos
+
+build-bench:
+	. $$HOME/.cargo/env && cargo +rvos build --release \
+		--manifest-path user/bench/Cargo.toml \
 		--target riscv64gc-unknown-rvos
 
 build-window-server:
@@ -44,7 +49,7 @@ build-fbcon:
 		--target riscv64gc-unknown-rvos
 
 # fs embeds user binaries via include_bytes!, so build them first
-build-fs: build-window-server build-winclient build-ipc-torture build-fbcon build-shell
+build-fs: build-window-server build-winclient build-ipc-torture build-fbcon build-shell build-bench
 	. $$HOME/.cargo/env && cargo +rvos build --release \
 		--manifest-path user/fs/Cargo.toml \
 		--target riscv64gc-unknown-rvos
@@ -109,3 +114,7 @@ clean:
 	. $$HOME/.cargo/env && cargo clean --manifest-path kernel/Cargo.toml
 	rm -f $(KERNEL_BIN)
 	cd user/shell && . $$HOME/.cargo/env && cargo clean 2>/dev/null || true
+
+bench: build
+	@echo "Running rvOS benchmarks..."
+	@expect scripts/bench.exp

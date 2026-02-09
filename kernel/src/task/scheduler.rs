@@ -42,6 +42,7 @@ struct Scheduler {
     current: usize, // PID of current process
     initialized: bool,
     last_switch_rdtime: u64, // rdtime when we switched TO the current task
+    global_cpu_ticks: u64, // total non-idle CPU ticks across all processes
 }
 
 impl Scheduler {
@@ -52,6 +53,7 @@ impl Scheduler {
             current: 0,
             initialized: false,
             last_switch_rdtime: 0,
+            global_cpu_ticks: 0,
         }
     }
 
@@ -260,6 +262,19 @@ pub fn current_pid() -> usize {
     SCHEDULER.lock().current
 }
 
+/// Return (wall_ticks, global_cpu_ticks) for the SYS_CLOCK syscall.
+/// global_cpu_ticks = total non-idle CPU time across all processes.
+pub fn global_clock() -> (u64, u64) {
+    let sched = SCHEDULER.lock();
+    let now = crate::task::process::rdtime();
+    let current_slice = if sched.current != 0 {
+        now.saturating_sub(sched.last_switch_rdtime)
+    } else {
+        0
+    };
+    (now, sched.global_cpu_ticks + current_slice)
+}
+
 /// Yield the current task and schedule the next one.
 pub fn schedule() {
     let mut sched = SCHEDULER.lock();
@@ -305,6 +320,11 @@ pub fn schedule() {
         }
 
         old_proc.last_switched_away = now;
+
+        // Accumulate global CPU time (exclude idle task, PID 0)
+        if old_pid != 0 {
+            sched.global_cpu_ticks += run_time;
+        }
     }
     sched.last_switch_rdtime = now;
 
