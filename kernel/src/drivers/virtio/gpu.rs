@@ -222,6 +222,7 @@ pub fn init() -> bool {
     let fb_pages = (fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     let fb_addr = alloc_dma_buffer(fb_pages);
     gpu.fb_addr = fb_addr;
+    crate::println!("[gpu] FB alloc: {:#x}..{:#x} ({} pages)", fb_addr, fb_addr + fb_pages * PAGE_SIZE, fb_pages);
 
     // Clear framebuffer to black
     unsafe {

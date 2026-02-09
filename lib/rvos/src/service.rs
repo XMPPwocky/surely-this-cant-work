@@ -62,8 +62,10 @@ pub fn spawn_process(path: &str) -> SysResult<Channel> {
 /// Spawn a process via a specific boot handle.
 pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
     let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&BootRequest::Spawn { path }, &mut msg.data)
-        .map_err(|_| SysError::BadAddress)?;
+    msg.len = rvos_wire::to_bytes(
+        &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
+        &mut msg.data,
+    ).map_err(|_| SysError::BadAddress)?;
     let ret = raw::syscall2(
         raw::SYS_CHAN_SEND,
         boot_handle,
@@ -83,7 +85,6 @@ pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
         return Err(SysError::from_code(ret).unwrap_err());
     }
 
-    // Parse response
     match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
         Ok(BootResponse::Ok {}) => {}
         _ => return Err(SysError::NoResources),
@@ -107,8 +108,10 @@ pub fn spawn_process_with_cap(path: &str, cap_handle: usize) -> SysResult<Channe
 /// Spawn a process with an extra capability via a specific boot handle.
 pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usize) -> SysResult<Channel> {
     let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&BootRequest::Spawn { path }, &mut msg.data)
-        .map_err(|_| SysError::BadAddress)?;
+    msg.len = rvos_wire::to_bytes(
+        &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
+        &mut msg.data,
+    ).map_err(|_| SysError::BadAddress)?;
     msg.set_cap(cap_handle);
     let ret = raw::syscall2(
         raw::SYS_CHAN_SEND,
@@ -129,7 +132,6 @@ pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usi
         return Err(SysError::from_code(ret).unwrap_err());
     }
 
-    // Parse response
     match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
         Ok(BootResponse::Ok {}) => {}
         _ => return Err(SysError::NoResources),
@@ -153,8 +155,10 @@ pub fn spawn_process_with_args(path: &str, args: &[u8]) -> SysResult<Channel> {
 /// Spawn a process with args via a specific boot handle.
 pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -> SysResult<Channel> {
     let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&BootRequest::SpawnWithArgs { path, args }, &mut msg.data)
-        .map_err(|_| SysError::BadAddress)?;
+    msg.len = rvos_wire::to_bytes(
+        &BootRequest::Spawn { path, args, ns_overrides: &[] },
+        &mut msg.data,
+    ).map_err(|_| SysError::BadAddress)?;
     let ret = raw::syscall2(
         raw::SYS_CHAN_SEND,
         boot_handle,
@@ -174,7 +178,69 @@ pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -
         return Err(SysError::from_code(ret).unwrap_err());
     }
 
-    // Parse response
+    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
+        Ok(BootResponse::Ok {}) => {}
+        _ => return Err(SysError::NoResources),
+    }
+
+    if reply.cap() == raw::NO_CAP {
+        return Err(SysError::NoResources);
+    }
+
+    Ok(Channel::from_raw_handle(reply.cap()))
+}
+
+/// Spawn a process with args and namespace overrides.
+///
+/// `ns_overrides` is a packed blob: `[count: u8] then count * [name_len: u8, name_bytes..., cap_index: u8]`
+/// Each cap_index references `msg.caps[cap_index]`.
+/// `caps` contains the handles to send as capabilities with the spawn message.
+pub fn spawn_process_with_overrides(
+    path: &str,
+    args: &[u8],
+    ns_overrides: &[u8],
+    caps: &[usize],
+) -> SysResult<Channel> {
+    spawn_process_with_overrides_on(0, path, args, ns_overrides, caps)
+}
+
+/// Spawn with overrides via a specific boot handle.
+pub fn spawn_process_with_overrides_on(
+    boot_handle: usize,
+    path: &str,
+    args: &[u8],
+    ns_overrides: &[u8],
+    caps: &[usize],
+) -> SysResult<Channel> {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(
+        &BootRequest::Spawn { path, args, ns_overrides },
+        &mut msg.data,
+    ).map_err(|_| SysError::BadAddress)?;
+    let cap_count = caps.len().min(crate::message::MAX_CAPS);
+    for i in 0..cap_count {
+        msg.caps[i] = caps[i];
+    }
+    msg.cap_count = cap_count;
+    let ret = raw::syscall2(
+        raw::SYS_CHAN_SEND,
+        boot_handle,
+        &msg as *const Message as usize,
+    );
+    if ret != 0 {
+        return Err(SysError::from_code(ret).unwrap_err());
+    }
+
+    let mut reply = Message::new();
+    let ret = raw::syscall2(
+        raw::SYS_CHAN_RECV_BLOCKING,
+        boot_handle,
+        &mut reply as *mut Message as usize,
+    );
+    if ret != 0 {
+        return Err(SysError::from_code(ret).unwrap_err());
+    }
+
     match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
         Ok(BootResponse::Ok {}) => {}
         _ => return Err(SysError::NoResources),

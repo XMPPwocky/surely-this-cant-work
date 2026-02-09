@@ -287,7 +287,7 @@ fn sys_chan_create(tf: &mut TrapFrame) {
 }
 
 /// SYS_CHAN_SEND: translate handle -> endpoint, copy message from user, send.
-/// If message has a cap, translate cap handle -> encoded capability.
+/// Translates all caps in caps[0..cap_count] from local handles to encoded capabilities.
 fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     let msg_pa = match validate_user_buffer(msg_ptr, core::mem::size_of::<crate::ipc::Message>()) {
         Some(pa) => pa,
@@ -305,27 +305,27 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
 
     // Clamp msg.len to prevent OOB slicing on untrusted user data
     msg.len = msg.len.min(crate::ipc::MAX_MSG_SIZE);
+    msg.cap_count = msg.cap_count.min(crate::ipc::MAX_CAPS);
 
     // Set sender PID
     msg.sender_pid = crate::task::current_pid();
 
-    // Translate cap if present: local handle -> encoded capability
-    if msg.cap != crate::ipc::NO_CAP {
-        match crate::task::current_process_handle(msg.cap) {
-            Some(HandleObject::Channel(global_ep)) => {
-                if !crate::ipc::channel_inc_ref(global_ep) {
-                    return usize::MAX;
-                }
-                msg.cap = crate::ipc::encode_cap_channel(global_ep);
+    // Translate all caps: local handle -> encoded capability
+    // Track how many we've successfully translated for rollback on failure
+    let mut translated = 0usize;
+    for i in 0..msg.cap_count {
+        match translate_cap_for_send(msg.caps[i]) {
+            Some(encoded) => {
+                msg.caps[i] = encoded;
+                translated += 1;
             }
-            Some(HandleObject::Shm { id, rw }) => {
-                // Increment ref_count for the SHM region being transferred
-                if !crate::ipc::shm_inc_ref(id) {
-                    return usize::MAX;
+            None => {
+                // Rollback previously translated caps
+                for j in 0..translated {
+                    rollback_encoded_cap(msg.caps[j]);
                 }
-                msg.cap = crate::ipc::encode_cap_shm(id, rw);
+                return usize::MAX;
             }
-            None => return usize::MAX, // invalid cap handle
         }
     }
 
@@ -341,8 +341,40 @@ fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
     0
 }
 
+/// Translate a user-space cap handle into an encoded capability for the message queue.
+/// Increments ref count on success. Returns None on invalid handle.
+fn translate_cap_for_send(local_handle: usize) -> Option<usize> {
+    if local_handle == crate::ipc::NO_CAP {
+        return Some(crate::ipc::NO_CAP);
+    }
+    match crate::task::current_process_handle(local_handle) {
+        Some(HandleObject::Channel(global_ep)) => {
+            if !crate::ipc::channel_inc_ref(global_ep) {
+                return None;
+            }
+            Some(crate::ipc::encode_cap_channel(global_ep))
+        }
+        Some(HandleObject::Shm { id, rw }) => {
+            if !crate::ipc::shm_inc_ref(id) {
+                return None;
+            }
+            Some(crate::ipc::encode_cap_shm(id, rw))
+        }
+        None => None,
+    }
+}
+
+/// Rollback an encoded cap by decrementing its ref count.
+fn rollback_encoded_cap(encoded: usize) {
+    match crate::ipc::decode_cap(encoded) {
+        crate::ipc::DecodedCap::Channel(ep) => { crate::ipc::channel_close(ep); }
+        crate::ipc::DecodedCap::Shm { id, .. } => { crate::ipc::shm_dec_ref(id); }
+        crate::ipc::DecodedCap::None => {}
+    }
+}
+
 /// Install a received capability into the current process's handle table.
-/// Returns the local handle index to write into msg.cap, or NO_CAP on failure.
+/// Returns the local handle index, or NO_CAP on failure.
 fn install_received_cap(encoded_cap: usize) -> usize {
     match crate::ipc::decode_cap(encoded_cap) {
         crate::ipc::DecodedCap::None => crate::ipc::NO_CAP,
@@ -350,7 +382,6 @@ fn install_received_cap(encoded_cap: usize) -> usize {
             match crate::task::current_process_alloc_handle(HandleObject::Channel(global_ep)) {
                 Some(h) => h,
                 None => {
-                    // Failed to install; decrement ref_count since it was incremented on send
                     crate::ipc::channel_close(global_ep);
                     crate::ipc::NO_CAP
                 }
@@ -360,7 +391,6 @@ fn install_received_cap(encoded_cap: usize) -> usize {
             match crate::task::current_process_alloc_handle(HandleObject::Shm { id, rw }) {
                 Some(h) => h,
                 None => {
-                    // Failed to install; decrement ref_count since it was incremented on send
                     crate::ipc::shm_dec_ref(id);
                     crate::ipc::NO_CAP
                 }
@@ -369,7 +399,16 @@ fn install_received_cap(encoded_cap: usize) -> usize {
     }
 }
 
-/// SYS_CHAN_RECV (non-blocking): translate handle, try recv, translate cap in result.
+/// Install all received caps in a message into the current process's handle table.
+fn install_received_caps(msg: &mut crate::ipc::Message) {
+    for i in 0..msg.cap_count {
+        if msg.caps[i] != crate::ipc::NO_CAP {
+            msg.caps[i] = install_received_cap(msg.caps[i]);
+        }
+    }
+}
+
+/// SYS_CHAN_RECV (non-blocking): translate handle, try recv, translate caps in result.
 fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
     let msg_pa = match validate_user_buffer(msg_buf_ptr, core::mem::size_of::<crate::ipc::Message>()) {
         Some(pa) => pa,
@@ -387,18 +426,13 @@ fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
     }
     match msg {
         Some(mut msg) => {
-            // Translate cap: encoded capability -> new local handle in receiver
-            if msg.cap != crate::ipc::NO_CAP {
-                msg.cap = install_received_cap(msg.cap);
-            }
-            // Write to user buffer via translated PA
+            install_received_caps(&mut msg);
             unsafe {
                 core::ptr::write(msg_pa as *mut crate::ipc::Message, msg);
             }
             0
         }
         None => {
-            // Distinguish "no message yet" from "channel closed"
             if !crate::ipc::channel_is_active(endpoint) {
                 2 // ChannelClosed
             } else {
@@ -436,11 +470,7 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
         }
         match msg {
             Some(mut msg) => {
-                // Translate cap
-                if msg.cap != crate::ipc::NO_CAP {
-                    msg.cap = install_received_cap(msg.cap);
-                }
-                // Write to user buffer via translated PA
+                install_received_caps(&mut msg);
                 unsafe {
                     core::ptr::write(msg_pa as *mut crate::ipc::Message, msg);
                 }
@@ -448,16 +478,13 @@ fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
                 return;
             }
             None => {
-                // Check if the channel was closed by the peer
                 if !crate::ipc::channel_is_active(endpoint) {
                     tf.regs[10] = 2; // ChannelClosed
                     return;
                 }
-                // Block and wait
                 crate::ipc::channel_set_blocked(endpoint, cur_pid);
                 crate::task::block_process(cur_pid);
                 crate::task::schedule();
-                // Woken up — loop back and retry
             }
         }
     }
@@ -486,28 +513,22 @@ fn sys_chan_send_blocking(tf: &mut TrapFrame) {
 
     // Read message from user space
     let mut msg = unsafe { core::ptr::read(msg_pa as *const crate::ipc::Message) };
-    // Clamp msg.len to prevent OOB slicing on untrusted user data
     msg.len = msg.len.min(crate::ipc::MAX_MSG_SIZE);
+    msg.cap_count = msg.cap_count.min(crate::ipc::MAX_CAPS);
     msg.sender_pid = crate::task::current_pid();
 
-    // Translate cap if present
-    if msg.cap != crate::ipc::NO_CAP {
-        match crate::task::current_process_handle(msg.cap) {
-            Some(HandleObject::Channel(global_ep)) => {
-                if !crate::ipc::channel_inc_ref(global_ep) {
-                    tf.regs[10] = usize::MAX;
-                    return;
-                }
-                msg.cap = crate::ipc::encode_cap_channel(global_ep);
-            }
-            Some(HandleObject::Shm { id, rw }) => {
-                if !crate::ipc::shm_inc_ref(id) {
-                    tf.regs[10] = usize::MAX;
-                    return;
-                }
-                msg.cap = crate::ipc::encode_cap_shm(id, rw);
+    // Translate all caps
+    let mut translated = 0usize;
+    for i in 0..msg.cap_count {
+        match translate_cap_for_send(msg.caps[i]) {
+            Some(encoded) => {
+                msg.caps[i] = encoded;
+                translated += 1;
             }
             None => {
+                for j in 0..translated {
+                    rollback_encoded_cap(msg.caps[j]);
+                }
                 tf.regs[10] = usize::MAX;
                 return;
             }
@@ -525,16 +546,13 @@ fn sys_chan_send_blocking(tf: &mut TrapFrame) {
                 return;
             }
             Err(crate::ipc::SendError::QueueFull) => {
-                // Check if channel was closed
                 if !crate::ipc::channel_is_active(endpoint) {
                     tf.regs[10] = usize::MAX;
                     return;
                 }
-                // Block until a recv frees a slot
                 crate::ipc::channel_set_send_blocked(endpoint, cur_pid);
                 crate::task::block_process(cur_pid);
                 crate::task::schedule();
-                // Woken up — retry
             }
             Err(_) => {
                 tf.regs[10] = usize::MAX;
@@ -591,6 +609,9 @@ fn sys_shm_create(size: usize) -> usize {
 
     // Zero the allocated pages
     let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
+    crate::println!("[shm_create] PID {} pages={} range={:#x}..{:#x} (ppn {:#x}..{:#x})",
+        crate::task::current_pid(), page_count, base_pa, base_pa + page_count * crate::mm::address::PAGE_SIZE,
+        ppn.0, ppn.0 + page_count);
     unsafe {
         core::ptr::write_bytes(base_pa as *mut u8, 0, page_count * crate::mm::address::PAGE_SIZE);
     }
@@ -755,6 +776,11 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
     } else {
         crate::mm::page_table::PTE_R | crate::mm::page_table::PTE_U
     };
+
+    crate::println!("[mmap_shm] PID {} shm={} pages={} range={:#x}..{:#x}",
+        crate::task::current_pid(), shm_id, map_pages,
+        base_ppn.0 * crate::mm::address::PAGE_SIZE,
+        (base_ppn.0 + map_pages) * crate::mm::address::PAGE_SIZE);
 
     // Map the SHM pages into the process's page table (identity-mapped: VA == PA)
     for i in 0..map_pages {

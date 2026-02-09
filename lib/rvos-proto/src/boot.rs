@@ -16,15 +16,13 @@ define_message! {
         /// Response cap = client endpoint of the service channel.
         ConnectService(0) { name: &'a str },
         /// Spawn a new process from a filesystem path (e.g., "/bin/hello-std").
+        /// `args` is a null-separated blob (e.g. b"arg1\0arg2\0arg3"), empty if none.
+        /// `ns_overrides` is a packed blob for namespace overrides, empty if none.
         /// Response cap = process handle channel.
-        Spawn(1) { path: &'a str },
+        Spawn(1) { path: &'a str, args: &'a [u8], ns_overrides: &'a [u8] },
         /// Fetch command-line arguments for this process.
         /// Response = Args with null-separated blob.
         GetArgs(2) {},
-        /// Spawn a new process with command-line arguments.
-        /// `args` is a null-separated blob (e.g. b"arg1\0arg2\0arg3").
-        /// Response cap = process handle channel.
-        SpawnWithArgs(3) { path: &'a str, args: &'a [u8] },
     }
 }
 

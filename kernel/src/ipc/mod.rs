@@ -80,14 +80,18 @@ pub fn decode_cap_channel(encoded: usize) -> Option<usize> {
     }
 }
 
-/// A fixed-size message with optional capability
+/// Maximum number of capabilities per message.
+pub const MAX_CAPS: usize = 4;
+
+/// A fixed-size message with optional capabilities
 #[derive(Clone)]
 #[repr(C)]
 pub struct Message {
     pub data: [u8; MAX_MSG_SIZE],
     pub len: usize,
     pub sender_pid: usize,
-    pub cap: usize, // NO_CAP = none, otherwise global endpoint ID
+    pub caps: [usize; MAX_CAPS],
+    pub cap_count: usize,
 }
 
 impl Message {
@@ -96,7 +100,8 @@ impl Message {
             data: [0u8; MAX_MSG_SIZE],
             len: 0,
             sender_pid: 0,
-            cap: NO_CAP,
+            caps: [NO_CAP; MAX_CAPS],
+            cap_count: 0,
         }
     }
 
@@ -393,20 +398,22 @@ pub fn accept_client(control_ep: usize, pid: usize) -> AcceptedClient {
     loop {
         match channel_recv_blocking(control_ep, pid) {
             Some(msg) => {
-                if let Some(ep) = decode_cap_channel(msg.cap) {
-                    // Parse client_pid from NewConnection message
-                    let client_pid = if msg.len >= 5 {
-                        // NewConnection wire format: u32(client_pid) + u8(channel_role)
-                        u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]])
-                    } else {
-                        0
-                    };
-                    let channel_role = if msg.len >= 5 {
-                        msg.data[4]
-                    } else {
-                        0
-                    };
-                    return AcceptedClient { endpoint: ep, client_pid, channel_role };
+                if msg.cap_count > 0 {
+                    if let Some(ep) = decode_cap_channel(msg.caps[0]) {
+                        // Parse client_pid from NewConnection message
+                        let client_pid = if msg.len >= 5 {
+                            // NewConnection wire format: u32(client_pid) + u8(channel_role)
+                            u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]])
+                        } else {
+                            0
+                        };
+                        let channel_role = if msg.len >= 5 {
+                            msg.data[4]
+                        } else {
+                            0
+                        };
+                        return AcceptedClient { endpoint: ep, client_pid, channel_role };
+                    }
                 }
                 // Message without channel cap — ignore and keep waiting
             }

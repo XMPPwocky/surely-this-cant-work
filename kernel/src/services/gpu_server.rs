@@ -65,7 +65,8 @@ pub fn gpu_server() {
                 resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
                 resp.sender_pid = my_pid;
                 // Attach SHM capability (RW)
-                resp.cap = ipc::encode_cap_shm(shm_id, true);
+                resp.caps[0] = ipc::encode_cap_shm(shm_id, true);
+                resp.cap_count = 1;
                 // Inc ref so the SHM stays alive when client maps it
                 ipc::shm_inc_ref(shm_id);
                 send_msg(client_ep, resp);

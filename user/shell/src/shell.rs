@@ -18,7 +18,7 @@ fn request_service(name: &str) -> usize {
     let mut reply = Message::new();
     raw::sys_chan_recv_blocking(0, &mut reply);
     match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => reply.cap,
+        Ok(BootResponse::Ok {}) => reply.cap(),
         _ => usize::MAX,
     }
 }
@@ -43,7 +43,9 @@ fn cmd_help() {
     println!("  cat <path>            - Read file");
     println!("  write <path> <text>   - Write to file");
     println!("  stat <path>           - Show file metadata");
-    println!("  run <path>            - Run a program and wait for it to exit");
+    println!("  run <path> [args...]   - Run a program and wait for it to exit");
+    println!("  run <path> > <file>   - Run with stdout redirected (truncate)");
+    println!("  run <path> >> <file>  - Run with stdout redirected (append)");
     println!("  clear                 - Clear screen");
     println!("  help                  - Show this help");
     println!("  shutdown              - Shut down the system");
@@ -210,6 +212,44 @@ fn cmd_math(args: &str) {
     raw::sys_chan_close(math_handle);
 }
 
+/// Rebuild the null-separated args blob from argv0 and remaining args string.
+/// Returns the total length written into the blob.
+fn rebuild_args(blob: &mut [u8; 512], argv0: &str, rest: &str) -> usize {
+    let mut len = 0;
+    let copy_len = argv0.len().min(512);
+    blob[..copy_len].copy_from_slice(argv0.as_bytes());
+    len += copy_len;
+
+    if !rest.is_empty() {
+        for arg in rest.split_whitespace() {
+            if len + 1 + arg.len() > 512 {
+                break;
+            }
+            blob[len] = 0; // null separator
+            len += 1;
+            blob[len..len + arg.len()].copy_from_slice(arg.as_bytes());
+            len += arg.len();
+        }
+    }
+    len
+}
+
+/// Wait for a child process to exit via its process handle channel, print exit code.
+fn wait_for_exit(proc_handle: usize) {
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+
+    let exit_code = match rvos_wire::from_bytes::<rvos_proto::process::ExitNotification>(
+        &exit_msg.data[..exit_msg.len],
+    ) {
+        Ok(notif) => notif.exit_code,
+        Err(_) => -1,
+    };
+    println!("Process exited with code {}", exit_code);
+
+    raw::sys_chan_close(proc_handle);
+}
+
 fn cmd_run(args: &str) {
     let args_str = args.trim();
     if args_str.is_empty() {
@@ -249,10 +289,85 @@ fn cmd_run(args: &str) {
         }
     }
 
-    // Send SpawnWithArgs request on boot channel (handle 0)
+    // Parse stdout redirect: > (truncate) or >> (append)
+    let mut redirect_path: Option<&str> = None;
+    let mut redirect_append = false;
+    let mut actual_args_len = args_len;
+
+    // Search for > or >> in the original command (not in args_blob)
+    // We'll re-parse from the rest string to find redirect
+    if let Some(pos) = rest.find(">>") {
+        redirect_path = Some(rest[pos + 2..].trim());
+        redirect_append = true;
+        // Rebuild args without the redirect part
+        let clean_rest = rest[..pos].trim();
+        actual_args_len = rebuild_args(&mut args_blob, argv0, clean_rest);
+    } else if let Some(pos) = rest.find('>') {
+        redirect_path = Some(rest[pos + 1..].trim());
+        redirect_append = false;
+        let clean_rest = rest[..pos].trim();
+        actual_args_len = rebuild_args(&mut args_blob, argv0, clean_rest);
+    }
+
+    // If redirecting, open the file and build ns_overrides
+    let mut ns_overrides_blob = [0u8; 32];
+    let mut ns_overrides_len = 0usize;
+    let mut redirect_handle: usize = 0;
+
+    if let Some(redir_path) = redirect_path {
+        if redir_path.is_empty() {
+            println!("Error: redirect path is empty");
+            return;
+        }
+        use rvos::rvos_proto::fs::OpenFlags;
+        let flags = if redirect_append {
+            OpenFlags::CREATE.or(OpenFlags::APPEND)
+        } else {
+            OpenFlags::CREATE.or(OpenFlags::TRUNCATE)
+        };
+        match rvos::fs::file_open_raw(redir_path, flags) {
+            Ok(fh) => {
+                redirect_handle = fh;
+                // Build ns_overrides blob: [count=1, name_len=6, "stdout", cap_index=0]
+                ns_overrides_blob[0] = 1; // count
+                ns_overrides_blob[1] = 6; // name_len
+                ns_overrides_blob[2..8].copy_from_slice(b"stdout");
+                ns_overrides_blob[8] = 0; // cap_index = 0
+                ns_overrides_len = 9;
+            }
+            Err(_) => {
+                println!("Error: could not open {} for redirect", redir_path);
+                return;
+            }
+        }
+    }
+
+    // Send Spawn request on boot channel (handle 0)
+    if ns_overrides_len > 0 {
+        // Spawn with namespace overrides
+        let proc_chan = rvos::spawn_process_with_overrides(
+            path,
+            &args_blob[..actual_args_len],
+            &ns_overrides_blob[..ns_overrides_len],
+            &[redirect_handle],
+        );
+        raw::sys_chan_close(redirect_handle);
+        match proc_chan {
+            Ok(ch) => {
+                let proc_handle = ch.into_raw_handle();
+                wait_for_exit(proc_handle);
+            }
+            Err(_) => {
+                println!("Spawn failed");
+                return;
+            }
+        }
+        return;
+    }
+
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(
-        &BootRequest::SpawnWithArgs { path, args: &args_blob[..args_len] },
+        &BootRequest::Spawn { path, args: &args_blob[..actual_args_len], ns_overrides: &[] },
         &mut msg.data,
     ).unwrap_or(0);
     raw::sys_chan_send(0, &msg);
@@ -273,27 +388,12 @@ fn cmd_run(args: &str) {
         }
     }
 
-    if reply.cap == rvos::NO_CAP {
+    if reply.cap() == rvos::NO_CAP {
         println!("Spawn failed: no process handle returned");
         return;
     }
 
-    let proc_handle = reply.cap;
-
-    // Wait for the child process to exit
-    let mut exit_msg = Message::new();
-    raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
-
-    // Parse exit notification
-    let exit_code = match rvos_wire::from_bytes::<rvos_proto::process::ExitNotification>(
-        &exit_msg.data[..exit_msg.len],
-    ) {
-        Ok(notif) => notif.exit_code,
-        Err(_) => -1,
-    };
-    println!("Process exited with code {}", exit_code);
-
-    raw::sys_chan_close(proc_handle);
+    wait_for_exit(reply.cap());
 }
 
 // --- Tab completion ---

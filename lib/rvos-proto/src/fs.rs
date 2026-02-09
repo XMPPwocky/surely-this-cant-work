@@ -32,6 +32,12 @@ impl OpenFlags {
     pub const TRUNCATE: Self   = Self { bits: 0x02 };
     pub const EXCL: Self       = Self { bits: 0x04 };
     pub const CREATE_NEW: Self = Self { bits: 0x05 }; // CREATE | EXCL
+    pub const APPEND: Self     = Self { bits: 0x08 };
+
+    /// Combine flags with bitwise OR.
+    pub const fn or(self, other: Self) -> Self {
+        Self { bits: self.bits | other.bits }
+    }
 }
 
 // ── Stat result kind ─────────────────────────────────────────────

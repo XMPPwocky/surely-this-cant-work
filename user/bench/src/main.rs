@@ -284,7 +284,7 @@ fn bench_process_spawn() -> (u64, u32) {
         let _ = w.write_u8(1); // Spawn tag
         let _ = w.write_str("/bin/hello-std");
         msg.len = w.position();
-        msg.cap = NO_CAP;
+        msg.set_cap(NO_CAP);
         raw::sys_chan_send_blocking(0, &msg);
 
         let mut resp = Message::new();
@@ -292,10 +292,10 @@ fn bench_process_spawn() -> (u64, u32) {
         let mut r = rvos::rvos_wire::Reader::new(&resp.data[..resp.len]);
         let tag = r.read_u8().unwrap_or(255);
         if tag == 0 {
-            if resp.cap != NO_CAP {
+            if resp.cap() != NO_CAP {
                 let mut exit_msg = Message::new();
-                raw::sys_chan_recv_blocking(resp.cap, &mut exit_msg);
-                raw::sys_chan_close(resp.cap);
+                raw::sys_chan_recv_blocking(resp.cap(), &mut exit_msg);
+                raw::sys_chan_close(resp.cap());
             }
         }
     }

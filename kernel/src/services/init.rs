@@ -15,6 +15,15 @@ pub enum ConsoleType {
 }
 
 const MAX_ARGS_LEN: usize = 512;
+const MAX_NS_OVERRIDES: usize = 4;
+
+/// A single namespace override: maps a service name to a pre-established endpoint.
+#[derive(Clone)]
+struct NsOverride {
+    name: [u8; SERVICE_NAME_LEN],
+    name_len: usize,
+    endpoint: usize, // global endpoint ID (decoded from cap)
+}
 
 /// A boot channel registration: the init server's end of a user process's boot channel.
 struct BootRegistration {
@@ -23,6 +32,7 @@ struct BootRegistration {
     is_shell: bool,           // true = primary stdin recipient
     args: [u8; MAX_ARGS_LEN], // null-separated command-line args
     args_len: usize,          // length of args blob
+    overrides: [Option<NsOverride>; MAX_NS_OVERRIDES],
 }
 
 /// A service registration: maps a name to a console control endpoint.
@@ -115,13 +125,24 @@ pub fn register_boot(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool
 
 /// Register a boot channel with command-line arguments.
 pub fn register_boot_with_args(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, args_blob: &[u8]) {
+    register_boot_with_overrides(boot_ep_b, console_type, is_shell, args_blob, [const { None }; MAX_NS_OVERRIDES]);
+}
+
+/// Register a boot channel with args and namespace overrides.
+fn register_boot_with_overrides(
+    boot_ep_b: usize,
+    console_type: ConsoleType,
+    is_shell: bool,
+    args_blob: &[u8],
+    overrides: [Option<NsOverride>; MAX_NS_OVERRIDES],
+) {
     let mut config = INIT_CONFIG.lock();
     for slot in config.boot_regs.iter_mut() {
         if slot.is_none() {
             let mut args = [0u8; MAX_ARGS_LEN];
             let args_len = args_blob.len().min(MAX_ARGS_LEN);
             args[..args_len].copy_from_slice(&args_blob[..args_len]);
-            *slot = Some(BootRegistration { boot_ep_b, console_type, is_shell, args, args_len });
+            *slot = Some(BootRegistration { boot_ep_b, console_type, is_shell, args, args_len, overrides });
             return;
         }
     }
@@ -190,6 +211,8 @@ struct FsLaunchCtx {
     /// Null-separated command-line arguments for the spawned process.
     args: [u8; MAX_ARGS_LEN],
     args_len: usize,
+    /// Namespace overrides for the spawned process.
+    ns_overrides: [Option<NsOverride>; MAX_NS_OVERRIDES],
 }
 
 impl FsLaunchCtx {
@@ -365,7 +388,10 @@ fn handle_request(
     let client_pid = msg.sender_pid as u32;
     match req {
         BootRequest::ConnectService { name } => {
-            if name == "stdin" {
+            // Check namespace overrides first
+            if let Some(override_ep) = find_ns_override(boot_ep_b, name) {
+                send_ok_with_cap(boot_ep_b, override_ep, my_pid);
+            } else if name == "stdin" {
                 handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid, 1);
             } else if name == "stdout" {
                 handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid, 2);
@@ -378,14 +404,12 @@ fn handle_request(
                 send_error(boot_ep_b, "unknown service", my_pid);
             }
         }
-        BootRequest::Spawn { path } => {
-            handle_spawn_request(boot_ep_b, console_type, path, msg.cap, &[], fs_launches, my_pid);
+        BootRequest::Spawn { path, args, ns_overrides } => {
+            let spawn_cap = if msg.cap_count > 0 { msg.caps[0] } else { NO_CAP };
+            handle_spawn_request(boot_ep_b, console_type, path, spawn_cap, args, ns_overrides, &msg, fs_launches, my_pid);
         }
         BootRequest::GetArgs {} => {
             handle_get_args(boot_ep_b, my_pid);
-        }
-        BootRequest::SpawnWithArgs { path, args } => {
-            handle_spawn_request(boot_ep_b, console_type, path, msg.cap, args, fs_launches, my_pid);
         }
     }
 
@@ -427,6 +451,74 @@ fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
     None
 }
 
+/// Find a namespace override for the given service name in the boot registration.
+fn find_ns_override(boot_ep_b: usize, name: &str) -> Option<usize> {
+    let config = INIT_CONFIG.lock();
+    for slot in config.boot_regs.iter() {
+        if let Some(ref reg) = slot {
+            if reg.boot_ep_b == boot_ep_b {
+                let name_bytes = name.as_bytes();
+                for ovr in reg.overrides.iter() {
+                    if let Some(ref o) = ovr {
+                        if o.name_len == name_bytes.len() && &o.name[..o.name_len] == name_bytes {
+                            return Some(o.endpoint);
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    None
+}
+
+/// Parse namespace overrides from the packed blob.
+/// Format: [count: u8] then count * [name_len: u8, name_bytes..., cap_index: u8]
+/// Each cap_index references orig_msg.caps[cap_index] (already encoded by kernel).
+fn parse_ns_overrides(blob: &[u8], orig_msg: &Message) -> [Option<NsOverride>; MAX_NS_OVERRIDES] {
+    let mut result: [Option<NsOverride>; MAX_NS_OVERRIDES] = [const { None }; MAX_NS_OVERRIDES];
+    if blob.is_empty() {
+        return result;
+    }
+
+    let count = blob[0] as usize;
+    let mut pos = 1usize;
+    let mut out_idx = 0;
+
+    for _ in 0..count {
+        if out_idx >= MAX_NS_OVERRIDES || pos >= blob.len() {
+            break;
+        }
+        let name_len = blob[pos] as usize;
+        pos += 1;
+        if pos + name_len >= blob.len() {
+            break;
+        }
+        let name_bytes = &blob[pos..pos + name_len];
+        pos += name_len;
+        let cap_index = blob[pos] as usize;
+        pos += 1;
+
+        // Decode the capability from the message's cap array
+        if cap_index < orig_msg.cap_count {
+            let encoded = orig_msg.caps[cap_index];
+            if let Some(ep) = ipc::decode_cap_channel(encoded) {
+                let mut name = [0u8; SERVICE_NAME_LEN];
+                let nlen = name_len.min(SERVICE_NAME_LEN);
+                name[..nlen].copy_from_slice(&name_bytes[..nlen]);
+                result[out_idx] = Some(NsOverride {
+                    name,
+                    name_len: nlen,
+                    endpoint: ep,
+                });
+                out_idx += 1;
+            }
+        }
+    }
+
+    result
+}
+
 /// Generic handler for any named service (sysinfo, math, fs, etc.).
 /// Creates a channel pair, sends the server endpoint to the service's control channel
 /// with a NewConnection message, and responds to the client with the client endpoint.
@@ -443,7 +535,8 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
     if ctl_ep != usize::MAX {
         // Send server endpoint to the service via its control channel with NewConnection
         let mut ctl_msg = Message::new();
-        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+    ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid, channel_role: 0 },
             &mut ctl_msg.data,
@@ -486,7 +579,8 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, client_pid:
     if let Some(ctl_ep) = control_ep {
         // Send NewConnection to console server via its control channel with role
         let mut ctl_msg = Message::new();
-        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+    ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid, channel_role: role },
             &mut ctl_msg.data,
@@ -508,6 +602,8 @@ fn handle_spawn_request(
     path: &str,
     spawn_cap: usize,
     args: &[u8],
+    ns_overrides: &[u8],
+    orig_msg: &Message,
     fs_launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
     my_pid: usize,
 ) {
@@ -550,7 +646,8 @@ fn handle_spawn_request(
 
     // Send the server endpoint to the fs service via its control channel with NewConnection
     let mut ctl_msg = Message::new();
-    ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+    ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+    ctl_msg.cap_count = 1;
     ctl_msg.len = rvos_wire::to_bytes(
         &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
         &mut ctl_msg.data,
@@ -585,6 +682,9 @@ fn handle_spawn_request(
     let args_len = args.len().min(MAX_ARGS_LEN);
     args_buf[..args_len].copy_from_slice(&args[..args_len]);
 
+    // Parse namespace overrides from the packed blob
+    let parsed_overrides = parse_ns_overrides(ns_overrides, orig_msg);
+
     let mut ctx = FsLaunchCtx {
         state: FsLaunchState::WaitStat,
         ctl_ep: my_ctl_ep,
@@ -603,6 +703,7 @@ fn handle_spawn_request(
         is_shell: false,
         args: args_buf,
         args_len,
+        ns_overrides: parsed_overrides,
     };
     ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
     ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
@@ -643,7 +744,8 @@ fn handle_get_args(boot_ep_b: usize, my_pid: usize) {
 fn send_ok_with_cap(endpoint: usize, cap_ep: usize, my_pid: usize) {
     let mut resp = Message::new();
     resp.len = rvos_wire::to_bytes(&BootResponse::Ok {}, &mut resp.data).unwrap_or(0);
-    resp.cap = ipc::encode_cap_channel(cap_ep);
+    resp.caps[0] = ipc::encode_cap_channel(cap_ep);
+    resp.cap_count = 1;
     resp.sender_pid = my_pid;
     send_and_wake(endpoint, resp);
 }
@@ -710,7 +812,8 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
 
         // Send the server endpoint to the fs service via its control channel with NewConnection
         let mut ctl_msg = Message::new();
-        ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+    ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
             &mut ctl_msg.data,
@@ -753,6 +856,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             is_shell: false,
             args: [0u8; MAX_ARGS_LEN],
             args_len: 0,
+            ns_overrides: [const { None }; MAX_NS_OVERRIDES],
         });
         slot_idx += 1;
     }
@@ -809,7 +913,7 @@ fn poll_fs_launch(
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             if let Some(resp) = resp {
                 let tag = wire_read_u8(&resp.data, 0);
-                if tag != 0 || resp.cap == NO_CAP {
+                if tag != 0 || resp.cap_count == 0 || resp.caps[0] == NO_CAP {
                     crate::println!("[init] fs: open {} failed", ctx.name());
                     if ctx.requester_ep != 0 {
                         send_error(ctx.requester_ep, "open failed", my_pid);
@@ -819,7 +923,7 @@ fn poll_fs_launch(
                     return true;
                 }
                 // Decode the file channel endpoint from the cap
-                match ipc::decode_cap_channel(resp.cap) {
+                match ipc::decode_cap_channel(resp.caps[0]) {
                     Some(ep) => ctx.file_ep = ep,
                     None => {
                         crate::println!("[init] fs: open {} bad cap", ctx.name());
@@ -943,7 +1047,9 @@ fn finish_fs_launch(
             return;
         }
     };
-    register_boot_with_args(boot_b, ctx.console_type, ctx.is_shell, &ctx.args[..ctx.args_len]);
+    // Take ns_overrides from ctx (replace with empty array)
+    let overrides = core::mem::replace(&mut ctx.ns_overrides, [const { None }; MAX_NS_OVERRIDES]);
+    register_boot_with_overrides(boot_b, ctx.console_type, ctx.is_shell, &ctx.args[..ctx.args_len], overrides);
 
     let pid = if let Some(svc_name) = ctx.service_name {
         // This program is a named service: give it a control channel as handle 1
@@ -1065,7 +1171,8 @@ fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid
     };
 
     let mut ctl_msg = Message::new();
-    ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+    ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+    ctl_msg.cap_count = 1;
     ctl_msg.len = rvos_wire::to_bytes(
         &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
         &mut ctl_msg.data,
@@ -1107,6 +1214,7 @@ fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid
         is_shell: true,
         args: [0u8; MAX_ARGS_LEN],
         args_len: 0,
+        ns_overrides: [const { None }; MAX_NS_OVERRIDES],
     });
 
     crate::println!("[init] Starting GPU shell (loading /bin/shell from fs)");

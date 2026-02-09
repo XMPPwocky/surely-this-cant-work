@@ -5,6 +5,9 @@ use rvos_wire::{Reader, Writer};
 
 const MAX_MSG_SIZE: usize = 1024;
 
+/// Maximum number of capabilities per message.
+pub const MAX_CAPS: usize = 4;
+
 /// Fixed-size IPC message matching kernel's `ipc::Message` layout exactly.
 #[repr(C)]
 #[derive(Clone)]
@@ -12,17 +15,19 @@ pub struct Message {
     pub data: [u8; MAX_MSG_SIZE],
     pub len: usize,
     pub sender_pid: usize,
-    pub cap: usize,
+    pub caps: [usize; MAX_CAPS],
+    pub cap_count: usize,
 }
 
 impl Message {
     /// Create a new empty message.
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Message {
             data: [0u8; MAX_MSG_SIZE],
             len: 0,
             sender_pid: 0,
-            cap: NO_CAP,
+            caps: [NO_CAP; MAX_CAPS],
+            cap_count: 0,
         }
     }
 
@@ -70,14 +75,17 @@ impl Message {
         self.sender_pid
     }
 
-    /// Get the capability handle.
+    /// Get the first capability handle (convenience for single-cap messages).
     pub fn cap(&self) -> usize {
-        self.cap
+        if self.cap_count > 0 { self.caps[0] } else { NO_CAP }
     }
 
-    /// Set the capability handle.
+    /// Set the first capability handle (convenience for single-cap messages).
     pub fn set_cap(&mut self, cap: usize) {
-        self.cap = cap;
+        self.caps[0] = cap;
+        if cap != NO_CAP {
+            self.cap_count = self.cap_count.max(1);
+        }
     }
 
     /// Create a Writer over the data buffer.
@@ -96,7 +104,10 @@ impl Message {
         F: FnOnce(&mut Writer<'_>),
     {
         let mut msg = Self::new();
-        msg.cap = cap;
+        if cap != NO_CAP {
+            msg.caps[0] = cap;
+            msg.cap_count = 1;
+        }
         let mut w = Writer::new(&mut msg.data);
         f(&mut w);
         msg.len = w.position();

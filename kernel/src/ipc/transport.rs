@@ -1,7 +1,7 @@
 //! Kernel-side Transport implementation for rvos-wire RPC.
 
 use crate::ipc::{self, Message, NO_CAP};
-use rvos_wire::{Transport, RpcError};
+use rvos_wire::{Transport, RpcError, MAX_CAPS};
 
 /// Kernel-side transport wrapping a channel endpoint.
 ///
@@ -29,13 +29,17 @@ impl Transport for KernelTransport {
         Self::new(cap, self.pid)
     }
 
-    fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
+    fn send(&mut self, data: &[u8], caps: &[usize]) -> Result<(), RpcError> {
         let mut msg = Message::new();
         let copy_len = data.len().min(msg.data.len());
         msg.data[..copy_len].copy_from_slice(&data[..copy_len]);
         msg.len = copy_len;
         msg.sender_pid = self.pid;
-        msg.cap = if cap == rvos_wire::NO_CAP { NO_CAP } else { ipc::encode_cap_channel(cap) };
+        msg.cap_count = caps.len().min(MAX_CAPS);
+        for i in 0..msg.cap_count {
+            let cap = caps[i];
+            msg.caps[i] = if cap == rvos_wire::NO_CAP { NO_CAP } else { ipc::encode_cap_channel(cap) };
+        }
         match ipc::channel_send_blocking(self.endpoint, &msg, self.pid) {
             Ok(()) => Ok(()),
             Err(ipc::SendError::ChannelClosed) => Err(RpcError::ChannelClosed),
@@ -43,20 +47,23 @@ impl Transport for KernelTransport {
         }
     }
 
-    fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+    fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
         match ipc::channel_recv_blocking(self.endpoint, self.pid) {
             Some(msg) => {
                 let copy_len = msg.len.min(buf.len());
                 buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
-                let cap = if msg.cap == NO_CAP {
-                    rvos_wire::NO_CAP
-                } else {
-                    match ipc::decode_cap(msg.cap) {
-                        ipc::DecodedCap::Channel(ep) => ep,
-                        _ => rvos_wire::NO_CAP,
+                let cap_count = msg.cap_count.min(caps.len());
+                for i in 0..cap_count {
+                    if msg.caps[i] == NO_CAP {
+                        caps[i] = rvos_wire::NO_CAP;
+                    } else {
+                        caps[i] = match ipc::decode_cap(msg.caps[i]) {
+                            ipc::DecodedCap::Channel(ep) => ep,
+                            _ => rvos_wire::NO_CAP,
+                        };
                     }
-                };
-                Ok((copy_len, cap))
+                }
+                Ok((copy_len, cap_count))
             }
             None => Err(RpcError::ChannelClosed),
         }

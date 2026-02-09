@@ -65,7 +65,7 @@ fn main() {
     };
 
     // The response should carry an SHM capability for the framebuffer
-    let gpu_shm_handle = resp.cap;
+    let gpu_shm_handle = resp.cap();
 
     // Map the GPU framebuffer into our address space
     let fb_size = (stride as usize) * (height as usize) * 4;
@@ -87,36 +87,40 @@ fn main() {
     loop {
         let mut did_work = false;
 
-        // 1. Poll control channel for new client connections (routed by init)
-        let mut cmsg = Message::new();
-        let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut cmsg);
-        if ret == 0 {
+        // 1. Drain control channel for new client connections (routed by init)
+        loop {
+            let mut cmsg = Message::new();
+            let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut cmsg);
+            if ret != 0 { break; }
             did_work = true;
             // Init sends a routing message with cap = per-client channel handle
-            let per_client_handle = cmsg.cap;
+            let per_client_handle = cmsg.cap();
             if per_client_handle != NO_CAP {
                 handle_new_client(&mut server, per_client_handle);
             }
         }
 
-        // 2. Poll kbd channel for key events → forward to foreground window
-        let mut kmsg = Message::new();
-        let ret = raw::sys_chan_recv(kbd_handle, &mut kmsg);
-        if ret == 0 {
+        // 2. Drain ALL kbd events → forward to foreground window
+        loop {
+            let mut kmsg = Message::new();
+            let ret = raw::sys_chan_recv(kbd_handle, &mut kmsg);
+            if ret != 0 { break; }
             did_work = true;
             handle_kbd_event(&mut server, &kmsg);
         }
 
-        // 3. Poll each window channel
+        // 3. Drain ALL window channel messages
         for i in 0..MAX_WINDOWS {
-            if let Some(ref mut win) = server.windows[i] {
-                if !win.active { continue; }
+            let ch = match server.windows[i] {
+                Some(ref win) if win.active => win.channel_handle,
+                _ => continue,
+            };
+            loop {
                 let mut wmsg = Message::new();
-                let ret = raw::sys_chan_recv(win.channel_handle, &mut wmsg);
-                if ret == 0 {
-                    did_work = true;
-                    handle_window_msg(&mut server, i, &wmsg);
-                }
+                let ret = raw::sys_chan_recv(ch, &mut wmsg);
+                if ret != 0 { break; }
+                did_work = true;
+                handle_window_msg(&mut server, i, &wmsg);
             }
         }
 
@@ -133,7 +137,17 @@ fn main() {
         }
 
         if !did_work {
-            raw::sys_yield();
+            // Register interest on all channels, then sleep until woken
+            raw::sys_chan_poll_add(CONTROL_HANDLE);
+            raw::sys_chan_poll_add(kbd_handle);
+            for i in 0..MAX_WINDOWS {
+                if let Some(ref win) = server.windows[i] {
+                    if win.active {
+                        raw::sys_chan_poll_add(win.channel_handle);
+                    }
+                }
+            }
+            raw::sys_block();
         }
     }
 }
@@ -205,7 +219,7 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
     let mut resp = Message::new();
     resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
     // Attach the client endpoint as a capability
-    resp.cap = client_ep;
+    resp.set_cap(client_ep);
     raw::sys_chan_send_blocking(per_client_handle, &resp);
 
     // Close per-client channel (no longer needed after handshake)
@@ -225,13 +239,18 @@ fn handle_kbd_event(server: &mut Server, msg: &Message) {
     if let Some(ref win) = server.windows[fg] {
         if !win.active { return; }
         let win_event = match event {
-            KbdEvent::KeyDown { code } => WindowServerMsg::KeyDown { code },
-            KbdEvent::KeyUp { code } => WindowServerMsg::KeyUp { code },
+            KbdEvent::KeyDown { code } => {
+                println!("[winsrv] recv D{}, fwd to win {}", code, win.id);
+                WindowServerMsg::KeyDown { code }
+            }
+            KbdEvent::KeyUp { code } => {
+                println!("[winsrv] recv U{}, fwd to win {}", code, win.id);
+                WindowServerMsg::KeyUp { code }
+            }
         };
         let mut fwd = Message::new();
         fwd.len = rvos_wire::to_bytes(&win_event, &mut fwd.data).unwrap_or(0);
-        // Non-blocking send: drop event if queue full
-        let _ = raw::sys_chan_send(win.channel_handle, &fwd);
+        raw::sys_chan_send_blocking(win.channel_handle, &fwd);
     }
 }
 
@@ -267,7 +286,7 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
             let mut resp = Message::new();
             resp.len = rvos_wire::to_bytes(&reply, &mut resp.data).unwrap_or(0);
             // Attach SHM handle (kernel translates local handle -> encoded cap on send)
-            resp.cap = win.shm_handle;
+            resp.set_cap(win.shm_handle);
             raw::sys_chan_send_blocking(win.channel_handle, &resp);
         }
         WindowRequest::SwapBuffers { seq } => {

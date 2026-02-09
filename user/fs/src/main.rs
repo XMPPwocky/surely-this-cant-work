@@ -418,7 +418,7 @@ fn send_ok(handle: usize, cap: usize) {
     let mut w = Writer::new(&mut msg.data);
     let _ = w.write_u8(0); // tag: Ok
     msg.len = w.position();
-    msg.cap = cap;
+    msg.set_cap(cap);
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -465,7 +465,7 @@ fn send_stat_ok(handle: usize, kind: u8, size: u64) {
     let _ = w.write_u8(kind);
     let _ = w.write_u64(size);
     msg.len = w.position();
-    msg.cap = NO_CAP;
+    msg.set_cap(NO_CAP);
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -477,7 +477,7 @@ fn send_dir_entry(handle: usize, kind: u8, size: u64, name: &[u8]) {
     let _ = w.write_u64(size);
     let _ = w.write_bytes(name);
     msg.len = w.position();
-    msg.cap = NO_CAP;
+    msg.set_cap(NO_CAP);
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -768,19 +768,19 @@ fn main() {
             let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut msg);
             if ret != 0 { break; }
             handled = true;
-            if msg.cap != NO_CAP {
+            if msg.cap() != NO_CAP {
                 // Find a free client slot (or reclaim an inactive one)
                 let slot = clients.iter_mut().find(|c| !c.active);
                 if let Some(slot) = slot {
                     *slot = ClientState {
-                        ctl_handle: msg.cap,
+                        ctl_handle: msg.cap(),
                         file_handle: 0,
                         file_inode: 0,
                         active: true,
                     };
                 } else {
                     // No free slots — close the endpoint
-                    raw::sys_chan_close(msg.cap);
+                    raw::sys_chan_close(msg.cap());
                 }
             }
         }
@@ -1074,6 +1074,6 @@ fn do_delete(client_handle: usize, path_bytes: &[u8]) {
     let mut w = Writer::new(&mut msg.data);
     let _ = w.write_u8(0); // Ok
     msg.len = w.position();
-    msg.cap = NO_CAP;
+    msg.set_cap(NO_CAP);
     raw::sys_chan_send(client_handle, &msg);
 }

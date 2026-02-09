@@ -437,7 +437,7 @@ fn main() {
     // 3. Receive CreateWindow reply with window channel capability
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(win_ctl, &mut resp);
-    let win_chan = resp.cap;
+    let win_chan = resp.cap();
     let _create_resp = rvos_wire::from_bytes::<CreateWindowResponse>(&resp.data[..resp.len]);
 
     // 4. GetInfo on window channel
@@ -465,7 +465,7 @@ fn main() {
 
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(win_chan, &mut resp);
-    let shm_handle = resp.cap;
+    let shm_handle = resp.cap();
 
     // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
     let fb_size = (stride as usize) * (height as usize) * 4 * 2;
@@ -494,7 +494,10 @@ fn main() {
     console.write_str(b"================\r\n\r\n");
 
     // Do initial present
-    do_swap(win_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
+    let mut deferred_msgs: [Message; MAX_DEFERRED_MSGS] = [const { Message::new() }; MAX_DEFERRED_MSGS];
+    let mut deferred_count: usize = 0;
+    do_swap(win_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back,
+            &mut deferred_msgs, &mut deferred_count);
     // Re-point console to new back buffer
     update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
     console.dirty = false;
@@ -509,7 +512,7 @@ fn main() {
             let ret = raw::sys_chan_recv(CONSOLE_CONTROL_HANDLE, &mut msg);
             if ret != 0 { break; }
             handled = true;
-            if msg.cap != NO_CAP {
+            if msg.cap() != NO_CAP {
                 // Parse NewConnection { client_pid: u32, channel_role: u8 }
                 let (pid, role) = if msg.len >= 5 {
                     let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
@@ -546,9 +549,9 @@ fn main() {
 
                 if let Some(idx) = idx {
                     match role {
-                        1 => clients[idx].stdin_handle = msg.cap,
-                        2 => clients[idx].stdout_handle = msg.cap,
-                        _ => clients[idx].stdout_handle = msg.cap,
+                        1 => clients[idx].stdin_handle = msg.cap(),
+                        2 => clients[idx].stdout_handle = msg.cap(),
+                        _ => clients[idx].stdout_handle = msg.cap(),
                     }
                     // Once both endpoints are set, push onto stdin stack
                     if clients[idx].is_complete() {
@@ -560,7 +563,7 @@ fn main() {
                     }
                 } else {
                     println!("[fbcon] WARN: too many console clients, dropping PID {}", pid);
-                    raw::sys_chan_close(msg.cap);
+                    raw::sys_chan_close(msg.cap());
                 }
             }
         }
@@ -576,6 +579,7 @@ fn main() {
             if msg.len > 0 {
                 match rvos_wire::from_bytes::<WindowServerMsg>(&msg.data[..msg.len]) {
                     Ok(WindowServerMsg::KeyDown { code }) => {
+                        println!("[fbcon] recv D{}", code);
                         let code = code as usize;
                         if code == 42 || code == 54 {
                             shift_pressed = true;
@@ -591,12 +595,15 @@ fn main() {
                         }
                     }
                     Ok(WindowServerMsg::KeyUp { code }) => {
+                        println!("[fbcon] recv U{}", code);
                         let code = code as usize;
                         if code == 42 || code == 54 {
                             shift_pressed = false;
                         }
                     }
-                    _ => {}
+                    _ => {
+                        println!("[fbcon] recv OTHER (len={})", msg.len);
+                    }
                 }
             }
         }
@@ -691,10 +698,50 @@ fn main() {
 
         // If console is dirty, present the frame
         if console.dirty {
-            do_swap(win_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
+            do_swap(win_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back,
+                    &mut deferred_msgs, &mut deferred_count);
             update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
             console.dirty = false;
             handled = true;
+
+            // Process any keyboard events that arrived during the swap
+            if deferred_count > 0 {
+                println!("[fbcon] processing {} deferred msgs from swap", deferred_count);
+            }
+            let stdin_idx_now = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
+            for di in 0..deferred_count {
+                let msg = &deferred_msgs[di];
+                if msg.len > 0 {
+                    match rvos_wire::from_bytes::<WindowServerMsg>(&msg.data[..msg.len]) {
+                        Ok(WindowServerMsg::KeyDown { code }) => {
+                            println!("[fbcon] deferred D{}", code);
+                            let code = code as usize;
+                            if code == 42 || code == 54 {
+                                shift_pressed = true;
+                            } else if code < 128 {
+                                let ascii = if shift_pressed {
+                                    KEYMAP_SHIFT[code]
+                                } else {
+                                    KEYMAP[code]
+                                };
+                                if ascii != 0 {
+                                    handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx_now);
+                                }
+                            }
+                        }
+                        Ok(WindowServerMsg::KeyUp { code }) => {
+                            println!("[fbcon] deferred U{}", code);
+                            let code = code as usize;
+                            if code == 42 || code == 54 {
+                                shift_pressed = false;
+                            }
+                        }
+                        _ => {
+                            println!("[fbcon] deferred OTHER (len={})", msg.len);
+                        }
+                    }
+                }
+            }
         }
 
         if !handled {
@@ -760,14 +807,21 @@ fn handle_key_input(
     }
 }
 
-/// Swap buffers, wait for swap reply (draining key events), then copy front→new-back.
+const MAX_DEFERRED_MSGS: usize = 16;
+
+/// Swap buffers, wait for swap reply (buffering key events), then copy front→new-back.
+/// Returns the number of deferred messages stored in `deferred`.
 fn do_swap(
     win_chan: usize,
     seq: &mut u32,
     fb_base: *mut u32,
     pixels_per_buffer: usize,
     current_back: &mut u8,
+    deferred: &mut [Message; MAX_DEFERRED_MSGS],
+    deferred_count: &mut usize,
 ) {
+    *deferred_count = 0;
+
     let mut req = Message::new();
     req.len = rvos_wire::to_bytes(
         &WindowRequest::SwapBuffers { seq: *seq },
@@ -776,14 +830,20 @@ fn do_swap(
     raw::sys_chan_send_blocking(win_chan, &req);
     *seq = seq.wrapping_add(1);
 
-    // Wait for swap reply
+    // Wait for swap reply, buffering any keyboard events that arrive
     loop {
         let mut resp = Message::new();
         raw::sys_chan_recv_blocking(win_chan, &mut resp);
         if resp.len == 0 { break; }
         match rvos_wire::from_bytes::<WindowServerMsg>(&resp.data[..resp.len]) {
             Ok(WindowServerMsg::SwapReply { .. }) => break,
-            _ => {} // ignore key events during swap
+            _ => {
+                // Buffer keyboard events instead of dropping them
+                if *deferred_count < MAX_DEFERRED_MSGS {
+                    deferred[*deferred_count] = resp;
+                    *deferred_count += 1;
+                }
+            }
         }
     }
 

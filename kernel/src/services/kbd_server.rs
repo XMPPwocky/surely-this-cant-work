@@ -40,22 +40,18 @@ pub fn kbd_server() {
             match event {
                 Some(ev) => {
                     let kbd_event = if ev.pressed {
+                        crate::println!("[kbd] D{}", ev.code);
                         KbdEvent::KeyDown { code: ev.code }
                     } else {
+                        crate::println!("[kbd] U{}", ev.code);
                         KbdEvent::KeyUp { code: ev.code }
                     };
                     let mut msg = Message::new();
                     msg.sender_pid = my_pid;
                     msg.len = rvos_wire::to_bytes(&kbd_event, &mut msg.data).unwrap_or(0);
-                    match ipc::channel_send(client_ep, msg) {
-                        Ok(wake) => {
-                            if wake != 0 { crate::task::wake_process(wake); }
+                    match ipc::channel_send_blocking(client_ep, &msg, my_pid) {
+                        Ok(()) => {
                             sent_any = true;
-                        }
-                        Err(ipc::SendError::QueueFull) => {
-                            // Drop event if queue is full — keyboard events are
-                            // best-effort; blocking here would stall the IRQ pipeline
-                            break;
                         }
                         Err(_) => {
                             // Client disconnected

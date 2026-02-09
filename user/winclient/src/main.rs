@@ -27,7 +27,7 @@ fn main() {
     // 3. Receive CreateWindow reply with window channel capability
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(win_ctl, &mut resp);
-    let win_chan = resp.cap; // window channel handle
+    let win_chan = resp.cap(); // window channel handle
 
     let _create_resp = rvos_wire::from_bytes::<CreateWindowResponse>(&resp.data[..resp.len]);
 
@@ -56,7 +56,7 @@ fn main() {
 
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(win_chan, &mut resp);
-    let shm_handle = resp.cap;
+    let shm_handle = resp.cap();
 
     // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
     let fb_size = (stride as usize) * (height as usize) * 4 * 2;

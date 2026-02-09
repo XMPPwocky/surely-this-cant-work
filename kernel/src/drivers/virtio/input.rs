@@ -165,6 +165,7 @@ pub fn init() -> bool {
 
     let irq = 1 + slot as u32;
     crate::println!("[keyboard] Found VirtIO input at {:#x} (slot {}, IRQ {})", base, slot, irq);
+    crate::println!("[keyboard] NOTE: next allocs are kbd virtq + event_bufs");
 
     if !mmio::init_device(base) {
         crate::println!("[keyboard] Device init failed");
@@ -216,7 +217,7 @@ pub fn init() -> bool {
         }));
     }
 
-    crate::println!("[keyboard] Initialized");
+    crate::println!("[keyboard] Initialized, event_bufs={:#x} (page {:#x})", event_bufs, event_bufs >> 12);
     true
 }
 
@@ -237,13 +238,31 @@ pub fn handle_irq() {
     while let Some((desc_idx, _len)) = kbd.eventq.pop_used() {
         // Read the event from the buffer
         let buf_addr = kbd.event_bufs + (desc_idx as usize) * core::mem::size_of::<VirtioInputEvent>();
+
+        // Corruption check: read the descriptor's addr field and compare with expected
+        let expected_addr = buf_addr as u64;
+        let desc = unsafe { &*(kbd.eventq.desc.add(desc_idx as usize)) };
+        if desc.addr != expected_addr {
+            crate::println!("[irq] CORRUPTION: desc[{}].addr={:#x} expected={:#x}",
+                desc_idx, desc.addr, expected_addr);
+        }
+
         let event = unsafe { &*(buf_addr as *const VirtioInputEvent) };
+
+        crate::println!("[irq] desc={} addr={:#x} type={:#x} code={:#x} val={:#x}",
+            desc_idx, buf_addr, event.type_, event.code, event.value);
 
         if event.type_ == EV_KEY {
             let code = event.code as usize;
+            let pressed = event.value != 0;
+            if pressed {
+                crate::println!("[irq] EV_KEY D{}", event.code);
+            } else {
+                crate::println!("[irq] EV_KEY U{}", event.code);
+            }
 
             // Push raw event for ALL key presses and releases (for kbd-server)
-            tty::push_raw_kbd_event(event.code, event.value != 0);
+            tty::push_raw_kbd_event(event.code, pressed);
 
             if code == 42 || code == 54 {
                 // Shift key

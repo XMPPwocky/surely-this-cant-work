@@ -486,16 +486,20 @@ pub enum RpcError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShmHandle(pub usize);
 
+/// Maximum number of capabilities per message.
+pub const MAX_CAPS: usize = 4;
+
 /// Abstraction over kernel-side and user-side IPC transports.
 ///
 /// Implementors wrap a channel endpoint and provide send/recv.
 pub trait Transport: Sized {
-    /// Send `data` bytes with an optional capability.
-    /// Use `cap = NO_CAP` when no capability is attached.
-    fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError>;
+    /// Send `data` bytes with sideband capabilities.
+    /// `caps[..cap_count]` contains handles to transfer.
+    fn send(&mut self, data: &[u8], caps: &[usize]) -> Result<(), RpcError>;
 
-    /// Receive into `buf`. Returns `(bytes_received, cap)`.
-    fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError>;
+    /// Receive into `buf`. Returns `(bytes_received, cap_count)`.
+    /// Received capability handles are written into `caps[..cap_count]`.
+    fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError>;
 
     /// Create a new transport for a child capability received on this transport.
     fn from_cap(&self, cap: usize) -> Self;
@@ -514,20 +518,19 @@ where
     Req: Serialize,
     Resp: Deserialize<'buf>,
 {
-    // Serialize the request into a scratch area
     let mut send_buf = [0u8; MAX_MSG_SIZE];
     let n = to_bytes(req, &mut send_buf).map_err(RpcError::Wire)?;
-    transport.send(&send_buf[..n], NO_CAP)?;
+    transport.send(&send_buf[..n], &[])?;
 
-    // Receive the response
-    let (len, _cap) = transport.recv(buf)?;
+    let mut caps = [0usize; MAX_CAPS];
+    let (len, _cap_count) = transport.recv(buf, &mut caps)?;
     let resp = from_bytes::<Resp>(&buf[..len]).map_err(RpcError::Wire)?;
     Ok(resp)
 }
 
 /// Send a request with a capability and receive a response with a capability.
 ///
-/// Like `rpc_call` but passes `cap` on send and returns the received cap.
+/// Like `rpc_call` but passes `cap` on send and returns the first received cap.
 pub fn rpc_call_with_cap<'buf, T, Req, Resp>(
     transport: &mut T,
     req: &Req,
@@ -541,16 +544,19 @@ where
 {
     let mut send_buf = [0u8; MAX_MSG_SIZE];
     let n = to_bytes(req, &mut send_buf).map_err(RpcError::Wire)?;
-    transport.send(&send_buf[..n], cap)?;
+    let send_caps = if cap == NO_CAP { &[][..] } else { &[cap][..] };
+    transport.send(&send_buf[..n], send_caps)?;
 
-    let (len, recv_cap) = transport.recv(buf)?;
+    let mut caps = [0usize; MAX_CAPS];
+    let (len, cap_count) = transport.recv(buf, &mut caps)?;
+    let recv_cap = if cap_count > 0 { caps[0] } else { NO_CAP };
     let resp = from_bytes::<Resp>(&buf[..len]).map_err(RpcError::Wire)?;
     Ok((resp, recv_cap))
 }
 
 /// Receive and deserialize a request (server side).
 ///
-/// Returns `(request, cap)` where cap is the capability from the message.
+/// Returns `(request, cap)` where cap is the first capability from the message.
 pub fn rpc_recv<'buf, T, Req>(
     transport: &mut T,
     buf: &'buf mut [u8],
@@ -559,7 +565,9 @@ where
     T: Transport,
     Req: Deserialize<'buf>,
 {
-    let (len, cap) = transport.recv(buf)?;
+    let mut caps = [0usize; MAX_CAPS];
+    let (len, cap_count) = transport.recv(buf, &mut caps)?;
+    let cap = if cap_count > 0 { caps[0] } else { NO_CAP };
     let req = from_bytes::<Req>(&buf[..len]).map_err(RpcError::Wire)?;
     Ok((req, cap))
 }
@@ -576,7 +584,8 @@ where
 {
     let mut send_buf = [0u8; MAX_MSG_SIZE];
     let n = to_bytes(resp, &mut send_buf).map_err(RpcError::Wire)?;
-    transport.send(&send_buf[..n], cap)
+    let send_caps = if cap == NO_CAP { &[][..] } else { &[cap][..] };
+    transport.send(&send_buf[..n], send_caps)
 }
 
 // ---------------------------------------------------------------------------
@@ -1758,40 +1767,48 @@ mod tests {
             pub struct MathResp { answer: u32 }
         }
 
-        // MockTransport stores sent data and returns pre-loaded response
         struct MockTransport {
             sent_buf: [u8; MAX_MSG_SIZE],
             sent_len: usize,
-            sent_cap: usize,
+            sent_caps: [usize; MAX_CAPS],
+            sent_cap_count: usize,
             recv_buf: [u8; MAX_MSG_SIZE],
             recv_len: usize,
-            recv_cap: usize,
+            recv_caps: [usize; MAX_CAPS],
+            recv_cap_count: usize,
         }
 
         impl Transport for MockTransport {
-            fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
+            fn send(&mut self, data: &[u8], caps: &[usize]) -> Result<(), RpcError> {
                 self.sent_buf[..data.len()].copy_from_slice(data);
                 self.sent_len = data.len();
-                self.sent_cap = cap;
+                self.sent_cap_count = caps.len();
+                for (i, &c) in caps.iter().enumerate() {
+                    self.sent_caps[i] = c;
+                }
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
-                Ok((self.recv_len, self.recv_cap))
+                for i in 0..self.recv_cap_count {
+                    caps[i] = self.recv_caps[i];
+                }
+                Ok((self.recv_len, self.recv_cap_count))
             }
             fn from_cap(&self, _cap: usize) -> Self {
                 Self {
                     sent_buf: [0u8; MAX_MSG_SIZE],
                     sent_len: 0,
-                    sent_cap: 0,
+                    sent_caps: [0; MAX_CAPS],
+                    sent_cap_count: 0,
                     recv_buf: [0u8; MAX_MSG_SIZE],
                     recv_len: 0,
-                    recv_cap: NO_CAP,
+                    recv_caps: [0; MAX_CAPS],
+                    recv_cap_count: 0,
                 }
             }
         }
 
-        // Pre-compute the response bytes
         let resp = MathResp { answer: 42 };
         let mut recv_buf = [0u8; MAX_MSG_SIZE];
         let resp_len = to_bytes(&resp, &mut recv_buf).unwrap();
@@ -1799,10 +1816,12 @@ mod tests {
         let mut transport = MockTransport {
             sent_buf: [0u8; MAX_MSG_SIZE],
             sent_len: 0,
-            sent_cap: 0,
+            sent_caps: [0; MAX_CAPS],
+            sent_cap_count: 0,
             recv_buf,
             recv_len: resp_len,
-            recv_cap: NO_CAP,
+            recv_caps: [0; MAX_CAPS],
+            recv_cap_count: 0,
         };
 
         let req = MathReq::Add { a: 3, b: 4 };
@@ -1810,7 +1829,6 @@ mod tests {
         let result: MathResp = rpc_call(&mut transport, &req, &mut buf).unwrap();
         assert_eq!(result.answer, 42);
 
-        // Verify the request was serialized correctly
         let sent_req: MathReq = from_bytes(&transport.sent_buf[..transport.sent_len]).unwrap();
         match sent_req {
             MathReq::Add { a, b } => { assert_eq!(a, 3); assert_eq!(b, 4); }
@@ -1836,13 +1854,14 @@ mod tests {
         }
 
         impl Transport for CapTransport {
-            fn send(&mut self, _data: &[u8], cap: usize) -> Result<(), RpcError> {
-                self.last_cap = cap;
+            fn send(&mut self, _data: &[u8], caps: &[usize]) -> Result<(), RpcError> {
+                self.last_cap = if caps.is_empty() { NO_CAP } else { caps[0] };
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
-                Ok((self.recv_len, self.recv_cap))
+                caps[0] = self.recv_cap;
+                Ok((self.recv_len, 1))
             }
             fn from_cap(&self, _cap: usize) -> Self {
                 Self {
@@ -1871,8 +1890,8 @@ mod tests {
             rpc_call_with_cap(&mut transport, &req, 7, &mut buf).unwrap();
 
         assert_eq!(result.val, 99);
-        assert_eq!(cap, 42);         // received cap
-        assert_eq!(transport.last_cap, 7); // sent cap
+        assert_eq!(cap, 42);
+        assert_eq!(transport.last_cap, 7);
     }
 
     // 30. rpc_recv + rpc_reply server-side roundtrip
@@ -1888,30 +1907,37 @@ mod tests {
         struct BufTransport {
             data: [u8; MAX_MSG_SIZE],
             len: usize,
-            cap: usize,
+            caps: [usize; MAX_CAPS],
+            cap_count: usize,
         }
 
         impl Transport for BufTransport {
-            fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
+            fn send(&mut self, data: &[u8], caps: &[usize]) -> Result<(), RpcError> {
                 self.data[..data.len()].copy_from_slice(data);
                 self.len = data.len();
-                self.cap = cap;
+                self.cap_count = caps.len();
+                for (i, &c) in caps.iter().enumerate() {
+                    self.caps[i] = c;
+                }
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.len].copy_from_slice(&self.data[..self.len]);
-                Ok((self.len, self.cap))
+                for i in 0..self.cap_count {
+                    caps[i] = self.caps[i];
+                }
+                Ok((self.len, self.cap_count))
             }
             fn from_cap(&self, _cap: usize) -> Self {
                 Self {
                     data: [0u8; MAX_MSG_SIZE],
                     len: 0,
-                    cap: NO_CAP,
+                    caps: [0; MAX_CAPS],
+                    cap_count: 0,
                 }
             }
         }
 
-        // Simulate client sending a request
         let req = Req { x: 10 };
         let mut data = [0u8; MAX_MSG_SIZE];
         let req_len = to_bytes(&req, &mut data).unwrap();
@@ -1919,19 +1945,17 @@ mod tests {
         let mut transport = BufTransport {
             data,
             len: req_len,
-            cap: NO_CAP,
+            caps: [0; MAX_CAPS],
+            cap_count: 0,
         };
 
-        // Server receives
         let mut buf = [0u8; MAX_MSG_SIZE];
         let (received, _cap): (Req, _) = rpc_recv(&mut transport, &mut buf).unwrap();
         assert_eq!(received.x, 10);
 
-        // Server replies
         let resp = Resp { y: 20 };
         rpc_reply(&mut transport, &resp, NO_CAP).unwrap();
 
-        // Verify reply was stored
         let reply: Resp = from_bytes(&transport.data[..transport.len]).unwrap();
         assert_eq!(reply.y, 20);
     }
@@ -1952,7 +1976,6 @@ mod tests {
             pub struct CalcResp { result: u32 }
         }
 
-        // MockTransport captures sent request and returns pre-loaded response
         struct MockTransport {
             sent_buf: [u8; MAX_MSG_SIZE],
             sent_len: usize,
@@ -1961,14 +1984,14 @@ mod tests {
         }
 
         impl Transport for MockTransport {
-            fn send(&mut self, data: &[u8], _cap: usize) -> Result<(), RpcError> {
+            fn send(&mut self, data: &[u8], _caps: &[usize]) -> Result<(), RpcError> {
                 self.sent_buf[..data.len()].copy_from_slice(data);
                 self.sent_len = data.len();
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], _caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
-                Ok((self.recv_len, NO_CAP))
+                Ok((self.recv_len, 0))
             }
             fn from_cap(&self, _cap: usize) -> Self {
                 Self {
@@ -1990,7 +2013,6 @@ mod tests {
             }
         }
 
-        // Pre-load a response
         let resp = CalcResp { result: 7 };
         let mut recv_buf = [0u8; MAX_MSG_SIZE];
         let recv_len = to_bytes(&resp, &mut recv_buf).unwrap();
@@ -2006,7 +2028,6 @@ mod tests {
         let result = client.add(3, 4).unwrap();
         assert_eq!(result.result, 7);
 
-        // Verify the request was serialized correctly
         let sent_req: CalcReq = from_bytes(
             &client.transport.sent_buf[..client.transport.sent_len]
         ).unwrap();
@@ -2050,25 +2071,28 @@ mod tests {
             }
         }
 
-        // Loopback transport: recv returns request, send captures response
         struct LoopbackTransport {
             req_buf: [u8; MAX_MSG_SIZE],
             req_len: usize,
             resp_buf: [u8; MAX_MSG_SIZE],
             resp_len: usize,
-            resp_cap: usize,
+            resp_caps: [usize; MAX_CAPS],
+            resp_cap_count: usize,
         }
 
         impl Transport for LoopbackTransport {
-            fn send(&mut self, data: &[u8], cap: usize) -> Result<(), RpcError> {
+            fn send(&mut self, data: &[u8], caps: &[usize]) -> Result<(), RpcError> {
                 self.resp_buf[..data.len()].copy_from_slice(data);
                 self.resp_len = data.len();
-                self.resp_cap = cap;
+                self.resp_cap_count = caps.len();
+                for (i, &c) in caps.iter().enumerate() {
+                    self.resp_caps[i] = c;
+                }
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], _caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.req_len].copy_from_slice(&self.req_buf[..self.req_len]);
-                Ok((self.req_len, NO_CAP))
+                Ok((self.req_len, 0))
             }
             fn from_cap(&self, _cap: usize) -> Self {
                 Self {
@@ -2076,12 +2100,12 @@ mod tests {
                     req_len: 0,
                     resp_buf: [0u8; MAX_MSG_SIZE],
                     resp_len: 0,
-                    resp_cap: 0,
+                    resp_caps: [0; MAX_CAPS],
+                    resp_cap_count: 0,
                 }
             }
         }
 
-        // Serialize a request
         let req = OpReq::Double { val: 21 };
         let mut req_buf = [0u8; MAX_MSG_SIZE];
         let req_len = to_bytes(&req, &mut req_buf).unwrap();
@@ -2091,16 +2115,16 @@ mod tests {
             req_len,
             resp_buf: [0u8; MAX_MSG_SIZE],
             resp_len: 0,
-            resp_cap: 0,
+            resp_caps: [0; MAX_CAPS],
+            resp_cap_count: 0,
         };
 
         let mut handler = OpImpl;
         op_dispatch(&mut transport, &mut handler).unwrap();
 
-        // Verify the response
         let resp: OpResp = from_bytes(&transport.resp_buf[..transport.resp_len]).unwrap();
         assert_eq!(resp.out, 42);
-        assert_eq!(transport.resp_cap, NO_CAP);
+        assert_eq!(transport.resp_cap_count, 0);
     }
 
     // 33. define_protocol! with [+cap] annotation
@@ -2125,19 +2149,19 @@ mod tests {
             }
         }
 
-        // MockTransport returns response with a capability
         struct MockTransport {
             recv_buf: [u8; MAX_MSG_SIZE],
             recv_len: usize,
         }
 
         impl Transport for MockTransport {
-            fn send(&mut self, _data: &[u8], _cap: usize) -> Result<(), RpcError> {
+            fn send(&mut self, _data: &[u8], _caps: &[usize]) -> Result<(), RpcError> {
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
-                Ok((self.recv_len, 42)) // cap = 42
+                caps[0] = 42;
+                Ok((self.recv_len, 1))
             }
             fn from_cap(&self, _cap: usize) -> Self {
                 Self {
@@ -2154,7 +2178,6 @@ mod tests {
         let transport = MockTransport { recv_buf, recv_len };
         let mut client = FileClient::new(transport);
 
-        // [+cap] method returns (Response, cap)
         let (result, cap) = client.open(0x01).unwrap();
         assert_eq!(result.ok, 1);
         assert_eq!(cap, 42);
@@ -2183,7 +2206,6 @@ mod tests {
             pub struct ChildResp { val: u32 }
         }
 
-        // Child protocol (defined first so ChildClient exists)
         define_protocol! {
             pub protocol Child => ChildClient, ChildHandler, child_dispatch {
                 type Request = ChildReq;
@@ -2193,7 +2215,6 @@ mod tests {
             }
         }
 
-        // MockTransport that tracks from_cap calls
         struct MockTransport {
             handle: usize,
             recv_buf: [u8; MAX_MSG_SIZE],
@@ -2202,12 +2223,13 @@ mod tests {
         }
 
         impl Transport for MockTransport {
-            fn send(&mut self, _data: &[u8], _cap: usize) -> Result<(), RpcError> {
+            fn send(&mut self, _data: &[u8], _caps: &[usize]) -> Result<(), RpcError> {
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
-                Ok((self.recv_len, self.recv_cap))
+                caps[0] = self.recv_cap;
+                Ok((self.recv_len, 1))
             }
             fn from_cap(&self, cap: usize) -> Self {
                 Self {
@@ -2219,7 +2241,6 @@ mod tests {
             }
         }
 
-        // Parent protocol uses [-> ChildClient]
         define_protocol! {
             pub protocol Parent => ParentClient, ParentHandler, parent_dispatch {
                 type Request = ParentReq;
@@ -2237,13 +2258,12 @@ mod tests {
             handle: 0,
             recv_buf,
             recv_len,
-            recv_cap: 99, // the child cap
+            recv_cap: 99,
         };
 
         let mut client = ParentClient::new(transport);
         let (result, child) = client.connect(5).unwrap();
         assert_eq!(result.ok, 1);
-        // Verify the child was created via from_cap with cap=99
         assert_eq!(child.transport.handle, 99);
     }
 
@@ -2267,12 +2287,13 @@ mod tests {
         }
 
         impl Transport for MockTransport {
-            fn send(&mut self, _data: &[u8], _cap: usize) -> Result<(), RpcError> {
+            fn send(&mut self, _data: &[u8], _caps: &[usize]) -> Result<(), RpcError> {
                 Ok(())
             }
-            fn recv(&mut self, buf: &mut [u8]) -> Result<(usize, usize), RpcError> {
+            fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
                 buf[..self.recv_len].copy_from_slice(&self.recv_buf[..self.recv_len]);
-                Ok((self.recv_len, self.recv_cap))
+                caps[0] = self.recv_cap;
+                Ok((self.recv_len, 1))
             }
             fn from_cap(&self, _cap: usize) -> Self {
                 Self {

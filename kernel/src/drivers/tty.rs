@@ -84,11 +84,14 @@ impl RawKeyRingBuffer {
         }
     }
 
-    pub fn push(&mut self, event: RawKeyEvent) {
+    pub fn push(&mut self, event: RawKeyEvent) -> bool {
         let next = (self.head + 1) % RAW_KBD_BUF_SIZE;
         if next != self.tail {
             self.buf[self.head] = event;
             self.head = next;
+            true
+        } else {
+            false
         }
     }
 
@@ -111,7 +114,10 @@ static RAW_KBD_WAKE_PID: SpinLock<usize> = SpinLock::new(0);
 
 /// Push a raw keyboard event from the IRQ handler.
 pub fn push_raw_kbd_event(code: u16, pressed: bool) {
-    RAW_KBD_EVENTS.lock().push(RawKeyEvent { code, pressed });
+    let ok = RAW_KBD_EVENTS.lock().push(RawKeyEvent { code, pressed });
+    if !ok {
+        crate::println!("[tty] DROPPED kbd event code={} pressed={}", code, pressed);
+    }
     let pid = *RAW_KBD_WAKE_PID.lock();
     if pid != 0 {
         crate::task::wake_process(pid);

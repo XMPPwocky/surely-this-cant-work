@@ -260,39 +260,41 @@ pub fn serial_console_server() {
             match msg {
                 Some(msg) => {
                     handled = true;
-                    if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                        // Parse NewConnection { client_pid, channel_role }
-                        let (client_pid, channel_role) = if msg.len >= 5 {
-                            let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                            (pid, msg.data[4])
-                        } else if msg.len >= 4 {
-                            let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                            (pid, 0u8)
-                        } else {
-                            (0, 0u8)
-                        };
+                    if msg.cap_count > 0 {
+                        if let Some(ep) = ipc::decode_cap_channel(msg.caps[0]) {
+                            // Parse NewConnection { client_pid, channel_role }
+                            let (client_pid, channel_role) = if msg.len >= 5 {
+                                let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                                (pid, msg.data[4])
+                            } else if msg.len >= 4 {
+                                let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                                (pid, 0u8)
+                            } else {
+                                (0, 0u8)
+                            };
 
-                        if let Some(idx) = find_or_create_client(&mut clients, client_pid) {
-                            match channel_role {
-                                1 => clients[idx].stdin_ep = ep,  // stdin
-                                2 => clients[idx].stdout_ep = ep, // stdout
-                                _ => {
-                                    // Legacy generic: treat as stdout (shouldn't happen)
-                                    clients[idx].stdout_ep = ep;
+                            if let Some(idx) = find_or_create_client(&mut clients, client_pid) {
+                                match channel_role {
+                                    1 => clients[idx].stdin_ep = ep,  // stdin
+                                    2 => clients[idx].stdout_ep = ep, // stdout
+                                    _ => {
+                                        // Legacy generic: treat as stdout (shouldn't happen)
+                                        clients[idx].stdout_ep = ep;
+                                    }
                                 }
-                            }
 
-                            // Once both endpoints are set, push onto stdin stack
-                            if clients[idx].is_complete() {
-                                // Only push if not already in stack
-                                let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == idx);
-                                if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
-                                    stdin_stack[stdin_stack_len] = idx;
-                                    stdin_stack_len += 1;
+                                // Once both endpoints are set, push onto stdin stack
+                                if clients[idx].is_complete() {
+                                    // Only push if not already in stack
+                                    let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == idx);
+                                    if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
+                                        stdin_stack[stdin_stack_len] = idx;
+                                        stdin_stack_len += 1;
+                                    }
                                 }
+                            } else {
+                                ipc::channel_close(ep);
                             }
-                        } else {
-                            ipc::channel_close(ep);
                         }
                     }
                 }
