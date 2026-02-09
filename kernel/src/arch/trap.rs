@@ -1,7 +1,6 @@
 use crate::arch::csr;
 use crate::arch::sbi;
 use crate::task::HandleObject;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 const TIMER_INTERVAL: u64 = 1_000_000; // 100ms at 10MHz
 
@@ -9,7 +8,6 @@ const TIMER_INTERVAL: u64 = 1_000_000; // 100ms at 10MHz
 /// Format: "name(a0,a1)=ret" with hex values.  Disabled by default.
 const TRACE_SYSCALLS: bool = false;
 
-static TICK_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 // Syscall numbers
 pub const SYS_EXIT: usize = 93;
@@ -968,10 +966,6 @@ fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
 }
 
 fn timer_tick() {
-    let count = TICK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count <= 3 {
-        crate::println!("[timer] tick {}", count);
-    }
     // Check keyboard DMA buffer canary every tick
     crate::drivers::virtio::input::check_canary();
     let time: u64;
