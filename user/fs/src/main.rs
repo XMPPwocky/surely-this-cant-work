@@ -805,6 +805,10 @@ fn main() {
                         match tag {
                             0 => handle_read(fh, inode, &mut r),
                             1 => handle_write(fh, inode, &mut r),
+                            2 => {
+                                // Ioctl: files don't support terminal ops
+                                send_file_error(fh, ERR_IO);
+                            }
                             _ => send_file_error(fh, ERR_IO),
                         }
                     }

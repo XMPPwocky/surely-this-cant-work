@@ -11,6 +11,7 @@ pub mod message;
 pub mod channel;
 pub mod service;
 pub mod transport;
+pub mod tty;
 
 pub use error::{SysError, SysResult};
 pub use message::Message;

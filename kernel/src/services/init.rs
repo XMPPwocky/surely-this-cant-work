@@ -365,8 +365,13 @@ fn handle_request(
     let client_pid = msg.sender_pid as u32;
     match req {
         BootRequest::ConnectService { name } => {
-            if name == "stdio" {
-                handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid);
+            if name == "stdin" {
+                handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid, 1);
+            } else if name == "stdout" {
+                handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid, 2);
+            } else if name == "stdio" {
+                // Legacy: redirect old "stdio" to error
+                send_error(boot_ep_b, "use stdin/stdout", my_pid);
             } else if let Some(svc) = find_named_service_by_name(name) {
                 handle_service_request(boot_ep_b, svc, client_pid, my_pid);
             } else {
@@ -440,7 +445,7 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
         let mut ctl_msg = Message::new();
         ctl_msg.cap = ipc::encode_cap_channel(server_ep);
         ctl_msg.len = rvos_wire::to_bytes(
-            &rvos_proto::service_control::NewConnection { client_pid },
+            &rvos_proto::service_control::NewConnection { client_pid, channel_role: 0 },
             &mut ctl_msg.data,
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
@@ -453,7 +458,7 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
     }
 }
 
-fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, client_pid: u32, my_pid: usize) {
+fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, client_pid: u32, my_pid: usize, role: u8) {
     // Create a new bidirectional channel for the client <-> console server
     let (client_ep, server_ep) = match ipc::channel_create_pair() {
         Some(pair) => pair,
@@ -479,11 +484,11 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, client_pid:
     };
 
     if let Some(ctl_ep) = control_ep {
-        // Send NewConnection to console server via its control channel
+        // Send NewConnection to console server via its control channel with role
         let mut ctl_msg = Message::new();
         ctl_msg.cap = ipc::encode_cap_channel(server_ep);
         ctl_msg.len = rvos_wire::to_bytes(
-            &rvos_proto::service_control::NewConnection { client_pid },
+            &rvos_proto::service_control::NewConnection { client_pid, channel_role: role },
             &mut ctl_msg.data,
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
@@ -547,7 +552,7 @@ fn handle_spawn_request(
     let mut ctl_msg = Message::new();
     ctl_msg.cap = ipc::encode_cap_channel(server_ep);
     ctl_msg.len = rvos_wire::to_bytes(
-        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32 },
+        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
         &mut ctl_msg.data,
     ).unwrap_or(0);
     ctl_msg.sender_pid = my_pid;
@@ -707,7 +712,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
         let mut ctl_msg = Message::new();
         ctl_msg.cap = ipc::encode_cap_channel(server_ep);
         ctl_msg.len = rvos_wire::to_bytes(
-            &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32 },
+            &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
             &mut ctl_msg.data,
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
@@ -1062,7 +1067,7 @@ fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid
     let mut ctl_msg = Message::new();
     ctl_msg.cap = ipc::encode_cap_channel(server_ep);
     ctl_msg.len = rvos_wire::to_bytes(
-        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32 },
+        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
         &mut ctl_msg.data,
     ).unwrap_or(0);
     ctl_msg.sender_pid = my_pid;

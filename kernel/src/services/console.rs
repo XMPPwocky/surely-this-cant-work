@@ -1,6 +1,7 @@
-use crate::ipc::{self, Message};
+use crate::ipc::{self, Message, MAX_MSG_SIZE};
 use crate::drivers::tty;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use rvos_wire::{Reader, Writer};
 
 /// Control endpoint for serial console server (set by kmain before spawn)
 static SERIAL_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -37,20 +38,13 @@ impl LineDiscipline {
             }
             b'\r' | b'\n' => {
                 // Enter: line is complete
-                let len = self.line_len;
-                // Add newline to buffer
                 if self.line_len < LINE_BUF_SIZE {
                     self.line_buf[self.line_len] = b'\n';
                     self.line_len += 1;
                 }
                 let result_len = self.line_len;
                 self.line_len = 0;
-                if len == 0 && result_len == 1 {
-                    // Just a newline with no content - still deliver it
-                    Some(result_len)
-                } else {
-                    Some(result_len)
-                }
+                Some(result_len)
             }
             ch if ch >= 0x20 && ch < 0x7F => {
                 if self.line_len < LINE_BUF_SIZE - 1 {
@@ -93,40 +87,137 @@ fn write_serial(data: &[u8]) {
     }
 }
 
-/// Send a line as a message to the client endpoint, blocking if queue is full.
-fn send_line(client_ep: usize, data: &[u8]) {
-    let pid = crate::task::current_pid();
-    // Send in MAX_MSG_SIZE-byte chunks with blocking backpressure
-    for chunk in data.chunks(ipc::MAX_MSG_SIZE) {
+// --- FileOps response helpers ---
+
+/// Max data payload per chunk: MAX_MSG_SIZE - 1 (tag) - 2 (length prefix) = 1021
+const MAX_DATA_CHUNK: usize = MAX_MSG_SIZE - 3;
+
+/// Send FileResponse::Data { chunk } on an endpoint.
+fn send_file_data(ep: usize, data: &[u8], pid: usize) {
+    for chunk in data.chunks(MAX_DATA_CHUNK) {
         let mut msg = Message::new();
-        msg.data[..chunk.len()].copy_from_slice(chunk);
-        msg.len = chunk.len();
+        let mut w = Writer::new(&mut msg.data);
+        let _ = w.write_u8(0); // tag: Data
+        let _ = w.write_bytes(chunk);
+        msg.len = w.position();
         msg.sender_pid = pid;
-        if ipc::channel_send_blocking(client_ep, &msg, pid).is_err() {
-            return; // channel closed
-        }
+        let _ = ipc::channel_send_blocking(ep, &msg, pid);
     }
 }
 
+/// Send FileResponse::Data with empty chunk (EOF sentinel).
+fn send_file_sentinel(ep: usize, pid: usize) {
+    let mut msg = Message::new();
+    let mut w = Writer::new(&mut msg.data);
+    let _ = w.write_u8(0); // tag: Data
+    let _ = w.write_u16(0); // zero-length payload
+    msg.len = w.position();
+    msg.sender_pid = pid;
+    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+}
+
+/// Send FileResponse::WriteOk { written }.
+fn send_write_ok(ep: usize, written: u32, pid: usize) {
+    let mut msg = Message::new();
+    let mut w = Writer::new(&mut msg.data);
+    let _ = w.write_u8(1); // tag: WriteOk
+    let _ = w.write_u32(written);
+    msg.len = w.position();
+    msg.sender_pid = pid;
+    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+}
+
+/// Send FileResponse::IoctlOk { result }.
+fn send_ioctl_ok(ep: usize, result: u32, pid: usize) {
+    let mut msg = Message::new();
+    let mut w = Writer::new(&mut msg.data);
+    let _ = w.write_u8(3); // tag: IoctlOk
+    let _ = w.write_u32(result);
+    msg.len = w.position();
+    msg.sender_pid = pid;
+    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+}
+
+// --- Per-client state ---
+
 const MAX_CONSOLE_CLIENTS: usize = 8;
 
-/// Remove dead (inactive) client channels and compact the array.
-/// Uses a stdin stack model: when the current stdin client dies, revert to previous.
+struct ConsoleClient {
+    stdin_ep: usize,          // receives Read/Ioctl requests, sends Data responses
+    stdout_ep: usize,         // receives Write requests, sends WriteOk responses
+    pid: u32,
+    has_pending_read: bool,   // true if client sent Read but no data available yet
+    pending_read_len: u32,    // requested read length
+    active: bool,
+}
+
+impl ConsoleClient {
+    const fn empty() -> Self {
+        ConsoleClient {
+            stdin_ep: usize::MAX,
+            stdout_ep: usize::MAX,
+            pid: 0,
+            has_pending_read: false,
+            pending_read_len: 0,
+            active: false,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.stdin_ep != usize::MAX && self.stdout_ep != usize::MAX
+    }
+}
+
+/// Find or create a client entry for the given PID. Returns index.
+fn find_or_create_client(
+    clients: &mut [ConsoleClient; MAX_CONSOLE_CLIENTS],
+    pid: u32,
+) -> Option<usize> {
+    // Find existing
+    for i in 0..MAX_CONSOLE_CLIENTS {
+        if clients[i].active && clients[i].pid == pid {
+            return Some(i);
+        }
+    }
+    // Create new
+    for i in 0..MAX_CONSOLE_CLIENTS {
+        if !clients[i].active {
+            clients[i] = ConsoleClient::empty();
+            clients[i].active = true;
+            clients[i].pid = pid;
+            return Some(i);
+        }
+    }
+    crate::println!("[serial-con] WARN: too many console clients, dropping PID {}", pid);
+    None
+}
+
+/// Clean up dead clients and update stdin stack.
 fn cleanup_dead_clients(
-    client_eps: &mut [usize; MAX_CONSOLE_CLIENTS],
-    client_count: &mut usize,
+    clients: &mut [ConsoleClient; MAX_CONSOLE_CLIENTS],
     stdin_stack: &mut [usize; MAX_CONSOLE_CLIENTS],
     stdin_stack_len: &mut usize,
 ) {
-    let mut i = 0;
-    while i < *client_count {
-        if !ipc::channel_is_active(client_eps[i]) {
-            ipc::channel_close(client_eps[i]);
-            let dead_ep = client_eps[i];
-            // Remove from stdin stack if present
+    for i in 0..MAX_CONSOLE_CLIENTS {
+        if !clients[i].active { continue; }
+
+        let stdin_dead = clients[i].stdin_ep != usize::MAX && !ipc::channel_is_active(clients[i].stdin_ep);
+        let stdout_dead = clients[i].stdout_ep != usize::MAX && !ipc::channel_is_active(clients[i].stdout_ep);
+
+        if stdin_dead || stdout_dead {
+            // Close both endpoints
+            if clients[i].stdin_ep != usize::MAX {
+                ipc::channel_close(clients[i].stdin_ep);
+            }
+            if clients[i].stdout_ep != usize::MAX {
+                ipc::channel_close(clients[i].stdout_ep);
+            }
+            clients[i].active = false;
+
+            // Remove from stdin stack
             let mut j = 0;
             while j < *stdin_stack_len {
-                if stdin_stack[j] == dead_ep {
+                if stdin_stack[j] == i {
                     for k in j..*stdin_stack_len - 1 {
                         stdin_stack[k] = stdin_stack[k + 1];
                     }
@@ -135,39 +226,13 @@ fn cleanup_dead_clients(
                     j += 1;
                 }
             }
-            // Shift remaining clients down
-            for j in i..*client_count - 1 {
-                client_eps[j] = client_eps[j + 1];
-            }
-            client_eps[*client_count - 1] = usize::MAX;
-            *client_count -= 1;
-        } else {
-            i += 1;
         }
     }
-}
-
-/// Get the current stdin recipient (top of stdin stack), or usize::MAX if empty.
-fn current_stdin_ep(stdin_stack: &[usize; MAX_CONSOLE_CLIENTS], stdin_stack_len: usize) -> usize {
-    if stdin_stack_len > 0 {
-        stdin_stack[stdin_stack_len - 1]
-    } else {
-        usize::MAX
-    }
-}
-
-/// Find the index of an endpoint in the client list.
-fn find_client_index(client_eps: &[usize; MAX_CONSOLE_CLIENTS], client_count: usize, ep: usize) -> usize {
-    for i in 0..client_count {
-        if client_eps[i] == ep {
-            return i;
-        }
-    }
-    usize::MAX
 }
 
 /// Serial console server kernel task.
 /// Owns UART I/O. Accepts multiple client endpoints via its control channel.
+/// Each client has separate stdin/stdout channels speaking the FileOps protocol.
 /// Stdin goes to the most recently connected client (stack model); reverts on disconnect.
 pub fn serial_console_server() {
     let control_ep = SERIAL_CONTROL_EP.load(Ordering::Relaxed);
@@ -176,59 +241,58 @@ pub fn serial_console_server() {
     // Register for wake on serial input
     tty::set_serial_wake_pid(my_pid);
 
-    let mut client_eps: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
-    let mut client_count: usize = 0;
-    // Stdin stack: most recently connected client is on top
+    let mut clients: [ConsoleClient; MAX_CONSOLE_CLIENTS] = [const { ConsoleClient::empty() }; MAX_CONSOLE_CLIENTS];
+    // Stdin stack: indices into clients[]; most recent is on top
     let mut stdin_stack: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
     let mut stdin_stack_len: usize = 0;
-
-    // Wait for at least the first client endpoint via control channel
-    loop {
-        let (msg, send_wake) = ipc::channel_recv(control_ep);
-        if send_wake != 0 { crate::task::wake_process(send_wake); }
-        match msg {
-            Some(msg) => {
-                if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                    if client_count < MAX_CONSOLE_CLIENTS {
-                        client_eps[client_count] = ep;
-                        client_count += 1;
-                        // Push onto stdin stack (most recent gets keyboard)
-                        if stdin_stack_len < MAX_CONSOLE_CLIENTS {
-                            stdin_stack[stdin_stack_len] = ep;
-                            stdin_stack_len += 1;
-                        }
-                        break;
-                    }
-                }
-            }
-            None => {
-                crate::ipc::channel_set_blocked(control_ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
-            }
-        }
-    }
 
     let mut line_disc = LineDiscipline::new();
     let mut raw_mode = false;
 
     // Main loop
     loop {
+        let mut handled = false;
+
         // Check control channel for new client registrations
         loop {
             let (msg, send_wake) = ipc::channel_recv(control_ep);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             match msg {
                 Some(msg) => {
+                    handled = true;
                     if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                        if client_count < MAX_CONSOLE_CLIENTS {
-                            client_eps[client_count] = ep;
-                            client_count += 1;
-                            // Push onto stdin stack (most recent gets keyboard)
-                            if stdin_stack_len < MAX_CONSOLE_CLIENTS {
-                                stdin_stack[stdin_stack_len] = ep;
-                                stdin_stack_len += 1;
+                        // Parse NewConnection { client_pid, channel_role }
+                        let (client_pid, channel_role) = if msg.len >= 5 {
+                            let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                            (pid, msg.data[4])
+                        } else if msg.len >= 4 {
+                            let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                            (pid, 0u8)
+                        } else {
+                            (0, 0u8)
+                        };
+
+                        if let Some(idx) = find_or_create_client(&mut clients, client_pid) {
+                            match channel_role {
+                                1 => clients[idx].stdin_ep = ep,  // stdin
+                                2 => clients[idx].stdout_ep = ep, // stdout
+                                _ => {
+                                    // Legacy generic: treat as stdout (shouldn't happen)
+                                    clients[idx].stdout_ep = ep;
+                                }
                             }
+
+                            // Once both endpoints are set, push onto stdin stack
+                            if clients[idx].is_complete() {
+                                // Only push if not already in stack
+                                let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == idx);
+                                if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
+                                    stdin_stack[stdin_stack_len] = idx;
+                                    stdin_stack_len += 1;
+                                }
+                            }
+                        } else {
+                            ipc::channel_close(ep);
                         }
                     }
                 }
@@ -236,32 +300,33 @@ pub fn serial_console_server() {
             }
         }
 
-        let stdin_ep = current_stdin_ep(&stdin_stack, stdin_stack_len);
-        let stdin_idx = find_client_index(&client_eps, client_count, stdin_ep);
+        // Current stdin recipient (top of stack)
+        let stdin_idx = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
 
-        // Check for input characters from UART ring buffer
-        let mut got_input = false;
+        // Process UART input characters
         loop {
             let ch = tty::SERIAL_INPUT.lock().pop();
             match ch {
                 Some(ch) => {
-                    got_input = true;
+                    handled = true;
                     if raw_mode {
-                        // Raw mode: no echo, no line discipline, send each byte directly
-                        if stdin_ep != usize::MAX {
-                            send_line(stdin_ep, &[ch]);
+                        // Raw mode: no echo, no line discipline, fulfill pending read directly
+                        if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+                            send_file_data(clients[stdin_idx].stdin_ep, &[ch], my_pid);
+                            send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
+                            clients[stdin_idx].has_pending_read = false;
                         }
                     } else {
                         echo_serial(ch);
                         if let Some(len) = line_disc.push_char(ch) {
-                            let data_copy = {
-                                let src = line_disc.line_data(len);
-                                let mut buf = [0u8; LINE_BUF_SIZE];
-                                buf[..len].copy_from_slice(src);
-                                (buf, len)
-                            };
-                            if stdin_ep != usize::MAX {
-                                send_line(stdin_ep, &data_copy.0[..data_copy.1]);
+                            let mut buf = [0u8; LINE_BUF_SIZE];
+                            let data = line_disc.line_data(len);
+                            buf[..len].copy_from_slice(data);
+                            // Fulfill pending read on stdin client
+                            if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+                                send_file_data(clients[stdin_idx].stdin_ep, &buf[..len], my_pid);
+                                send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
+                                clients[stdin_idx].has_pending_read = false;
                             }
                         }
                     }
@@ -270,20 +335,52 @@ pub fn serial_console_server() {
             }
         }
 
-        // Check for write requests from ALL clients
-        let mut got_write = false;
-        for i in 0..client_count {
+        // Poll stdin channels for Read/Ioctl requests
+        for i in 0..MAX_CONSOLE_CLIENTS {
+            if !clients[i].active || clients[i].stdin_ep == usize::MAX { continue; }
             loop {
-                let (msg, send_wake) = ipc::channel_recv(client_eps[i]);
+                let (msg, send_wake) = ipc::channel_recv(clients[i].stdin_ep);
                 if send_wake != 0 { crate::task::wake_process(send_wake); }
                 match msg {
                     Some(msg) => {
-                        got_write = true;
-                        // Check for raw mode control from stdin client
-                        if i == stdin_idx && msg.len == 2 && msg.data[0] == 0 {
-                            raw_mode = msg.data[1] == 1;
-                        } else if msg.len > 0 {
-                            write_serial(&msg.data[..msg.len]);
+                        handled = true;
+                        if msg.len == 0 { continue; }
+                        let mut r = Reader::new(&msg.data[..msg.len]);
+                        let tag = r.read_u8().unwrap_or(0xFF);
+                        match tag {
+                            0 => {
+                                // FileRequest::Read { offset, len }
+                                let _offset = r.read_u64().unwrap_or(0);
+                                let len = r.read_u32().unwrap_or(1024);
+                                clients[i].has_pending_read = true;
+                                clients[i].pending_read_len = len;
+                            }
+                            2 => {
+                                // FileRequest::Ioctl { cmd, arg }
+                                let cmd = r.read_u32().unwrap_or(0);
+                                let _arg = r.read_u32().unwrap_or(0);
+                                match cmd {
+                                    1 => { // TCRAW
+                                        raw_mode = true;
+                                        send_ioctl_ok(clients[i].stdin_ep, 0, my_pid);
+                                    }
+                                    2 => { // TCCOOKED
+                                        raw_mode = false;
+                                        send_ioctl_ok(clients[i].stdin_ep, 0, my_pid);
+                                    }
+                                    _ => {
+                                        // Unknown ioctl — send error
+                                        let mut emsg = Message::new();
+                                        let mut w = Writer::new(&mut emsg.data);
+                                        let _ = w.write_u8(2); // tag: Error
+                                        let _ = w.write_u8(7); // IO error
+                                        emsg.len = w.position();
+                                        emsg.sender_pid = my_pid;
+                                        let _ = ipc::channel_send_blocking(clients[i].stdin_ep, &emsg, my_pid);
+                                    }
+                                }
+                            }
+                            _ => {} // ignore unknown tags
                         }
                     }
                     None => break,
@@ -291,18 +388,51 @@ pub fn serial_console_server() {
             }
         }
 
-        // Clean up dead clients (process exited, channel closed on their side)
-        cleanup_dead_clients(&mut client_eps, &mut client_count, &mut stdin_stack, &mut stdin_stack_len);
+        // Poll stdout channels for Write requests
+        for i in 0..MAX_CONSOLE_CLIENTS {
+            if !clients[i].active || clients[i].stdout_ep == usize::MAX { continue; }
+            loop {
+                let (msg, send_wake) = ipc::channel_recv(clients[i].stdout_ep);
+                if send_wake != 0 { crate::task::wake_process(send_wake); }
+                match msg {
+                    Some(msg) => {
+                        handled = true;
+                        if msg.len == 0 { continue; }
+                        let mut r = Reader::new(&msg.data[..msg.len]);
+                        let tag = r.read_u8().unwrap_or(0xFF);
+                        match tag {
+                            1 => {
+                                // FileRequest::Write { offset, data }
+                                let _offset = r.read_u64().unwrap_or(0);
+                                let data = r.read_bytes().unwrap_or(&[]);
+                                write_serial(data);
+                                send_write_ok(clients[i].stdout_ep, data.len() as u32, my_pid);
+                            }
+                            _ => {} // ignore unknown tags
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
 
-        if !got_input && !got_write {
-            // Register blocked on control channel + all client endpoints
+        // Clean up dead clients
+        cleanup_dead_clients(&mut clients, &mut stdin_stack, &mut stdin_stack_len);
+
+        if !handled {
+            // Register blocked on control channel + all stdin/stdout endpoints + UART wake
             ipc::channel_set_blocked(control_ep, my_pid);
-            for i in 0..client_count {
-                ipc::channel_set_blocked(client_eps[i], my_pid);
+            for i in 0..MAX_CONSOLE_CLIENTS {
+                if !clients[i].active { continue; }
+                if clients[i].stdin_ep != usize::MAX {
+                    ipc::channel_set_blocked(clients[i].stdin_ep, my_pid);
+                }
+                if clients[i].stdout_ep != usize::MAX {
+                    ipc::channel_set_blocked(clients[i].stdout_ep, my_pid);
+                }
             }
             crate::task::block_process(my_pid);
             crate::task::schedule();
         }
     }
 }
-

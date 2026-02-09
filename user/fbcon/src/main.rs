@@ -347,81 +347,73 @@ impl LineDiscipline {
     }
 }
 
-// --- Console client management ---
+// --- Console client management (FileOps protocol) ---
+
+use rvos_wire::Reader;
 
 const MAX_CONSOLE_CLIENTS: usize = 8;
 /// Console control handle is given as handle 1 by init
 const CONSOLE_CONTROL_HANDLE: usize = 1;
+/// Max data payload per chunk: 1024 - 1 (tag) - 2 (length prefix) = 1021
+const MAX_DATA_CHUNK: usize = 1021;
 
-struct ConsoleState {
-    client_handles: [usize; MAX_CONSOLE_CLIENTS],
-    client_count: usize,
-    stdin_client: usize, // index, or usize::MAX if none
+struct FbconClient {
+    stdin_handle: usize,     // receives Read/Ioctl requests
+    stdout_handle: usize,    // receives Write requests
+    pid: u32,
+    has_pending_read: bool,
+    active: bool,
 }
 
-impl ConsoleState {
-    fn new() -> Self {
-        ConsoleState {
-            client_handles: [usize::MAX; MAX_CONSOLE_CLIENTS],
-            client_count: 0,
-            stdin_client: usize::MAX,
+impl FbconClient {
+    const fn empty() -> Self {
+        FbconClient {
+            stdin_handle: usize::MAX,
+            stdout_handle: usize::MAX,
+            pid: 0,
+            has_pending_read: false,
+            active: false,
         }
     }
 
-    fn add_client(&mut self, handle: usize) {
-        if self.client_count < MAX_CONSOLE_CLIENTS {
-            // Stack model: most recently connected client gets stdin
-            self.stdin_client = self.client_count;
-            self.client_handles[self.client_count] = handle;
-            self.client_count += 1;
-        } else {
-            println!("[fbcon] WARN: too many console clients, dropping");
-            raw::sys_chan_close(handle);
-        }
+    fn is_complete(&self) -> bool {
+        self.stdin_handle != usize::MAX && self.stdout_handle != usize::MAX
     }
+}
 
-    fn cleanup_dead(&mut self) {
-        let mut i = 0;
-        while i < self.client_count {
-            let mut msg = Message::new();
-            let ret = raw::sys_chan_recv(self.client_handles[i], &mut msg);
-            // If ret == 2 (ChannelClosed) AND the channel is dead
-            if ret == 2 {
-                raw::sys_chan_close(self.client_handles[i]);
-                for j in i..self.client_count - 1 {
-                    self.client_handles[j] = self.client_handles[j + 1];
-                }
-                self.client_handles[self.client_count - 1] = usize::MAX;
-                self.client_count -= 1;
-                // Stack model: revert stdin to the most recent remaining client
-                if self.stdin_client == i {
-                    if self.client_count > 0 {
-                        self.stdin_client = self.client_count - 1;
-                    } else {
-                        self.stdin_client = usize::MAX;
-                    }
-                } else if self.stdin_client != usize::MAX && self.stdin_client > i {
-                    self.stdin_client -= 1;
-                }
-                continue;
-            }
-            i += 1;
-        }
+/// FileOps response helpers for user-space
+fn fb_send_data(handle: usize, data: &[u8]) {
+    for chunk in data.chunks(MAX_DATA_CHUNK) {
+        let msg = Message::build(NO_CAP, |w| {
+            let _ = w.write_u8(0); // tag: Data
+            let _ = w.write_bytes(chunk);
+        });
+        raw::sys_chan_send_blocking(handle, &msg);
     }
+}
 
-    fn send_to_stdin(&self, data: &[u8]) {
-        if self.stdin_client == usize::MAX || self.stdin_client >= self.client_count {
-            return;
-        }
-        let handle = self.client_handles[self.stdin_client];
-        // Send in chunks
-        for chunk in data.chunks(1024) {
-            let mut msg = Message::new();
-            msg.data[..chunk.len()].copy_from_slice(chunk);
-            msg.len = chunk.len();
-            raw::sys_chan_send_blocking(handle, &msg);
-        }
-    }
+fn fb_send_sentinel(handle: usize) {
+    let msg = Message::build(NO_CAP, |w| {
+        let _ = w.write_u8(0); // tag: Data
+        let _ = w.write_u16(0); // zero-length
+    });
+    raw::sys_chan_send_blocking(handle, &msg);
+}
+
+fn fb_send_write_ok(handle: usize, written: u32) {
+    let msg = Message::build(NO_CAP, |w| {
+        let _ = w.write_u8(1); // tag: WriteOk
+        let _ = w.write_u32(written);
+    });
+    raw::sys_chan_send_blocking(handle, &msg);
+}
+
+fn fb_send_ioctl_ok(handle: usize, result: u32) {
+    let msg = Message::build(NO_CAP, |w| {
+        let _ = w.write_u8(3); // tag: IoctlOk
+        let _ = w.write_u32(result);
+    });
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 // --- Main ---
@@ -489,7 +481,10 @@ fn main() {
 
     // Initialize FbConsole on the back buffer
     let mut console = FbConsole::new(back_fb, width, height, stride);
-    let mut con_state = ConsoleState::new();
+    let mut clients: [FbconClient; MAX_CONSOLE_CLIENTS] = [const { FbconClient::empty() }; MAX_CONSOLE_CLIENTS];
+    // Stdin stack: indices into clients[]; most recent is on top
+    let mut stdin_stack: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
+    let mut stdin_stack_len: usize = 0;
     let mut line_disc = LineDiscipline::new();
     let mut shift_pressed = false;
     let mut swap_seq: u32 = 10;
@@ -515,9 +510,62 @@ fn main() {
             if ret != 0 { break; }
             handled = true;
             if msg.cap != NO_CAP {
-                con_state.add_client(msg.cap);
+                // Parse NewConnection { client_pid: u32, channel_role: u8 }
+                let (pid, role) = if msg.len >= 5 {
+                    let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                    (pid, msg.data[4])
+                } else if msg.len >= 4 {
+                    let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
+                    (pid, 0u8)
+                } else {
+                    (0, 0u8)
+                };
+
+                // Find or create client by PID
+                let idx = {
+                    let mut found = None;
+                    for i in 0..MAX_CONSOLE_CLIENTS {
+                        if clients[i].active && clients[i].pid == pid {
+                            found = Some(i);
+                            break;
+                        }
+                    }
+                    if found.is_none() {
+                        for i in 0..MAX_CONSOLE_CLIENTS {
+                            if !clients[i].active {
+                                clients[i] = FbconClient::empty();
+                                clients[i].active = true;
+                                clients[i].pid = pid;
+                                found = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    found
+                };
+
+                if let Some(idx) = idx {
+                    match role {
+                        1 => clients[idx].stdin_handle = msg.cap,
+                        2 => clients[idx].stdout_handle = msg.cap,
+                        _ => clients[idx].stdout_handle = msg.cap,
+                    }
+                    // Once both endpoints are set, push onto stdin stack
+                    if clients[idx].is_complete() {
+                        let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == idx);
+                        if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
+                            stdin_stack[stdin_stack_len] = idx;
+                            stdin_stack_len += 1;
+                        }
+                    }
+                } else {
+                    println!("[fbcon] WARN: too many console clients, dropping PID {}", pid);
+                    raw::sys_chan_close(msg.cap);
+                }
             }
         }
+
+        let stdin_idx = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
 
         // Check for keyboard events on window channel
         loop {
@@ -538,7 +586,7 @@ fn main() {
                                 KEYMAP[code]
                             };
                             if ascii != 0 {
-                                handle_key_input(ascii, &mut console, &mut line_disc, &con_state);
+                                handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx);
                             }
                         }
                     }
@@ -553,24 +601,93 @@ fn main() {
             }
         }
 
-        // Check for stdout data from ALL console clients
-        for i in 0..con_state.client_count {
+        // Poll stdin channels for Read/Ioctl requests
+        for i in 0..MAX_CONSOLE_CLIENTS {
+            if !clients[i].active || clients[i].stdin_handle == usize::MAX { continue; }
             loop {
                 let mut msg = Message::new();
-                let ret = raw::sys_chan_recv(con_state.client_handles[i], &mut msg);
+                let ret = raw::sys_chan_recv(clients[i].stdin_handle, &mut msg);
                 if ret != 0 { break; }
                 handled = true;
-                // Check for raw mode control from stdin client
-                if i == con_state.stdin_client && msg.len == 2 && msg.data[0] == 0 {
-                    line_disc.raw_mode = msg.data[1] == 1;
-                } else if msg.len > 0 {
-                    console.write_str(&msg.data[..msg.len]);
+                if msg.len == 0 { continue; }
+                let mut r = Reader::new(&msg.data[..msg.len]);
+                let tag = r.read_u8().unwrap_or(0xFF);
+                match tag {
+                    0 => {
+                        // FileRequest::Read
+                        let _offset = r.read_u64().unwrap_or(0);
+                        let _len = r.read_u32().unwrap_or(1024);
+                        clients[i].has_pending_read = true;
+                    }
+                    2 => {
+                        // FileRequest::Ioctl { cmd, arg }
+                        let cmd = r.read_u32().unwrap_or(0);
+                        let _arg = r.read_u32().unwrap_or(0);
+                        match cmd {
+                            1 => { line_disc.raw_mode = true; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
+                            2 => { line_disc.raw_mode = false; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
+                            _ => {
+                                let msg = Message::build(NO_CAP, |w| {
+                                    let _ = w.write_u8(2); // Error
+                                    let _ = w.write_u8(7); // IO
+                                });
+                                raw::sys_chan_send_blocking(clients[i].stdin_handle, &msg);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Poll stdout channels for Write requests
+        for i in 0..MAX_CONSOLE_CLIENTS {
+            if !clients[i].active || clients[i].stdout_handle == usize::MAX { continue; }
+            loop {
+                let mut msg = Message::new();
+                let ret = raw::sys_chan_recv(clients[i].stdout_handle, &mut msg);
+                if ret != 0 { break; }
+                handled = true;
+                if msg.len == 0 { continue; }
+                let mut r = Reader::new(&msg.data[..msg.len]);
+                let tag = r.read_u8().unwrap_or(0xFF);
+                if tag == 1 {
+                    // FileRequest::Write { offset, data }
+                    let _offset = r.read_u64().unwrap_or(0);
+                    let data = r.read_bytes().unwrap_or(&[]);
+                    console.write_str(data);
+                    fb_send_write_ok(clients[i].stdout_handle, data.len() as u32);
                 }
             }
         }
 
         // Clean up dead clients
-        con_state.cleanup_dead();
+        for i in 0..MAX_CONSOLE_CLIENTS {
+            if !clients[i].active { continue; }
+            let stdin_dead = clients[i].stdin_handle != usize::MAX && {
+                let mut msg = Message::new();
+                raw::sys_chan_recv(clients[i].stdin_handle, &mut msg) == 2
+            };
+            let stdout_dead = clients[i].stdout_handle != usize::MAX && {
+                let mut msg = Message::new();
+                raw::sys_chan_recv(clients[i].stdout_handle, &mut msg) == 2
+            };
+            if stdin_dead || stdout_dead {
+                if clients[i].stdin_handle != usize::MAX { raw::sys_chan_close(clients[i].stdin_handle); }
+                if clients[i].stdout_handle != usize::MAX { raw::sys_chan_close(clients[i].stdout_handle); }
+                clients[i].active = false;
+                // Remove from stdin stack
+                let mut j = 0;
+                while j < stdin_stack_len {
+                    if stdin_stack[j] == i {
+                        for k in j..stdin_stack_len - 1 { stdin_stack[k] = stdin_stack[k + 1]; }
+                        stdin_stack_len -= 1;
+                    } else {
+                        j += 1;
+                    }
+                }
+            }
+        }
 
         // If console is dirty, present the frame
         if console.dirty {
@@ -584,25 +701,32 @@ fn main() {
             // Register interest on all channels then block
             raw::sys_chan_poll_add(CONSOLE_CONTROL_HANDLE);
             raw::sys_chan_poll_add(win_chan);
-            for i in 0..con_state.client_count {
-                raw::sys_chan_poll_add(con_state.client_handles[i]);
+            for i in 0..MAX_CONSOLE_CLIENTS {
+                if !clients[i].active { continue; }
+                if clients[i].stdin_handle != usize::MAX { raw::sys_chan_poll_add(clients[i].stdin_handle); }
+                if clients[i].stdout_handle != usize::MAX { raw::sys_chan_poll_add(clients[i].stdout_handle); }
             }
             raw::sys_block();
         }
     }
 }
 
-/// Handle a single ASCII keypress: echo + line discipline
+/// Handle a single ASCII keypress: echo + line discipline + fulfill pending reads
 fn handle_key_input(
     ascii: u8,
     console: &mut FbConsole,
     line_disc: &mut LineDiscipline,
-    con_state: &ConsoleState,
+    clients: &mut [FbconClient; MAX_CONSOLE_CLIENTS],
+    stdin_idx: usize,
 ) {
     if line_disc.raw_mode {
-        // Raw mode: send directly, no echo
+        // Raw mode: no echo, fulfill pending read directly
         if let Some(len) = line_disc.push_char(ascii) {
-            con_state.send_to_stdin(line_disc.line_data(len));
+            if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+                fb_send_data(clients[stdin_idx].stdin_handle, line_disc.line_data(len));
+                fb_send_sentinel(clients[stdin_idx].stdin_handle);
+                clients[stdin_idx].has_pending_read = false;
+            }
         }
         return;
     }
@@ -610,7 +734,6 @@ fn handle_key_input(
     // Echo to console
     match ascii {
         0x7F | 0x08 => {
-            // Backspace echo: move back, overwrite with space, move back again
             console.write_char(0x08);
             console.write_char(b' ');
             console.write_char(0x08);
@@ -629,7 +752,11 @@ fn handle_key_input(
         let mut buf = [0u8; LINE_BUF_SIZE];
         let data = line_disc.line_data(len);
         buf[..len].copy_from_slice(data);
-        con_state.send_to_stdin(&buf[..len]);
+        if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+            fb_send_data(clients[stdin_idx].stdin_handle, &buf[..len]);
+            fb_send_sentinel(clients[stdin_idx].stdin_handle);
+            clients[stdin_idx].has_pending_read = false;
+        }
     }
 }
 

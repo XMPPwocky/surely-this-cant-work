@@ -80,6 +80,8 @@ define_message! {
         Read(0) { offset: u64, len: u32 },
         /// Write `data` at `offset`.
         Write(1) { offset: u64, data: &'a [u8] },
+        /// Terminal ioctl (cmd + arg).
+        Ioctl(2) { cmd: u32, arg: u32 },
     }
 }
 
@@ -92,8 +94,17 @@ define_message! {
         WriteOk(1) { written: u32 },
         /// Error with structured code.
         Error(2) { code: FsError },
+        /// Ioctl succeeded.
+        IoctlOk(3) { result: u32 },
     }
 }
+
+// ── Ioctl command constants ─────────────────────────────────────
+
+/// Enable raw mode (arg ignored).
+pub const TCRAW: u32 = 1;
+/// Disable raw mode (arg ignored).
+pub const TCCOOKED: u32 = 2;
 
 use rvos_wire::define_protocol;
 
@@ -110,6 +121,8 @@ define_protocol! {
         rpc read as Read(offset: u64, len: u32) -> FileResponse<'_>;
         /// Write data at offset.
         rpc write as Write(offset: u64, data: &[u8]) -> FileResponse<'_>;
+        /// Terminal ioctl.
+        rpc ioctl as Ioctl(cmd: u32, arg: u32) -> FileResponse<'_>;
     }
 }
 

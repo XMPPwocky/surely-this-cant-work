@@ -401,8 +401,7 @@ fn handle_tab(buf: &mut String) {
 
 fn set_raw_mode(enable: bool) {
     io::stdout().flush().ok();
-    io::stdout().write_all(&[0, if enable { 1 } else { 0 }]).ok();
-    io::stdout().flush().ok();
+    rvos::tty::set_raw_mode(enable);
 }
 
 // --- Main shell loop ---
