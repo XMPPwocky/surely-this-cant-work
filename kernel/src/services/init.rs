@@ -11,6 +11,7 @@ use rvos_proto::boot::{BootRequest, BootResponse};
 pub enum ConsoleType {
     Serial,
     Framebuffer,
+    GpuConsole,
 }
 
 /// A boot channel registration: the init server's end of a user process's boot channel.
@@ -170,6 +171,11 @@ struct FsLaunchCtx {
     requester_ep: usize,
     /// If nonzero, global endpoint ID to give spawned process as handle 1.
     extra_cap: usize,
+    /// If set, this process provides a console of the given type.
+    /// Init will create a console control channel and register it.
+    provides_console: Option<ConsoleType>,
+    /// If true, register_boot with is_shell=true (so it gets stdin).
+    is_shell: bool,
 }
 
 impl FsLaunchCtx {
@@ -203,6 +209,8 @@ pub fn init_server() {
     let mut fs_launches: [Option<FsLaunchCtx>; MAX_FS_LAUNCHES] = [const { None }; MAX_FS_LAUNCHES];
     let mut dyn_spawns: [Option<DynSpawn>; MAX_DYN_SPAWNS] = [const { None }; MAX_DYN_SPAWNS];
     init_fs_launches(&mut fs_launches, my_pid);
+
+    let mut gpu_shell_launched = false;
 
     loop {
         // Snapshot boot registrations under the lock
@@ -257,6 +265,19 @@ pub fn init_server() {
                 if ctx.state == FsLaunchState::Done {
                     *slot = None;
                 }
+            }
+        }
+
+        // Launch GPU shell once fbcon's GpuConsole is registered
+        if !gpu_shell_launched && GPU_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
+            let has_gpu_console = {
+                let config = INIT_CONFIG.lock();
+                config.services.iter().any(|s| matches!(s, Some(ref e) if e.console_type == ConsoleType::GpuConsole))
+            };
+            if has_gpu_console {
+                start_gpu_shell(&mut fs_launches, my_pid);
+                gpu_shell_launched = true;
+                handled = true;
             }
         }
 
@@ -538,6 +559,8 @@ fn handle_spawn_request(
         service_name: None,
         requester_ep: boot_ep_b,
         extra_cap,
+        provides_console: None,
+        is_shell: false,
     };
     ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
     ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
@@ -581,11 +604,11 @@ fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
 // ============================================================
 
 /// Programs to launch from the filesystem at boot time.
-/// (path, process name, console type, service_name, requires_gpu)
-const FS_PROGRAMS: &[(&[u8], &str, ConsoleType, Option<&str>, bool)] = &[
-    (b"/bin/hello-std", "hello-std", ConsoleType::Serial, None, false),
-    (b"/bin/window-server", "window-srv", ConsoleType::Serial, Some("window"), true),
-    (b"/bin/winclient", "winclient", ConsoleType::Serial, None, true),
+/// (path, name, console_type, service_name, requires_gpu, provides_console)
+const FS_PROGRAMS: &[(&[u8], &str, ConsoleType, Option<&str>, bool, Option<ConsoleType>)] = &[
+    (b"/bin/hello-std", "hello-std", ConsoleType::Serial, None, false, None),
+    (b"/bin/window-server", "window-srv", ConsoleType::Serial, Some("window"), true, None),
+    (b"/bin/fbcon", "fbcon", ConsoleType::Serial, None, true, Some(ConsoleType::GpuConsole)),
 ];
 
 /// Initialize fs launch state machines. For each program, create a client
@@ -602,7 +625,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
 
     let gpu = GPU_PRESENT.load(core::sync::atomic::Ordering::Relaxed);
     let mut slot_idx = 0;
-    for &(path, name, console_type, service_name, requires_gpu) in FS_PROGRAMS.iter() {
+    for &(path, name, console_type, service_name, requires_gpu, provides_console) in FS_PROGRAMS.iter() {
         if slot_idx >= MAX_FS_LAUNCHES { break; }
         if requires_gpu && !gpu { continue; }
 
@@ -651,6 +674,8 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             service_name,
             requester_ep: 0, // boot-time launch, no requester
             extra_cap: 0,
+            provides_console,
+            is_shell: false,
         });
         slot_idx += 1;
     }
@@ -841,7 +866,7 @@ fn finish_fs_launch(
             return;
         }
     };
-    register_boot(boot_b, ctx.console_type, false);
+    register_boot(boot_b, ctx.console_type, ctx.is_shell);
 
     let pid = if let Some(svc_name) = ctx.service_name {
         // This program is a named service: give it a control channel as handle 1
@@ -855,6 +880,18 @@ fn finish_fs_launch(
         };
         register_service(svc_name, init_svc_ep);
         crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, svc_ctl_ep)
+    } else if let Some(console_type) = ctx.provides_console {
+        // This program provides a console: give it a control channel as handle 1
+        let (init_ep, ctl_ep) = match ipc::channel_create_pair() {
+            Some(pair) => pair,
+            None => {
+                crate::println!("[init] no channels for console {}", ctx.name());
+                ctx.state = FsLaunchState::Done;
+                return;
+            }
+        };
+        register_console(console_type, init_ep);
+        crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, ctl_ep)
     } else if ctx.extra_cap != 0 {
         crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, ctx.extra_cap)
     } else {
@@ -916,6 +953,80 @@ fn finish_fs_launch(
     }
 
     ctx.state = FsLaunchState::Done;
+}
+
+/// Start loading /bin/shell from the filesystem to run on the GPU console.
+/// Called once after fbcon registers its GpuConsole.
+fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid: usize) {
+    let fs_svc = match find_named_service(b"fs") {
+        Some(svc) => svc,
+        None => {
+            crate::println!("[init] no fs service for gpu shell");
+            return;
+        }
+    };
+    let fs_ctl_ep = fs_svc.control_ep.load(Ordering::Relaxed);
+    if fs_ctl_ep == usize::MAX {
+        crate::println!("[init] fs not ready for gpu shell");
+        return;
+    }
+
+    let slot_idx = match launches.iter().position(|s| s.is_none()) {
+        Some(i) => i,
+        None => {
+            crate::println!("[init] no launch slot for gpu shell");
+            return;
+        }
+    };
+
+    let (my_ctl_ep, server_ep) = match ipc::channel_create_pair() {
+        Some(pair) => pair,
+        None => {
+            crate::println!("[init] no channels for gpu shell");
+            return;
+        }
+    };
+
+    let mut ctl_msg = Message::new();
+    ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+    ctl_msg.sender_pid = my_pid;
+    send_and_wake(fs_ctl_ep, ctl_msg);
+
+    let path = b"/bin/shell";
+    let mut msg = Message::new();
+    let mut pos = 0;
+    pos = wire_write_u8(&mut msg.data, pos, 2); // tag: Stat
+    pos = wire_write_str(&mut msg.data, pos, path);
+    msg.len = pos;
+    msg.sender_pid = my_pid;
+    send_and_wake(my_ctl_ep, msg);
+
+    let mut path_buf = [0u8; PATH_BUF_LEN];
+    path_buf[..path.len()].copy_from_slice(path);
+
+    let mut name_buf = [0u8; NAME_BUF_LEN];
+    let name = b"shell-gpu";
+    name_buf[..name.len()].copy_from_slice(name);
+
+    launches[slot_idx] = Some(FsLaunchCtx {
+        state: FsLaunchState::WaitStat,
+        ctl_ep: my_ctl_ep,
+        file_ep: 0,
+        file_size: 0,
+        data: Vec::new_in(INIT_ALLOC),
+        path_buf,
+        path_len: path.len(),
+        name_buf,
+        name_len: name.len(),
+        console_type: ConsoleType::GpuConsole,
+        service_name: None,
+        requester_ep: 0,
+        extra_cap: 0,
+        provides_console: None,
+        is_shell: true,
+    });
+
+    crate::println!("[init] Starting GPU shell (loading /bin/shell from fs)");
 }
 
 // --- Wire protocol helpers (manual byte packing for fs protocol — NOT boot channel) ---

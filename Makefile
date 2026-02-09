@@ -6,7 +6,7 @@ OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 # build-std flags (moved out of .cargo/config.toml to avoid leaking into x.py)
 BUILD_STD = -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 
-.PHONY: build build-shell build-hello build-fs build-window-server build-winclient build-ipc-torture build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
+.PHONY: build build-shell build-hello build-fs build-fbcon build-window-server build-winclient build-ipc-torture build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean
 
 build-shell:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
@@ -38,8 +38,13 @@ build-ipc-torture:
 		--manifest-path user/ipc-torture/Cargo.toml \
 		--target riscv64gc-unknown-rvos
 
-# fs embeds window-server and winclient via include_bytes!, so build them first
-build-fs: build-window-server build-winclient build-ipc-torture
+build-fbcon:
+	. $$HOME/.cargo/env && cargo +rvos build --release \
+		--manifest-path user/fbcon/Cargo.toml \
+		--target riscv64gc-unknown-rvos
+
+# fs embeds user binaries via include_bytes!, so build them first
+build-fs: build-window-server build-winclient build-ipc-torture build-fbcon build-shell
 	. $$HOME/.cargo/env && cargo +rvos build --release \
 		--manifest-path user/fs/Cargo.toml \
 		--target riscv64gc-unknown-rvos
@@ -61,7 +66,6 @@ run-gui: build
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
 		-display gtk \
-		-no-shutdown -no-reboot \
 		-kernel $(KERNEL_BIN)
 
 # VNC mode: connect with a VNC client to :5900, serial on stdio
@@ -71,7 +75,6 @@ run-vnc: build
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
 		-display vnc=:0 \
-		-no-shutdown -no-reboot \
 		-kernel $(KERNEL_BIN)
 
 # Headless GPU with screenshot via monitor socket

@@ -96,11 +96,8 @@ pub extern "C" fn kmain() -> ! {
     // ---- Phase 3b: VirtIO GPU (optional, nographic mode has no device) ----
     let gpu_present = drivers::virtio::gpu::init();
     if gpu_present {
-        if let Some((fb, w, h)) = drivers::virtio::gpu::framebuffer() {
-            console::init_fb(fb, w, h);
-            println!("[boot] Framebuffer console active ({}x{})", w, h);
-            // Draw animated color logo and offset text below it
-            console::draw_boot_logo();
+        if let Some((_fb, w, h)) = drivers::virtio::gpu::framebuffer() {
+            println!("[boot] VirtIO GPU active ({}x{})", w, h);
         }
     }
 
@@ -214,7 +211,6 @@ pub extern "C" fn kmain() -> ! {
     // Idle loop: run forever, shell "shutdown" command calls sys_exit
     loop {
         task::schedule();
-        console::logo_tick();
         unsafe { core::arch::asm!("wfi"); }
     }
 }

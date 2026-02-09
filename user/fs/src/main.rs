@@ -712,6 +712,14 @@ static IPC_TORTURE_ELF: &[u8] = include_bytes!(
     "../../../user/ipc-torture/target/riscv64gc-unknown-rvos/release/ipc-torture"
 );
 
+static FBCON_ELF: &[u8] = include_bytes!(
+    "../../../user/fbcon/target/riscv64gc-unknown-rvos/release/fbcon"
+);
+
+static SHELL_ELF: &[u8] = include_bytes!(
+    "../../../user/shell/target/riscv64gc-unknown-rvos/release/shell"
+);
+
 // --- Multiplexed client state ---
 
 const MAX_CLIENTS: usize = 8;
@@ -734,6 +742,8 @@ fn main() {
     fs().add_static_file(b"/bin/window-server", WINDOW_SERVER_ELF);
     fs().add_static_file(b"/bin/winclient", WINCLIENT_ELF);
     fs().add_static_file(b"/bin/ipc-torture", IPC_TORTURE_ELF);
+    fs().add_static_file(b"/bin/fbcon", FBCON_ELF);
+    fs().add_static_file(b"/bin/shell", SHELL_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)

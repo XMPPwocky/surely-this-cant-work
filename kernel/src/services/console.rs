@@ -5,15 +5,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Control endpoint for serial console server (set by kmain before spawn)
 static SERIAL_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// Control endpoint for FB console server (set by kmain before spawn)
-static FB_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
-
 pub fn set_serial_control_ep(ep: usize) {
     SERIAL_CONTROL_EP.store(ep, Ordering::Relaxed);
-}
-
-pub fn set_fb_control_ep(ep: usize) {
-    FB_CONTROL_EP.store(ep, Ordering::Relaxed);
 }
 
 const LINE_BUF_SIZE: usize = 256;
@@ -93,47 +86,11 @@ fn echo_serial(ch: u8) {
     }
 }
 
-/// Echo a character to framebuffer console.
-fn echo_fb(ch: u8) {
-    let mut fb = crate::console::FB_CONSOLE.lock();
-    if !fb.is_active() {
-        return;
-    }
-    match ch {
-        0x7F | 0x08 => {
-            fb.write_char(0x08);
-            fb.write_char(b' ');
-            fb.write_char(0x08);
-        }
-        b'\r' | b'\n' => {
-            fb.write_char(b'\r');
-            fb.write_char(b'\n');
-        }
-        ch => {
-            fb.write_char(ch);
-        }
-    }
-    drop(fb);
-    crate::drivers::virtio::gpu::flush();
-}
-
 /// Write data to UART output.
 fn write_serial(data: &[u8]) {
     for &ch in data {
         tty::raw_uart_putchar(ch);
     }
-}
-
-/// Write data to framebuffer console output.
-fn write_fb(data: &[u8]) {
-    let mut fb = crate::console::FB_CONSOLE.lock();
-    if fb.is_active() {
-        for &ch in data {
-            fb.write_char(ch);
-        }
-    }
-    drop(fb);
-    crate::drivers::virtio::gpu::flush();
 }
 
 /// Send a line as a message to the client endpoint, blocking if queue is full.
@@ -261,7 +218,6 @@ pub fn serial_console_server() {
                         }
                     } else {
                         echo_serial(ch);
-                        echo_fb(ch);
                         if let Some(len) = line_disc.push_char(ch) {
                             let data_copy = {
                                 let src = line_disc.line_data(len);
@@ -293,7 +249,6 @@ pub fn serial_console_server() {
                             raw_mode = msg.data[1] == 1;
                         } else if msg.len > 0 {
                             write_serial(&msg.data[..msg.len]);
-                            write_fb(&msg.data[..msg.len]);
                         }
                     }
                     None => break,
@@ -316,121 +271,3 @@ pub fn serial_console_server() {
     }
 }
 
-/// FB console server kernel task.
-/// Owns framebuffer + keyboard. Same multi-client pattern as serial console server.
-pub fn fb_console_server() {
-    let control_ep = FB_CONTROL_EP.load(Ordering::Relaxed);
-    let my_pid = crate::task::current_pid();
-
-    // Register for wake on keyboard input
-    tty::set_kbd_wake_pid(my_pid);
-
-    let mut client_eps: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
-    let mut client_count: usize = 0;
-    let mut stdin_client: usize = usize::MAX;
-
-    // Wait for at least the first client
-    loop {
-        let (msg, send_wake) = ipc::channel_recv(control_ep);
-        if send_wake != 0 { crate::task::wake_process(send_wake); }
-        match msg {
-            Some(msg) => {
-                if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                    if client_count < MAX_CONSOLE_CLIENTS {
-                        let is_shell = msg.len >= 1 && msg.data[0] == 1;
-                        if is_shell {
-                            stdin_client = client_count;
-                        }
-                        client_eps[client_count] = ep;
-                        client_count += 1;
-                        break;
-                    }
-                }
-            }
-            None => {
-                crate::ipc::channel_set_blocked(control_ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
-            }
-        }
-    }
-
-    let mut line_disc = LineDiscipline::new();
-
-    loop {
-        // Check control channel for new clients
-        loop {
-            let (msg, send_wake) = ipc::channel_recv(control_ep);
-            if send_wake != 0 { crate::task::wake_process(send_wake); }
-            match msg {
-                Some(msg) => {
-                    if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                        if client_count < MAX_CONSOLE_CLIENTS {
-                            let is_shell = msg.len >= 1 && msg.data[0] == 1;
-                            if is_shell {
-                                stdin_client = client_count;
-                            }
-                            client_eps[client_count] = ep;
-                            client_count += 1;
-                        }
-                    }
-                }
-                None => break,
-            }
-        }
-
-        // Check for keyboard input
-        let mut got_input = false;
-        loop {
-            let ch = tty::KBD_INPUT.lock().pop();
-            match ch {
-                Some(ch) => {
-                    got_input = true;
-                    echo_fb(ch);
-                    if let Some(len) = line_disc.push_char(ch) {
-                        let data_copy = {
-                            let src = line_disc.line_data(len);
-                            let mut buf = [0u8; LINE_BUF_SIZE];
-                            buf[..len].copy_from_slice(src);
-                            (buf, len)
-                        };
-                        if stdin_client != usize::MAX {
-                            send_line(client_eps[stdin_client], &data_copy.0[..data_copy.1]);
-                        }
-                    }
-                }
-                None => break,
-            }
-        }
-
-        // Check for write requests from ALL clients
-        let mut got_write = false;
-        for i in 0..client_count {
-            loop {
-                let (msg, send_wake) = ipc::channel_recv(client_eps[i]);
-                if send_wake != 0 { crate::task::wake_process(send_wake); }
-                match msg {
-                    Some(msg) => {
-                        got_write = true;
-                        if msg.len > 0 {
-                            write_fb(&msg.data[..msg.len]);
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
-
-        // Clean up dead clients
-        cleanup_dead_clients(&mut client_eps, &mut client_count, &mut stdin_client);
-
-        if !got_input && !got_write {
-            ipc::channel_set_blocked(control_ep, my_pid);
-            for i in 0..client_count {
-                ipc::channel_set_blocked(client_eps[i], my_pid);
-            }
-            crate::task::block_process(my_pid);
-            crate::task::schedule();
-        }
-    }
-}
