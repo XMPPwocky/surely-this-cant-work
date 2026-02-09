@@ -32,7 +32,8 @@ pub fn math_service() {
     let mut handler = MathImpl;
 
     loop {
-        let client = ipc::OwnedEndpoint::new(ipc::accept_client(control_ep, my_pid));
+        let accepted = ipc::accept_client(control_ep, my_pid);
+        let client = ipc::OwnedEndpoint::new(accepted.endpoint);
         let mut transport = KernelTransport::new(client.raw(), my_pid);
 
         if let Err(_) = math_dispatch(&mut transport, &mut handler) {

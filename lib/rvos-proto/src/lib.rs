@@ -14,3 +14,4 @@ pub mod process;
 pub mod gpu;
 pub mod kbd;
 pub mod window;
+pub mod service_control;

@@ -111,36 +111,64 @@ fn send_line(client_ep: usize, data: &[u8]) {
 const MAX_CONSOLE_CLIENTS: usize = 8;
 
 /// Remove dead (inactive) client channels and compact the array.
+/// Uses a stdin stack model: when the current stdin client dies, revert to previous.
 fn cleanup_dead_clients(
     client_eps: &mut [usize; MAX_CONSOLE_CLIENTS],
     client_count: &mut usize,
-    stdin_client: &mut usize,
+    stdin_stack: &mut [usize; MAX_CONSOLE_CLIENTS],
+    stdin_stack_len: &mut usize,
 ) {
     let mut i = 0;
     while i < *client_count {
         if !ipc::channel_is_active(client_eps[i]) {
             ipc::channel_close(client_eps[i]);
+            let dead_ep = client_eps[i];
+            // Remove from stdin stack if present
+            let mut j = 0;
+            while j < *stdin_stack_len {
+                if stdin_stack[j] == dead_ep {
+                    for k in j..*stdin_stack_len - 1 {
+                        stdin_stack[k] = stdin_stack[k + 1];
+                    }
+                    *stdin_stack_len -= 1;
+                } else {
+                    j += 1;
+                }
+            }
             // Shift remaining clients down
             for j in i..*client_count - 1 {
                 client_eps[j] = client_eps[j + 1];
             }
             client_eps[*client_count - 1] = usize::MAX;
             *client_count -= 1;
-            // Adjust stdin_client index
-            if *stdin_client == i {
-                *stdin_client = usize::MAX; // stdin client died
-            } else if *stdin_client != usize::MAX && *stdin_client > i {
-                *stdin_client -= 1;
-            }
         } else {
             i += 1;
         }
     }
 }
 
+/// Get the current stdin recipient (top of stdin stack), or usize::MAX if empty.
+fn current_stdin_ep(stdin_stack: &[usize; MAX_CONSOLE_CLIENTS], stdin_stack_len: usize) -> usize {
+    if stdin_stack_len > 0 {
+        stdin_stack[stdin_stack_len - 1]
+    } else {
+        usize::MAX
+    }
+}
+
+/// Find the index of an endpoint in the client list.
+fn find_client_index(client_eps: &[usize; MAX_CONSOLE_CLIENTS], client_count: usize, ep: usize) -> usize {
+    for i in 0..client_count {
+        if client_eps[i] == ep {
+            return i;
+        }
+    }
+    usize::MAX
+}
+
 /// Serial console server kernel task.
 /// Owns UART I/O. Accepts multiple client endpoints via its control channel.
-/// All clients can write output; only the client marked is_shell receives stdin.
+/// Stdin goes to the most recently connected client (stack model); reverts on disconnect.
 pub fn serial_console_server() {
     let control_ep = SERIAL_CONTROL_EP.load(Ordering::Relaxed);
     let my_pid = crate::task::current_pid();
@@ -150,7 +178,9 @@ pub fn serial_console_server() {
 
     let mut client_eps: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
     let mut client_count: usize = 0;
-    let mut stdin_client: usize = usize::MAX; // index of the client that receives stdin
+    // Stdin stack: most recently connected client is on top
+    let mut stdin_stack: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
+    let mut stdin_stack_len: usize = 0;
 
     // Wait for at least the first client endpoint via control channel
     loop {
@@ -160,12 +190,13 @@ pub fn serial_console_server() {
             Some(msg) => {
                 if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                     if client_count < MAX_CONSOLE_CLIENTS {
-                        let is_shell = msg.len >= 1 && msg.data[0] == 1;
-                        if is_shell {
-                            stdin_client = client_count;
-                        }
                         client_eps[client_count] = ep;
                         client_count += 1;
+                        // Push onto stdin stack (most recent gets keyboard)
+                        if stdin_stack_len < MAX_CONSOLE_CLIENTS {
+                            stdin_stack[stdin_stack_len] = ep;
+                            stdin_stack_len += 1;
+                        }
                         break;
                     }
                 }
@@ -191,18 +222,22 @@ pub fn serial_console_server() {
                 Some(msg) => {
                     if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
                         if client_count < MAX_CONSOLE_CLIENTS {
-                            let is_shell = msg.len >= 1 && msg.data[0] == 1;
-                            if is_shell {
-                                stdin_client = client_count;
-                            }
                             client_eps[client_count] = ep;
                             client_count += 1;
+                            // Push onto stdin stack (most recent gets keyboard)
+                            if stdin_stack_len < MAX_CONSOLE_CLIENTS {
+                                stdin_stack[stdin_stack_len] = ep;
+                                stdin_stack_len += 1;
+                            }
                         }
                     }
                 }
                 None => break,
             }
         }
+
+        let stdin_ep = current_stdin_ep(&stdin_stack, stdin_stack_len);
+        let stdin_idx = find_client_index(&client_eps, client_count, stdin_ep);
 
         // Check for input characters from UART ring buffer
         let mut got_input = false;
@@ -213,8 +248,8 @@ pub fn serial_console_server() {
                     got_input = true;
                     if raw_mode {
                         // Raw mode: no echo, no line discipline, send each byte directly
-                        if stdin_client != usize::MAX {
-                            send_line(client_eps[stdin_client], &[ch]);
+                        if stdin_ep != usize::MAX {
+                            send_line(stdin_ep, &[ch]);
                         }
                     } else {
                         echo_serial(ch);
@@ -225,8 +260,8 @@ pub fn serial_console_server() {
                                 buf[..len].copy_from_slice(src);
                                 (buf, len)
                             };
-                            if stdin_client != usize::MAX {
-                                send_line(client_eps[stdin_client], &data_copy.0[..data_copy.1]);
+                            if stdin_ep != usize::MAX {
+                                send_line(stdin_ep, &data_copy.0[..data_copy.1]);
                             }
                         }
                     }
@@ -245,7 +280,7 @@ pub fn serial_console_server() {
                     Some(msg) => {
                         got_write = true;
                         // Check for raw mode control from stdin client
-                        if i == stdin_client && msg.len == 2 && msg.data[0] == 0 {
+                        if i == stdin_idx && msg.len == 2 && msg.data[0] == 0 {
                             raw_mode = msg.data[1] == 1;
                         } else if msg.len > 0 {
                             write_serial(&msg.data[..msg.len]);
@@ -257,7 +292,7 @@ pub fn serial_console_server() {
         }
 
         // Clean up dead clients (process exited, channel closed on their side)
-        cleanup_dead_clients(&mut client_eps, &mut client_count, &mut stdin_client);
+        cleanup_dead_clients(&mut client_eps, &mut client_count, &mut stdin_stack, &mut stdin_stack_len);
 
         if !got_input && !got_write {
             // Register blocked on control channel + all client endpoints

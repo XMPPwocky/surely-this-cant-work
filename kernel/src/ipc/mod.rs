@@ -343,6 +343,7 @@ pub fn channel_send_blocking(endpoint: usize, msg: &Message, pid: usize) -> Resu
             Ok(wake) => {
                 if wake != 0 {
                     crate::task::wake_process(wake);
+                    crate::task::schedule(); // yield so woken receiver runs immediately
                 }
                 return Ok(());
             }
@@ -379,14 +380,30 @@ pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
     }
 }
 
+/// Result of accepting a client connection from a service control channel.
+pub struct AcceptedClient {
+    /// The server-side endpoint for the new client channel.
+    pub endpoint: usize,
+    /// The PID of the connecting client (from the NewConnection message).
+    pub client_pid: u32,
+}
+
 /// Wait for a client endpoint from a service's control channel.
-/// Blocks until a message carrying a channel capability arrives.
-pub fn accept_client(control_ep: usize, pid: usize) -> usize {
+/// Blocks until a NewConnection message carrying a channel capability arrives.
+/// Parses the `NewConnection { client_pid }` payload from the message data.
+pub fn accept_client(control_ep: usize, pid: usize) -> AcceptedClient {
     loop {
         match channel_recv_blocking(control_ep, pid) {
             Some(msg) => {
                 if let Some(ep) = decode_cap_channel(msg.cap) {
-                    return ep;
+                    // Parse client_pid from NewConnection message
+                    let client_pid = if msg.len >= 5 {
+                        // NewConnection wire format: u8(tag=0) + u32(client_pid)
+                        u32::from_le_bytes([msg.data[1], msg.data[2], msg.data[3], msg.data[4]])
+                    } else {
+                        0
+                    };
+                    return AcceptedClient { endpoint: ep, client_pid };
                 }
                 // Message without channel cap — ignore and keep waiting
             }

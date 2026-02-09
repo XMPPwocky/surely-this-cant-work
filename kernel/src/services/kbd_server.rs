@@ -25,22 +25,8 @@ pub fn kbd_server() {
     crate::println!("[kbd-server] ready");
 
     // Wait for a client endpoint from init (via control channel)
-    let client_ep = loop {
-        let (msg, send_wake) = ipc::channel_recv(control_ep);
-        if send_wake != 0 { crate::task::wake_process(send_wake); }
-        match msg {
-            Some(msg) => {
-                if let Some(ep) = ipc::decode_cap_channel(msg.cap) {
-                    break ep;
-                }
-            }
-            None => {
-                ipc::channel_set_blocked(control_ep, my_pid);
-                crate::task::block_process(my_pid);
-                crate::task::schedule();
-            }
-        }
-    };
+    let accepted = ipc::accept_client(control_ep, my_pid);
+    let client_ep = accepted.endpoint;
 
     crate::println!("[kbd-server] client connected");
 

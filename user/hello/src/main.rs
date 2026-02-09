@@ -2,6 +2,10 @@
 extern crate rvos_rt;
 
 fn main() {
+    // Print command-line arguments
+    let args: Vec<String> = std::env::args().collect();
+    println!("args({}):{}", args.len(), args.iter().map(|a| format!(" \"{}\"", a)).collect::<String>());
+
     println!("--- test ---");
 
     // 1. Create file

@@ -18,6 +18,13 @@ define_message! {
         /// Spawn a new process from a filesystem path (e.g., "/bin/hello-std").
         /// Response cap = process handle channel.
         Spawn(1) { path: &'a str },
+        /// Fetch command-line arguments for this process.
+        /// Response = Args with null-separated blob.
+        GetArgs(2) {},
+        /// Spawn a new process with command-line arguments.
+        /// `args` is a null-separated blob (e.g. b"arg1\0arg2\0arg3").
+        /// Response cap = process handle channel.
+        SpawnWithArgs(3) { path: &'a str, args: &'a [u8] },
     }
 }
 
@@ -28,5 +35,7 @@ define_message! {
         Ok(0) {},
         /// Failure. `message` is a human-readable error string.
         Error(1) { message: &'a str },
+        /// Command-line arguments (null-separated blob).
+        Args(2) { args: &'a [u8] },
     }
 }

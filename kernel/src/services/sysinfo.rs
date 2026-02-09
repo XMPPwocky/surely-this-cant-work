@@ -19,7 +19,8 @@ pub fn sysinfo_service() {
     let my_pid = crate::task::current_pid();
 
     loop {
-        let client = ipc::OwnedEndpoint::new(ipc::accept_client(control_ep, my_pid));
+        let accepted = ipc::accept_client(control_ep, my_pid);
+        let client = ipc::OwnedEndpoint::new(accepted.endpoint);
 
         // Wait for one request from this client
         let msg = match ipc::channel_recv_blocking(client.raw(), my_pid) {

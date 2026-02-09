@@ -14,11 +14,15 @@ pub enum ConsoleType {
     GpuConsole,
 }
 
+const MAX_ARGS_LEN: usize = 512;
+
 /// A boot channel registration: the init server's end of a user process's boot channel.
 struct BootRegistration {
     boot_ep_b: usize,        // init server's endpoint of the boot channel
     console_type: ConsoleType, // which console this process should use
     is_shell: bool,           // true = primary stdin recipient
+    args: [u8; MAX_ARGS_LEN], // null-separated command-line args
+    args_len: usize,          // length of args blob
 }
 
 /// A service registration: maps a name to a console control endpoint.
@@ -105,12 +109,19 @@ impl InitConfig {
 static INIT_CONFIG: SpinLock<InitConfig> = SpinLock::new(InitConfig::new());
 
 /// Register a boot channel for a user process (called from kmain before spawning init).
-/// If `is_shell` is true, the console server will direct keyboard input to this client.
 pub fn register_boot(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool) {
+    register_boot_with_args(boot_ep_b, console_type, is_shell, &[]);
+}
+
+/// Register a boot channel with command-line arguments.
+pub fn register_boot_with_args(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, args_blob: &[u8]) {
     let mut config = INIT_CONFIG.lock();
     for slot in config.boot_regs.iter_mut() {
         if slot.is_none() {
-            *slot = Some(BootRegistration { boot_ep_b, console_type, is_shell });
+            let mut args = [0u8; MAX_ARGS_LEN];
+            let args_len = args_blob.len().min(MAX_ARGS_LEN);
+            args[..args_len].copy_from_slice(&args_blob[..args_len]);
+            *slot = Some(BootRegistration { boot_ep_b, console_type, is_shell, args, args_len });
             return;
         }
     }
@@ -176,6 +187,9 @@ struct FsLaunchCtx {
     provides_console: Option<ConsoleType>,
     /// If true, register_boot with is_shell=true (so it gets stdin).
     is_shell: bool,
+    /// Null-separated command-line arguments for the spawned process.
+    args: [u8; MAX_ARGS_LEN],
+    args_len: usize,
 }
 
 impl FsLaunchCtx {
@@ -332,7 +346,7 @@ pub fn init_server() {
 fn handle_request(
     boot_ep_b: usize,
     console_type: ConsoleType,
-    is_shell: bool,
+    _is_shell: bool,
     msg: &Message,
     my_pid: usize,
     fs_launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
@@ -348,18 +362,25 @@ fn handle_request(
         }
     };
 
+    let client_pid = msg.sender_pid as u32;
     match req {
         BootRequest::ConnectService { name } => {
             if name == "stdio" {
-                handle_stdio_request(boot_ep_b, console_type, is_shell, my_pid);
+                handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid);
             } else if let Some(svc) = find_named_service_by_name(name) {
-                handle_service_request(boot_ep_b, svc, my_pid);
+                handle_service_request(boot_ep_b, svc, client_pid, my_pid);
             } else {
                 send_error(boot_ep_b, "unknown service", my_pid);
             }
         }
         BootRequest::Spawn { path } => {
-            handle_spawn_request(boot_ep_b, console_type, path, msg.cap, fs_launches, my_pid);
+            handle_spawn_request(boot_ep_b, console_type, path, msg.cap, &[], fs_launches, my_pid);
+        }
+        BootRequest::GetArgs {} => {
+            handle_get_args(boot_ep_b, my_pid);
+        }
+        BootRequest::SpawnWithArgs { path, args } => {
+            handle_spawn_request(boot_ep_b, console_type, path, msg.cap, args, fs_launches, my_pid);
         }
     }
 
@@ -402,9 +423,9 @@ fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
 }
 
 /// Generic handler for any named service (sysinfo, math, fs, etc.).
-/// Creates a channel pair, sends the server endpoint to the service's control channel,
-/// and responds to the client with the client endpoint.
-fn handle_service_request(boot_ep_b: usize, svc: &NamedService, my_pid: usize) {
+/// Creates a channel pair, sends the server endpoint to the service's control channel
+/// with a NewConnection message, and responds to the client with the client endpoint.
+fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32, my_pid: usize) {
     let (client_ep, server_ep) = match ipc::channel_create_pair() {
         Some(pair) => pair,
         None => {
@@ -415,9 +436,13 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, my_pid: usize) {
 
     let ctl_ep = svc.control_ep.load(Ordering::Relaxed);
     if ctl_ep != usize::MAX {
-        // Send server endpoint to the service via its control channel
+        // Send server endpoint to the service via its control channel with NewConnection
         let mut ctl_msg = Message::new();
         ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.len = rvos_wire::to_bytes(
+            &rvos_proto::service_control::NewConnection { client_pid },
+            &mut ctl_msg.data,
+        ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
 
@@ -428,7 +453,7 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, my_pid: usize) {
     }
 }
 
-fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, my_pid: usize) {
+fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, client_pid: u32, my_pid: usize) {
     // Create a new bidirectional channel for the client <-> console server
     let (client_ep, server_ep) = match ipc::channel_create_pair() {
         Some(pair) => pair,
@@ -454,12 +479,13 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, is_shell: b
     };
 
     if let Some(ctl_ep) = control_ep {
-        // Send server endpoint to console server via its control channel.
-        // data[0] = 1 means this client wants stdin (is a shell).
+        // Send NewConnection to console server via its control channel
         let mut ctl_msg = Message::new();
         ctl_msg.cap = ipc::encode_cap_channel(server_ep);
-        ctl_msg.data[0] = if is_shell { 1 } else { 0 };
-        ctl_msg.len = 1;
+        ctl_msg.len = rvos_wire::to_bytes(
+            &rvos_proto::service_control::NewConnection { client_pid },
+            &mut ctl_msg.data,
+        ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
 
@@ -476,6 +502,7 @@ fn handle_spawn_request(
     console_type: ConsoleType,
     path: &str,
     spawn_cap: usize,
+    args: &[u8],
     fs_launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
     my_pid: usize,
 ) {
@@ -516,9 +543,13 @@ fn handle_spawn_request(
         }
     };
 
-    // Send the server endpoint to the fs service via its control channel
+    // Send the server endpoint to the fs service via its control channel with NewConnection
     let mut ctl_msg = Message::new();
     ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+    ctl_msg.len = rvos_wire::to_bytes(
+        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32 },
+        &mut ctl_msg.data,
+    ).unwrap_or(0);
     ctl_msg.sender_pid = my_pid;
     send_and_wake(fs_ctl_ep, ctl_msg);
 
@@ -545,6 +576,10 @@ fn handle_spawn_request(
         0
     };
 
+    let mut args_buf = [0u8; MAX_ARGS_LEN];
+    let args_len = args.len().min(MAX_ARGS_LEN);
+    args_buf[..args_len].copy_from_slice(&args[..args_len]);
+
     let mut ctx = FsLaunchCtx {
         state: FsLaunchState::WaitStat,
         ctl_ep: my_ctl_ep,
@@ -561,11 +596,42 @@ fn handle_spawn_request(
         extra_cap,
         provides_console: None,
         is_shell: false,
+        args: args_buf,
+        args_len,
     };
     ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
     ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
     fs_launches[slot_idx] = Some(ctx);
+}
+
+/// Handle GetArgs: respond with the stored args for this process.
+fn handle_get_args(boot_ep_b: usize, my_pid: usize) {
+    let config = INIT_CONFIG.lock();
+    for slot in config.boot_regs.iter() {
+        if let Some(ref reg) = slot {
+            if reg.boot_ep_b == boot_ep_b {
+                let mut resp = Message::new();
+                resp.len = rvos_wire::to_bytes(
+                    &BootResponse::Args { args: &reg.args[..reg.args_len] },
+                    &mut resp.data,
+                ).unwrap_or(0);
+                resp.sender_pid = my_pid;
+                drop(config);
+                send_and_wake(boot_ep_b, resp);
+                return;
+            }
+        }
+    }
+    // Not found — send empty args
+    drop(config);
+    let mut resp = Message::new();
+    resp.len = rvos_wire::to_bytes(
+        &BootResponse::Args { args: &[] },
+        &mut resp.data,
+    ).unwrap_or(0);
+    resp.sender_pid = my_pid;
+    send_and_wake(boot_ep_b, resp);
 }
 
 /// Send an Ok response with a capability on the boot channel.
@@ -637,9 +703,13 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             }
         };
 
-        // Send the server endpoint to the fs service via its control channel
+        // Send the server endpoint to the fs service via its control channel with NewConnection
         let mut ctl_msg = Message::new();
         ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+        ctl_msg.len = rvos_wire::to_bytes(
+            &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32 },
+            &mut ctl_msg.data,
+        ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(fs_init_ctl_ep, ctl_msg);
 
@@ -676,6 +746,8 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             extra_cap: 0,
             provides_console,
             is_shell: false,
+            args: [0u8; MAX_ARGS_LEN],
+            args_len: 0,
         });
         slot_idx += 1;
     }
@@ -866,7 +938,7 @@ fn finish_fs_launch(
             return;
         }
     };
-    register_boot(boot_b, ctx.console_type, ctx.is_shell);
+    register_boot_with_args(boot_b, ctx.console_type, ctx.is_shell, &ctx.args[..ctx.args_len]);
 
     let pid = if let Some(svc_name) = ctx.service_name {
         // This program is a named service: give it a control channel as handle 1
@@ -989,6 +1061,10 @@ fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid
 
     let mut ctl_msg = Message::new();
     ctl_msg.cap = ipc::encode_cap_channel(server_ep);
+    ctl_msg.len = rvos_wire::to_bytes(
+        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32 },
+        &mut ctl_msg.data,
+    ).unwrap_or(0);
     ctl_msg.sender_pid = my_pid;
     send_and_wake(fs_ctl_ep, ctl_msg);
 
@@ -1024,6 +1100,8 @@ fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid
         extra_cap: 0,
         provides_console: None,
         is_shell: true,
+        args: [0u8; MAX_ARGS_LEN],
+        args_len: 0,
     });
 
     crate::println!("[init] Starting GPU shell (loading /bin/shell from fs)");

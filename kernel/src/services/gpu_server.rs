@@ -34,7 +34,8 @@ pub fn gpu_server() {
         width, height, fb_pages, shm_id);
 
     // Wait for a client endpoint from init (via control channel)
-    let client_ep = ipc::accept_client(control_ep, my_pid);
+    let accepted = ipc::accept_client(control_ep, my_pid);
+    let client_ep = accepted.endpoint;
 
     crate::println!("[gpu-server] client connected");
 

@@ -368,11 +368,10 @@ impl ConsoleState {
         }
     }
 
-    fn add_client(&mut self, handle: usize, is_shell: bool) {
+    fn add_client(&mut self, handle: usize) {
         if self.client_count < MAX_CONSOLE_CLIENTS {
-            if is_shell {
-                self.stdin_client = self.client_count;
-            }
+            // Stack model: most recently connected client gets stdin
+            self.stdin_client = self.client_count;
             self.client_handles[self.client_count] = handle;
             self.client_count += 1;
         } else {
@@ -394,8 +393,13 @@ impl ConsoleState {
                 }
                 self.client_handles[self.client_count - 1] = usize::MAX;
                 self.client_count -= 1;
+                // Stack model: revert stdin to the most recent remaining client
                 if self.stdin_client == i {
-                    self.stdin_client = usize::MAX;
+                    if self.client_count > 0 {
+                        self.stdin_client = self.client_count - 1;
+                    } else {
+                        self.stdin_client = usize::MAX;
+                    }
                 } else if self.stdin_client != usize::MAX && self.stdin_client > i {
                     self.stdin_client -= 1;
                 }
@@ -511,8 +515,7 @@ fn main() {
             if ret != 0 { break; }
             handled = true;
             if msg.cap != NO_CAP {
-                let is_shell = msg.len >= 1 && msg.data[0] == 1;
-                con_state.add_client(msg.cap, is_shell);
+                con_state.add_client(msg.cap);
             }
         }
 

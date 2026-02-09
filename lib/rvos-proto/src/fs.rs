@@ -107,9 +107,9 @@ define_protocol! {
         type Response<'a> = FileResponse;
 
         /// Read data from offset.
-        rpc read as Read(offset: u64, len: u32) -> FileResponse;
+        rpc read as Read(offset: u64, len: u32) -> FileResponse<'_>;
         /// Write data at offset.
-        rpc write as Write(offset: u64, data: &[u8]) -> FileResponse;
+        rpc write as Write(offset: u64, data: &[u8]) -> FileResponse<'_>;
     }
 }
 

@@ -211,16 +211,50 @@ fn cmd_math(args: &str) {
 }
 
 fn cmd_run(args: &str) {
-    let path = args.trim();
-    if path.is_empty() {
-        println!("Usage: run <path>");
+    let args_str = args.trim();
+    if args_str.is_empty() {
+        println!("Usage: run <path> [args...]");
         return;
     }
 
-    // Send Spawn request on boot channel (handle 0)
+    // Split into path and arguments
+    let (path, rest) = match args_str.split_once(' ') {
+        Some((p, r)) => (p, r.trim()),
+        None => (args_str, ""),
+    };
+
+    // Build null-separated args blob: argv[0] is the binary name (last component of path)
+    let mut args_blob = [0u8; 512];
+    let mut args_len = 0;
+
+    // argv[0] = binary name (everything after last '/')
+    let argv0 = match path.rfind('/') {
+        Some(pos) => &path[pos + 1..],
+        None => path,
+    };
+    let copy_len = argv0.len().min(512);
+    args_blob[..copy_len].copy_from_slice(argv0.as_bytes());
+    args_len += copy_len;
+
+    // Append remaining arguments, null-separated
+    if !rest.is_empty() {
+        for arg in rest.split_whitespace() {
+            if args_len + 1 + arg.len() > 512 {
+                break;
+            }
+            args_blob[args_len] = 0; // null separator
+            args_len += 1;
+            args_blob[args_len..args_len + arg.len()].copy_from_slice(arg.as_bytes());
+            args_len += arg.len();
+        }
+    }
+
+    // Send SpawnWithArgs request on boot channel (handle 0)
     let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&BootRequest::Spawn { path }, &mut msg.data)
-        .unwrap_or(0);
+    msg.len = rvos_wire::to_bytes(
+        &BootRequest::SpawnWithArgs { path, args: &args_blob[..args_len] },
+        &mut msg.data,
+    ).unwrap_or(0);
     raw::sys_chan_send(0, &msg);
 
     // Wait for response

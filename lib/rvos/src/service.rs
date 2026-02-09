@@ -39,7 +39,7 @@ pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<Channe
     }
 
     // Parse response
-    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
         Ok(BootResponse::Ok {}) => {}
         _ => return Err(SysError::NoResources),
     }
@@ -84,7 +84,7 @@ pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
     }
 
     // Parse response
-    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
         Ok(BootResponse::Ok {}) => {}
         _ => return Err(SysError::NoResources),
     }
@@ -130,7 +130,52 @@ pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usi
     }
 
     // Parse response
-    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
+    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
+        Ok(BootResponse::Ok {}) => {}
+        _ => return Err(SysError::NoResources),
+    }
+
+    if reply.cap() == raw::NO_CAP {
+        return Err(SysError::NoResources);
+    }
+
+    Ok(Channel::from_raw_handle(reply.cap()))
+}
+
+/// Spawn a process with command-line arguments via the boot channel (handle 0).
+///
+/// `args` is a null-separated blob (e.g., b"arg1\0arg2"). The spawned process
+/// retrieves these via `GetArgs` on its boot channel (used by `std::env::args()`).
+pub fn spawn_process_with_args(path: &str, args: &[u8]) -> SysResult<Channel> {
+    spawn_process_with_args_on(0, path, args)
+}
+
+/// Spawn a process with args via a specific boot handle.
+pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -> SysResult<Channel> {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&BootRequest::SpawnWithArgs { path, args }, &mut msg.data)
+        .map_err(|_| SysError::BadAddress)?;
+    let ret = raw::syscall2(
+        raw::SYS_CHAN_SEND,
+        boot_handle,
+        &msg as *const Message as usize,
+    );
+    if ret != 0 {
+        return Err(SysError::from_code(ret).unwrap_err());
+    }
+
+    let mut reply = Message::new();
+    let ret = raw::syscall2(
+        raw::SYS_CHAN_RECV_BLOCKING,
+        boot_handle,
+        &mut reply as *mut Message as usize,
+    );
+    if ret != 0 {
+        return Err(SysError::from_code(ret).unwrap_err());
+    }
+
+    // Parse response
+    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
         Ok(BootResponse::Ok {}) => {}
         _ => return Err(SysError::NoResources),
     }
@@ -145,7 +190,7 @@ pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usi
 /// Read the error message from a boot channel Error response.
 /// Returns the error string from msg.data, or "unknown" if parsing fails.
 pub fn read_error_response(msg: &Message) -> &str {
-    match rvos_wire::from_bytes::<BootResponse>(&msg.data[..msg.len]) {
+    match rvos_wire::from_bytes::<BootResponse<'_>>(&msg.data[..msg.len]) {
         Ok(BootResponse::Error { message }) => message,
         _ => "unknown",
     }
