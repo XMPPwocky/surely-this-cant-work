@@ -2,7 +2,11 @@ extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
-use rvos::rvos_wire::{Reader, Writer};
+use rvos::rvos_wire::{self, Writer};
+use rvos_proto::fs::{
+    FsRequest, FsResponse, FsEntryKind, FsError, OpenFlags,
+    FileRequest, FileResponse, FileOffset,
+};
 
 // --- Constants ---
 
@@ -12,24 +16,8 @@ const MAX_NAME_LEN: usize = 32;
 const MAX_CHILDREN: usize = 128;
 const MAX_OPEN_FILES: usize = 16;
 
-// Open flags
-const FLAG_CREATE: u8 = 0x01;
-const FLAG_TRUNCATE: u8 = 0x02;
-const FLAG_EXCL: u8 = 0x04;
-const FLAG_APPEND: u8 = 0x08;
-
-// Error codes
-const ERR_NOT_FOUND: u8 = 1;
-const ERR_ALREADY_EXISTS: u8 = 2;
-const ERR_NOT_A_FILE: u8 = 3;
-const ERR_NOT_EMPTY: u8 = 4;
-const ERR_INVALID_PATH: u8 = 5;
-// const ERR_NO_SPACE: u8 = 6;
-const ERR_IO: u8 = 7;
-const ERR_READ_ONLY: u8 = 8;
-
-// Max data payload per chunk (64 - 1 tag - 2 length prefix = 61)
-const MAX_DATA_CHUNK: usize = 1021; // MAX_MSG_SIZE(1024) - 3 (tag u8 + length u16)
+// Max data payload per chunk: MAX_MSG_SIZE(1024) - 3 (tag u8 + length u16)
+const MAX_DATA_CHUNK: usize = 1021;
 
 // Control channel handle (set by kernel at spawn)
 const CONTROL_HANDLE: usize = 1;
@@ -425,58 +413,41 @@ impl<'a> Iterator for PathSplitter<'a> {
 
 fn send_ok(handle: usize, cap: usize) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0); // tag: Ok
-    let _ = w.write_u8(0); // kind: File (dummy for Open/Delete)
-    let _ = w.write_u64(0); // size: 0 (dummy for Open/Delete)
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(
+        &FsResponse::Ok { kind: FsEntryKind::File {}, size: 0 },
+        &mut msg.data,
+    ).unwrap_or(0);
     msg.set_cap(cap);
     raw::sys_chan_send(handle, &msg);
 }
 
-fn send_error(handle: usize, code: u8) {
+fn send_error(handle: usize, code: FsError) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(1); // tag: Error
-    let _ = w.write_u8(code);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FsResponse::Error { code }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send(handle, &msg);
 }
 
 fn send_data_chunk(handle: usize, data: &[u8]) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0); // tag: Data
-    let _ = w.write_bytes(data);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk: data }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_retry(handle, &msg);
 }
 
 fn send_data_sentinel(handle: usize) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0); // tag: Data
-    let _ = w.write_u16(0); // zero-length payload
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk: &[] }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_retry(handle, &msg);
 }
 
 fn send_write_ok(handle: usize, written: u32) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(1); // tag: Ok
-    let _ = w.write_u32(written);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FileResponse::WriteOk { written }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send(handle, &msg);
 }
 
-fn send_stat_ok(handle: usize, kind: u8, size: u64) {
+fn send_stat_ok(handle: usize, kind: FsEntryKind, size: u64) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0); // tag: Ok
-    let _ = w.write_u8(kind);
-    let _ = w.write_u64(size);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FsResponse::Ok { kind, size }, &mut msg.data).unwrap_or(0);
     msg.set_cap(NO_CAP);
     raw::sys_chan_send(handle, &msg);
 }
@@ -502,12 +473,9 @@ fn send_dir_sentinel(handle: usize) {
     raw::sys_chan_send(handle, &msg);
 }
 
-fn send_file_error(handle: usize, code: u8) {
+fn send_file_error(handle: usize, code: FsError) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(2); // tag: Error
-    let _ = w.write_u8(code);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FileResponse::Error { code }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -524,22 +492,13 @@ fn fs() -> &'static mut Filesystem {
     unsafe { (*FS.0.get()).as_mut().unwrap() }
 }
 
-fn handle_read(file_handle: usize, inode_idx: usize, r: &mut Reader) {
-    // Parse offset: kind=0 → Explicit(u64), kind=1 → Stream (server-tracked)
-    let offset_kind = r.read_u8().unwrap_or(1);
-    let explicit_offset = if offset_kind == 0 {
-        Some(r.read_u64().unwrap_or(0) as usize)
-    } else {
-        None
+fn handle_read(file_handle: usize, inode_idx: usize, offset: FileOffset, len: u32) {
+    let explicit_offset = match offset {
+        FileOffset::Explicit { offset } => Some(offset as usize),
+        FileOffset::Stream {} => None,
     };
 
-    let len = match r.read_u32() {
-        Ok(v) => v as usize,
-        Err(_) => {
-            send_file_error(file_handle, ERR_IO);
-            return;
-        }
-    };
+    let len = len as usize;
 
     let fs = fs();
 
@@ -590,21 +549,10 @@ fn handle_read(file_handle: usize, inode_idx: usize, r: &mut Reader) {
     }
 }
 
-fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
-    // Parse offset: kind=0 → Explicit(u64), kind=1 → Stream (server-tracked)
-    let offset_kind = r.read_u8().unwrap_or(1);
-    let explicit_offset = if offset_kind == 0 {
-        Some(r.read_u64().unwrap_or(0) as usize)
-    } else {
-        None
-    };
-
-    let data = match r.read_bytes() {
-        Ok(d) => d,
-        Err(_) => {
-            send_file_error(file_handle, ERR_IO);
-            return;
-        }
+fn handle_write(file_handle: usize, inode_idx: usize, offset: FileOffset, data: &[u8]) {
+    let explicit_offset = match offset {
+        FileOffset::Explicit { offset } => Some(offset as usize),
+        FileOffset::Stream {} => None,
     };
 
     let fs = fs();
@@ -629,7 +577,7 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
     let inode = &mut fs.inodes[inode_idx];
 
     if inode.read_only {
-        send_file_error(file_handle, ERR_READ_ONLY);
+        send_file_error(file_handle, FsError::Io {});
         return;
     }
 
@@ -639,7 +587,7 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
         // Truncate to max
         let can_write = if offset < MAX_FILE_SIZE { MAX_FILE_SIZE - offset } else { 0 };
         if can_write == 0 {
-            send_file_error(file_handle, ERR_IO);
+            send_file_error(file_handle, FsError::Io {});
             return;
         }
         // Zero-fill gap if needed
@@ -678,44 +626,34 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
     }
 }
 
-fn do_stat(client_handle: usize, r: &mut Reader) {
-    let path = match r.read_str() {
-        Ok(p) => p,
-        Err(_) => {
-            send_error(client_handle, ERR_INVALID_PATH);
-            return;
-        }
-    };
+fn do_stat(client_handle: usize, path: &str) {
     let path_bytes = path.as_bytes();
     if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
-        send_error(client_handle, ERR_INVALID_PATH);
+        send_error(client_handle, FsError::InvalidPath {});
         return;
     }
 
     let fs = fs();
     match fs.resolve_path(path_bytes) {
         Some(idx) => {
-            let kind = if fs.inodes[idx].kind == InodeKind::Dir { 1u8 } else { 0u8 };
+            let kind = if fs.inodes[idx].kind == InodeKind::Dir {
+                FsEntryKind::Directory {}
+            } else {
+                FsEntryKind::File {}
+            };
             let size = if fs.inodes[idx].kind == InodeKind::File { fs.inodes[idx].data_len as u64 } else { 0u64 };
             send_stat_ok(client_handle, kind, size);
         }
         None => {
-            send_error(client_handle, ERR_NOT_FOUND);
+            send_error(client_handle, FsError::NotFound {});
         }
     }
 }
 
-fn do_readdir(client_handle: usize, r: &mut Reader) {
-    let path = match r.read_str() {
-        Ok(p) => p,
-        Err(_) => {
-            send_error(client_handle, ERR_INVALID_PATH);
-            return;
-        }
-    };
+fn do_readdir(client_handle: usize, path: &str) {
     let path_bytes = path.as_bytes();
     if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
-        send_error(client_handle, ERR_INVALID_PATH);
+        send_error(client_handle, FsError::InvalidPath {});
         return;
     }
 
@@ -723,13 +661,13 @@ fn do_readdir(client_handle: usize, r: &mut Reader) {
     let idx = match fs.resolve_path(path_bytes) {
         Some(i) => i,
         None => {
-            send_error(client_handle, ERR_NOT_FOUND);
+            send_error(client_handle, FsError::NotFound {});
             return;
         }
     };
 
     if fs.inodes[idx].kind != InodeKind::Dir {
-        send_error(client_handle, ERR_NOT_A_FILE);
+        send_error(client_handle, FsError::NotAFile {});
         return;
     }
 
@@ -855,16 +793,19 @@ fn main() {
                     } else {
                         let fh = clients[i].file_handle;
                         let inode = clients[i].file_inode;
-                        let mut r = Reader::new(&msg.data[..msg.len]);
-                        let tag = r.read_u8().unwrap_or(0xFF);
-                        match tag {
-                            0 => handle_read(fh, inode, &mut r),
-                            1 => handle_write(fh, inode, &mut r),
-                            2 => {
-                                // Ioctl: files don't support terminal ops
-                                send_file_error(fh, ERR_IO);
+                        match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                            Ok(FileRequest::Read { offset, len }) => {
+                                handle_read(fh, inode, offset, len);
                             }
-                            _ => send_file_error(fh, ERR_IO),
+                            Ok(FileRequest::Write { offset, data }) => {
+                                handle_write(fh, inode, offset, data);
+                            }
+                            Ok(FileRequest::Ioctl { .. }) => {
+                                send_file_error(fh, FsError::Io {});
+                            }
+                            Err(_) => {
+                                send_file_error(fh, FsError::Io {});
+                            }
                         }
                     }
                 } else if ret == 2 {
@@ -936,60 +877,35 @@ fn close_client_full(client: &mut ClientState) {
 }
 
 fn handle_ctl_msg(client: &mut ClientState, msg: &Message) {
-    let mut r = Reader::new(&msg.data[..msg.len]);
-    let tag = match r.read_u8() {
-        Ok(t) => t,
-        Err(_) => {
-            send_error(client.ctl_handle, ERR_IO);
-            return;
-        }
-    };
-
-    match tag {
-        0 => {
-            // Open
-            let flags = match r.read_u8() {
-                Ok(f) => f,
-                Err(_) => { send_error(client.ctl_handle, ERR_IO); return; }
-            };
-            let path = match r.read_str() {
-                Ok(p) => p,
-                Err(_) => { send_error(client.ctl_handle, ERR_INVALID_PATH); return; }
-            };
+    match rvos_wire::from_bytes::<FsRequest>(&msg.data[..msg.len]) {
+        Ok(FsRequest::Open { flags, path }) => {
             let path_bytes = path.as_bytes();
             if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
-                send_error(client.ctl_handle, ERR_INVALID_PATH);
+                send_error(client.ctl_handle, FsError::InvalidPath {});
                 return;
             }
             do_open(client, flags, path_bytes);
         }
-        1 => {
-            // Delete
-            let path = match r.read_str() {
-                Ok(p) => p,
-                Err(_) => { send_error(client.ctl_handle, ERR_INVALID_PATH); return; }
-            };
+        Ok(FsRequest::Delete { path }) => {
             do_delete(client.ctl_handle, path.as_bytes());
         }
-        2 => {
-            // Stat
-            do_stat(client.ctl_handle, &mut r);
+        Ok(FsRequest::Stat { path }) => {
+            do_stat(client.ctl_handle, path);
         }
-        3 => {
-            // Readdir
-            do_readdir(client.ctl_handle, &mut r);
+        Ok(FsRequest::Readdir { path }) => {
+            do_readdir(client.ctl_handle, path);
         }
-        _ => {
-            send_error(client.ctl_handle, ERR_IO);
+        Err(_) => {
+            send_error(client.ctl_handle, FsError::Io {});
         }
     }
 }
 
-fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
-    let create = flags & FLAG_CREATE != 0;
-    let truncate = flags & FLAG_TRUNCATE != 0;
-    let excl = flags & FLAG_EXCL != 0;
-    let append = flags & FLAG_APPEND != 0;
+fn do_open(client: &mut ClientState, flags: OpenFlags, path_bytes: &[u8]) {
+    let create = flags.bits & OpenFlags::CREATE.bits != 0;
+    let truncate = flags.bits & OpenFlags::TRUNCATE.bits != 0;
+    let excl = flags.bits & OpenFlags::EXCL.bits != 0;
+    let append = flags.bits & OpenFlags::APPEND.bits != 0;
 
     let client_handle = client.ctl_handle;
     let fs = fs();
@@ -997,15 +913,15 @@ fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
     let inode_idx = match fs.resolve_path(path_bytes) {
         Some(idx) => {
             if excl && create {
-                send_error(client_handle, ERR_ALREADY_EXISTS);
+                send_error(client_handle, FsError::AlreadyExists {});
                 return;
             }
             if fs.inodes[idx].kind == InodeKind::Dir {
-                send_error(client_handle, ERR_NOT_A_FILE);
+                send_error(client_handle, FsError::NotAFile {});
                 return;
             }
             if truncate && fs.inodes[idx].read_only {
-                send_error(client_handle, ERR_READ_ONLY);
+                send_error(client_handle, FsError::Io {});
                 return;
             }
             if truncate {
@@ -1015,31 +931,31 @@ fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
         }
         None => {
             if !create {
-                send_error(client_handle, ERR_NOT_FOUND);
+                send_error(client_handle, FsError::NotFound {});
                 return;
             }
             // Ensure parent dirs exist (mkdir -p) and get the parent and filename
             let (parent_inode, filename) = match fs.ensure_parent_dirs(path_bytes) {
                 Some(v) => v,
                 None => {
-                    send_error(client_handle, ERR_INVALID_PATH);
+                    send_error(client_handle, FsError::InvalidPath {});
                     return;
                 }
             };
 
             if filename.len() > MAX_NAME_LEN {
-                send_error(client_handle, ERR_INVALID_PATH);
+                send_error(client_handle, FsError::InvalidPath {});
                 return;
             }
 
             // Could already exist after ensure_parent_dirs
             if let Some(idx) = fs.inodes[parent_inode].find_child(filename) {
                 if excl {
-                    send_error(client_handle, ERR_ALREADY_EXISTS);
+                    send_error(client_handle, FsError::AlreadyExists {});
                     return;
                 }
                 if fs.inodes[idx].kind == InodeKind::Dir {
-                    send_error(client_handle, ERR_NOT_A_FILE);
+                    send_error(client_handle, FsError::NotAFile {});
                     return;
                 }
                 if truncate {
@@ -1050,14 +966,14 @@ fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
                 let new_inode = match fs.alloc_inode() {
                     Some(i) => i,
                     None => {
-                        send_error(client_handle, ERR_IO);
+                        send_error(client_handle, FsError::Io {});
                         return;
                     }
                 };
                 fs.inodes[new_inode].init_file();
                 if !fs.inodes[parent_inode].add_child(filename, new_inode) {
                     fs.inodes[new_inode].active = false;
-                    send_error(client_handle, ERR_IO);
+                    send_error(client_handle, FsError::Io {});
                     return;
                 }
                 new_inode
@@ -1074,7 +990,7 @@ fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
     if !fs.register_open_file(my_handle, inode_idx, append) {
         raw::sys_chan_close(my_handle);
         raw::sys_chan_close(client_file_handle);
-        send_error(client_handle, ERR_IO);
+        send_error(client_handle, FsError::Io {});
         return;
     }
 
@@ -1092,12 +1008,12 @@ fn do_open(client: &mut ClientState, flags: u8, path_bytes: &[u8]) {
 
 fn do_delete(client_handle: usize, path_bytes: &[u8]) {
     if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
-        send_error(client_handle, ERR_INVALID_PATH);
+        send_error(client_handle, FsError::InvalidPath {});
         return;
     }
 
     if path_bytes == b"/" {
-        send_error(client_handle, ERR_INVALID_PATH);
+        send_error(client_handle, FsError::InvalidPath {});
         return;
     }
 
@@ -1106,7 +1022,7 @@ fn do_delete(client_handle: usize, path_bytes: &[u8]) {
     let (parent_inode, filename) = match fs.resolve_parent(path_bytes) {
         Some(v) => v,
         None => {
-            send_error(client_handle, ERR_NOT_FOUND);
+            send_error(client_handle, FsError::NotFound {});
             return;
         }
     };
@@ -1114,18 +1030,18 @@ fn do_delete(client_handle: usize, path_bytes: &[u8]) {
     let target_inode = match fs.inodes[parent_inode].find_child(filename) {
         Some(idx) => idx,
         None => {
-            send_error(client_handle, ERR_NOT_FOUND);
+            send_error(client_handle, FsError::NotFound {});
             return;
         }
     };
 
     if fs.inodes[target_inode].kind == InodeKind::Dir && fs.inodes[target_inode].child_count > 0 {
-        send_error(client_handle, ERR_NOT_EMPTY);
+        send_error(client_handle, FsError::NotEmpty {});
         return;
     }
 
     if fs.inodes[target_inode].read_only {
-        send_error(client_handle, ERR_READ_ONLY);
+        send_error(client_handle, FsError::Io {});
         return;
     }
 
@@ -1136,12 +1052,5 @@ fn do_delete(client_handle: usize, path_bytes: &[u8]) {
         fs.inodes[target_inode].active = false;
     }
 
-    let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0); // tag: Ok
-    let _ = w.write_u8(0); // kind: File (dummy)
-    let _ = w.write_u64(0); // size: 0 (dummy)
-    msg.len = w.position();
-    msg.set_cap(NO_CAP);
-    raw::sys_chan_send(client_handle, &msg);
+    send_stat_ok(client_handle, FsEntryKind::File {}, 0);
 }

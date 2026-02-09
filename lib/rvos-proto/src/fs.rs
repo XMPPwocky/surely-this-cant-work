@@ -77,15 +77,27 @@ define_message! {
     }
 }
 
+// ── File offset ─────────────────────────────────────────────────
+
+define_message! {
+    /// How to interpret the file position for a read/write.
+    pub enum FileOffset {
+        /// Use this explicit byte offset.
+        Explicit(0) { offset: u64 },
+        /// Use the server-tracked stream position (e.g. stdio).
+        Stream(1) {},
+    }
+}
+
 // ── Per-file channel requests/responses ──────────────────────────
 
 define_message! {
     /// Requests on a per-file channel.
     pub enum FileRequest<'a> {
-        /// Read up to `len` bytes at `offset`.
-        Read(0) { offset: u64, len: u32 },
-        /// Write `data` at `offset`.
-        Write(1) { offset: u64, data: &'a [u8] },
+        /// Read up to `len` bytes starting at `offset`.
+        Read(0) { offset: FileOffset, len: u32 },
+        /// Write `data` starting at `offset`.
+        Write(1) { offset: FileOffset, data: &'a [u8] },
         /// Terminal ioctl (cmd + arg).
         Ioctl(2) { cmd: u32, arg: u32 },
     }
@@ -124,9 +136,9 @@ define_protocol! {
         type Response<'a> = FileResponse;
 
         /// Read data from offset.
-        rpc read as Read(offset: u64, len: u32) -> FileResponse<'_>;
+        rpc read as Read(offset: FileOffset, len: u32) -> FileResponse<'_>;
         /// Write data at offset.
-        rpc write as Write(offset: u64, data: &[u8]) -> FileResponse<'_>;
+        rpc write as Write(offset: FileOffset, data: &[u8]) -> FileResponse<'_>;
         /// Terminal ioctl.
         rpc ioctl as Ioctl(cmd: u32, arg: u32) -> FileResponse<'_>;
     }

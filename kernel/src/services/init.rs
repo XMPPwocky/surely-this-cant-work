@@ -5,6 +5,7 @@ use crate::mm::heap::{InitAlloc, INIT_ALLOC};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::boot::{BootRequest, BootResponse};
+use rvos_proto::fs::{FsRequest, FsResponse, FileRequest, FileResponse, FileOffset, OpenFlags};
 
 /// Console type for routing stdio requests
 #[derive(Clone, Copy, PartialEq)]
@@ -658,10 +659,11 @@ fn handle_spawn_request(
 
     // Send the initial Stat request
     let mut msg = Message::new();
-    let mut pos = 0;
-    pos = wire_write_u8(&mut msg.data, pos, 2); // tag: Stat
-    pos = wire_write_str(&mut msg.data, pos, path_bytes);
-    msg.len = pos;
+    let path_str = core::str::from_utf8(path_bytes).unwrap_or("");
+    msg.len = rvos_wire::to_bytes(
+        &FsRequest::Stat { path: path_str },
+        &mut msg.data,
+    ).unwrap_or(0);
     msg.sender_pid = my_pid;
     send_and_wake(my_ctl_ep, msg);
 
@@ -823,10 +825,11 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
 
         // Send the initial Stat request
         let mut msg = Message::new();
-        let mut pos = 0;
-        pos = wire_write_u8(&mut msg.data, pos, 2); // tag: Stat
-        pos = wire_write_str(&mut msg.data, pos, path);
-        msg.len = pos;
+        let path_str = core::str::from_utf8(path).unwrap_or("");
+        msg.len = rvos_wire::to_bytes(
+            &FsRequest::Stat { path: path_str },
+            &mut msg.data,
+        ).unwrap_or(0);
         msg.sender_pid = my_pid;
         send_and_wake(my_ctl_ep, msg);
 
@@ -873,27 +876,29 @@ fn poll_fs_launch(
             let (resp, send_wake) = ipc::channel_recv(ctx.ctl_ep);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             if let Some(resp) = resp {
-                let tag = wire_read_u8(&resp.data, 0);
-                if tag != 0 {
-                    crate::println!("[init] fs: stat {} failed", ctx.name());
-                    if ctx.requester_ep != 0 {
-                        send_error(ctx.requester_ep, "not found", my_pid);
+                match rvos_wire::from_bytes::<FsResponse>(&resp.data[..resp.len]) {
+                    Ok(FsResponse::Ok { kind: _, size }) => {
+                        ctx.file_size = size as usize;
                     }
-                    ipc::channel_close(ctx.ctl_ep);
-                    ctx.state = FsLaunchState::Done;
-                    return true;
+                    _ => {
+                        crate::println!("[init] fs: stat {} failed", ctx.name());
+                        if ctx.requester_ep != 0 {
+                            send_error(ctx.requester_ep, "not found", my_pid);
+                        }
+                        ipc::channel_close(ctx.ctl_ep);
+                        ctx.state = FsLaunchState::Done;
+                        return true;
+                    }
                 }
-                // Ok response: u8(0) + u8(kind) + u64(size)
-                ctx.file_size = wire_read_u64(&resp.data, 2) as usize;
                 ctx.data = Vec::with_capacity_in(ctx.file_size, INIT_ALLOC);
 
                 // Send Open request
                 let mut msg = Message::new();
-                let mut pos = 0;
-                pos = wire_write_u8(&mut msg.data, pos, 0); // tag: Open
-                pos = wire_write_u8(&mut msg.data, pos, 0); // flags: 0
-                pos = wire_write_str(&mut msg.data, pos, ctx.path());
-                msg.len = pos;
+                let path_str = core::str::from_utf8(ctx.path()).unwrap_or("");
+                msg.len = rvos_wire::to_bytes(
+                    &FsRequest::Open { flags: OpenFlags::OPEN, path: path_str },
+                    &mut msg.data,
+                ).unwrap_or(0);
                 msg.sender_pid = my_pid;
                 send_and_wake(ctx.ctl_ep, msg);
                 ctx.state = FsLaunchState::WaitOpen;
@@ -912,8 +917,11 @@ fn poll_fs_launch(
             let (resp, send_wake) = ipc::channel_recv(ctx.ctl_ep);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             if let Some(resp) = resp {
-                let tag = wire_read_u8(&resp.data, 0);
-                if tag != 0 || resp.cap_count == 0 || resp.caps[0] == NO_CAP {
+                let is_ok = matches!(
+                    rvos_wire::from_bytes::<FsResponse>(&resp.data[..resp.len]),
+                    Ok(FsResponse::Ok { .. })
+                );
+                if !is_ok || resp.cap_count == 0 || resp.caps[0] == NO_CAP {
                     crate::println!("[init] fs: open {} failed", ctx.name());
                     if ctx.requester_ep != 0 {
                         send_error(ctx.requester_ep, "open failed", my_pid);
@@ -938,12 +946,13 @@ fn poll_fs_launch(
 
                 // Send Read request for the whole file
                 let mut msg = Message::new();
-                let mut pos = 0;
-                pos = wire_write_u8(&mut msg.data, pos, 0); // tag: Read
-                pos = wire_write_u8(&mut msg.data, pos, 0); // offset kind: Explicit
-                pos = wire_write_u64(&mut msg.data, pos, 0); // offset: 0
-                pos = wire_write_u32(&mut msg.data, pos, ctx.file_size as u32);
-                msg.len = pos;
+                msg.len = rvos_wire::to_bytes(
+                    &FileRequest::Read {
+                        offset: FileOffset::Explicit { offset: 0 },
+                        len: ctx.file_size as u32,
+                    },
+                    &mut msg.data,
+                ).unwrap_or(0);
                 msg.sender_pid = my_pid;
                 send_and_wake(ctx.file_ep, msg);
                 ctx.state = FsLaunchState::WaitRead;
@@ -967,31 +976,31 @@ fn poll_fs_launch(
                 match resp {
                     Some(resp) => {
                         progress = true;
-                        if resp.len < 3 {
-                            // Sentinel or malformed — end of data
-                            finish_fs_launch(ctx, my_pid, dyn_spawns);
-                            return true;
-                        }
-                        let tag = wire_read_u8(&resp.data, 0);
-                        if tag == 2 {
-                            // Error response
-                            crate::println!("[init] fs: read {} error", ctx.name());
-                            if ctx.requester_ep != 0 {
-                                send_error(ctx.requester_ep, "read error", my_pid);
+                        match rvos_wire::from_bytes::<FileResponse>(&resp.data[..resp.len]) {
+                            Ok(FileResponse::Data { chunk }) => {
+                                if chunk.is_empty() {
+                                    // Sentinel — all data received
+                                    finish_fs_launch(ctx, my_pid, dyn_spawns);
+                                    return true;
+                                }
+                                ctx.data.extend_from_slice(chunk);
                             }
-                            ipc::channel_close(ctx.file_ep);
-                            ipc::channel_close(ctx.ctl_ep);
-                            ctx.state = FsLaunchState::Done;
-                            return true;
+                            Ok(FileResponse::Error { .. }) => {
+                                crate::println!("[init] fs: read {} error", ctx.name());
+                                if ctx.requester_ep != 0 {
+                                    send_error(ctx.requester_ep, "read error", my_pid);
+                                }
+                                ipc::channel_close(ctx.file_ep);
+                                ipc::channel_close(ctx.ctl_ep);
+                                ctx.state = FsLaunchState::Done;
+                                return true;
+                            }
+                            _ => {
+                                // Malformed or unexpected — treat as end of data
+                                finish_fs_launch(ctx, my_pid, dyn_spawns);
+                                return true;
+                            }
                         }
-                        // Data chunk: u8(0) + u16(len) + bytes
-                        let chunk_len = wire_read_u16(&resp.data, 1) as usize;
-                        if chunk_len == 0 {
-                            // Sentinel — all data received
-                            finish_fs_launch(ctx, my_pid, dyn_spawns);
-                            return true;
-                        }
-                        ctx.data.extend_from_slice(&resp.data[3..3 + chunk_len]);
                     }
                     None => {
                         // Check if the file channel was closed
@@ -1183,10 +1192,10 @@ fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid
 
     let path = b"/bin/shell";
     let mut msg = Message::new();
-    let mut pos = 0;
-    pos = wire_write_u8(&mut msg.data, pos, 2); // tag: Stat
-    pos = wire_write_str(&mut msg.data, pos, path);
-    msg.len = pos;
+    msg.len = rvos_wire::to_bytes(
+        &FsRequest::Stat { path: "/bin/shell" },
+        &mut msg.data,
+    ).unwrap_or(0);
     msg.sender_pid = my_pid;
     send_and_wake(my_ctl_ep, msg);
 
@@ -1221,51 +1230,3 @@ fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid
     crate::println!("[init] Starting GPU shell (loading /bin/shell from fs)");
 }
 
-// --- Wire protocol helpers (manual byte packing for fs protocol — NOT boot channel) ---
-
-/// Write a u16 little-endian length-prefixed string into buf at pos.
-/// Returns the new position.
-fn wire_write_str(buf: &mut [u8], pos: usize, s: &[u8]) -> usize {
-    let len = s.len() as u16;
-    buf[pos] = len as u8;
-    buf[pos + 1] = (len >> 8) as u8;
-    buf[pos + 2..pos + 2 + s.len()].copy_from_slice(s);
-    pos + 2 + s.len()
-}
-
-/// Write a u8 into buf at pos. Returns new position.
-fn wire_write_u8(buf: &mut [u8], pos: usize, v: u8) -> usize {
-    buf[pos] = v;
-    pos + 1
-}
-
-/// Write a u32 little-endian into buf at pos. Returns new position.
-fn wire_write_u32(buf: &mut [u8], pos: usize, v: u32) -> usize {
-    let bytes = v.to_le_bytes();
-    buf[pos..pos + 4].copy_from_slice(&bytes);
-    pos + 4
-}
-
-/// Write a u64 little-endian into buf at pos. Returns new position.
-fn wire_write_u64(buf: &mut [u8], pos: usize, v: u64) -> usize {
-    let bytes = v.to_le_bytes();
-    buf[pos..pos + 8].copy_from_slice(&bytes);
-    pos + 8
-}
-
-/// Read a u8 from buf at pos.
-fn wire_read_u8(buf: &[u8], pos: usize) -> u8 {
-    buf[pos]
-}
-
-/// Read a u16 little-endian from buf at pos.
-fn wire_read_u16(buf: &[u8], pos: usize) -> u16 {
-    u16::from_le_bytes([buf[pos], buf[pos + 1]])
-}
-
-/// Read a u64 little-endian from buf at pos.
-fn wire_read_u64(buf: &[u8], pos: usize) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&buf[pos..pos + 8]);
-    u64::from_le_bytes(bytes)
-}

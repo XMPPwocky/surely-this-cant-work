@@ -3,6 +3,8 @@ extern crate rvos_rt;
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
 use rvos::rvos_wire;
+use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED};
+use rvos_proto::service_control::NewConnection;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
     WindowRequest, WindowServerMsg,
@@ -349,8 +351,6 @@ impl LineDiscipline {
 
 // --- Console client management (FileOps protocol) ---
 
-use rvos_wire::Reader;
-
 const MAX_CONSOLE_CLIENTS: usize = 8;
 /// Console control handle is given as handle 1 by init
 const CONSOLE_CONTROL_HANDLE: usize = 1;
@@ -384,35 +384,27 @@ impl FbconClient {
 /// FileOps response helpers for user-space
 fn fb_send_data(handle: usize, data: &[u8]) {
     for chunk in data.chunks(MAX_DATA_CHUNK) {
-        let msg = Message::build(NO_CAP, |w| {
-            let _ = w.write_u8(0); // tag: Data
-            let _ = w.write_bytes(chunk);
-        });
+        let mut msg = Message::new();
+        msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk }, &mut msg.data).unwrap_or(0);
         raw::sys_chan_send_blocking(handle, &msg);
     }
 }
 
 fn fb_send_sentinel(handle: usize) {
-    let msg = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(0); // tag: Data
-        let _ = w.write_u16(0); // zero-length
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk: &[] }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn fb_send_write_ok(handle: usize, written: u32) {
-    let msg = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(1); // tag: WriteOk
-        let _ = w.write_u32(written);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&FileResponse::WriteOk { written }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn fb_send_ioctl_ok(handle: usize, result: u32) {
-    let msg = Message::build(NO_CAP, |w| {
-        let _ = w.write_u8(3); // tag: IoctlOk
-        let _ = w.write_u32(result);
-    });
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&FileResponse::IoctlOk { result }, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_blocking(handle, &msg);
 }
 
@@ -514,14 +506,9 @@ fn main() {
             handled = true;
             if msg.cap() != NO_CAP {
                 // Parse NewConnection { client_pid: u32, channel_role: u8 }
-                let (pid, role) = if msg.len >= 5 {
-                    let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                    (pid, msg.data[4])
-                } else if msg.len >= 4 {
-                    let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                    (pid, 0u8)
-                } else {
-                    (0, 0u8)
+                let (pid, role) = match rvos_wire::from_bytes::<NewConnection>(&msg.data[..msg.len]) {
+                    Ok(nc) => (nc.client_pid, nc.channel_role),
+                    Err(_) => (0, 0u8),
                 };
 
                 // Find or create client by PID
@@ -617,28 +604,18 @@ fn main() {
                 if ret != 0 { break; }
                 handled = true;
                 if msg.len == 0 { continue; }
-                let mut r = Reader::new(&msg.data[..msg.len]);
-                let tag = r.read_u8().unwrap_or(0xFF);
-                match tag {
-                    0 => {
-                        // FileRequest::Read
-                        let _offset = r.read_u64().unwrap_or(0);
-                        let _len = r.read_u32().unwrap_or(1024);
+                match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                    Ok(FileRequest::Read { offset: _, len: _ }) => {
                         clients[i].has_pending_read = true;
                     }
-                    2 => {
-                        // FileRequest::Ioctl { cmd, arg }
-                        let cmd = r.read_u32().unwrap_or(0);
-                        let _arg = r.read_u32().unwrap_or(0);
+                    Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
                         match cmd {
-                            1 => { line_disc.raw_mode = true; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
-                            2 => { line_disc.raw_mode = false; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
+                            TCRAW => { line_disc.raw_mode = true; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
+                            TCCOOKED => { line_disc.raw_mode = false; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
                             _ => {
-                                let msg = Message::build(NO_CAP, |w| {
-                                    let _ = w.write_u8(2); // Error
-                                    let _ = w.write_u8(7); // IO
-                                });
-                                raw::sys_chan_send_blocking(clients[i].stdin_handle, &msg);
+                                let mut err_msg = Message::new();
+                                err_msg.len = rvos_wire::to_bytes(&FileResponse::Error { code: FsError::Io {} }, &mut err_msg.data).unwrap_or(0);
+                                raw::sys_chan_send_blocking(clients[i].stdin_handle, &err_msg);
                             }
                         }
                     }
@@ -656,14 +633,12 @@ fn main() {
                 if ret != 0 { break; }
                 handled = true;
                 if msg.len == 0 { continue; }
-                let mut r = Reader::new(&msg.data[..msg.len]);
-                let tag = r.read_u8().unwrap_or(0xFF);
-                if tag == 1 {
-                    // FileRequest::Write { offset, data }
-                    let _offset = r.read_u64().unwrap_or(0);
-                    let data = r.read_bytes().unwrap_or(&[]);
-                    console.write_str(data);
-                    fb_send_write_ok(clients[i].stdout_handle, data.len() as u32);
+                match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                    Ok(FileRequest::Write { offset: _, data }) => {
+                        console.write_str(data);
+                        fb_send_write_ok(clients[i].stdout_handle, data.len() as u32);
+                    }
+                    _ => {}
                 }
             }
         }

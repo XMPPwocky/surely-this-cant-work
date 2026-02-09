@@ -276,22 +276,21 @@ fn bench_readdir_large() -> (u64, u32) {
 }
 
 fn bench_process_spawn() -> (u64, u32) {
+    use rvos_proto::boot::{BootRequest, BootResponse};
     let iters = 3u32;
     let start = rdtime();
     for _ in 0..iters {
         let mut msg = Message::new();
-        let mut w = rvos::rvos_wire::Writer::new(&mut msg.data);
-        let _ = w.write_u8(1); // Spawn tag
-        let _ = w.write_str("/bin/hello-std");
-        msg.len = w.position();
+        msg.len = rvos::rvos_wire::to_bytes(
+            &BootRequest::Spawn { path: "/bin/hello-std", args: &[], ns_overrides: &[] },
+            &mut msg.data,
+        ).unwrap_or(0);
         msg.set_cap(NO_CAP);
         raw::sys_chan_send_blocking(0, &msg);
 
         let mut resp = Message::new();
         raw::sys_chan_recv_blocking(0, &mut resp);
-        let mut r = rvos::rvos_wire::Reader::new(&resp.data[..resp.len]);
-        let tag = r.read_u8().unwrap_or(255);
-        if tag == 0 {
+        if let Ok(BootResponse::Ok {}) = rvos::rvos_wire::from_bytes::<BootResponse>(&resp.data[..resp.len]) {
             if resp.cap() != NO_CAP {
                 let mut exit_msg = Message::new();
                 raw::sys_chan_recv_blocking(resp.cap(), &mut exit_msg);

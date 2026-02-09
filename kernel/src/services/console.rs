@@ -1,7 +1,8 @@
 use crate::ipc::{self, Message, MAX_MSG_SIZE};
 use crate::drivers::tty;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use rvos_wire::{Reader, Writer};
+use rvos_proto::service_control::NewConnection;
+use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED};
 
 /// Control endpoint for serial console server (set by kmain before spawn)
 static SERIAL_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -96,10 +97,7 @@ const MAX_DATA_CHUNK: usize = MAX_MSG_SIZE - 3;
 fn send_file_data(ep: usize, data: &[u8], pid: usize) {
     for chunk in data.chunks(MAX_DATA_CHUNK) {
         let mut msg = Message::new();
-        let mut w = Writer::new(&mut msg.data);
-        let _ = w.write_u8(0); // tag: Data
-        let _ = w.write_bytes(chunk);
-        msg.len = w.position();
+        msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk }, &mut msg.data).unwrap_or(0);
         msg.sender_pid = pid;
         let _ = ipc::channel_send_blocking(ep, &msg, pid);
     }
@@ -108,10 +106,7 @@ fn send_file_data(ep: usize, data: &[u8], pid: usize) {
 /// Send FileResponse::Data with empty chunk (EOF sentinel).
 fn send_file_sentinel(ep: usize, pid: usize) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0); // tag: Data
-    let _ = w.write_u16(0); // zero-length payload
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk: &[] }, &mut msg.data).unwrap_or(0);
     msg.sender_pid = pid;
     let _ = ipc::channel_send_blocking(ep, &msg, pid);
 }
@@ -119,10 +114,7 @@ fn send_file_sentinel(ep: usize, pid: usize) {
 /// Send FileResponse::WriteOk { written }.
 fn send_write_ok(ep: usize, written: u32, pid: usize) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(1); // tag: WriteOk
-    let _ = w.write_u32(written);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FileResponse::WriteOk { written }, &mut msg.data).unwrap_or(0);
     msg.sender_pid = pid;
     let _ = ipc::channel_send_blocking(ep, &msg, pid);
 }
@@ -130,10 +122,7 @@ fn send_write_ok(ep: usize, written: u32, pid: usize) {
 /// Send FileResponse::IoctlOk { result }.
 fn send_ioctl_ok(ep: usize, result: u32, pid: usize) {
     let mut msg = Message::new();
-    let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(3); // tag: IoctlOk
-    let _ = w.write_u32(result);
-    msg.len = w.position();
+    msg.len = rvos_wire::to_bytes(&FileResponse::IoctlOk { result }, &mut msg.data).unwrap_or(0);
     msg.sender_pid = pid;
     let _ = ipc::channel_send_blocking(ep, &msg, pid);
 }
@@ -263,14 +252,9 @@ pub fn serial_console_server() {
                     if msg.cap_count > 0 {
                         if let Some(ep) = ipc::decode_cap_channel(msg.caps[0]) {
                             // Parse NewConnection { client_pid, channel_role }
-                            let (client_pid, channel_role) = if msg.len >= 5 {
-                                let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                                (pid, msg.data[4])
-                            } else if msg.len >= 4 {
-                                let pid = u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                                (pid, 0u8)
-                            } else {
-                                (0, 0u8)
+                            let (client_pid, channel_role) = match rvos_wire::from_bytes::<NewConnection>(&msg.data[..msg.len]) {
+                                Ok(nc) => (nc.client_pid, nc.channel_role),
+                                Err(_) => (0, 0u8),
                             };
 
                             if let Some(idx) = find_or_create_client(&mut clients, client_pid) {
@@ -353,43 +337,34 @@ pub fn serial_console_server() {
                     Some(msg) => {
                         handled = true;
                         if msg.len == 0 { continue; }
-                        let mut r = Reader::new(&msg.data[..msg.len]);
-                        let tag = r.read_u8().unwrap_or(0xFF);
-                        match tag {
-                            0 => {
-                                // FileRequest::Read { offset_kind, [offset], len }
-                                let offset_kind = r.read_u8().unwrap_or(1);
-                                if offset_kind == 0 { let _ = r.read_u64(); } // skip explicit offset
-                                let len = r.read_u32().unwrap_or(1024);
+                        match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                            Ok(FileRequest::Read { offset: _, len }) => {
                                 clients[i].has_pending_read = true;
                                 clients[i].pending_read_len = len;
                             }
-                            2 => {
-                                // FileRequest::Ioctl { cmd, arg }
-                                let cmd = r.read_u32().unwrap_or(0);
-                                let _arg = r.read_u32().unwrap_or(0);
+                            Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
                                 match cmd {
-                                    1 => { // TCRAW
+                                    TCRAW => {
                                         raw_mode = true;
                                         send_ioctl_ok(clients[i].stdin_ep, 0, my_pid);
                                     }
-                                    2 => { // TCCOOKED
+                                    TCCOOKED => {
                                         raw_mode = false;
                                         send_ioctl_ok(clients[i].stdin_ep, 0, my_pid);
                                     }
                                     _ => {
                                         // Unknown ioctl — send error
                                         let mut emsg = Message::new();
-                                        let mut w = Writer::new(&mut emsg.data);
-                                        let _ = w.write_u8(2); // tag: Error
-                                        let _ = w.write_u8(7); // IO error
-                                        emsg.len = w.position();
+                                        emsg.len = rvos_wire::to_bytes(
+                                            &FileResponse::Error { code: FsError::Io {} },
+                                            &mut emsg.data,
+                                        ).unwrap_or(0);
                                         emsg.sender_pid = my_pid;
                                         let _ = ipc::channel_send_blocking(clients[i].stdin_ep, &emsg, my_pid);
                                     }
                                 }
                             }
-                            _ => {} // ignore unknown tags
+                            _ => {} // ignore unknown tags / Write on stdin
                         }
                     }
                     None => break,
@@ -407,14 +382,8 @@ pub fn serial_console_server() {
                     Some(msg) => {
                         handled = true;
                         if msg.len == 0 { continue; }
-                        let mut r = Reader::new(&msg.data[..msg.len]);
-                        let tag = r.read_u8().unwrap_or(0xFF);
-                        match tag {
-                            1 => {
-                                // FileRequest::Write { offset_kind, [offset], data }
-                                let offset_kind = r.read_u8().unwrap_or(1);
-                                if offset_kind == 0 { let _ = r.read_u64(); } // skip explicit offset
-                                let data = r.read_bytes().unwrap_or(&[]);
+                        match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                            Ok(FileRequest::Write { offset: _, data }) => {
                                 write_serial(data);
                                 send_write_ok(clients[i].stdout_ep, data.len() as u32, my_pid);
                             }
