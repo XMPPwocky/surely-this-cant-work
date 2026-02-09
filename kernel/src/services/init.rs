@@ -940,6 +940,7 @@ fn poll_fs_launch(
                 let mut msg = Message::new();
                 let mut pos = 0;
                 pos = wire_write_u8(&mut msg.data, pos, 0); // tag: Read
+                pos = wire_write_u8(&mut msg.data, pos, 0); // offset kind: Explicit
                 pos = wire_write_u64(&mut msg.data, pos, 0); // offset: 0
                 pos = wire_write_u32(&mut msg.data, pos, ctx.file_size as u32);
                 msg.len = pos;

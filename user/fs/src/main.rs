@@ -150,6 +150,7 @@ struct OpenFile {
     inode: usize,
     active: bool,
     append: bool,
+    position: usize,
 }
 
 struct Filesystem {
@@ -162,7 +163,7 @@ impl Filesystem {
     fn new() -> Self {
         let mut fs = Filesystem {
             inodes: [const { Inode::new_empty() }; MAX_FILES],
-            open_files: [const { OpenFile { endpoint_handle: 0, inode: 0, active: false, append: false } }; MAX_OPEN_FILES],
+            open_files: [const { OpenFile { endpoint_handle: 0, inode: 0, active: false, append: false, position: 0 } }; MAX_OPEN_FILES],
             open_count: 0,
         };
         // Inode 0 is the root directory
@@ -351,7 +352,7 @@ impl Filesystem {
     fn register_open_file(&mut self, endpoint_handle: usize, inode: usize, append: bool) -> bool {
         for i in 0..MAX_OPEN_FILES {
             if !self.open_files[i].active {
-                self.open_files[i] = OpenFile { endpoint_handle, inode, active: true, append };
+                self.open_files[i] = OpenFile { endpoint_handle, inode, active: true, append, position: 0 };
                 self.open_count += 1;
                 return true;
             }
@@ -366,6 +367,15 @@ impl Filesystem {
             }
         }
         false
+    }
+
+    fn get_open_file_mut(&mut self, endpoint_handle: usize) -> Option<&mut OpenFile> {
+        for i in 0..MAX_OPEN_FILES {
+            if self.open_files[i].active && self.open_files[i].endpoint_handle == endpoint_handle {
+                return Some(&mut self.open_files[i]);
+            }
+        }
+        None
     }
 
     fn close_open_file(&mut self, endpoint_handle: usize) {
@@ -515,12 +525,12 @@ fn fs() -> &'static mut Filesystem {
 }
 
 fn handle_read(file_handle: usize, inode_idx: usize, r: &mut Reader) {
-    let offset = match r.read_u64() {
-        Ok(v) => v as usize,
-        Err(_) => {
-            send_file_error(file_handle, ERR_IO);
-            return;
-        }
+    // Parse offset: kind=0 → Explicit(u64), kind=1 → Stream (server-tracked)
+    let offset_kind = r.read_u8().unwrap_or(1);
+    let explicit_offset = if offset_kind == 0 {
+        Some(r.read_u64().unwrap_or(0) as usize)
+    } else {
+        None
     };
 
     let len = match r.read_u32() {
@@ -532,6 +542,18 @@ fn handle_read(file_handle: usize, inode_idx: usize, r: &mut Reader) {
     };
 
     let fs = fs();
+
+    let offset = match explicit_offset {
+        Some(off) => off,
+        None => {
+            // Stream mode: use server-tracked position
+            match fs.get_open_file_mut(file_handle) {
+                Some(of) => of.position,
+                None => 0,
+            }
+        }
+    };
+
     let inode = &fs.inodes[inode_idx];
 
     if offset >= inode.data_len {
@@ -559,15 +581,22 @@ fn handle_read(file_handle: usize, inode_idx: usize, r: &mut Reader) {
 
     // Send sentinel
     send_data_sentinel(file_handle);
+
+    // Advance server-side position for stream mode
+    if explicit_offset.is_none() {
+        if let Some(of) = fs.get_open_file_mut(file_handle) {
+            of.position = offset + to_send;
+        }
+    }
 }
 
 fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
-    let client_offset = match r.read_u64() {
-        Ok(v) => v as usize,
-        Err(_) => {
-            send_file_error(file_handle, ERR_IO);
-            return;
-        }
+    // Parse offset: kind=0 → Explicit(u64), kind=1 → Stream (server-tracked)
+    let offset_kind = r.read_u8().unwrap_or(1);
+    let explicit_offset = if offset_kind == 0 {
+        Some(r.read_u64().unwrap_or(0) as usize)
+    } else {
+        None
     };
 
     let data = match r.read_bytes() {
@@ -580,10 +609,24 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
 
     let fs = fs();
     let is_append_mode = fs.is_append(file_handle);
-    let inode = &mut fs.inodes[inode_idx];
 
-    // In append mode, always write at the end of the file
-    let offset = if is_append_mode { inode.data_len } else { client_offset };
+    // Resolve offset: append > stream > explicit
+    let offset = if is_append_mode {
+        fs.inodes[inode_idx].data_len
+    } else {
+        match explicit_offset {
+            Some(off) => off,
+            None => {
+                // Stream mode: use server-tracked position
+                match fs.get_open_file_mut(file_handle) {
+                    Some(of) => of.position,
+                    None => 0,
+                }
+            }
+        }
+    };
+
+    let inode = &mut fs.inodes[inode_idx];
 
     if inode.read_only {
         send_file_error(file_handle, ERR_READ_ONLY);
@@ -591,6 +634,7 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
     }
 
     let end = offset + data.len();
+    let written;
     if end > MAX_FILE_SIZE {
         // Truncate to max
         let can_write = if offset < MAX_FILE_SIZE { MAX_FILE_SIZE - offset } else { 0 };
@@ -609,6 +653,7 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
         if offset + can_write > inode.data_len {
             inode.data_len = offset + can_write;
         }
+        written = can_write;
         send_write_ok(file_handle, can_write as u32);
     } else {
         // Zero-fill gap if needed
@@ -621,7 +666,15 @@ fn handle_write(file_handle: usize, inode_idx: usize, r: &mut Reader) {
         if end > inode.data_len {
             inode.data_len = end;
         }
+        written = data.len();
         send_write_ok(file_handle, data.len() as u32);
+    }
+
+    // Advance server-side position for stream mode
+    if explicit_offset.is_none() {
+        if let Some(of) = fs.get_open_file_mut(file_handle) {
+            of.position = offset + written;
+        }
     }
 }
 

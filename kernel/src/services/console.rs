@@ -357,8 +357,9 @@ pub fn serial_console_server() {
                         let tag = r.read_u8().unwrap_or(0xFF);
                         match tag {
                             0 => {
-                                // FileRequest::Read { offset, len }
-                                let _offset = r.read_u64().unwrap_or(0);
+                                // FileRequest::Read { offset_kind, [offset], len }
+                                let offset_kind = r.read_u8().unwrap_or(1);
+                                if offset_kind == 0 { let _ = r.read_u64(); } // skip explicit offset
                                 let len = r.read_u32().unwrap_or(1024);
                                 clients[i].has_pending_read = true;
                                 clients[i].pending_read_len = len;
@@ -410,8 +411,9 @@ pub fn serial_console_server() {
                         let tag = r.read_u8().unwrap_or(0xFF);
                         match tag {
                             1 => {
-                                // FileRequest::Write { offset, data }
-                                let _offset = r.read_u64().unwrap_or(0);
+                                // FileRequest::Write { offset_kind, [offset], data }
+                                let offset_kind = r.read_u8().unwrap_or(1);
+                                if offset_kind == 0 { let _ = r.read_u64(); } // skip explicit offset
                                 let data = r.read_bytes().unwrap_or(&[]);
                                 write_serial(data);
                                 send_write_ok(clients[i].stdout_ep, data.len() as u32, my_pid);
