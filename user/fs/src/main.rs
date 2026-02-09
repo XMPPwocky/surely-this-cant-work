@@ -417,6 +417,8 @@ fn send_ok(handle: usize, cap: usize) {
     let mut msg = Message::new();
     let mut w = Writer::new(&mut msg.data);
     let _ = w.write_u8(0); // tag: Ok
+    let _ = w.write_u8(0); // kind: File (dummy for Open/Delete)
+    let _ = w.write_u64(0); // size: 0 (dummy for Open/Delete)
     msg.len = w.position();
     msg.set_cap(cap);
     raw::sys_chan_send(handle, &msg);
@@ -815,11 +817,15 @@ fn main() {
                 } else if ret == 2 {
                     // Channel closed by peer
                     close_client_file(&mut clients[i]);
+                    // If control channel is also gone, fully clean up
+                    if clients[i].ctl_handle == 0 {
+                        clients[i].active = false;
+                    }
                 }
             }
 
-            // Poll client control channel
-            {
+            // Poll client control channel (skip if already disconnected)
+            if clients[i].ctl_handle != 0 {
                 let mut msg = Message::new();
                 let ret = raw::sys_chan_recv(clients[i].ctl_handle, &mut msg);
                 if ret == 0 {
@@ -844,7 +850,9 @@ fn main() {
             raw::sys_chan_poll_add(CONTROL_HANDLE);
             for i in 0..MAX_CLIENTS {
                 if !clients[i].active { continue; }
-                raw::sys_chan_poll_add(clients[i].ctl_handle);
+                if clients[i].ctl_handle != 0 {
+                    raw::sys_chan_poll_add(clients[i].ctl_handle);
+                }
                 if clients[i].file_handle != 0 {
                     raw::sys_chan_poll_add(clients[i].file_handle);
                 }
@@ -864,9 +872,14 @@ fn close_client_file(client: &mut ClientState) {
 }
 
 fn close_client_full(client: &mut ClientState) {
-    close_client_file(client);
     raw::sys_chan_close(client.ctl_handle);
-    client.active = false;
+    client.ctl_handle = 0;
+    if client.file_handle == 0 {
+        // No open file — fully clean up
+        client.active = false;
+    }
+    // If a file handle is still open, keep client active to serve file I/O.
+    // The client will be fully cleaned up when the file channel also closes.
 }
 
 fn handle_ctl_msg(client: &mut ClientState, msg: &Message) {
@@ -1072,7 +1085,9 @@ fn do_delete(client_handle: usize, path_bytes: &[u8]) {
 
     let mut msg = Message::new();
     let mut w = Writer::new(&mut msg.data);
-    let _ = w.write_u8(0); // Ok
+    let _ = w.write_u8(0); // tag: Ok
+    let _ = w.write_u8(0); // kind: File (dummy)
+    let _ = w.write_u64(0); // size: 0 (dummy)
     msg.len = w.position();
     msg.set_cap(NO_CAP);
     raw::sys_chan_send(client_handle, &msg);

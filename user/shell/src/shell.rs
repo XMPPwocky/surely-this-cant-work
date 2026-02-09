@@ -501,7 +501,11 @@ fn handle_tab(buf: &mut String) {
 
 fn set_raw_mode(enable: bool) {
     io::stdout().flush().ok();
-    rvos::tty::set_raw_mode(enable);
+    let h = std::os::rvos::stdin_handle();
+    if h != 0 {
+        let cmd = if enable { rvos_proto::fs::TCRAW } else { rvos_proto::fs::TCCOOKED };
+        rvos::tty::ioctl(h, cmd, 0);
+    }
 }
 
 // --- Main shell loop ---

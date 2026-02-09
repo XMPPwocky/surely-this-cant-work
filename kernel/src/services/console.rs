@@ -306,19 +306,25 @@ pub fn serial_console_server() {
         let stdin_idx = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
 
         // Process UART input characters
-        loop {
-            let ch = tty::SERIAL_INPUT.lock().pop();
-            match ch {
-                Some(ch) => {
+        if raw_mode {
+            // Raw mode: deliver at most one character per iteration.
+            // Leave remaining characters in the ring buffer so they are
+            // not lost if has_pending_read is false.
+            if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+                if let Some(ch) = tty::SERIAL_INPUT.lock().pop() {
                     handled = true;
-                    if raw_mode {
-                        // Raw mode: no echo, no line discipline, fulfill pending read directly
-                        if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
-                            send_file_data(clients[stdin_idx].stdin_ep, &[ch], my_pid);
-                            send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
-                            clients[stdin_idx].has_pending_read = false;
-                        }
-                    } else {
+                    send_file_data(clients[stdin_idx].stdin_ep, &[ch], my_pid);
+                    send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
+                    clients[stdin_idx].has_pending_read = false;
+                }
+            }
+        } else {
+            // Cooked mode: process all available characters through line discipline
+            loop {
+                let ch = tty::SERIAL_INPUT.lock().pop();
+                match ch {
+                    Some(ch) => {
+                        handled = true;
                         echo_serial(ch);
                         if let Some(len) = line_disc.push_char(ch) {
                             let mut buf = [0u8; LINE_BUF_SIZE];
@@ -332,8 +338,8 @@ pub fn serial_console_server() {
                             }
                         }
                     }
+                    None => break,
                 }
-                None => break,
             }
         }
 
