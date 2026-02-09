@@ -209,16 +209,16 @@ fn checksum(data: &[u8]) -> u32 {
 
 // --- Mode detection ---
 fn main() {
-    // Detect mode by checking handle 2.
+    // Detect mode by checking handle 3.
     //
-    // After std init connects stdio, handle layout is:
-    //   Parent: h0=boot, h1=stdio          (no h2)
-    //   Child:  h0=boot, h1=extra_cap, h2=stdio
+    // After std init connects stdio (separate stdin + stdout handles):
+    //   Parent: h0=boot, h1=stdin, h2=stdout           (no h3)
+    //   Child:  h0=boot, h1=extra_cap, h2=stdin, h3=stdout
     //
-    // So if handle 2 is valid, we're a child (h1 is parent's command channel).
-    // If handle 2 is invalid, we're the parent (h1 is stdio, not a command channel).
+    // So if handle 3 is valid, we're a child (h1 is parent's command channel).
+    // If handle 3 is invalid, we're the parent.
     let mut probe = Message::new();
-    let ret = raw::sys_chan_recv(2, &mut probe);
+    let ret = raw::sys_chan_recv(3, &mut probe);
 
     if ret == usize::MAX {
         run_parent();
