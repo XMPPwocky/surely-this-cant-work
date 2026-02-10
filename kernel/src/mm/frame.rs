@@ -34,18 +34,21 @@ impl FrameAllocator {
     }
 
     fn set_used(&mut self, frame_idx: usize) {
+        assert!(frame_idx < TOTAL_FRAMES, "set_used: frame_idx {} out of range", frame_idx);
         let word = frame_idx / 64;
         let bit = frame_idx % 64;
         self.bitmap[word] |= 1u64 << bit;
     }
 
     fn set_free(&mut self, frame_idx: usize) {
+        assert!(frame_idx < TOTAL_FRAMES, "set_free: frame_idx {} out of range", frame_idx);
         let word = frame_idx / 64;
         let bit = frame_idx % 64;
         self.bitmap[word] &= !(1u64 << bit);
     }
 
     fn is_used(&self, frame_idx: usize) -> bool {
+        assert!(frame_idx < TOTAL_FRAMES, "is_used: frame_idx {} out of range", frame_idx);
         let word = frame_idx / 64;
         let bit = frame_idx % 64;
         (self.bitmap[word] >> bit) & 1 == 1
