@@ -604,9 +604,8 @@ pub fn shm_dec_ref(shm_id: usize) -> bool {
         if !region.active {
             return false;
         }
-        if region.ref_count > 0 {
-            region.ref_count -= 1;
-        }
+        assert!(region.ref_count > 0, "shm_dec_ref: underflow on shm_id {}", shm_id);
+        region.ref_count -= 1;
         if region.ref_count == 0 {
             // Free physical frames
             for i in 0..region.page_count {
