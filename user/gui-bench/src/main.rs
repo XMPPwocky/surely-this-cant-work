@@ -292,6 +292,4 @@ fn main() {
 
     println!();
     println!("=== GUI Benchmark Complete ===");
-
-    raw::sys_shutdown();
 }

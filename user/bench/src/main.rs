@@ -354,6 +354,4 @@ fn main() {
 
     // Cleanup
     let _ = std::fs::remove_file("/tmp/bench");
-
-    raw::sys_shutdown();
 }

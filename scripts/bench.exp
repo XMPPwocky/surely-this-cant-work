@@ -26,5 +26,10 @@ expect {
     timeout { puts "TIMEOUT waiting for benchmarks"; exit 1 }
 }
 
-# QEMU will exit via sys_shutdown
+# Wait for shell prompt, then shut down QEMU
+expect {
+    "rvos>" {}
+    timeout {}
+}
+send "shutdown\r"
 expect eof
