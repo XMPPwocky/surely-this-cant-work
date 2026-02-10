@@ -71,7 +71,7 @@ unsafe impl Send for BuddyAllocator {}
 fn order_for_size(size: usize) -> usize {
     let size = size.max(1 << MIN_ORDER);
     let order = (usize::BITS - (size - 1).leading_zeros()) as usize;
-    order.max(MIN_ORDER).min(MAX_ORDER)
+    order.clamp(MIN_ORDER, MAX_ORDER)
 }
 
 impl BuddyAllocator {
@@ -349,7 +349,7 @@ pub const fn heap_total_size() -> usize {
 pub struct TaggedAlloc<const TAG: u32>;
 
 impl<const TAG: u32> Clone for TaggedAlloc<TAG> {
-    fn clone(&self) -> Self { Self }
+    fn clone(&self) -> Self { *self }
 }
 impl<const TAG: u32> Copy for TaggedAlloc<TAG> {}
 

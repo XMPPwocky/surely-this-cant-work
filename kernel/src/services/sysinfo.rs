@@ -88,15 +88,14 @@ fn format_memstat() -> String {
     let total = heap::heap_total_size();
     let (stats, count, used) = heap::heap_stats();
     let free = total.saturating_sub(used);
-    let pct = if total > 0 { (used * 100) / total } else { 0 };
+    let pct = ((used * 100).checked_div(total)).unwrap_or(0);
 
     let mut out = String::new();
     let _ = writeln!(out, "Kernel heap: {}K total, {}K used ({}%), {}K free",
         total / 1024, used / 1024, pct, free / 1024);
     let _ = writeln!(out, "  Tag     Current    Peak  Allocs");
     let _ = writeln!(out, "  ----  ---------  ------  ------");
-    for i in 0..count {
-        let s = &stats[i];
+    for s in stats.iter().take(count) {
         if s.current_bytes == 0 && s.peak_bytes == 0 && s.alloc_count == 0 {
             continue;
         }

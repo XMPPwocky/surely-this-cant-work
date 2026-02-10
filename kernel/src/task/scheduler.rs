@@ -323,7 +323,7 @@ pub fn schedule() {
             // it keep running.  Otherwise (Blocked/Dead) fall back to idle.
             let still_running = sched.processes[old_pid]
                 .as_ref()
-                .map_or(false, |p| p.state == ProcessState::Running);
+                .is_some_and(|p| p.state == ProcessState::Running);
             if still_running {
                 return;
             }

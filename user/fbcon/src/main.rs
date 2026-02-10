@@ -197,7 +197,7 @@ impl FbConsole {
             }
             2 => {
                 // In CSI: accumulate params and dispatch
-                if ch >= b'0' && ch <= b'9' {
+                if ch.is_ascii_digit() {
                     self.esc_cur_param = self.esc_cur_param * 10 + (ch - b'0') as u32;
                     self.esc_has_digit = true;
                 } else if ch == b';' {
@@ -321,7 +321,7 @@ impl FbConsole {
                 let offset = (y * self.stride + x) as usize;
                 unsafe {
                     let p = self.fb.add(offset);
-                    *p = *p ^ xor;
+                    *p ^= xor;
                 }
             }
         }
@@ -375,7 +375,7 @@ impl LineDiscipline {
                 self.len = 0;
                 Some(result)
             }
-            ch if ch >= 0x20 && ch < 0x7F => {
+            ch if (0x20..0x7F).contains(&ch) => {
                 if self.len < LINE_BUF_SIZE - 1 {
                     self.buf[self.len] = ch;
                     self.len += 1;
@@ -573,13 +573,12 @@ fn main() {
                             shift_pressed = true;
                         } else if let Some(seq) = escape_seq_for_keycode(code) {
                             // Special key: send full escape sequence in raw mode
-                            if line_disc.raw_mode {
-                                if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+                            if line_disc.raw_mode
+                                && stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
                                     fb_send_data(clients[stdin_idx].stdin_handle, seq);
                                     fb_send_sentinel(clients[stdin_idx].stdin_handle);
                                     clients[stdin_idx].has_pending_read = false;
                                 }
-                            }
                             // In cooked mode, arrow keys are ignored
                         } else if code < 128 {
                             let ascii = if shift_pressed {
@@ -612,14 +611,14 @@ fn main() {
 
         // Poll stdin channels for Read/Ioctl requests.
         // Also detect closed channels (ret == 2) for dead client cleanup.
-        for i in 0..MAX_CONSOLE_CLIENTS {
-            if !clients[i].active || clients[i].stdin_handle == usize::MAX { continue; }
+        for (i, client) in clients.iter_mut().enumerate() {
+            if !client.active || client.stdin_handle == usize::MAX { continue; }
             loop {
                 let mut msg = Message::new();
-                let ret = raw::sys_chan_recv(clients[i].stdin_handle, &mut msg);
+                let ret = raw::sys_chan_recv(client.stdin_handle, &mut msg);
                 if ret == 2 {
                     // Channel closed — mark client dead
-                    mark_client_dead(&mut clients[i], &mut stdin_stack, &mut stdin_stack_len, i);
+                    mark_client_dead(client, &mut stdin_stack, &mut stdin_stack_len, i);
                     handled = true;
                     break;
                 }
@@ -628,7 +627,7 @@ fn main() {
                 if msg.len == 0 { continue; }
                 match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
                     Ok(FileRequest::Read { offset: _, len: _ }) => {
-                        clients[i].has_pending_read = true;
+                        client.has_pending_read = true;
                         // Push onto stdin_stack on first Read (lazy)
                         let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == i);
                         if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
@@ -638,12 +637,12 @@ fn main() {
                     }
                     Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
                         match cmd {
-                            TCRAW => { line_disc.raw_mode = true; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
-                            TCCOOKED => { line_disc.raw_mode = false; fb_send_ioctl_ok(clients[i].stdin_handle, 0); }
+                            TCRAW => { line_disc.raw_mode = true; fb_send_ioctl_ok(client.stdin_handle, 0); }
+                            TCCOOKED => { line_disc.raw_mode = false; fb_send_ioctl_ok(client.stdin_handle, 0); }
                             _ => {
                                 let mut err_msg = Message::new();
                                 err_msg.len = rvos_wire::to_bytes(&FileResponse::Error { code: FsError::Io {} }, &mut err_msg.data).unwrap_or(0);
-                                raw::sys_chan_send_blocking(clients[i].stdin_handle, &err_msg);
+                                raw::sys_chan_send_blocking(client.stdin_handle, &err_msg);
                             }
                         }
                     }
@@ -653,25 +652,22 @@ fn main() {
         }
 
         // Poll stdout channels for Write requests.
-        for i in 0..MAX_CONSOLE_CLIENTS {
-            if !clients[i].active || clients[i].stdout_handle == usize::MAX { continue; }
+        for (i, client) in clients.iter_mut().enumerate() {
+            if !client.active || client.stdout_handle == usize::MAX { continue; }
             loop {
                 let mut msg = Message::new();
-                let ret = raw::sys_chan_recv(clients[i].stdout_handle, &mut msg);
+                let ret = raw::sys_chan_recv(client.stdout_handle, &mut msg);
                 if ret == 2 {
-                    mark_client_dead(&mut clients[i], &mut stdin_stack, &mut stdin_stack_len, i);
+                    mark_client_dead(client, &mut stdin_stack, &mut stdin_stack_len, i);
                     handled = true;
                     break;
                 }
                 if ret != 0 { break; }
                 handled = true;
                 if msg.len == 0 { continue; }
-                match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
-                    Ok(FileRequest::Write { offset: _, data }) => {
-                        console.write_str(data);
-                        fb_send_write_ok(clients[i].stdout_handle, data.len() as u32);
-                    }
-                    _ => {}
+                if let Ok(FileRequest::Write { offset: _, data }) = rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                    console.write_str(data);
+                    fb_send_write_ok(client.stdout_handle, data.len() as u32);
                 }
             }
         }
@@ -690,10 +686,10 @@ fn main() {
             // Register interest on all channels then block
             raw::sys_chan_poll_add(req_chan);
             raw::sys_chan_poll_add(event_chan);
-            for i in 0..MAX_CONSOLE_CLIENTS {
-                if !clients[i].active { continue; }
-                if clients[i].stdin_handle != usize::MAX { raw::sys_chan_poll_add(clients[i].stdin_handle); }
-                if clients[i].stdout_handle != usize::MAX { raw::sys_chan_poll_add(clients[i].stdout_handle); }
+            for client in clients.iter() {
+                if !client.active { continue; }
+                if client.stdin_handle != usize::MAX { raw::sys_chan_poll_add(client.stdin_handle); }
+                if client.stdout_handle != usize::MAX { raw::sys_chan_poll_add(client.stdout_handle); }
             }
             raw::sys_block();
         }

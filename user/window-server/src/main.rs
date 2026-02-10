@@ -35,6 +35,14 @@ const TABLET_MAX: u32 = 32767;
 // Background color (dark gray)
 const BG_COLOR: u32 = 0xFF333333;
 
+/// Raw display surface: pointer + dimensions.
+struct Display {
+    ptr: *mut u32,
+    w: usize,
+    h: usize,
+    stride: usize,
+}
+
 // Window decoration constants
 const TITLE_BAR_HEIGHT: i32 = 24;
 const TITLE_BAR_FOCUSED: u32 = 0xFF2266AA;
@@ -690,17 +698,19 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
 }
 
 fn composite(server: &mut Server) {
-    let fb = server.display_fb;
-    let dw = server.display_width as usize;
-    let dh = server.display_height as usize;
-    let ds = server.display_stride as usize;
+    let disp = Display {
+        ptr: server.display_fb,
+        w: server.display_width as usize,
+        h: server.display_height as usize,
+        stride: server.display_stride as usize,
+    };
 
     // 1. Clear to background color
     unsafe {
-        for row in 0..dh {
-            let row_start = row * ds;
-            for col in 0..dw {
-                *fb.add(row_start + col) = BG_COLOR;
+        for row in 0..disp.h {
+            let row_start = row * disp.stride;
+            for col in 0..disp.w {
+                *disp.ptr.add(row_start + col) = BG_COLOR;
             }
         }
     }
@@ -717,12 +727,12 @@ fn composite(server: &mut Server) {
                 if !win.active || win.fb_ptr.is_null() { continue; }
 
                 if win.fullscreen {
-                    blit_window_at(fb, dw, dh, ds, win, win.x, win.y);
+                    blit_window_at(&disp, win, win.x, win.y);
                 } else {
                     // Blit content shifted down by title bar height
-                    blit_window_at(fb, dw, dh, ds, win, win.x, win.y + TITLE_BAR_HEIGHT);
+                    blit_window_at(&disp, win, win.x, win.y + TITLE_BAR_HEIGHT);
                     // Draw decorations
-                    draw_decorations(fb, dw, dh, ds, win, is_fg);
+                    draw_decorations(&disp, win, is_fg);
                 }
                 win.dirty = false;
             }
@@ -731,12 +741,12 @@ fn composite(server: &mut Server) {
 
     // 3. Draw cursor
     if server.cursor_visible {
-        draw_cursor(fb, dw, dh, ds, server.cursor_x, server.cursor_y);
+        draw_cursor(&disp, server.cursor_x, server.cursor_y);
     }
 }
 
 /// Blit a window's front buffer at the given display position with clipping.
-fn blit_window_at(display: *mut u32, dw: usize, dh: usize, ds: usize, win: &Window, dx: i32, dy: i32) {
+fn blit_window_at(disp: &Display, win: &Window, dx: i32, dy: i32) {
     let ww = win.width as i32;
     let wh = win.height as i32;
     let ws = win.stride as usize;
@@ -747,8 +757,8 @@ fn blit_window_at(display: *mut u32, dw: usize, dh: usize, ds: usize, win: &Wind
     let src_y0 = if dy < 0 { (-dy) as usize } else { 0 };
     let dst_x0 = dx.max(0) as usize;
     let dst_y0 = dy.max(0) as usize;
-    let dst_x1 = ((dx + ww) as usize).min(dw);
-    let dst_y1 = ((dy + wh) as usize).min(dh);
+    let dst_x1 = ((dx + ww) as usize).min(disp.w);
+    let dst_y1 = ((dy + wh) as usize).min(disp.h);
 
     if dst_x0 >= dst_x1 || dst_y0 >= dst_y1 { return; }
 
@@ -759,14 +769,14 @@ fn blit_window_at(display: *mut u32, dw: usize, dh: usize, ds: usize, win: &Wind
             let src_row = src_y0 + row;
             let dst_row = dst_y0 + row;
             let src_ptr = win.fb_ptr.add(front_offset + src_row * ws + src_x0);
-            let dst_ptr = display.add(dst_row * ds + dst_x0);
+            let dst_ptr = disp.ptr.add(dst_row * disp.stride + dst_x0);
             core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_w);
         }
     }
 }
 
 /// Draw window decorations (title bar, close button, border) directly on display fb.
-fn draw_decorations(display: *mut u32, dw: usize, dh: usize, ds: usize, win: &Window, focused: bool) {
+fn draw_decorations(disp: &Display, win: &Window, focused: bool) {
     let wx = win.x;
     let wy = win.y;
     let ww = win.width as i32;
@@ -777,12 +787,12 @@ fn draw_decorations(display: *mut u32, dw: usize, dh: usize, ds: usize, win: &Wi
     // Draw title bar background
     for row in 0..TITLE_BAR_HEIGHT {
         let dy = wy + row;
-        if dy < 0 || dy >= dh as i32 { continue; }
+        if dy < 0 || dy >= disp.h as i32 { continue; }
         let x0 = wx.max(0) as usize;
-        let x1 = ((wx + ww) as usize).min(dw);
+        let x1 = ((wx + ww) as usize).min(disp.w);
         unsafe {
             for col in x0..x1 {
-                *display.add(dy as usize * ds + col) = title_color;
+                *disp.ptr.add(dy as usize * disp.stride + col) = title_color;
             }
         }
     }
@@ -790,7 +800,7 @@ fn draw_decorations(display: *mut u32, dw: usize, dh: usize, ds: usize, win: &Wi
     // Draw title text centered vertically in title bar
     let title_y = wy + (TITLE_BAR_HEIGHT - GLYPH_HEIGHT as i32) / 2;
     let title_x = wx + 6;
-    if title_y >= 0 && title_y < dh as i32 && title_x >= 0 {
+    if title_y >= 0 && title_y < disp.h as i32 && title_x >= 0 {
         // Build "Window N" title
         let mut title_buf = [0u8; 12];
         title_buf[0] = b'W';
@@ -801,48 +811,48 @@ fn draw_decorations(display: *mut u32, dw: usize, dh: usize, ds: usize, win: &Wi
         if id >= 10 {
             title_buf[4] = b'0' + ((id / 10) % 10) as u8;
             title_buf[5] = b'0' + (id % 10) as u8;
-            draw_title_text(display, dw, dh, ds, title_x, title_y, &title_buf[..6]);
+            draw_title_text(disp, title_x, title_y, &title_buf[..6]);
         } else {
             title_buf[4] = b'0' + (id % 10) as u8;
-            draw_title_text(display, dw, dh, ds, title_x, title_y, &title_buf[..5]);
+            draw_title_text(disp, title_x, title_y, &title_buf[..5]);
         }
     }
 
     // Draw close button (top-right of title bar)
     let close_x = wx + ww - CLOSE_BTN_SIZE - 4;
     let close_y = wy + (TITLE_BAR_HEIGHT - CLOSE_BTN_SIZE) / 2;
-    draw_close_button(display, dw, dh, ds, close_x, close_y);
+    draw_close_button(disp, close_x, close_y);
 
     // Draw 1px border around entire decorated window
     // Top
-    draw_hline(display, dw, dh, ds, wx, wy, ww, BORDER_COLOR);
+    draw_hline(disp, wx, wy, ww, BORDER_COLOR);
     // Bottom
-    draw_hline(display, dw, dh, ds, wx, wy + total_h - 1, ww, BORDER_COLOR);
+    draw_hline(disp, wx, wy + total_h - 1, ww, BORDER_COLOR);
     // Left
-    draw_vline(display, dw, dh, ds, wx, wy, total_h, BORDER_COLOR);
+    draw_vline(disp, wx, wy, total_h, BORDER_COLOR);
     // Right
-    draw_vline(display, dw, dh, ds, wx + ww - 1, wy, total_h, BORDER_COLOR);
+    draw_vline(disp, wx + ww - 1, wy, total_h, BORDER_COLOR);
 }
 
-fn draw_title_text(display: *mut u32, dw: usize, dh: usize, ds: usize, x: i32, y: i32, text_bytes: &[u8]) {
-    if y < 0 || y + GLYPH_HEIGHT as i32 > dh as i32 || x < 0 { return; }
+fn draw_title_text(disp: &Display, x: i32, y: i32, text_bytes: &[u8]) {
+    if y < 0 || y + GLYPH_HEIGHT as i32 > disp.h as i32 || x < 0 { return; }
     // Create a temporary framebuffer view over the display
-    let total = ds * dh;
-    let fb_slice = unsafe { core::slice::from_raw_parts_mut(display, total) };
-    let mut fb = Framebuffer::new(fb_slice, dw as u32, dh as u32, ds as u32);
+    let total = disp.stride * disp.h;
+    let fb_slice = unsafe { core::slice::from_raw_parts_mut(disp.ptr, total) };
+    let mut fb = Framebuffer::new(fb_slice, disp.w as u32, disp.h as u32, disp.stride as u32);
     text::draw_str_no_bg(&mut fb, x as u32, y as u32, text_bytes, 0xFFFFFFFF);
 }
 
-fn draw_close_button(display: *mut u32, dw: usize, dh: usize, ds: usize, bx: i32, by: i32) {
+fn draw_close_button(disp: &Display, bx: i32, by: i32) {
     // Red background
     for row in 0..CLOSE_BTN_SIZE {
         let dy = by + row;
-        if dy < 0 || dy >= dh as i32 { continue; }
+        if dy < 0 || dy >= disp.h as i32 { continue; }
         for col in 0..CLOSE_BTN_SIZE {
             let dx = bx + col;
-            if dx < 0 || dx >= dw as i32 { continue; }
+            if dx < 0 || dx >= disp.w as i32 { continue; }
             unsafe {
-                *display.add(dy as usize * ds + dx as usize) = CLOSE_BTN_BG;
+                *disp.ptr.add(dy as usize * disp.stride + dx as usize) = CLOSE_BTN_BG;
             }
         }
     }
@@ -853,50 +863,49 @@ fn draw_close_button(display: *mut u32, dw: usize, dh: usize, ds: usize, bx: i32
         // Diagonal \
         let x1 = bx + inset + i;
         let y1 = by + inset + i;
-        if x1 >= 0 && x1 < dw as i32 && y1 >= 0 && y1 < dh as i32 {
-            unsafe { *display.add(y1 as usize * ds + x1 as usize) = CLOSE_BTN_FG; }
+        if x1 >= 0 && x1 < disp.w as i32 && y1 >= 0 && y1 < disp.h as i32 {
+            unsafe { *disp.ptr.add(y1 as usize * disp.stride + x1 as usize) = CLOSE_BTN_FG; }
         }
         // Diagonal /
         let x2 = bx + CLOSE_BTN_SIZE - 1 - inset - i;
-        if x2 >= 0 && x2 < dw as i32 && y1 >= 0 && y1 < dh as i32 {
-            unsafe { *display.add(y1 as usize * ds + x2 as usize) = CLOSE_BTN_FG; }
+        if x2 >= 0 && x2 < disp.w as i32 && y1 >= 0 && y1 < disp.h as i32 {
+            unsafe { *disp.ptr.add(y1 as usize * disp.stride + x2 as usize) = CLOSE_BTN_FG; }
         }
     }
 }
 
-fn draw_hline(display: *mut u32, dw: usize, dh: usize, ds: usize, x: i32, y: i32, w: i32, color: u32) {
-    if y < 0 || y >= dh as i32 { return; }
+fn draw_hline(disp: &Display, x: i32, y: i32, w: i32, color: u32) {
+    if y < 0 || y >= disp.h as i32 { return; }
     let x0 = x.max(0) as usize;
-    let x1 = ((x + w) as usize).min(dw);
+    let x1 = ((x + w) as usize).min(disp.w);
     unsafe {
         for col in x0..x1 {
-            *display.add(y as usize * ds + col) = color;
+            *disp.ptr.add(y as usize * disp.stride + col) = color;
         }
     }
 }
 
-fn draw_vline(display: *mut u32, dw: usize, dh: usize, ds: usize, x: i32, y: i32, h: i32, color: u32) {
-    if x < 0 || x >= dw as i32 { return; }
+fn draw_vline(disp: &Display, x: i32, y: i32, h: i32, color: u32) {
+    if x < 0 || x >= disp.w as i32 { return; }
     let y0 = y.max(0) as usize;
-    let y1 = ((y + h) as usize).min(dh);
+    let y1 = ((y + h) as usize).min(disp.h);
     unsafe {
         for row in y0..y1 {
-            *display.add(row * ds + x as usize) = color;
+            *disp.ptr.add(row * disp.stride + x as usize) = color;
         }
     }
 }
 
-fn draw_cursor(display: *mut u32, dw: usize, dh: usize, ds: usize, cx: i32, cy: i32) {
-    for row in 0..CURSOR_H {
+fn draw_cursor(disp: &Display, cx: i32, cy: i32) {
+    for (row, &bits) in CURSOR_BITMAP.iter().enumerate() {
         let dy = cy + row as i32;
-        if dy < 0 || dy >= dh as i32 { continue; }
-        let bits = CURSOR_BITMAP[row];
+        if dy < 0 || dy >= disp.h as i32 { continue; }
         for col in 0..CURSOR_W {
             let dx = cx + col as i32;
-            if dx < 0 || dx >= dw as i32 { continue; }
+            if dx < 0 || dx >= disp.w as i32 { continue; }
             if bits & (1 << (15 - col)) != 0 {
                 unsafe {
-                    *display.add(dy as usize * ds + dx as usize) = 0xFFFFFFFF;
+                    *disp.ptr.add(dy as usize * disp.stride + dx as usize) = 0xFFFFFFFF;
                 }
             }
         }

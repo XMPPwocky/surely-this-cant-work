@@ -255,8 +255,8 @@ fn cmd_run(args: &str) {
     }
 
     // Check for trailing '&' (background execution)
-    let (args_str, background) = if args_str.ends_with('&') {
-        (args_str[..args_str.len() - 1].trim(), true)
+    let (args_str, background) = if let Some(stripped) = args_str.strip_suffix('&') {
+        (stripped.trim(), true)
     } else {
         (args_str, false)
     };
@@ -421,9 +421,9 @@ fn try_complete(line: &str) -> Completion {
 
         let (dir, fname_prefix) = if prefix.is_empty() {
             (default_dir, "")
-        } else if prefix.starts_with('/') {
+        } else if let Some(stripped) = prefix.strip_prefix('/') {
             match prefix.rfind('/') {
-                Some(0) => ("/", &prefix[1..]),
+                Some(0) => ("/", stripped),
                 Some(pos) => (&prefix[..pos], &prefix[pos + 1..]),
                 None => (default_dir, prefix),
             }
@@ -704,7 +704,7 @@ impl LineEditor {
 
     fn history_next(&mut self, history: &HistoryRing) {
         match self.hist_index {
-            None => return,
+            None => (),
             Some(0) => {
                 // Restore the saved original line
                 self.hist_index = None;
@@ -919,7 +919,7 @@ pub fn run() {
                                 io::stdout().flush().ok();
                                 break;
                             }
-                            c if c >= 0x20 && c < 0x7F => {
+                            c if (0x20..0x7F).contains(&c) => {
                                 editor.search_push_char(c, &history);
                             }
                             _ => {}
@@ -947,7 +947,7 @@ pub fn run() {
                                 editor.clear();
                                 break;
                             }
-                            c if c >= 0x20 && c < 0x7F => {
+                            c if (0x20..0x7F).contains(&c) => {
                                 editor.insert_char(c);
                             }
                             _ => {}
@@ -970,7 +970,7 @@ pub fn run() {
                     }
                 }
                 EscState::Csi => {
-                    if ch >= b'0' && ch <= b'9' {
+                    if ch.is_ascii_digit() {
                         csi_param = csi_param * 10 + (ch - b'0') as u32;
                         continue;
                     }
@@ -1029,27 +1029,27 @@ pub fn run() {
             "ps" => cmd_ps(),
             "mem" => cmd_mem(),
             "trace" => {
-                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 cmd_trace(args);
             }
             "cat" | "read" => {
-                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 cmd_cat(args);
             }
             "write" => {
-                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 cmd_write(args);
             }
             "ls" => {
-                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 cmd_ls(args);
             }
             "stat" => {
-                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 cmd_stat(args);
             }
             "run" => {
-                let args = line.splitn(2, ' ').nth(1).unwrap_or("");
+                let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 cmd_run(args);
             }
             "help" => cmd_help(),

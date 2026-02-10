@@ -1,4 +1,4 @@
-/// Split virtqueue implementation for VirtIO.
+//! Split virtqueue implementation for VirtIO.
 
 use core::sync::atomic::{fence, Ordering};
 use crate::mm::frame;

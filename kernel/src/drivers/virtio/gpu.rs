@@ -1,7 +1,7 @@
-/// VirtIO GPU driver.
-///
-/// Implements a minimal VirtIO GPU driver that sets up a 2D framebuffer
-/// and provides `flush()` to update the display.
+//! VirtIO GPU driver.
+//!
+//! Implements a minimal VirtIO GPU driver that sets up a 2D framebuffer
+//! and provides `flush()` to update the display.
 
 use crate::mm::address::PAGE_SIZE;
 use super::mmio;
@@ -219,7 +219,7 @@ pub fn init() -> bool {
 
     // 2. Allocate framebuffer
     let fb_bytes = (width as usize) * (height as usize) * 4;
-    let fb_pages = (fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    let fb_pages = fb_bytes.div_ceil(PAGE_SIZE);
     let fb_addr = alloc_dma_buffer(fb_pages);
     gpu.fb_addr = fb_addr;
     crate::println!("[gpu] FB alloc: {:#x}..{:#x} ({} pages)", fb_addr, fb_addr + fb_pages * PAGE_SIZE, fb_pages);
@@ -411,7 +411,7 @@ pub fn framebuffer_phys() -> Option<(crate::mm::address::PhysPageNum, usize)> {
         let ptr = core::ptr::addr_of!(GPU);
         (*ptr).as_ref().map(|gpu| {
             let fb_bytes = (gpu.width as usize) * (gpu.height as usize) * 4;
-            let pages = (fb_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+            let pages = fb_bytes.div_ceil(PAGE_SIZE);
             (crate::mm::address::PhysPageNum(gpu.fb_addr / PAGE_SIZE), pages)
         })
     }

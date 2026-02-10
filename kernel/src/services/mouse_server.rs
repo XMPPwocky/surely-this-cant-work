@@ -1,7 +1,7 @@
-/// Mouse IPC server — kernel task that wraps VirtIO tablet/mouse.
-///
-/// Registers as the "mouse" service. A single client (the window server)
-/// connects and receives raw mouse events (move + button press/release).
+//! Mouse IPC server — kernel task that wraps VirtIO tablet/mouse.
+//!
+//! Registers as the "mouse" service. A single client (the window server)
+//! connects and receives raw mouse events (move + button press/release).
 
 use crate::ipc::{self, Message};
 use crate::drivers::tty;

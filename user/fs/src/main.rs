@@ -160,12 +160,7 @@ impl Filesystem {
     }
 
     fn alloc_inode(&mut self) -> Option<usize> {
-        for i in 1..MAX_FILES {
-            if !self.inodes[i].active {
-                return Some(i);
-            }
-        }
-        None
+        (1..MAX_FILES).find(|&i| !self.inodes[i].active)
     }
 
     /// Resolve a path to an inode index. Returns None if not found.
@@ -211,8 +206,8 @@ impl Filesystem {
 
         // Find last '/'
         let mut last_slash = None;
-        for i in 0..path.len() {
-            if path[i] == b'/' {
+        for (i, &byte) in path.iter().enumerate() {
+            if byte == b'/' {
                 last_slash = Some(i);
             }
         }
@@ -267,21 +262,19 @@ impl Filesystem {
             let mut start = 0;
             for i in 0..path.len() {
                 if path[i] == b'/' {
-                    if i > start {
-                        if comp_count < 16 {
+                    if i > start
+                        && comp_count < 16 {
                             components[comp_count] = (&path[start..i], start, i);
                             comp_count += 1;
                         }
-                    }
                     start = i + 1;
                 }
             }
-            if start < path.len() {
-                if comp_count < 16 {
+            if start < path.len()
+                && comp_count < 16 {
                     components[comp_count] = (&path[start..], start, path.len());
                     comp_count += 1;
                 }
-            }
         }
 
         if comp_count == 0 {
@@ -292,8 +285,8 @@ impl Filesystem {
 
         // Create directories for all but the last component
         let mut current = 0usize; // root
-        for i in 0..comp_count - 1 {
-            let name = components[i].0;
+        for comp in components[..comp_count - 1].iter() {
+            let name = comp.0;
             if name.is_empty() {
                 continue;
             }
@@ -579,7 +572,7 @@ fn handle_write(file_handle: usize, inode_idx: usize, offset: FileOffset, data: 
     let written;
     if end > MAX_FILE_SIZE {
         // Truncate to max
-        let can_write = if offset < MAX_FILE_SIZE { MAX_FILE_SIZE - offset } else { 0 };
+        let can_write = MAX_FILE_SIZE.saturating_sub(offset);
         if can_write == 0 {
             send_file_error(file_handle, FsError::Io {});
             return;
@@ -789,20 +782,20 @@ fn main() {
         }
 
         // Poll each active client
-        for i in 0..MAX_CLIENTS {
-            if !clients[i].active { continue; }
+        for client in clients.iter_mut() {
+            if !client.active { continue; }
 
             // If a file channel is open, poll it
-            if clients[i].file_handle != 0 {
+            if client.file_handle != 0 {
                 let mut msg = Message::new();
-                let ret = raw::sys_chan_recv(clients[i].file_handle, &mut msg);
+                let ret = raw::sys_chan_recv(client.file_handle, &mut msg);
                 if ret == 0 {
                     handled = true;
                     if msg.len == 0 {
-                        close_client_file(&mut clients[i]);
+                        close_client_file(client);
                     } else {
-                        let fh = clients[i].file_handle;
-                        let inode = clients[i].file_inode;
+                        let fh = client.file_handle;
+                        let inode = client.file_inode;
                         match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
                             Ok(FileRequest::Read { offset, len }) => {
                                 handle_read(fh, inode, offset, len);
@@ -820,28 +813,28 @@ fn main() {
                     }
                 } else if ret == 2 {
                     // Channel closed by peer
-                    close_client_file(&mut clients[i]);
+                    close_client_file(client);
                     // If control channel is also gone, fully clean up
-                    if clients[i].ctl_handle == 0 {
-                        clients[i].active = false;
+                    if client.ctl_handle == 0 {
+                        client.active = false;
                     }
                 }
             }
 
             // Poll client control channel (skip if already disconnected)
-            if clients[i].ctl_handle != 0 {
+            if client.ctl_handle != 0 {
                 let mut msg = Message::new();
-                let ret = raw::sys_chan_recv(clients[i].ctl_handle, &mut msg);
+                let ret = raw::sys_chan_recv(client.ctl_handle, &mut msg);
                 if ret == 0 {
                     handled = true;
                     if msg.len == 0 {
-                        close_client_full(&mut clients[i]);
+                        close_client_full(client);
                     } else {
-                        handle_ctl_msg(&mut clients[i], &msg);
+                        handle_ctl_msg(client, &msg);
                     }
                 } else if ret == 2 {
                     // Client disconnected
-                    close_client_full(&mut clients[i]);
+                    close_client_full(client);
                 }
             }
         }
@@ -852,13 +845,13 @@ fn main() {
             // polling (sys_yield) and lets the scheduler skip us entirely
             // when there's nothing to do.
             raw::sys_chan_poll_add(CONTROL_HANDLE);
-            for i in 0..MAX_CLIENTS {
-                if !clients[i].active { continue; }
-                if clients[i].ctl_handle != 0 {
-                    raw::sys_chan_poll_add(clients[i].ctl_handle);
+            for client in clients.iter() {
+                if !client.active { continue; }
+                if client.ctl_handle != 0 {
+                    raw::sys_chan_poll_add(client.ctl_handle);
                 }
-                if clients[i].file_handle != 0 {
-                    raw::sys_chan_poll_add(clients[i].file_handle);
+                if client.file_handle != 0 {
+                    raw::sys_chan_poll_add(client.file_handle);
                 }
             }
             raw::sys_block();

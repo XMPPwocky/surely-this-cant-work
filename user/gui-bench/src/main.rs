@@ -60,8 +60,8 @@ fn print_result(name: &str, iters: u32, total_us: u64, per_us: u64, fill_us: u64
     print!("us  swap=");
     print_u64(swap_us);
     print!("us  fps=");
-    if total_us > 0 {
-        print_u64((iters as u64 * 1_000_000) / total_us);
+    if let Some(fps) = (iters as u64 * 1_000_000).checked_div(total_us) {
+        print_u64(fps);
     } else {
         print!("inf");
     }
@@ -149,7 +149,7 @@ fn bench_small_fill_swap() {
 
     for i in 0..iters {
         let off = if back == 0 { 0 } else { ctx.pixels_per_buffer };
-        let color = 0xFF000000 | ((i * 4) as u32);
+        let color = 0xFF000000 | (i * 4);
 
         let t0 = rdtime();
         fill_solid(ctx.fb_base, off, ctx.pixels_per_buffer, color);
@@ -193,7 +193,7 @@ fn bench_fullscreen_fill_swap() {
 
     for i in 0..iters {
         let off = if back == 0 { 0 } else { ctx.pixels_per_buffer };
-        let color = 0xFF000000 | (((i * 8) & 0xFF) as u32);
+        let color = 0xFF000000 | ((i * 8) & 0xFF);
 
         let t0 = rdtime();
         fill_solid(ctx.fb_base, off, ctx.pixels_per_buffer, color);

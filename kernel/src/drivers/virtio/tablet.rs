@@ -1,8 +1,8 @@
-/// VirtIO Tablet (absolute pointer) driver.
-///
-/// Implements a VirtIO input device driver for virtio-tablet-device.
-/// Uses eventq (queue 0) to receive input events from QEMU.
-/// Tablet provides absolute coordinates (0..32767) instead of relative deltas.
+//! VirtIO Tablet (absolute pointer) driver.
+//!
+//! Implements a VirtIO input device driver for virtio-tablet-device.
+//! Uses eventq (queue 0) to receive input events from QEMU.
+//! Tablet provides absolute coordinates (0..32767) instead of relative deltas.
 
 use super::mmio;
 use super::queue::{Virtqueue, VIRTQ_DESC_F_WRITE, QUEUE_SIZE, alloc_dma_buffer};

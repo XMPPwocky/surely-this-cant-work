@@ -52,6 +52,8 @@ fn main() {
 
     println!("[winclient] window ready ({}x{}, stride={})", width, height, stride);
 
+    let fb = Framebuf { base: fb_base, pixels_per_buffer, stride, width, height };
+
     let mut current_back = 1u8;
     let mut swap_seq: u32 = 10;
     let mut color_idx: u8 = 0;
@@ -82,8 +84,7 @@ fn main() {
                         // Left click: draw a dot
                         mouse_down = true;
                         let color = palette(color_idx);
-                        draw_dot(fb_base, pixels_per_buffer,
-                                 stride, width, height, x, y, 6, color);
+                        draw_dot(&fb, x, y, 6, color);
                         need_present = true;
                     } else if button == 1 {
                         // Right click: clear canvas and cycle color
@@ -103,12 +104,10 @@ fn main() {
                     if mouse_down {
                         // Draw while dragging
                         let color = palette(color_idx);
-                        draw_dot(fb_base, pixels_per_buffer,
-                                 stride, width, height, x, y, 6, color);
+                        draw_dot(&fb, x, y, 6, color);
                     }
                     // Draw a small crosshair at cursor position
-                    draw_crosshair(fb_base, pixels_per_buffer, current_back,
-                                   stride, width, height, x, y);
+                    draw_crosshair(&fb, current_back, x, y);
                     need_present = true;
                 }
                 Ok(WindowEvent::KeyDown { code }) => {
@@ -137,6 +136,15 @@ fn main() {
     }
 }
 
+/// Shared framebuffer parameters passed to drawing helpers.
+struct Framebuf {
+    base: *mut u32,
+    pixels_per_buffer: usize,
+    stride: u32,
+    width: u32,
+    height: u32,
+}
+
 /// Cycle through bright colors for drawing.
 fn palette(idx: u8) -> u32 {
     match idx % 8 {
@@ -154,13 +162,12 @@ fn palette(idx: u8) -> u32 {
 /// Draw a filled circle at (cx, cy) with given radius and color.
 /// Draws into both buffers so the dot persists across swaps.
 fn draw_dot(
-    fb_base: *mut u32, pixels_per_buffer: usize,
-    stride: u32, width: u32, height: u32,
+    fb: &Framebuf,
     cx: u32, cy: u32, radius: i32, color: u32,
 ) {
-    let w = width as i32;
-    let h = height as i32;
-    let s = stride as usize;
+    let w = fb.width as i32;
+    let h = fb.height as i32;
+    let s = fb.stride as usize;
     let icx = cx as i32;
     let icy = cy as i32;
 
@@ -173,8 +180,8 @@ fn draw_dot(
             let idx = py as usize * s + px as usize;
             unsafe {
                 // Draw into both buffers so dots persist
-                *fb_base.add(idx) = color;
-                *fb_base.add(pixels_per_buffer + idx) = color;
+                *fb.base.add(idx) = color;
+                *fb.base.add(fb.pixels_per_buffer + idx) = color;
             }
         }
     }
@@ -182,14 +189,13 @@ fn draw_dot(
 
 /// Draw a small crosshair at cursor position (into current back buffer only).
 fn draw_crosshair(
-    fb_base: *mut u32, pixels_per_buffer: usize, current_back: u8,
-    stride: u32, width: u32, height: u32,
+    fb: &Framebuf, current_back: u8,
     cx: u32, cy: u32,
 ) {
-    let w = width as i32;
-    let h = height as i32;
-    let s = stride as usize;
-    let back_offset = if current_back == 0 { 0 } else { pixels_per_buffer };
+    let w = fb.width as i32;
+    let h = fb.height as i32;
+    let s = fb.stride as usize;
+    let back_offset = if current_back == 0 { 0 } else { fb.pixels_per_buffer };
     let icx = cx as i32;
     let icy = cy as i32;
     let color: u32 = 0x80FFFFFF; // semi-transparent white
@@ -198,14 +204,14 @@ fn draw_crosshair(
     for dx in -2i32..=2 {
         let px = icx + dx;
         if px >= 0 && px < w && icy >= 0 && icy < h {
-            unsafe { *fb_base.add(back_offset + icy as usize * s + px as usize) = color; }
+            unsafe { *fb.base.add(back_offset + icy as usize * s + px as usize) = color; }
         }
     }
     // Vertical line (5 pixels)
     for dy in -2i32..=2 {
         let py = icy + dy;
         if icx >= 0 && icx < w && py >= 0 && py < h {
-            unsafe { *fb_base.add(back_offset + py as usize * s + icx as usize) = color; }
+            unsafe { *fb.base.add(back_offset + py as usize * s + icx as usize) = color; }
         }
     }
 }

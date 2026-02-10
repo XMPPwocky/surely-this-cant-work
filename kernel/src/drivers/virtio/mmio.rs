@@ -1,7 +1,7 @@
-/// VirtIO MMIO transport layer for QEMU virt machine.
-///
-/// 8 VirtIO MMIO slots at 0x1000_1000 .. 0x1000_8000, each 0x1000 apart.
-/// QEMU virt machine exposes legacy (v1) devices, so we support both v1 and v2.
+//! VirtIO MMIO transport layer for QEMU virt machine.
+//!
+//! 8 VirtIO MMIO slots at 0x1000_1000 .. 0x1000_8000, each 0x1000 apart.
+//! QEMU virt machine exposes legacy (v1) devices, so we support both v1 and v2.
 
 const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
 const VIRTIO_MMIO_STRIDE: usize = 0x1000;

@@ -159,7 +159,7 @@ impl PageTable {
         size: usize,
         flags: usize,
     ) {
-        let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages = size.div_ceil(PAGE_SIZE);
         for i in 0..pages {
             let vpn = VirtPageNum((va_start + i * PAGE_SIZE) / PAGE_SIZE);
             let ppn = PhysPageNum((pa_start + i * PAGE_SIZE) / PAGE_SIZE);

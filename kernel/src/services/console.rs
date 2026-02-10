@@ -47,7 +47,7 @@ impl LineDiscipline {
                 self.line_len = 0;
                 Some(result_len)
             }
-            ch if ch >= 0x20 && ch < 0x7F => {
+            ch if (0x20..0x7F).contains(&ch) => {
                 if self.line_len < LINE_BUF_SIZE - 1 {
                     self.line_buf[self.line_len] = ch;
                     self.line_len += 1;
@@ -160,17 +160,17 @@ fn find_or_create_client(
     pid: u32,
 ) -> Option<usize> {
     // Find existing
-    for i in 0..MAX_CONSOLE_CLIENTS {
-        if clients[i].active && clients[i].pid == pid {
+    for (i, client) in clients.iter().enumerate().take(MAX_CONSOLE_CLIENTS) {
+        if client.active && client.pid == pid {
             return Some(i);
         }
     }
     // Create new
-    for i in 0..MAX_CONSOLE_CLIENTS {
-        if !clients[i].active {
-            clients[i] = ConsoleClient::empty();
-            clients[i].active = true;
-            clients[i].pid = pid;
+    for (i, client) in clients.iter_mut().enumerate().take(MAX_CONSOLE_CLIENTS) {
+        if !client.active {
+            *client = ConsoleClient::empty();
+            client.active = true;
+            client.pid = pid;
             return Some(i);
         }
     }
@@ -184,21 +184,21 @@ fn cleanup_dead_clients(
     stdin_stack: &mut [usize; MAX_CONSOLE_CLIENTS],
     stdin_stack_len: &mut usize,
 ) {
-    for i in 0..MAX_CONSOLE_CLIENTS {
-        if !clients[i].active { continue; }
+    for (i, client) in clients.iter_mut().enumerate().take(MAX_CONSOLE_CLIENTS) {
+        if !client.active { continue; }
 
-        let stdin_dead = clients[i].stdin_ep != usize::MAX && !ipc::channel_is_active(clients[i].stdin_ep);
-        let stdout_dead = clients[i].stdout_ep != usize::MAX && !ipc::channel_is_active(clients[i].stdout_ep);
+        let stdin_dead = client.stdin_ep != usize::MAX && !ipc::channel_is_active(client.stdin_ep);
+        let stdout_dead = client.stdout_ep != usize::MAX && !ipc::channel_is_active(client.stdout_ep);
 
         if stdin_dead || stdout_dead {
             // Close both endpoints
-            if clients[i].stdin_ep != usize::MAX {
-                ipc::channel_close(clients[i].stdin_ep);
+            if client.stdin_ep != usize::MAX {
+                ipc::channel_close(client.stdin_ep);
             }
-            if clients[i].stdout_ep != usize::MAX {
-                ipc::channel_close(clients[i].stdout_ep);
+            if client.stdout_ep != usize::MAX {
+                ipc::channel_close(client.stdout_ep);
             }
-            clients[i].active = false;
+            client.active = false;
 
             // Remove from stdin stack
             let mut j = 0;
@@ -321,10 +321,10 @@ pub fn serial_console_server() {
         }
 
         // Poll stdin channels for Read/Ioctl requests
-        for i in 0..MAX_CONSOLE_CLIENTS {
-            if !clients[i].active || clients[i].stdin_ep == usize::MAX { continue; }
+        for (i, client) in clients.iter_mut().enumerate().take(MAX_CONSOLE_CLIENTS) {
+            if !client.active || client.stdin_ep == usize::MAX { continue; }
             loop {
-                let (msg, send_wake) = ipc::channel_recv(clients[i].stdin_ep);
+                let (msg, send_wake) = ipc::channel_recv(client.stdin_ep);
                 if send_wake != 0 { crate::task::wake_process(send_wake); }
                 match msg {
                     Some(msg) => {
@@ -332,8 +332,8 @@ pub fn serial_console_server() {
                         if msg.len == 0 { continue; }
                         match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
                             Ok(FileRequest::Read { offset: _, len }) => {
-                                clients[i].has_pending_read = true;
-                                clients[i].pending_read_len = len;
+                                client.has_pending_read = true;
+                                client.pending_read_len = len;
                                 // Push onto stdin_stack on first Read (lazy)
                                 let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == i);
                                 if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
@@ -345,11 +345,11 @@ pub fn serial_console_server() {
                                 match cmd {
                                     TCRAW => {
                                         raw_mode = true;
-                                        send_ioctl_ok(clients[i].stdin_ep, 0, my_pid);
+                                        send_ioctl_ok(client.stdin_ep, 0, my_pid);
                                     }
                                     TCCOOKED => {
                                         raw_mode = false;
-                                        send_ioctl_ok(clients[i].stdin_ep, 0, my_pid);
+                                        send_ioctl_ok(client.stdin_ep, 0, my_pid);
                                     }
                                     _ => {
                                         // Unknown ioctl — send error
@@ -359,7 +359,7 @@ pub fn serial_console_server() {
                                             &mut emsg.data,
                                         ).unwrap_or(0);
                                         emsg.sender_pid = my_pid;
-                                        let _ = ipc::channel_send_blocking(clients[i].stdin_ep, &emsg, my_pid);
+                                        let _ = ipc::channel_send_blocking(client.stdin_ep, &emsg, my_pid);
                                     }
                                 }
                             }
@@ -372,21 +372,18 @@ pub fn serial_console_server() {
         }
 
         // Poll stdout channels for Write requests
-        for i in 0..MAX_CONSOLE_CLIENTS {
-            if !clients[i].active || clients[i].stdout_ep == usize::MAX { continue; }
+        for client in clients.iter().take(MAX_CONSOLE_CLIENTS) {
+            if !client.active || client.stdout_ep == usize::MAX { continue; }
             loop {
-                let (msg, send_wake) = ipc::channel_recv(clients[i].stdout_ep);
+                let (msg, send_wake) = ipc::channel_recv(client.stdout_ep);
                 if send_wake != 0 { crate::task::wake_process(send_wake); }
                 match msg {
                     Some(msg) => {
                         handled = true;
                         if msg.len == 0 { continue; }
-                        match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
-                            Ok(FileRequest::Write { offset: _, data }) => {
-                                write_serial(data);
-                                send_write_ok(clients[i].stdout_ep, data.len() as u32, my_pid);
-                            }
-                            _ => {} // ignore unknown tags
+                        if let Ok(FileRequest::Write { offset: _, data }) = rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                            write_serial(data);
+                            send_write_ok(client.stdout_ep, data.len() as u32, my_pid);
                         }
                     }
                     None => break,
@@ -400,13 +397,13 @@ pub fn serial_console_server() {
         if !handled {
             // Register blocked on control channel + all stdin/stdout endpoints + UART wake
             ipc::channel_set_blocked(control_ep, my_pid);
-            for i in 0..MAX_CONSOLE_CLIENTS {
-                if !clients[i].active { continue; }
-                if clients[i].stdin_ep != usize::MAX {
-                    ipc::channel_set_blocked(clients[i].stdin_ep, my_pid);
+            for client in clients.iter().take(MAX_CONSOLE_CLIENTS) {
+                if !client.active { continue; }
+                if client.stdin_ep != usize::MAX {
+                    ipc::channel_set_blocked(client.stdin_ep, my_pid);
                 }
-                if clients[i].stdout_ep != usize::MAX {
-                    ipc::channel_set_blocked(clients[i].stdout_ep, my_pid);
+                if client.stdout_ep != usize::MAX {
+                    ipc::channel_set_blocked(client.stdout_ep, my_pid);
                 }
             }
             crate::task::block_process(my_pid);

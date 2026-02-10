@@ -30,7 +30,7 @@ impl PhysAddr {
         PhysPageNum(self.0 / PAGE_SIZE)
     }
     pub fn ceil(&self) -> PhysPageNum {
-        PhysPageNum((self.0 + PAGE_SIZE - 1) / PAGE_SIZE)
+        PhysPageNum(self.0.div_ceil(PAGE_SIZE))
     }
 }
 
@@ -73,13 +73,13 @@ impl VirtAddr {
         VirtPageNum(self.0 / PAGE_SIZE)
     }
     pub fn ceil(&self) -> VirtPageNum {
-        VirtPageNum((self.0 + PAGE_SIZE - 1) / PAGE_SIZE)
+        VirtPageNum(self.0.div_ceil(PAGE_SIZE))
     }
     /// Extract the three Sv39 VPN indices
     pub fn vpn_indices(&self) -> [usize; 3] {
         let vpn = self.0 >> PAGE_SIZE_BITS;
         [
-            (vpn >> 0) & 0x1FF,  // VPN[0]
+            vpn & 0x1FF,  // VPN[0]
             (vpn >> 9) & 0x1FF,  // VPN[1]
             (vpn >> 18) & 0x1FF, // VPN[2]
         ]
@@ -158,7 +158,7 @@ impl VirtPageNum {
     /// Extract the three Sv39 VPN indices
     pub fn indices(&self) -> [usize; 3] {
         [
-            (self.0 >> 0) & 0x1FF,  // VPN[0]
+            self.0 & 0x1FF,  // VPN[0]
             (self.0 >> 9) & 0x1FF,  // VPN[1]
             (self.0 >> 18) & 0x1FF, // VPN[2]
         ]

@@ -244,9 +244,9 @@ fn run_parent() {
     println!("[parent] Spawning {} children...", NUM_CHILDREN);
     let mut child_handles: [usize; NUM_CHILDREN] = [usize::MAX; NUM_CHILDREN];
 
-    for i in 0..NUM_CHILDREN {
+    for (i, handle) in child_handles.iter_mut().enumerate() {
         let (my_ep, child_ep) = raw::sys_chan_create();
-        child_handles[i] = my_ep;
+        *handle = my_ep;
 
         match rvos::spawn_process_with_cap("/bin/ipc-torture", child_ep) {
             Ok(proc_handle) => {
@@ -265,9 +265,9 @@ fn run_parent() {
     }
 
     // Wait for HELLO from each child
-    for i in 0..NUM_CHILDREN {
+    for (i, &handle) in child_handles.iter().enumerate() {
         let mut msg = Message::new();
-        match recv_msg(child_handles[i], &mut msg) {
+        match recv_msg(handle, &mut msg) {
             Ok((TAG_HELLO, _)) => println!("[parent] Child {} ready", i),
             Ok((tag, _)) => {
                 println!("[parent] Child {} unexpected tag {}", i, tag);
@@ -316,12 +316,12 @@ fn run_parent() {
     fail += f;
 
     // Send EXIT to remaining children
-    for i in 0..NUM_CHILDREN {
-        if child_handles[i] != usize::MAX {
+    for handle in child_handles.iter_mut() {
+        if *handle != usize::MAX {
             let mid = ids.next();
-            build_and_send(child_handles[i], TAG_EXIT, mid, NO_CAP, |_| {});
-            raw::sys_chan_close(child_handles[i]);
-            child_handles[i] = usize::MAX;
+            build_and_send(*handle, TAG_EXIT, mid, NO_CAP, |_| {});
+            raw::sys_chan_close(*handle);
+            *handle = usize::MAX;
         }
     }
 
@@ -339,15 +339,15 @@ fn phase_ping_pong(ids: &mut MsgIdGen, handles: &[usize; NUM_CHILDREN]) -> (u32,
     let mut pass = 0u32;
     let mut fail = 0u32;
 
-    for i in 0..NUM_CHILDREN {
+    for (i, &handle) in handles.iter().enumerate() {
         for seq in 0..PING_COUNT {
             let mid = ids.next();
-            build_and_send(handles[i], TAG_PING, mid, NO_CAP, |w| {
+            build_and_send(handle, TAG_PING, mid, NO_CAP, |w| {
                 let _ = w.write_u32(seq as u32);
             });
 
             let mut reply = Message::new();
-            match recv_msg(handles[i], &mut reply) {
+            match recv_msg(handle, &mut reply) {
                 Ok((TAG_PONG, rmid)) => {
                     let mut r = Reader::new(&reply.data[5..reply.len]);
                     let rseq = r.read_u32().unwrap_or(u32::MAX);
@@ -381,20 +381,20 @@ fn phase_flood(ids: &mut MsgIdGen, handles: &[usize; NUM_CHILDREN]) -> (u32, u32
     let mut pass = 0u32;
     let mut fail = 0u32;
 
-    for i in 0..NUM_CHILDREN {
+    for (i, &handle) in handles.iter().enumerate() {
         let start_mid = ids.next();
-        build_and_send(handles[i], TAG_FLOOD_START, start_mid, NO_CAP, |_| {});
+        build_and_send(handle, TAG_FLOOD_START, start_mid, NO_CAP, |_| {});
 
         for _ in 0..FLOOD_COUNT {
             let mid = ids.next();
-            build_and_send(handles[i], TAG_FLOOD_MSG, mid, NO_CAP, |_| {});
+            build_and_send(handle, TAG_FLOOD_MSG, mid, NO_CAP, |_| {});
         }
 
         let done_mid = ids.next();
-        build_and_send(handles[i], TAG_FLOOD_DONE, done_mid, NO_CAP, |_| {});
+        build_and_send(handle, TAG_FLOOD_DONE, done_mid, NO_CAP, |_| {});
 
         let mut reply = Message::new();
-        match recv_msg(handles[i], &mut reply) {
+        match recv_msg(handle, &mut reply) {
             Ok((TAG_FLOOD_ACK, _)) => {
                 let mut r = Reader::new(&reply.data[5..reply.len]);
                 let count = r.read_u32().unwrap_or(0);
@@ -424,7 +424,7 @@ fn phase_varsize(ids: &mut MsgIdGen, handles: &[usize; NUM_CHILDREN]) -> (u32, u
     let mut pass = 0u32;
     let mut fail = 0u32;
 
-    for i in 0..NUM_CHILDREN {
+    for (i, &handle) in handles.iter().enumerate() {
         let mut rng = Xorshift64::new((i as u64 + 1) * 12345);
 
         for _ in 0..VARSIZE_COUNT {
@@ -439,13 +439,13 @@ fn phase_varsize(ids: &mut MsgIdGen, handles: &[usize; NUM_CHILDREN]) -> (u32, u
             let expected_cksum = checksum(&payload);
 
             // Send: [TAG_VARSIZE][msg_id][bytes(u16-prefixed)]
-            build_and_send(handles[i], TAG_VARSIZE, mid, NO_CAP, |w| {
+            build_and_send(handle, TAG_VARSIZE, mid, NO_CAP, |w| {
                 let _ = w.write_bytes(&payload);
             });
 
             // Receive VARSIZE_ACK with checksum
             let mut reply = Message::new();
-            match recv_msg(handles[i], &mut reply) {
+            match recv_msg(handle, &mut reply) {
                 Ok((TAG_VARSIZE_ACK, rmid)) => {
                     let mut r = Reader::new(&reply.data[5..reply.len]);
                     let recv_cksum = r.read_u32().unwrap_or(0);
@@ -479,12 +479,12 @@ fn phase_cap_pass(ids: &mut MsgIdGen, handles: &[usize; NUM_CHILDREN]) -> (u32, 
     let mut pass = 0u32;
     let mut fail = 0u32;
 
-    for i in 0..NUM_CHILDREN {
+    for (i, &handle) in handles.iter().enumerate() {
         let mid = ids.next();
         let (my_new_ep, child_new_ep) = raw::sys_chan_create();
 
         // Send CAP_PASS with new endpoint as cap
-        build_and_send(handles[i], TAG_CAP_PASS, mid, child_new_ep, |_| {});
+        build_and_send(handle, TAG_CAP_PASS, mid, child_new_ep, |_| {});
         raw::sys_chan_close(child_new_ep); // child gets it via cap
 
         // Send CAP_ECHO on the new channel with magic number

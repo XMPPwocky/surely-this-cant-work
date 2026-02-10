@@ -32,8 +32,7 @@ impl Transport for KernelTransport {
         msg.len = copy_len;
         msg.sender_pid = self.pid;
         msg.cap_count = caps.len().min(MAX_CAPS);
-        for i in 0..msg.cap_count {
-            let cap = caps[i];
+        for (i, &cap) in caps.iter().enumerate().take(msg.cap_count) {
             msg.caps[i] = if cap == rvos_wire::NO_CAP { NO_CAP } else { ipc::encode_cap_channel(cap) };
         }
         match ipc::channel_send_blocking(self.endpoint, &msg, self.pid) {
@@ -49,11 +48,11 @@ impl Transport for KernelTransport {
                 let copy_len = msg.len.min(buf.len());
                 buf[..copy_len].copy_from_slice(&msg.data[..copy_len]);
                 let cap_count = msg.cap_count.min(caps.len());
-                for i in 0..cap_count {
-                    if msg.caps[i] == NO_CAP {
-                        caps[i] = rvos_wire::NO_CAP;
+                for (cap_out, &msg_cap) in caps.iter_mut().zip(msg.caps.iter()).take(cap_count) {
+                    if msg_cap == NO_CAP {
+                        *cap_out = rvos_wire::NO_CAP;
                     } else {
-                        caps[i] = match ipc::decode_cap(msg.caps[i]) {
+                        *cap_out = match ipc::decode_cap(msg_cap) {
                             ipc::DecodedCap::Channel(ep) => ep,
                             _ => rvos_wire::NO_CAP,
                         };

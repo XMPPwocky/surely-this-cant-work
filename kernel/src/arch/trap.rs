@@ -145,7 +145,7 @@ pub fn print_backtrace(start_fp: usize) {
     crate::println!("  Backtrace:");
     let mut fp = start_fp;
     let mut depth = 0;
-    while fp >= KERN_LO && fp < KERN_HI && fp % 8 == 0 && depth < MAX_DEPTH {
+    while (KERN_LO..KERN_HI).contains(&fp) && fp.is_multiple_of(8) && depth < MAX_DEPTH {
         let ra = unsafe { *((fp - 8) as *const usize) };
         let prev_fp = unsafe { *((fp - 16) as *const usize) };
         crate::println!("    #{}: ra={:#x} fp={:#x}", depth, ra, fp);
@@ -664,7 +664,7 @@ fn sys_shm_create(size: usize) -> usize {
         return usize::MAX;
     }
 
-    let page_count = (size + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+    let page_count = size.div_ceil(crate::mm::address::PAGE_SIZE);
 
     // Allocate contiguous physical frames
     let ppn = match crate::mm::frame::frame_alloc_contiguous(page_count) {
@@ -746,7 +746,7 @@ fn sys_mmap(shm_handle: usize, length: usize) -> usize {
 }
 
 fn sys_mmap_anonymous(length: usize) -> usize {
-    let pages = (length + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+    let pages = length.div_ceil(crate::mm::address::PAGE_SIZE);
 
     // Allocate contiguous physical pages
     let ppn = match crate::mm::frame::frame_alloc_contiguous(pages) {
@@ -820,7 +820,7 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
         None => return usize::MAX,
     };
 
-    let map_pages = (length + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+    let map_pages = length.div_ceil(crate::mm::address::PAGE_SIZE);
 
     // Validate: requested length must not exceed region size
     if map_pages > region_page_count {
@@ -876,11 +876,11 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
 }
 
 fn sys_munmap(addr: usize, length: usize) -> usize {
-    if length == 0 || addr % crate::mm::address::PAGE_SIZE != 0 {
+    if length == 0 || !addr.is_multiple_of(crate::mm::address::PAGE_SIZE) {
         return usize::MAX;
     }
 
-    let pages = (length + crate::mm::address::PAGE_SIZE - 1) / crate::mm::address::PAGE_SIZE;
+    let pages = length.div_ceil(crate::mm::address::PAGE_SIZE);
     let base_ppn = addr / crate::mm::address::PAGE_SIZE;
 
     // Validate and remove from process tracking
@@ -1022,8 +1022,8 @@ fn external_interrupt() {
                     }
                 }
                 // UART lock released; push to TTY
-                for i in 0..count {
-                    crate::drivers::tty::push_serial_char(chars[i]);
+                for ch in chars.iter().take(count) {
+                    crate::drivers::tty::push_serial_char(*ch);
                 }
             }
             kbd_irq if Some(kbd_irq) == crate::drivers::virtio::input::irq_number() => {

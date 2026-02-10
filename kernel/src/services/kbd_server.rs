@@ -1,7 +1,7 @@
-/// Keyboard IPC server — kernel task that wraps VirtIO keyboard.
-///
-/// Registers as the "kbd" service. A single client (the window server)
-/// connects and receives raw key events (press/release + keycode).
+//! Keyboard IPC server — kernel task that wraps VirtIO keyboard.
+//!
+//! Registers as the "kbd" service. A single client (the window server)
+//! connects and receives raw key events (press/release + keycode).
 
 use crate::ipc::{self, Message};
 use crate::drivers::tty;

@@ -9,6 +9,15 @@ A from-scratch RISC-V 64-bit microkernel OS written in Rust, targeting qemu-syst
 - `make bench` — build and run benchmark suite (boots QEMU, runs /bin/bench, shuts down)
 - `make debug` — QEMU with GDB attach
 
+## Linting
+- `make clippy` — run clippy on all crates (kernel + user)
+- `make clippy-kernel` — run clippy on the kernel only
+- `make clippy-user` — run clippy on all user-space crates
+
+Run `make clippy` after any code changes. Clippy uses `-W clippy::all` so all
+default lints are warnings. Fix warnings rather than suppressing them unless
+there is a good reason (document why with `#[allow(clippy::lint_name)]`).
+
 ## Conventions
 - No external crates — only `core` and `alloc`
 - All hardware access through typed wrappers (not raw pointer math)

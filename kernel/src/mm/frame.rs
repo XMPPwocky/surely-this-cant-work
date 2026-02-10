@@ -4,7 +4,7 @@ use crate::sync::SpinLock;
 const RAM_BASE: usize = 0x8000_0000;
 const RAM_END: usize = 0x8800_0000;
 const TOTAL_FRAMES: usize = (RAM_END - RAM_BASE) / PAGE_SIZE; // 32768
-const BITMAP_LEN: usize = (TOTAL_FRAMES + 63) / 64; // 512
+const BITMAP_LEN: usize = TOTAL_FRAMES.div_ceil(64); // 512
 
 struct FrameAllocator {
     bitmap: [u64; BITMAP_LEN],

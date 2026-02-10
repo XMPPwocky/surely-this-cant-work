@@ -310,8 +310,7 @@ fn main() {
     let total_bytes = iters as u64 * 1000;
     let total_us = ticks_to_us(ticks);
     print_row("ipc throughput 1KB", iters, total_us, ticks_to_ns(ticks) / iters as u64);
-    if total_us > 0 {
-        let mb_per_sec = total_bytes / total_us;
+    if let Some(mb_per_sec) = total_bytes.checked_div(total_us) {
         print!("    => ");
         print_u64(mb_per_sec);
         println!(" MB/s");

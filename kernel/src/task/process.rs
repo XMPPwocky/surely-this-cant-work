@@ -181,7 +181,7 @@ impl Process {
         setup_guard_page(kstack_alloc_base);
 
         // Allocate user code pages
-        let n_code_pages = (user_code.len() + PAGE_SIZE - 1) / PAGE_SIZE;
+        let n_code_pages = user_code.len().div_ceil(PAGE_SIZE);
         let n_code_pages = if n_code_pages == 0 { 1 } else { n_code_pages };
         let code_ppn = frame::frame_alloc_contiguous(n_code_pages)
             .expect("Failed to allocate user code pages");

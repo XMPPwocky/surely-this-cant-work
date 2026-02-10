@@ -6,17 +6,21 @@ OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 # build-std flags (moved out of .cargo/config.toml to avoid leaking into x.py)
 BUILD_STD = -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 
-.PHONY: build build-shell build-hello build-bench build-gui-bench build-fs build-fbcon build-window-server build-winclient build-ipc-torture build-triangle build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench
+# All user crates (order doesn't matter for clippy)
+USER_CRATES = shell hello bench window-server winclient ipc-torture triangle gui-bench fbcon fs
+
+.PHONY: build build-shell build-hello build-bench build-gui-bench build-fs build-fbcon build-window-server build-winclient build-ipc-torture build-triangle build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench clippy clippy-kernel clippy-user
 
 build-shell:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
 		--manifest-path user/shell/Cargo.toml \
 		--target riscv64gc-unknown-rvos
 
-# Rebuild the rvOS std library via x.py (run after modifying vendor/rust/library/)
+# Rebuild the rvOS std library + clippy via x.py (run after modifying vendor/rust/library/)
+# Both must be built together so x.py doesn't remove one when installing the other.
 build-std-lib:
 	cd vendor/rust && BOOTSTRAP_SKIP_TARGET_SANITY=1 \
-		python3 x.py build library --target riscv64gc-unknown-rvos --keep-stage 0
+		python3 x.py build src/tools/clippy library --target riscv64gc-unknown-rvos --keep-stage 0
 
 build-hello:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
@@ -135,3 +139,19 @@ bench: build
 gui-bench: build
 	@echo "Running rvOS GUI benchmarks..."
 	@expect scripts/gui-bench.exp
+
+# --- Clippy ---
+
+clippy-kernel:
+	cargo clippy --release --manifest-path kernel/Cargo.toml \
+		--target riscv64gc-unknown-none-elf $(BUILD_STD) -- -W clippy::all
+
+clippy-user:
+	@for crate in $(USER_CRATES); do \
+		echo "=== clippy: $$crate ===" && \
+		cargo +rvos clippy --release \
+			--manifest-path user/$$crate/Cargo.toml \
+			--target riscv64gc-unknown-rvos -- -W clippy::all || exit 1; \
+	done
+
+clippy: clippy-kernel clippy-user

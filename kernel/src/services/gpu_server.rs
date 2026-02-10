@@ -1,8 +1,8 @@
-/// GPU IPC server — kernel task that wraps VirtIO GPU access.
-///
-/// Registers as the "gpu" service. A single client (the window server)
-/// connects and receives the display framebuffer as a SHM capability,
-/// then sends Flush commands to update rectangular regions.
+//! GPU IPC server — kernel task that wraps VirtIO GPU access.
+//!
+//! Registers as the "gpu" service. A single client (the window server)
+//! connects and receives the display framebuffer as a SHM capability,
+//! then sends Flush commands to update rectangular regions.
 
 use crate::ipc::{self, Message};
 use core::sync::atomic::{AtomicUsize, Ordering};

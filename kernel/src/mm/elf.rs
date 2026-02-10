@@ -105,7 +105,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedElf, &'static str> {
 
     let base_va = min_vaddr as usize;
     let total_size = (max_vaddr as usize) - base_va;
-    let total_pages = (total_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let total_pages = total_size.div_ceil(PAGE_SIZE);
     let total_pages = if total_pages == 0 { 1 } else { total_pages };
 
     // Allocate contiguous physical pages

@@ -1,7 +1,7 @@
-/// VirtIO Input (keyboard) driver.
-///
-/// Implements a VirtIO input device driver for virtio-keyboard-device.
-/// Uses eventq (queue 0) to receive input events from QEMU.
+//! VirtIO Input (keyboard) driver.
+//!
+//! Implements a VirtIO input device driver for virtio-keyboard-device.
+//! Uses eventq (queue 0) to receive input events from QEMU.
 
 use super::mmio;
 use super::queue::{Virtqueue, VIRTQ_DESC_F_WRITE, QUEUE_SIZE, alloc_dma_buffer};

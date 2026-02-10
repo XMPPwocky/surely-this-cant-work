@@ -36,7 +36,7 @@ pub fn math_service() {
         let client = ipc::OwnedEndpoint::new(accepted.endpoint);
         let mut transport = KernelTransport::new(client.raw(), my_pid);
 
-        if let Err(_) = math_dispatch(&mut transport, &mut handler) {
+        if math_dispatch(&mut transport, &mut handler).is_err() {
             // Bad request — send error text manually
             let mut resp = Message::new();
             let err = b"bad request";
