@@ -1,10 +1,9 @@
 extern crate rvos_rt;
 
-use rvos::raw::{self, NO_CAP};
+use rvos::raw;
 use rvos::{Message, Channel, UserTransport};
 use rvos::rvos_wire;
 use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED};
-use rvos_proto::service_control::NewConnection;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
     WindowReply, WindowEvent, WindowClient,
@@ -395,15 +394,12 @@ impl LineDiscipline {
 // --- Console client management (FileOps protocol) ---
 
 const MAX_CONSOLE_CLIENTS: usize = 8;
-/// Console control handle is given as handle 1 by init
-const CONSOLE_CONTROL_HANDLE: usize = 1;
 /// Max data payload per chunk: 1024 - 1 (tag) - 2 (length prefix) = 1021
 const MAX_DATA_CHUNK: usize = 1021;
 
 struct FbconClient {
     stdin_handle: usize,     // receives Read/Ioctl requests
     stdout_handle: usize,    // receives Write requests
-    pid: u32,
     has_pending_read: bool,
     active: bool,
 }
@@ -413,14 +409,9 @@ impl FbconClient {
         FbconClient {
             stdin_handle: usize::MAX,
             stdout_handle: usize::MAX,
-            pid: 0,
             has_pending_read: false,
             active: false,
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.stdin_handle != usize::MAX && self.stdout_handle != usize::MAX
     }
 }
 
@@ -456,6 +447,16 @@ fn fb_send_ioctl_ok(handle: usize, result: u32) {
 fn main() {
     println!("[fbcon] starting");
 
+    // Parse command-line arguments: fbcon [width height]
+    let args: Vec<String> = std::env::args().collect();
+    let (req_width, req_height) = if args.len() >= 3 {
+        let w: u32 = args[1].parse().unwrap_or(0);
+        let h: u32 = args[2].parse().unwrap_or(0);
+        (w, h)
+    } else {
+        (0, 0) // fullscreen
+    };
+
     // 1. Connect to "window" service via boot channel
     let win_ctl = rvos::connect_to_service("window")
         .expect("failed to connect to window service")
@@ -463,7 +464,7 @@ fn main() {
 
     // 2. Send CreateWindow request and receive per-window channels
     let ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
-    ch.send(&CreateWindowRequest { width: 0, height: 0 }).expect("CreateWindow send failed");
+    ch.send(&CreateWindowRequest { width: req_width, height: req_height }).expect("CreateWindow send failed");
     let (_create_resp, caps, cap_count) = ch.recv_with_caps_blocking().expect("CreateWindow recv failed");
     if cap_count < 2 {
         panic!("[fbcon] CreateWindow response missing channels");
@@ -512,7 +513,7 @@ fn main() {
     let mut swap_seq: u32 = 10;
 
     // Print startup banner
-    console.write_str(b"rvOS GPU Console\r\n");
+    console.write_str(b"rvOS GUI Console\r\n");
     console.write_str(b"================\r\n\r\n");
 
     // Do initial present
@@ -521,63 +522,44 @@ fn main() {
     update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
     console.dirty = false;
 
+    // Spawn /bin/shell with stdin/stdout connected to us
+    let (stdin_our, stdin_shell) = raw::sys_chan_create();
+    let (stdout_our, stdout_shell) = raw::sys_chan_create();
+
+    // Build namespace overrides: redirect shell's stdin and stdout to our channels
+    // Format: [count: u8] then count * [name_len: u8, name_bytes..., cap_index: u8]
+    let ns_overrides: [u8; 16] = [
+        2,                                         // count = 2
+        5, b's', b't', b'd', b'i', b'n', 0,       // "stdin" -> cap_index 0
+        6, b's', b't', b'd', b'o', b'u', b't', 1, // "stdout" -> cap_index 1
+    ];
+    match rvos::spawn_process_with_overrides(
+        "/bin/shell",
+        b"shell",
+        &ns_overrides,
+        &[stdin_shell, stdout_shell],
+    ) {
+        Ok(_proc_chan) => {
+            println!("[fbcon] spawned /bin/shell");
+        }
+        Err(e) => {
+            println!("[fbcon] ERROR: failed to spawn shell: {:?}", e);
+        }
+    }
+    raw::sys_chan_close(stdin_shell);
+    raw::sys_chan_close(stdout_shell);
+
+    // Register shell as client 0
+    clients[0] = FbconClient {
+        stdin_handle: stdin_our,
+        stdout_handle: stdout_our,
+        has_pending_read: false,
+        active: true,
+    };
+
     // Main event loop
     loop {
         let mut handled = false;
-
-        // Check for new console clients on control handle
-        loop {
-            let mut msg = Message::new();
-            let ret = raw::sys_chan_recv(CONSOLE_CONTROL_HANDLE, &mut msg);
-            if ret != 0 { break; }
-            handled = true;
-            let cap = if msg.cap_count > 0 { msg.caps[0] } else { NO_CAP };
-            if cap != NO_CAP {
-                // Parse NewConnection { client_pid: u32, channel_role: u8 }
-                let (pid, role) = match rvos_wire::from_bytes::<NewConnection>(&msg.data[..msg.len]) {
-                    Ok(nc) => (nc.client_pid, nc.channel_role),
-                    Err(_) => (0, 0u8),
-                };
-
-                // Find or create client by PID
-                let idx = {
-                    let mut found = None;
-                    for i in 0..MAX_CONSOLE_CLIENTS {
-                        if clients[i].active && clients[i].pid == pid {
-                            found = Some(i);
-                            break;
-                        }
-                    }
-                    if found.is_none() {
-                        for i in 0..MAX_CONSOLE_CLIENTS {
-                            if !clients[i].active {
-                                clients[i] = FbconClient::empty();
-                                clients[i].active = true;
-                                clients[i].pid = pid;
-                                found = Some(i);
-                                break;
-                            }
-                        }
-                    }
-                    found
-                };
-
-                if let Some(idx) = idx {
-                    match role {
-                        1 => clients[idx].stdin_handle = cap,
-                        2 => clients[idx].stdout_handle = cap,
-                        _ => clients[idx].stdout_handle = cap,
-                    }
-                    // Don't auto-push onto stdin_stack here.
-                    // Clients are added only when they first issue a Read
-                    // request — prevents non-reading processes (like triangle)
-                    // from stealing keyboard input from the shell.
-                } else {
-                    println!("[fbcon] WARN: too many console clients, dropping PID {}", pid);
-                    raw::sys_chan_close(cap);
-                }
-            }
-        }
 
         let stdin_idx = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
 
@@ -620,6 +602,11 @@ fn main() {
                             shift_pressed = false;
                         }
                     }
+                    Ok(WindowEvent::CloseRequested {}) => {
+                        // Close window and exit
+                        let _ = window_client.close_window();
+                        return;
+                    }
                     _ => {
                         // Ignore mouse events and other window events
                     }
@@ -627,12 +614,19 @@ fn main() {
             }
         }
 
-        // Poll stdin channels for Read/Ioctl requests
+        // Poll stdin channels for Read/Ioctl requests.
+        // Also detect closed channels (ret == 2) for dead client cleanup.
         for i in 0..MAX_CONSOLE_CLIENTS {
             if !clients[i].active || clients[i].stdin_handle == usize::MAX { continue; }
             loop {
                 let mut msg = Message::new();
                 let ret = raw::sys_chan_recv(clients[i].stdin_handle, &mut msg);
+                if ret == 2 {
+                    // Channel closed — mark client dead
+                    mark_client_dead(&mut clients[i], &mut stdin_stack, &mut stdin_stack_len, i);
+                    handled = true;
+                    break;
+                }
                 if ret != 0 { break; }
                 handled = true;
                 if msg.len == 0 { continue; }
@@ -662,12 +656,17 @@ fn main() {
             }
         }
 
-        // Poll stdout channels for Write requests
+        // Poll stdout channels for Write requests.
         for i in 0..MAX_CONSOLE_CLIENTS {
             if !clients[i].active || clients[i].stdout_handle == usize::MAX { continue; }
             loop {
                 let mut msg = Message::new();
                 let ret = raw::sys_chan_recv(clients[i].stdout_handle, &mut msg);
+                if ret == 2 {
+                    mark_client_dead(&mut clients[i], &mut stdin_stack, &mut stdin_stack_len, i);
+                    handled = true;
+                    break;
+                }
                 if ret != 0 { break; }
                 handled = true;
                 if msg.len == 0 { continue; }
@@ -677,34 +676,6 @@ fn main() {
                         fb_send_write_ok(clients[i].stdout_handle, data.len() as u32);
                     }
                     _ => {}
-                }
-            }
-        }
-
-        // Clean up dead clients
-        for i in 0..MAX_CONSOLE_CLIENTS {
-            if !clients[i].active { continue; }
-            let stdin_dead = clients[i].stdin_handle != usize::MAX && {
-                let mut msg = Message::new();
-                raw::sys_chan_recv(clients[i].stdin_handle, &mut msg) == 2
-            };
-            let stdout_dead = clients[i].stdout_handle != usize::MAX && {
-                let mut msg = Message::new();
-                raw::sys_chan_recv(clients[i].stdout_handle, &mut msg) == 2
-            };
-            if stdin_dead || stdout_dead {
-                if clients[i].stdin_handle != usize::MAX { raw::sys_chan_close(clients[i].stdin_handle); }
-                if clients[i].stdout_handle != usize::MAX { raw::sys_chan_close(clients[i].stdout_handle); }
-                clients[i].active = false;
-                // Remove from stdin stack
-                let mut j = 0;
-                while j < stdin_stack_len {
-                    if stdin_stack[j] == i {
-                        for k in j..stdin_stack_len - 1 { stdin_stack[k] = stdin_stack[k + 1]; }
-                        stdin_stack_len -= 1;
-                    } else {
-                        j += 1;
-                    }
                 }
             }
         }
@@ -721,7 +692,6 @@ fn main() {
 
         if !handled {
             // Register interest on all channels then block
-            raw::sys_chan_poll_add(CONSOLE_CONTROL_HANDLE);
             raw::sys_chan_poll_add(req_chan);
             raw::sys_chan_poll_add(event_chan);
             for i in 0..MAX_CONSOLE_CLIENTS {
@@ -734,7 +704,27 @@ fn main() {
     }
 }
 
-/// Handle a single ASCII keypress: echo + line discipline + fulfill pending reads
+/// Clean up a dead client: close handles, deactivate, remove from stdin stack.
+fn mark_client_dead(
+    client: &mut FbconClient,
+    stdin_stack: &mut [usize; MAX_CONSOLE_CLIENTS],
+    stdin_stack_len: &mut usize,
+    client_idx: usize,
+) {
+    if client.stdin_handle != usize::MAX { raw::sys_chan_close(client.stdin_handle); }
+    if client.stdout_handle != usize::MAX { raw::sys_chan_close(client.stdout_handle); }
+    client.active = false;
+    let mut j = 0;
+    while j < *stdin_stack_len {
+        if stdin_stack[j] == client_idx {
+            for k in j..*stdin_stack_len - 1 { stdin_stack[k] = stdin_stack[k + 1]; }
+            *stdin_stack_len -= 1;
+        } else {
+            j += 1;
+        }
+    }
+}
+
 /// Map Linux keycodes for special keys to ANSI escape sequences.
 fn escape_seq_for_keycode(code: usize) -> Option<&'static [u8]> {
     match code {

@@ -16,14 +16,16 @@ pub enum ConsoleType {
 }
 
 const MAX_ARGS_LEN: usize = 512;
-const MAX_NS_OVERRIDES: usize = 4;
+const MAX_NS_OVERRIDES: usize = 16;
 
-/// A single namespace override: maps a service name to a pre-established endpoint.
+/// A single namespace override: maps a service name to a pre-established endpoint,
+/// or marks it as explicitly removed (blocks inheritance from parent).
 #[derive(Clone)]
 struct NsOverride {
     name: [u8; SERVICE_NAME_LEN],
     name_len: usize,
-    endpoint: usize, // global endpoint ID (decoded from cap)
+    endpoint: usize, // global endpoint ID (decoded from cap); unused if removed
+    removed: bool,   // if true, this entry blocks parent inheritance (endpoint unused)
 }
 
 /// A boot channel registration: the init server's end of a user process's boot channel.
@@ -249,8 +251,6 @@ pub fn init_server() {
     let mut dyn_spawns: [Option<DynSpawn>; MAX_DYN_SPAWNS] = [const { None }; MAX_DYN_SPAWNS];
     init_fs_launches(&mut *fs_launches, my_pid);
 
-    let mut gpu_shell_launched = false;
-
     loop {
         // Snapshot boot registrations under the lock
         let mut endpoints = [(0usize, ConsoleType::Serial, false); MAX_BOOT_REGS];
@@ -304,19 +304,6 @@ pub fn init_server() {
                 if ctx.state == FsLaunchState::Done {
                     *slot = None;
                 }
-            }
-        }
-
-        // Launch GPU shell once fbcon's GpuConsole is registered
-        if !gpu_shell_launched && GPU_PRESENT.load(core::sync::atomic::Ordering::Relaxed) {
-            let has_gpu_console = {
-                let config = INIT_CONFIG.lock();
-                config.services.iter().any(|s| matches!(s, Some(ref e) if e.console_type == ConsoleType::GpuConsole))
-            };
-            if has_gpu_console {
-                start_gpu_shell(&mut fs_launches, my_pid);
-                gpu_shell_launched = true;
-                handled = true;
             }
         }
 
@@ -512,6 +499,7 @@ fn parse_ns_overrides(blob: &[u8], orig_msg: &Message) -> [Option<NsOverride>; M
                     name,
                     name_len: nlen,
                     endpoint: ep,
+                    removed: false,
                 });
                 out_idx += 1;
             }
@@ -553,7 +541,7 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
     }
 }
 
-fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, client_pid: u32, my_pid: usize, role: u8) {
+fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid: u32, my_pid: usize, role: u8) {
     // Create a new bidirectional channel for the client <-> console server
     let (client_ep, server_ep) = match ipc::channel_create_pair() {
         Some(pair) => pair,
@@ -563,19 +551,14 @@ fn handle_stdio_request(boot_ep_b: usize, console_type: ConsoleType, client_pid:
         }
     };
 
-    // Find the control endpoint for the appropriate console server
+    // Always route stdio to the serial console. Programs that need a different
+    // console (e.g., fbcon's shell) use namespace overrides instead.
     let control_ep = {
         let config = INIT_CONFIG.lock();
-        let mut found = None;
-        for slot in config.services.iter() {
-            if let Some(ref svc) = slot {
-                if svc.console_type == console_type {
-                    found = Some(svc.control_ep);
-                    break;
-                }
-            }
-        }
-        found
+        config.services.iter()
+            .filter_map(|s| s.as_ref())
+            .find(|s| s.console_type == ConsoleType::Serial)
+            .map(|s| s.control_ep)
     };
 
     if let Some(ctl_ep) = control_ep {
@@ -783,7 +766,7 @@ fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
 /// (path, name, console_type, service_name, requires_gpu, provides_console)
 const FS_PROGRAMS: &[(&[u8], &str, ConsoleType, Option<&str>, bool, Option<ConsoleType>)] = &[
     (b"/bin/window-server", "window-srv", ConsoleType::Serial, Some("window"), true, None),
-    (b"/bin/fbcon", "fbcon", ConsoleType::Serial, None, true, Some(ConsoleType::GpuConsole)),
+    (b"/bin/fbcon", "fbcon", ConsoleType::Serial, None, true, None),
 ];
 
 /// Initialize fs launch state machines. For each program, create a client
@@ -1148,85 +1131,4 @@ fn finish_fs_launch(
     ctx.state = FsLaunchState::Done;
 }
 
-/// Start loading /bin/shell from the filesystem to run on the GPU console.
-/// Called once after fbcon registers its GpuConsole.
-fn start_gpu_shell(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pid: usize) {
-    let fs_svc = match find_named_service(b"fs") {
-        Some(svc) => svc,
-        None => {
-            crate::println!("[init] no fs service for gpu shell");
-            return;
-        }
-    };
-    let fs_ctl_ep = fs_svc.control_ep.load(Ordering::Relaxed);
-    if fs_ctl_ep == usize::MAX {
-        crate::println!("[init] fs not ready for gpu shell");
-        return;
-    }
-
-    let slot_idx = match launches.iter().position(|s| s.is_none()) {
-        Some(i) => i,
-        None => {
-            crate::println!("[init] no launch slot for gpu shell");
-            return;
-        }
-    };
-
-    let (my_ctl_ep, server_ep) = match ipc::channel_create_pair() {
-        Some(pair) => pair,
-        None => {
-            crate::println!("[init] no channels for gpu shell");
-            return;
-        }
-    };
-
-    let mut ctl_msg = Message::new();
-    ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
-    ctl_msg.cap_count = 1;
-    ctl_msg.len = rvos_wire::to_bytes(
-        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
-        &mut ctl_msg.data,
-    ).unwrap_or(0);
-    ctl_msg.sender_pid = my_pid;
-    send_and_wake(fs_ctl_ep, ctl_msg);
-
-    let path = b"/bin/shell";
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
-        &FsRequest::Stat { path: "/bin/shell" },
-        &mut msg.data,
-    ).unwrap_or(0);
-    msg.sender_pid = my_pid;
-    send_and_wake(my_ctl_ep, msg);
-
-    let mut path_buf = [0u8; PATH_BUF_LEN];
-    path_buf[..path.len()].copy_from_slice(path);
-
-    let mut name_buf = [0u8; NAME_BUF_LEN];
-    let name = b"shell-gpu";
-    name_buf[..name.len()].copy_from_slice(name);
-
-    launches[slot_idx] = Some(FsLaunchCtx {
-        state: FsLaunchState::WaitStat,
-        ctl_ep: my_ctl_ep,
-        file_ep: 0,
-        file_size: 0,
-        data: Vec::new_in(INIT_ALLOC),
-        path_buf,
-        path_len: path.len(),
-        name_buf,
-        name_len: name.len(),
-        console_type: ConsoleType::GpuConsole,
-        service_name: None,
-        requester_ep: 0,
-        extra_cap: 0,
-        provides_console: None,
-        is_shell: true,
-        args: [0u8; MAX_ARGS_LEN],
-        args_len: 0,
-        ns_overrides: [const { None }; MAX_NS_OVERRIDES],
-    });
-
-    crate::println!("[init] Starting GPU shell (loading /bin/shell from fs)");
-}
 
