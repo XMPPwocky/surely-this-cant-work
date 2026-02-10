@@ -235,7 +235,7 @@ calling process's user page table with U+R+W permissions.
 
 Because rvOS uses identity mapping (VA == PA), the returned address is both the
 virtual and physical address of the allocation. The region is recorded in the
-process's `mmap_regions` table (max 32 regions). A TLB flush (`sfence.vma`) is
+process's `mmap_regions` table (max 256 regions). A TLB flush (`sfence.vma`) is
 performed after mapping.
 
 Returns the base address on success, `usize::MAX` on failure (zero length,
@@ -302,27 +302,30 @@ and user space. It is `#[repr(C)]` to guarantee a stable ABI layout.
 ```rust
 #[repr(C)]
 pub struct Message {
-    pub data: [u8; 64],     // offset 0x00, 64 bytes of payload
-    pub len: usize,         // offset 0x40, number of valid bytes in data
-    pub sender_pid: usize,  // offset 0x48, PID of sender (set by kernel)
-    pub cap: usize,         // offset 0x50, capability (handle or NO_CAP)
+    pub data: [u8; 1024],       // offset 0x000, 1024 bytes of payload
+    pub len: usize,             // offset 0x400, number of valid bytes in data
+    pub sender_pid: usize,      // offset 0x408, PID of sender (set by kernel)
+    pub caps: [usize; 4],       // offset 0x410, capability slots (handles or NO_CAP)
+    pub cap_count: usize,       // offset 0x430, number of valid capabilities
 }
 ```
 
 ### Field Layout (RV64, 8-byte usize)
 
-| Field        | Offset | Size    | Description                                            |
-|--------------|--------|---------|--------------------------------------------------------|
-| `data`       | 0x00   | 64 bytes | Message payload. Only `data[0..len]` is meaningful.   |
-| `len`        | 0x40   | 8 bytes  | Number of valid payload bytes (0..64).                |
-| `sender_pid` | 0x48   | 8 bytes  | PID of the sender. The kernel overwrites this field on send; user-set values are ignored. |
-| `cap`        | 0x50   | 8 bytes  | Capability slot. `NO_CAP` (usize::MAX) means no capability attached. Otherwise, a handle index. |
+| Field        | Offset | Size      | Description                                            |
+|--------------|--------|-----------|--------------------------------------------------------|
+| `data`       | 0x000  | 1024 bytes | Message payload. Only `data[0..len]` is meaningful.   |
+| `len`        | 0x400  | 8 bytes   | Number of valid payload bytes (0..1024).              |
+| `sender_pid` | 0x408  | 8 bytes   | PID of the sender. The kernel overwrites this field on send; user-set values are ignored. |
+| `caps`       | 0x410  | 32 bytes  | Capability slots (up to 4). `NO_CAP` (usize::MAX) means no capability attached. Otherwise, a handle index. |
+| `cap_count`  | 0x430  | 8 bytes   | Number of valid capabilities in `caps` (0..4).        |
 
-**Total size:** 88 bytes (0x58).
+**Total size:** 1080 bytes (0x438).
 
 ### Constants
 
-- `MAX_MSG_SIZE` = 64 -- maximum payload size in bytes.
+- `MAX_MSG_SIZE` = 1024 -- maximum payload size in bytes.
+- `MAX_CAPS` = 4 -- maximum number of capabilities per message.
 - `NO_CAP` = `usize::MAX` (`0xFFFF_FFFF_FFFF_FFFF`) -- sentinel meaning "no capability attached."
 
 ### Capability Translation
@@ -518,13 +521,13 @@ The table maps:
 
 ### Kernel Stack (per process)
 
-- `KERNEL_STACK_PAGES` = 4 (16 KiB).
+- `KERNEL_STACK_PAGES` = 16 (64 KiB).
 - Each process (including user processes) has a dedicated kernel stack used
   during trap handling.
 
 ### mmap Tracking
 
-Each process can track up to `MAX_MMAP_REGIONS` = 32 mmap'd regions. Each
+Each process can track up to `MAX_MMAP_REGIONS` = 256 mmap'd regions. Each
 region records `base_ppn` and `page_count`. The `SYS_MUNMAP` syscall
 validates that the requested unmap matches a tracked region before freeing.
 
@@ -656,9 +659,10 @@ After obtaining a `"sysinfo"` channel:
 | `MAX_PROCS`         | 64    | Maximum number of processes         |
 | `MAX_CHANNELS`      | 64    | Maximum simultaneous channels       |
 | `MAX_QUEUE_DEPTH`   | 64    | Maximum messages per endpoint queue  |
-| `MAX_MSG_SIZE`      | 64    | Maximum message payload (bytes)     |
-| `MAX_MMAP_REGIONS`  | 32    | mmap tracking slots per process     |
+| `MAX_MSG_SIZE`      | 1024  | Maximum message payload (bytes)     |
+| `MAX_CAPS`          | 4     | Capability slots per message        |
+| `MAX_MMAP_REGIONS`  | 256   | mmap tracking slots per process     |
 | `PAGE_SIZE`         | 4096  | Page size (bytes)                   |
-| `KERNEL_STACK_PAGES`| 4     | Kernel stack per process (16 KiB)   |
+| `KERNEL_STACK_PAGES`| 16    | Kernel stack per process (64 KiB)   |
 | `USER_STACK_PAGES`  | 8     | User stack per process (32 KiB)     |
 | `NO_CAP`            | usize::MAX | Sentinel for "no capability"   |

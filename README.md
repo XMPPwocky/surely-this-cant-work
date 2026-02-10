@@ -66,17 +66,20 @@ rvOS follows a **microkernel service model**. All user-visible services (console
 
 ### Process List
 
+Serial-only boot (no GPU):
+
 | PID | Name | Type | Role |
 |-----|------|------|------|
 | 0 | idle | kernel | Idle loop (kmain) |
-| 1 | init | kernel | Service directory |
+| 1 | init | kernel | Service directory + process loader |
 | 2 | serial-con | kernel | Serial console server |
-| 3 | fb-con | kernel | Framebuffer console (if GPU) |
-| 4 | sysinfo | kernel | Process list service |
-| 5 | math | kernel | Computation service |
-| 6 | hello-std | user | Test program (Rust std) |
-| 7 | shell-serial | user | Interactive shell (serial) |
-| 8 | shell-fb | user | Interactive shell (framebuffer, if GPU) |
+| 3 | sysinfo | kernel | Process/memory info service |
+| 4 | math | kernel | Computation service |
+| 5 | fs | user | Filesystem server (tmpfs) |
+| 6 | shell-serial | user | Interactive shell (serial) |
+
+With GPU, additional kernel tasks are spawned: gpu-server, kbd-server,
+mouse-server, fb-con; and user processes: fbcon, shell-fb.
 
 ### IPC Model
 
@@ -113,12 +116,20 @@ User Process                     Init Server                 Service
 | 124 | `SYS_YIELD` | Yield CPU |
 | 172 | `SYS_GETPID` | Get process ID |
 | 200 | `SYS_CHAN_CREATE` | Create bidirectional channel pair |
-| 201 | `SYS_CHAN_SEND` | Send message on channel |
+| 201 | `SYS_CHAN_SEND` | Send message on channel (non-blocking) |
 | 202 | `SYS_CHAN_RECV` | Non-blocking receive |
 | 203 | `SYS_CHAN_CLOSE` | Close channel handle |
 | 204 | `SYS_CHAN_RECV_BLOCKING` | Blocking receive |
-| 222 | `SYS_MMAP` | Allocate and map pages |
+| 205 | `SYS_SHM_CREATE` | Create shared memory region |
+| 206 | `SYS_SHM_DUP_RO` | Duplicate SHM handle as read-only |
+| 207 | `SYS_CHAN_SEND_BLOCKING` | Blocking send |
+| 208 | `SYS_CHAN_POLL_ADD` | Register channel for poll-based blocking |
+| 209 | `SYS_BLOCK` | Block until woken by channel event |
 | 215 | `SYS_MUNMAP` | Unmap and free pages |
+| 222 | `SYS_MMAP` | Allocate and map pages (or map SHM) |
+| 230 | `SYS_TRACE` | Record timestamped trace event |
+| 231 | `SYS_SHUTDOWN` | Shut down machine via SBI |
+| 232 | `SYS_CLOCK` | Read wall-clock and CPU ticks |
 
 See [docs/kernel-abi.md](docs/kernel-abi.md) for the full ABI reference.
 

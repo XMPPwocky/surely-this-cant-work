@@ -506,12 +506,12 @@ region must coordinate access themselves. Recommended patterns:
 
 | Constant            | Value | Description                              |
 |---------------------|-------|------------------------------------------|
-| `MAX_HANDLES`       | 16    | Handle table slots per process (channels + SHM) |
+| `MAX_HANDLES`       | 32    | Handle table slots per process (channels + SHM) |
 | `MAX_PROCS`         | 64    | Maximum number of processes               |
-| `MAX_CHANNELS`      | 32    | Maximum simultaneous channels             |
+| `MAX_CHANNELS`      | 64    | Maximum simultaneous channels             |
 | `MAX_SHM_REGIONS`   | 32    | Maximum simultaneous shared memory regions |
-| `MAX_MSG_SIZE`      | 64    | Maximum message payload (bytes)           |
-| `MAX_MMAP_REGIONS`  | 32    | mmap tracking slots per process           |
+| `MAX_MSG_SIZE`      | 1024  | Maximum message payload (bytes)           |
+| `MAX_MMAP_REGIONS`  | 256   | mmap tracking slots per process           |
 | `PAGE_SIZE`         | 4096  | Page size (bytes)                         |
 | `NO_CAP`            | usize::MAX | Sentinel for "no capability"         |
 
