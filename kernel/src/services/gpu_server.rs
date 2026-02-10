@@ -72,7 +72,14 @@ pub fn gpu_server() {
                 send_msg(client_ep, resp);
             }
             GpuRequest::Flush { x, y, w, h } => {
-                crate::drivers::virtio::gpu::flush_rect(x, y, w, h);
+                let in_bounds = x.checked_add(w).is_some_and(|xw| xw <= width)
+                    && y.checked_add(h).is_some_and(|yh| yh <= height);
+                if in_bounds {
+                    crate::drivers::virtio::gpu::flush_rect(x, y, w, h);
+                } else {
+                    crate::println!("[gpu-server] flush out of bounds: {}x{}+{}+{} (display {}x{})",
+                        w, h, x, y, width, height);
+                }
                 let resp_data = GpuResponse::FlushOk {};
                 let mut resp = Message::new();
                 resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
