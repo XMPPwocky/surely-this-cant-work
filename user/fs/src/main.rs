@@ -682,39 +682,39 @@ fn do_readdir(client_handle: usize, path: &str) {
 }
 
 static HELLO_STD_ELF: &[u8] = include_bytes!(
-    "../../../user/hello/target/riscv64gc-unknown-rvos/release/hello"
+    "../../target/riscv64gc-unknown-rvos/release/hello"
 );
 
 static WINDOW_SERVER_ELF: &[u8] = include_bytes!(
-    "../../../user/window-server/target/riscv64gc-unknown-rvos/release/window-server"
+    "../../target/riscv64gc-unknown-rvos/release/window-server"
 );
 
 static WINCLIENT_ELF: &[u8] = include_bytes!(
-    "../../../user/winclient/target/riscv64gc-unknown-rvos/release/winclient"
+    "../../target/riscv64gc-unknown-rvos/release/winclient"
 );
 
 static IPC_TORTURE_ELF: &[u8] = include_bytes!(
-    "../../../user/ipc-torture/target/riscv64gc-unknown-rvos/release/ipc-torture"
+    "../../target/riscv64gc-unknown-rvos/release/ipc-torture"
 );
 
 static FBCON_ELF: &[u8] = include_bytes!(
-    "../../../user/fbcon/target/riscv64gc-unknown-rvos/release/fbcon"
+    "../../target/riscv64gc-unknown-rvos/release/fbcon"
 );
 
 static SHELL_ELF: &[u8] = include_bytes!(
-    "../../../user/shell/target/riscv64gc-unknown-rvos/release/shell"
+    "../../target/riscv64gc-unknown-rvos/release/shell"
 );
 
 static BENCH_ELF: &[u8] = include_bytes!(
-    "../../../user/bench/target/riscv64gc-unknown-rvos/release/bench"
+    "../../target/riscv64gc-unknown-rvos/release/bench"
 );
 
 static TRIANGLE_ELF: &[u8] = include_bytes!(
-    "../../../user/triangle/target/riscv64gc-unknown-rvos/release/triangle"
+    "../../target/riscv64gc-unknown-rvos/release/triangle"
 );
 
 static GUI_BENCH_ELF: &[u8] = include_bytes!(
-    "../../../user/gui-bench/target/riscv64gc-unknown-rvos/release/gui-bench"
+    "../../target/riscv64gc-unknown-rvos/release/gui-bench"
 );
 
 // --- Multiplexed client state ---

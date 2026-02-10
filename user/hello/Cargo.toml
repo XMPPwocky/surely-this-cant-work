@@ -3,12 +3,5 @@ name = "hello"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-
 [dependencies]
-rvos-rt = { path = "../rvos-rt" }
-
-[profile.release]
-panic = "abort"
-opt-level = "s"
-lto = true
+rvos-rt.workspace = true

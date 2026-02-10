@@ -1,3 +1,6 @@
+// C ABI compiler-builtins: standard safety contracts, no per-fn docs needed.
+#![allow(clippy::missing_safety_doc)]
+
 use core::arch::global_asm;
 
 // Entry point: the ELF loader jumps here.

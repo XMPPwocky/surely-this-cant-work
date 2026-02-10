@@ -3,15 +3,8 @@ name = "fbcon"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-
 [dependencies]
-rvos-rt = { path = "../rvos-rt" }
-rvos = { path = "../../lib/rvos" }
-rvos-proto = { path = "../../lib/rvos-proto" }
-rvos-gfx = { path = "../../lib/rvos-gfx" }
-
-[profile.release]
-panic = "abort"
-opt-level = "s"
-lto = true
+rvos-rt.workspace = true
+rvos.workspace = true
+rvos-proto.workspace = true
+rvos-gfx.workspace = true

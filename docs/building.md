@@ -224,7 +224,7 @@ In `kernel/src/arch/user_programs.S`:
 .global _user_myapp_end
 .balign 8
 _user_myapp_start:
-    .incbin "user/myapp/target/riscv64gc-unknown-none-elf/release/myapp"
+    .incbin "user/target/riscv64gc-unknown-rvos/release/myapp"
 _user_myapp_end:
 ```
 

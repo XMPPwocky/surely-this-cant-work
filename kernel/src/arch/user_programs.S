@@ -96,7 +96,7 @@ _user_getpid_end:
     .globl _user_shell_end
     .align 4
 _user_shell_start:
-    .incbin "user/shell/target/riscv64gc-unknown-rvos/release/shell"
+    .incbin "user/target/riscv64gc-unknown-rvos/release/shell"
 _user_shell_end:
 
     #---------------------------------------------------------------------------
@@ -106,6 +106,6 @@ _user_shell_end:
     .globl _user_fs_end
     .align 4
 _user_fs_start:
-    .incbin "user/fs/target/riscv64gc-unknown-rvos/release/fs"
+    .incbin "user/target/riscv64gc-unknown-rvos/release/fs"
 _user_fs_end:
 
