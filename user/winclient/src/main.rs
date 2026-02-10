@@ -19,7 +19,7 @@ fn main() {
     // 2. Send CreateWindow request
     let mut req = Message::new();
     req.len = rvos_wire::to_bytes(
-        &CreateWindowRequest { width: 0, height: 0 }, // ignored, fullscreen
+        &CreateWindowRequest { width: 400, height: 300 },
         &mut req.data,
     ).unwrap_or(0);
     raw::sys_chan_send_blocking(win_ctl, &req);

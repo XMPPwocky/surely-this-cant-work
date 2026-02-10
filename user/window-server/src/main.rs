@@ -426,10 +426,12 @@ fn handle_mouse_event(server: &mut Server, msg: &Message) {
                         }
                     }
 
-                    // Click in content area or fullscreen -> drag + forward
-                    server.dragging = Some(idx);
-                    server.drag_offset_x = cx - win_x;
-                    server.drag_offset_y = cy - win_y;
+                    // Click in content area -> drag + forward (not fullscreen)
+                    if !is_fs {
+                        server.dragging = Some(idx);
+                        server.drag_offset_x = cx - win_x;
+                        server.drag_offset_y = cy - win_y;
+                    }
                 }
             }
             forward_mouse_button(server, true, button);
