@@ -131,7 +131,8 @@ impl<S: rvos_wire::Serialize, R> Channel<S, R> {
         let mut msg = Message::new();
         msg.len = rvos_wire::to_bytes(val, &mut msg.data)
             .map_err(|_| SysError::BadAddress)?;
-        msg.set_cap(cap);
+        msg.caps[0] = cap;
+        msg.cap_count = 1;
         self.inner.send(&msg)
     }
 }
@@ -151,7 +152,8 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
         self.inner.recv_blocking(&mut msg)?;
         let val = rvos_wire::from_bytes::<R>(&msg.data[..msg.len])
             .map_err(|_| SysError::BadAddress)?;
-        Ok((val, msg.cap()))
+        let cap = if msg.cap_count > 0 { msg.caps[0] } else { crate::raw::NO_CAP };
+        Ok((val, cap))
     }
 
     /// Blocking receive, returning the deserialized value and all capabilities.
@@ -175,7 +177,8 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
         let mut msg = Message::new();
         if self.inner.try_recv(&mut msg) != 0 { return None; }
         let val = rvos_wire::from_bytes::<R>(&msg.data[..msg.len]).ok()?;
-        Some((val, msg.cap()))
+        let cap = if msg.cap_count > 0 { msg.caps[0] } else { crate::raw::NO_CAP };
+        Some((val, cap))
     }
 }
 

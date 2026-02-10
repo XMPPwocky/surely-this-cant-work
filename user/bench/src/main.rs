@@ -1,6 +1,6 @@
 extern crate rvos_rt;
 
-use rvos::raw::{self, NO_CAP};
+use rvos::raw::{self};
 use rvos::Message;
 
 // --- Timing helpers ---
@@ -276,26 +276,14 @@ fn bench_readdir_large() -> (u64, u32) {
 }
 
 fn bench_process_spawn() -> (u64, u32) {
-    use rvos_proto::boot::{BootRequest, BootResponse};
     let iters = 3u32;
     let start = rdtime();
     for _ in 0..iters {
-        let mut msg = Message::new();
-        msg.len = rvos::rvos_wire::to_bytes(
-            &BootRequest::Spawn { path: "/bin/hello-std", args: &[], ns_overrides: &[] },
-            &mut msg.data,
-        ).unwrap_or(0);
-        msg.set_cap(NO_CAP);
-        raw::sys_chan_send_blocking(0, &msg);
-
-        let mut resp = Message::new();
-        raw::sys_chan_recv_blocking(0, &mut resp);
-        if let Ok(BootResponse::Ok {}) = rvos::rvos_wire::from_bytes::<BootResponse>(&resp.data[..resp.len]) {
-            if resp.cap() != NO_CAP {
-                let mut exit_msg = Message::new();
-                raw::sys_chan_recv_blocking(resp.cap(), &mut exit_msg);
-                raw::sys_chan_close(resp.cap());
-            }
+        if let Ok(proc_chan) = rvos::spawn_process("/bin/hello-std") {
+            let proc_handle = proc_chan.into_raw_handle();
+            let mut exit_msg = Message::new();
+            raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+            raw::sys_chan_close(proc_handle);
         }
     }
     (rdtime() - start, iters)

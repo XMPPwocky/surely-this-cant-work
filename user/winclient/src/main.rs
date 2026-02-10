@@ -1,11 +1,12 @@
 extern crate rvos_rt;
 
 use rvos::raw::{self};
-use rvos::Message;
+use rvos::UserTransport;
+use rvos::Channel;
 use rvos::rvos_wire;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
-    WindowRequest, WindowReply, WindowEvent,
+    WindowReply, WindowEvent, WindowClient,
 };
 
 fn main() {
@@ -16,52 +17,30 @@ fn main() {
         .expect("failed to connect to window service")
         .into_raw_handle();
 
-    // 2. Send CreateWindow request
-    let mut req = Message::new();
-    req.len = rvos_wire::to_bytes(
-        &CreateWindowRequest { width: 400, height: 300 },
-        &mut req.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(win_ctl, &req);
+    // 2. CreateWindow handshake (returns 2 caps: request + event channels)
+    let win_ctl_ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
+    win_ctl_ch.send(&CreateWindowRequest { width: 400, height: 300 })
+        .expect("CreateWindow send");
+    let (_create_resp, caps, _cap_count) = win_ctl_ch.recv_with_caps_blocking()
+        .expect("CreateWindow recv");
+    let req_chan = caps[0];
+    let event_chan = caps[1];
 
-    // 3. Receive CreateWindow reply with two channel capabilities
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(win_ctl, &mut resp);
-    let req_chan = resp.caps[0];   // request channel
-    let event_chan = resp.caps[1]; // event channel
+    // 3. Typed WindowClient for RPC on request channel
+    let mut win_client = WindowClient::new(UserTransport::new(req_chan));
 
-    let _create_resp = rvos_wire::from_bytes::<CreateWindowResponse>(&resp.data[..resp.len]);
-
-    // 4. GetInfo on request channel
-    let mut req = Message::new();
-    req.len = rvos_wire::to_bytes(
-        &WindowRequest::GetInfo { seq: 1 },
-        &mut req.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(req_chan, &req);
-
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(req_chan, &mut resp);
-    let (width, height, stride) = match rvos_wire::from_bytes::<WindowReply>(&resp.data[..resp.len]) {
+    // 4. GetInfo
+    let (width, height, stride) = match win_client.get_info(1) {
         Ok(WindowReply::InfoReply { width, height, stride, .. }) => (width, height, stride),
         _ => (1024, 768, 1024),
     };
 
-    // 5. GetFramebuffer → receive SHM handle
-    let mut req = Message::new();
-    req.len = rvos_wire::to_bytes(
-        &WindowRequest::GetFramebuffer { seq: 2 },
-        &mut req.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(req_chan, &req);
-
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(req_chan, &mut resp);
-    let shm_handle = resp.cap();
+    // 5. GetFramebuffer -> SHM handle
+    let (_, shm) = win_client.get_framebuffer(2).expect("GetFramebuffer failed");
 
     // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
     let fb_size = (stride as usize) * (height as usize) * 4 * 2;
-    let fb_base = match raw::mmap(shm_handle, fb_size) {
+    let fb_base = match raw::mmap(shm.0, fb_size) {
         Ok(ptr) => ptr as *mut u32,
         Err(_) => {
             println!("[winclient] ERROR: mmap failed");
@@ -84,23 +63,7 @@ fn main() {
         draw_gradient(fb_base, back_offset, width, height, stride, frame);
 
         // SwapBuffers
-        let mut req = Message::new();
-        req.len = rvos_wire::to_bytes(
-            &WindowRequest::SwapBuffers { seq: frame },
-            &mut req.data,
-        ).unwrap_or(0);
-        raw::sys_chan_send_blocking(req_chan, &req);
-
-        // Wait for swap reply on request channel
-        loop {
-            let mut resp = Message::new();
-            raw::sys_chan_recv_blocking(req_chan, &mut resp);
-            if resp.len == 0 { break; }
-            match rvos_wire::from_bytes::<WindowReply>(&resp.data[..resp.len]) {
-                Ok(WindowReply::SwapReply { .. }) => break,
-                _ => {}
-            }
-        }
+        let _ = win_client.swap_buffers(frame);
 
         // After swap, what was back becomes front, toggle back
         current_back = 1 - current_back;
@@ -108,7 +71,7 @@ fn main() {
 
         // Drain any pending key events from event channel between frames
         loop {
-            let mut msg = Message::new();
+            let mut msg = rvos::Message::new();
             let ret = raw::sys_chan_recv(event_chan, &mut msg);
             if ret != 0 { break; }
             if msg.len > 0 {

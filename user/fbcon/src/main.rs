@@ -1,13 +1,13 @@
 extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
-use rvos::Message;
+use rvos::{Message, Channel, UserTransport};
 use rvos::rvos_wire;
 use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED};
 use rvos_proto::service_control::NewConnection;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
-    WindowRequest, WindowReply, WindowEvent,
+    WindowReply, WindowEvent, WindowClient,
 };
 
 // --- Font data (shared from rvos-gfx) ---
@@ -321,47 +321,30 @@ fn main() {
         .expect("failed to connect to window service")
         .into_raw_handle();
 
-    // 2. Send CreateWindow request
-    let mut req = Message::new();
-    req.len = rvos_wire::to_bytes(
-        &CreateWindowRequest { width: 0, height: 0 },
-        &mut req.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(win_ctl, &req);
+    // 2. Send CreateWindow request and receive per-window channels
+    let ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
+    ch.send(&CreateWindowRequest { width: 0, height: 0 }).expect("CreateWindow send failed");
+    let (_create_resp, caps, cap_count) = ch.recv_with_caps_blocking().expect("CreateWindow recv failed");
+    if cap_count < 2 {
+        panic!("[fbcon] CreateWindow response missing channels");
+    }
+    let req_chan = caps[0];
+    let event_chan = caps[1];
 
-    // 3. Receive CreateWindow reply with two per-window channel capabilities
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(win_ctl, &mut resp);
-    let _create_resp = rvos_wire::from_bytes::<CreateWindowResponse>(&resp.data[..resp.len]);
-    let req_chan = resp.caps[0];
-    let event_chan = resp.caps[1];
+    // 3. Use WindowClient for typed RPC
+    let mut window_client = WindowClient::new(UserTransport::new(req_chan));
 
-    // 4. GetInfo on request channel
-    let mut req = Message::new();
-    req.len = rvos_wire::to_bytes(
-        &WindowRequest::GetInfo { seq: 1 },
-        &mut req.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(req_chan, &req);
-
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(req_chan, &mut resp);
-    let (width, height, stride) = match rvos_wire::from_bytes::<WindowReply>(&resp.data[..resp.len]) {
+    // 4. GetInfo to query dimensions
+    let (width, height, stride) = match window_client.get_info(1) {
         Ok(WindowReply::InfoReply { width, height, stride, .. }) => (width, height, stride),
         _ => (1024, 768, 1024),
     };
 
     // 5. GetFramebuffer → receive SHM handle
-    let mut req = Message::new();
-    req.len = rvos_wire::to_bytes(
-        &WindowRequest::GetFramebuffer { seq: 2 },
-        &mut req.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(req_chan, &req);
-
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(req_chan, &mut resp);
-    let shm_handle = resp.cap();
+    let shm_handle = match window_client.get_framebuffer(2) {
+        Ok((WindowReply::FbReply { .. }, shm_handle)) => shm_handle.0,
+        _ => panic!("[fbcon] GetFramebuffer failed"),
+    };
 
     // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
     let fb_size = (stride as usize) * (height as usize) * 4 * 2;
@@ -393,7 +376,7 @@ fn main() {
     console.write_str(b"================\r\n\r\n");
 
     // Do initial present
-    do_swap(req_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
+    do_swap(&mut window_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
     // Re-point console to new back buffer
     update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
     console.dirty = false;
@@ -408,7 +391,8 @@ fn main() {
             let ret = raw::sys_chan_recv(CONSOLE_CONTROL_HANDLE, &mut msg);
             if ret != 0 { break; }
             handled = true;
-            if msg.cap() != NO_CAP {
+            let cap = if msg.cap_count > 0 { msg.caps[0] } else { NO_CAP };
+            if cap != NO_CAP {
                 // Parse NewConnection { client_pid: u32, channel_role: u8 }
                 let (pid, role) = match rvos_wire::from_bytes::<NewConnection>(&msg.data[..msg.len]) {
                     Ok(nc) => (nc.client_pid, nc.channel_role),
@@ -440,9 +424,9 @@ fn main() {
 
                 if let Some(idx) = idx {
                     match role {
-                        1 => clients[idx].stdin_handle = msg.cap(),
-                        2 => clients[idx].stdout_handle = msg.cap(),
-                        _ => clients[idx].stdout_handle = msg.cap(),
+                        1 => clients[idx].stdin_handle = cap,
+                        2 => clients[idx].stdout_handle = cap,
+                        _ => clients[idx].stdout_handle = cap,
                     }
                     // Don't auto-push onto stdin_stack here.
                     // Clients are added only when they first issue a Read
@@ -450,7 +434,7 @@ fn main() {
                     // from stealing keyboard input from the shell.
                 } else {
                     println!("[fbcon] WARN: too many console clients, dropping PID {}", pid);
-                    raw::sys_chan_close(msg.cap());
+                    raw::sys_chan_close(cap);
                 }
             }
         }
@@ -579,7 +563,7 @@ fn main() {
 
         // If console is dirty, present the frame
         if console.dirty {
-            do_swap(req_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
+            do_swap(&mut window_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
             update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
             console.dirty = false;
             handled = true;
@@ -651,23 +635,15 @@ fn handle_key_input(
 
 /// Swap buffers, wait for swap reply, then copy front→new-back.
 fn do_swap(
-    req_chan: usize,
+    window_client: &mut WindowClient<UserTransport>,
     seq: &mut u32,
     fb_base: *mut u32,
     pixels_per_buffer: usize,
     current_back: &mut u8,
 ) {
-    let mut req = Message::new();
-    req.len = rvos_wire::to_bytes(
-        &WindowRequest::SwapBuffers { seq: *seq },
-        &mut req.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(req_chan, &req);
+    // Send swap request and wait for reply
+    let _ = window_client.swap_buffers(*seq);
     *seq = seq.wrapping_add(1);
-
-    // Wait for swap reply — events arrive on separate event_chan, no buffering needed
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(req_chan, &mut resp);
 
     // Toggle back buffer
     *current_back = 1 - *current_back;

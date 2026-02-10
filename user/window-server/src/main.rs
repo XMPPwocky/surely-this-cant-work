@@ -134,7 +134,8 @@ fn send_reply(handle: usize, reply: &WindowReply) {
 fn send_reply_with_cap(handle: usize, reply: &WindowReply, cap: usize) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(reply, &mut msg.data).unwrap_or(0);
-    msg.set_cap(cap);
+    msg.caps[0] = cap;
+    msg.cap_count = 1;
     raw::sys_chan_send_blocking(handle, &msg);
 }
 
@@ -161,7 +162,7 @@ fn main() {
         _ => (1024, 768, 1024),
     };
 
-    let gpu_shm_handle = resp.cap();
+    let gpu_shm_handle = if resp.cap_count > 0 { resp.caps[0] } else { NO_CAP };
     let fb_size = (stride as usize) * (height as usize) * 4;
     let display_fb = match raw::mmap(gpu_shm_handle, fb_size) {
         Ok(ptr) => ptr as *mut u32,
@@ -203,7 +204,7 @@ fn main() {
             let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut cmsg);
             if ret != 0 { break; }
             did_work = true;
-            let per_client_handle = cmsg.cap();
+            let per_client_handle = if cmsg.cap_count > 0 { cmsg.caps[0] } else { NO_CAP };
             if per_client_handle != NO_CAP {
                 handle_new_client(&mut server, per_client_handle);
             }

@@ -5,21 +5,14 @@ use rvos::Message;
 use rvos::UserTransport;
 use rvos::rvos_wire;
 use rvos::rvos_proto;
-use rvos_proto::boot::{BootRequest, BootResponse};
 use rvos_proto::math::MathClient;
 use rvos_proto::sysinfo::SysinfoCommand;
 
 /// Request a service from the init server via boot channel (handle 0).
 fn request_service(name: &str) -> usize {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&BootRequest::ConnectService { name }, &mut msg.data)
-        .unwrap_or(0);
-    raw::sys_chan_send(0, &msg);
-    let mut reply = Message::new();
-    raw::sys_chan_recv_blocking(0, &mut reply);
-    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => reply.cap(),
-        _ => usize::MAX,
+    match rvos::connect_to_service(name) {
+        Ok(ch) => ch.into_raw_handle(),
+        Err(_) => usize::MAX,
     }
 }
 
@@ -378,39 +371,19 @@ fn cmd_run(args: &str) {
         return;
     }
 
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
-        &BootRequest::Spawn { path, args: &args_blob[..actual_args_len], ns_overrides: &[] },
-        &mut msg.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send(0, &msg);
-
-    // Wait for response
-    let mut reply = Message::new();
-    raw::sys_chan_recv_blocking(0, &mut reply);
-
-    match rvos_wire::from_bytes::<BootResponse>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => {}
-        Ok(BootResponse::Error { message }) => {
-            println!("Spawn failed: {}", message);
-            return;
+    match rvos::spawn_process_with_args(path, &args_blob[..actual_args_len]) {
+        Ok(ch) => {
+            let proc_handle = ch.into_raw_handle();
+            if background {
+                println!("Started in background");
+                raw::sys_chan_close(proc_handle);
+            } else {
+                wait_for_exit(proc_handle);
+            }
         }
-        _ => {
-            println!("Spawn failed: bad response");
-            return;
+        Err(_) => {
+            println!("Spawn failed");
         }
-    }
-
-    if reply.cap() == rvos::NO_CAP {
-        println!("Spawn failed: no process handle returned");
-        return;
-    }
-
-    if background {
-        println!("Started in background");
-        raw::sys_chan_close(reply.cap());
-    } else {
-        wait_for_exit(reply.cap());
     }
 }
 

@@ -15,6 +15,9 @@ pub struct Message {
     pub data: [u8; MAX_MSG_SIZE],
     pub len: usize,
     pub sender_pid: usize,
+    /// Capability sideband — only accessed by `Transport::send/recv` and
+    /// IPC infrastructure (`Channel`).  Application code should use typed
+    /// protocol clients (`define_protocol!`) instead of touching this directly.
     pub caps: [usize; MAX_CAPS],
     pub cap_count: usize,
 }
@@ -75,19 +78,6 @@ impl Message {
         self.sender_pid
     }
 
-    /// Get the first capability handle (convenience for single-cap messages).
-    pub fn cap(&self) -> usize {
-        if self.cap_count > 0 { self.caps[0] } else { NO_CAP }
-    }
-
-    /// Set the first capability handle (convenience for single-cap messages).
-    pub fn set_cap(&mut self, cap: usize) {
-        self.caps[0] = cap;
-        if cap != NO_CAP {
-            self.cap_count = self.cap_count.max(1);
-        }
-    }
-
     /// Create a Writer over the data buffer.
     pub fn writer(&mut self) -> Writer<'_> {
         Writer::new(&mut self.data)
@@ -96,21 +86,5 @@ impl Message {
     /// Create a Reader over the payload.
     pub fn reader(&self) -> Reader<'_> {
         Reader::new(&self.data[..self.len])
-    }
-
-    /// Build a message: write into data using a closure, set len from writer position.
-    pub fn build<F>(cap: usize, f: F) -> Self
-    where
-        F: FnOnce(&mut Writer<'_>),
-    {
-        let mut msg = Self::new();
-        if cap != NO_CAP {
-            msg.caps[0] = cap;
-            msg.cap_count = 1;
-        }
-        let mut w = Writer::new(&mut msg.data);
-        f(&mut w);
-        msg.len = w.position();
-        msg
     }
 }

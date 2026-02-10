@@ -417,7 +417,8 @@ fn send_ok(handle: usize, cap: usize) {
         &FsResponse::Ok { kind: FsEntryKind::File {}, size: 0 },
         &mut msg.data,
     ).unwrap_or(0);
-    msg.set_cap(cap);
+    msg.caps[0] = cap;
+    if cap != rvos::NO_CAP { msg.cap_count = 1; }
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -448,7 +449,6 @@ fn send_write_ok(handle: usize, written: u32) {
 fn send_stat_ok(handle: usize, kind: FsEntryKind, size: u64) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FsResponse::Ok { kind, size }, &mut msg.data).unwrap_or(0);
-    msg.set_cap(NO_CAP);
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -458,7 +458,6 @@ fn send_dir_entry(handle: usize, kind: FsEntryKind, size: u64, name: &str) {
         &ReaddirResponse::Entry { kind, size, name },
         &mut msg.data,
     ).unwrap_or(0);
-    msg.set_cap(NO_CAP);
     raw::sys_chan_send(handle, &msg);
 }
 
@@ -771,19 +770,20 @@ fn main() {
             let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut msg);
             if ret != 0 { break; }
             handled = true;
-            if msg.cap() != NO_CAP {
+            let cap = if msg.cap_count > 0 { msg.caps[0] } else { rvos::NO_CAP };
+            if cap != NO_CAP {
                 // Find a free client slot (or reclaim an inactive one)
                 let slot = clients.iter_mut().find(|c| !c.active);
                 if let Some(slot) = slot {
                     *slot = ClientState {
-                        ctl_handle: msg.cap(),
+                        ctl_handle: cap,
                         file_handle: 0,
                         file_inode: 0,
                         active: true,
                     };
                 } else {
                     // No free slots — close the endpoint
-                    raw::sys_chan_close(msg.cap());
+                    raw::sys_chan_close(cap);
                 }
             }
         }

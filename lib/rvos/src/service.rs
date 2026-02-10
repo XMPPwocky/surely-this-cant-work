@@ -4,7 +4,22 @@ use crate::channel::RawChannel;
 use crate::error::{SysError, SysResult};
 use crate::message::Message;
 use crate::raw;
+use crate::transport::UserTransport;
 use rvos_proto::boot::{BootRequest, BootResponse};
+use rvos_wire::{Transport, NO_CAP, MAX_MSG_SIZE};
+
+/// Extract a capability handle from a boot channel response, returning
+/// an error if the response is not Ok or carries no capability.
+fn boot_response_cap(resp: BootResponse<'_>, cap: usize) -> SysResult<RawChannel> {
+    match resp {
+        BootResponse::Ok {} => {}
+        _ => return Err(SysError::NoResources),
+    }
+    if cap == NO_CAP {
+        return Err(SysError::NoResources);
+    }
+    Ok(RawChannel::from_raw_handle(cap))
+}
 
 /// Connect to a named service via the boot channel (handle 0).
 ///
@@ -16,39 +31,15 @@ pub fn connect_to_service(name: &str) -> SysResult<RawChannel> {
 
 /// Connect to a named service via a specific boot handle.
 pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<RawChannel> {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&BootRequest::ConnectService { name }, &mut msg.data)
-        .map_err(|_| SysError::BadAddress)?;
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_SEND,
-        boot_handle,
-        &msg as *const Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    let mut reply = Message::new();
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_RECV_BLOCKING,
-        boot_handle,
-        &mut reply as *mut Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    // Parse response
-    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => {}
-        _ => return Err(SysError::NoResources),
-    }
-
-    if reply.cap() == raw::NO_CAP {
-        return Err(SysError::NoResources);
-    }
-
-    Ok(RawChannel::from_raw_handle(reply.cap()))
+    let mut transport = UserTransport::new(boot_handle);
+    let mut buf = [0u8; MAX_MSG_SIZE];
+    let (resp, cap) = rvos_wire::rpc_call_with_cap(
+        &mut transport,
+        &BootRequest::ConnectService { name },
+        NO_CAP,
+        &mut buf,
+    ).map_err(|_| SysError::NoResources)?;
+    boot_response_cap(resp, cap)
 }
 
 /// Spawn a process from a filesystem path via the boot channel (handle 0).
@@ -61,40 +52,15 @@ pub fn spawn_process(path: &str) -> SysResult<RawChannel> {
 
 /// Spawn a process via a specific boot handle.
 pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<RawChannel> {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
+    let mut transport = UserTransport::new(boot_handle);
+    let mut buf = [0u8; MAX_MSG_SIZE];
+    let (resp, cap) = rvos_wire::rpc_call_with_cap(
+        &mut transport,
         &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
-        &mut msg.data,
-    ).map_err(|_| SysError::BadAddress)?;
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_SEND,
-        boot_handle,
-        &msg as *const Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    let mut reply = Message::new();
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_RECV_BLOCKING,
-        boot_handle,
-        &mut reply as *mut Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => {}
-        _ => return Err(SysError::NoResources),
-    }
-
-    if reply.cap() == raw::NO_CAP {
-        return Err(SysError::NoResources);
-    }
-
-    Ok(RawChannel::from_raw_handle(reply.cap()))
+        NO_CAP,
+        &mut buf,
+    ).map_err(|_| SysError::NoResources)?;
+    boot_response_cap(resp, cap)
 }
 
 /// Spawn a process with an extra capability channel passed as handle 1.
@@ -107,41 +73,15 @@ pub fn spawn_process_with_cap(path: &str, cap_handle: usize) -> SysResult<RawCha
 
 /// Spawn a process with an extra capability via a specific boot handle.
 pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usize) -> SysResult<RawChannel> {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
+    let mut transport = UserTransport::new(boot_handle);
+    let mut buf = [0u8; MAX_MSG_SIZE];
+    let (resp, cap) = rvos_wire::rpc_call_with_cap(
+        &mut transport,
         &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
-        &mut msg.data,
-    ).map_err(|_| SysError::BadAddress)?;
-    msg.set_cap(cap_handle);
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_SEND,
-        boot_handle,
-        &msg as *const Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    let mut reply = Message::new();
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_RECV_BLOCKING,
-        boot_handle,
-        &mut reply as *mut Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => {}
-        _ => return Err(SysError::NoResources),
-    }
-
-    if reply.cap() == raw::NO_CAP {
-        return Err(SysError::NoResources);
-    }
-
-    Ok(RawChannel::from_raw_handle(reply.cap()))
+        cap_handle,
+        &mut buf,
+    ).map_err(|_| SysError::NoResources)?;
+    boot_response_cap(resp, cap)
 }
 
 /// Spawn a process with command-line arguments via the boot channel (handle 0).
@@ -154,40 +94,15 @@ pub fn spawn_process_with_args(path: &str, args: &[u8]) -> SysResult<RawChannel>
 
 /// Spawn a process with args via a specific boot handle.
 pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -> SysResult<RawChannel> {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
+    let mut transport = UserTransport::new(boot_handle);
+    let mut buf = [0u8; MAX_MSG_SIZE];
+    let (resp, cap) = rvos_wire::rpc_call_with_cap(
+        &mut transport,
         &BootRequest::Spawn { path, args, ns_overrides: &[] },
-        &mut msg.data,
-    ).map_err(|_| SysError::BadAddress)?;
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_SEND,
-        boot_handle,
-        &msg as *const Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    let mut reply = Message::new();
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_RECV_BLOCKING,
-        boot_handle,
-        &mut reply as *mut Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => {}
-        _ => return Err(SysError::NoResources),
-    }
-
-    if reply.cap() == raw::NO_CAP {
-        return Err(SysError::NoResources);
-    }
-
-    Ok(RawChannel::from_raw_handle(reply.cap()))
+        NO_CAP,
+        &mut buf,
+    ).map_err(|_| SysError::NoResources)?;
+    boot_response_cap(resp, cap)
 }
 
 /// Spawn a process with args and namespace overrides.
@@ -212,45 +127,26 @@ pub fn spawn_process_with_overrides_on(
     ns_overrides: &[u8],
     caps: &[usize],
 ) -> SysResult<RawChannel> {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
+    // Multi-cap send — use Transport directly since rpc_call_with_cap
+    // only supports a single capability.
+    let mut transport = UserTransport::new(boot_handle);
+    let mut send_buf = [0u8; MAX_MSG_SIZE];
+    let n = rvos_wire::to_bytes(
         &BootRequest::Spawn { path, args, ns_overrides },
-        &mut msg.data,
+        &mut send_buf,
     ).map_err(|_| SysError::BadAddress)?;
-    let cap_count = caps.len().min(crate::message::MAX_CAPS);
-    for i in 0..cap_count {
-        msg.caps[i] = caps[i];
-    }
-    msg.cap_count = cap_count;
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_SEND,
-        boot_handle,
-        &msg as *const Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
+    transport.send(&send_buf[..n], caps)
+        .map_err(|_| SysError::NoResources)?;
 
-    let mut reply = Message::new();
-    let ret = raw::syscall2(
-        raw::SYS_CHAN_RECV_BLOCKING,
-        boot_handle,
-        &mut reply as *mut Message as usize,
-    );
-    if ret != 0 {
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
+    let mut recv_buf = [0u8; MAX_MSG_SIZE];
+    let mut recv_caps = [0usize; rvos_wire::MAX_CAPS];
+    let (len, cap_count) = transport.recv(&mut recv_buf, &mut recv_caps)
+        .map_err(|_| SysError::NoResources)?;
 
-    match rvos_wire::from_bytes::<BootResponse<'_>>(&reply.data[..reply.len]) {
-        Ok(BootResponse::Ok {}) => {}
-        _ => return Err(SysError::NoResources),
-    }
-
-    if reply.cap() == raw::NO_CAP {
-        return Err(SysError::NoResources);
-    }
-
-    Ok(RawChannel::from_raw_handle(reply.cap()))
+    let resp = rvos_wire::from_bytes::<BootResponse<'_>>(&recv_buf[..len])
+        .map_err(|_| SysError::BadAddress)?;
+    let cap = if cap_count > 0 { recv_caps[0] } else { NO_CAP };
+    boot_response_cap(resp, cap)
 }
 
 /// Read the error message from a boot channel Error response.

@@ -17,7 +17,7 @@ pub mod fs;
 pub use error::{SysError, SysResult};
 pub use message::Message;
 pub use channel::{RawChannel, Channel, channel_pair};
-pub use service::{connect_to_service, spawn_process, spawn_process_with_cap, spawn_process_with_overrides};
+pub use service::{connect_to_service, spawn_process, spawn_process_with_args, spawn_process_with_cap, spawn_process_with_overrides};
 pub use raw::NO_CAP;
 pub use transport::UserTransport;
 

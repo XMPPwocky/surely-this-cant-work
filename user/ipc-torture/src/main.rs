@@ -177,7 +177,9 @@ where
     let _ = w.write_u32(msg_id);
     f(&mut w);
     msg.len = w.position();
-    msg.set_cap(cap);
+    // Raw cap access — ipc-torture deliberately tests low-level IPC.
+    msg.caps[0] = cap;
+    if cap != NO_CAP { msg.cap_count = 1; }
     trace_send(msg_id, tag, handle);
     raw::sys_chan_send_blocking(handle, &msg);
 }
@@ -653,8 +655,9 @@ fn run_child() {
 
             TAG_CAP_PASS => {
                 // Receive new channel endpoint from cap
-                if msg.cap() != NO_CAP {
-                    let new_handle = msg.cap();
+                let recv_cap = if msg.cap_count > 0 { msg.caps[0] } else { NO_CAP };
+                if recv_cap != NO_CAP {
+                    let new_handle = recv_cap;
                     // Wait for CAP_ECHO on new channel
                     let mut echo_msg = Message::new();
                     let ret = raw::sys_chan_recv_blocking(new_handle, &mut echo_msg);
@@ -687,8 +690,9 @@ fn run_child() {
 
             TAG_CLOSE_TEST => {
                 // Store report handle from cap; next recv will get ChannelClosed
-                if msg.cap() != NO_CAP {
-                    report_handle = msg.cap();
+                let recv_cap = if msg.cap_count > 0 { msg.caps[0] } else { NO_CAP };
+                if recv_cap != NO_CAP {
+                    report_handle = recv_cap;
                 }
                 // Continue loop — the parent will close our main channel
             }

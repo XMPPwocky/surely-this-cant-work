@@ -1,9 +1,9 @@
 //! Filesystem helpers for raw handle-based file operations.
 
 use crate::error::{SysError, SysResult};
-use crate::message::Message;
-use crate::raw;
+use crate::transport::UserTransport;
 use rvos_proto::fs::{FsRequest, FsResponse, OpenFlags};
+use rvos_wire::NO_CAP;
 
 /// Open a file via the fs service and return the raw file channel handle.
 ///
@@ -15,39 +15,28 @@ pub fn file_open_raw(path: &str, flags: OpenFlags) -> SysResult<usize> {
     let fs_chan = crate::service::connect_to_service("fs")?;
     let fs_handle = fs_chan.into_raw_handle();
 
-    // Send Open request
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
+    // Send Open, receive response + file handle cap
+    let mut transport = UserTransport::new(fs_handle);
+    let mut buf = [0u8; rvos_wire::MAX_MSG_SIZE];
+    let result = rvos_wire::rpc_call_with_cap(
+        &mut transport,
         &FsRequest::Open { flags, path },
-        &mut msg.data,
-    ).map_err(|_| SysError::BadAddress)?;
-    let ret = raw::sys_chan_send_blocking(fs_handle, &msg);
-    if ret != 0 {
-        raw::sys_chan_close(fs_handle);
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
-
-    // Recv response
-    let mut reply = Message::new();
-    let ret = raw::sys_chan_recv_blocking(fs_handle, &mut reply);
-    if ret != 0 {
-        raw::sys_chan_close(fs_handle);
-        return Err(SysError::from_code(ret).unwrap_err());
-    }
+        NO_CAP,
+        &mut buf,
+    );
 
     // Done with fs control channel
-    raw::sys_chan_close(fs_handle);
+    crate::raw::sys_chan_close(fs_handle);
 
-    // Parse response
-    match rvos_wire::from_bytes::<FsResponse>(&reply.data[..reply.len]) {
-        Ok(FsResponse::Ok { .. }) => {}
+    let (resp, cap) = result.map_err(|_| SysError::NoResources)?;
+    match resp {
+        FsResponse::Ok { .. } => {}
         _ => return Err(SysError::NoResources),
     }
 
-    let file_handle = reply.cap();
-    if file_handle == raw::NO_CAP {
+    if cap == NO_CAP {
         return Err(SysError::NoResources);
     }
 
-    Ok(file_handle)
+    Ok(cap)
 }
