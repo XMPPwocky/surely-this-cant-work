@@ -25,24 +25,27 @@ fn cmd_echo(line: &str) {
 }
 
 fn cmd_help() {
-    println!("Available commands:");
+    println!("Commands:");
     println!("  echo <text>           - Print text");
     println!("  math <op> <a> <b>     - Compute math (add/mul/sub)");
     println!("  ps                    - Show process list");
     println!("  mem                   - Show kernel memory stats");
-    println!("  trace                 - Show trace ring buffer");
-    println!("  trace clear           - Clear trace ring buffer");
+    println!("  trace [clear]         - Show/clear trace ring buffer");
     println!("  ls [path]             - List directory");
     println!("  cat <path>            - Read file");
     println!("  write <path> <text>   - Write to file");
     println!("  stat <path>           - Show file metadata");
-    println!("  run <path> [args...]   - Run a program and wait for it to exit");
-    println!("  run <path> [args...] & - Run a program in the background");
-    println!("  run <path> > <file>   - Run with stdout redirected (truncate)");
-    println!("  run <path> >> <file>  - Run with stdout redirected (append)");
+    println!("  run <path> [args...]  - Run program (& for background, > for redirect)");
     println!("  clear                 - Clear screen");
     println!("  help                  - Show this help");
     println!("  shutdown              - Shut down the system");
+    println!();
+    println!("Line editing:");
+    println!("  Left/Right, Ctrl+B/F  - Move cursor");
+    println!("  Home/End, Ctrl+A/E    - Jump to start/end of line");
+    println!("  Up/Down, Ctrl+P/N     - History navigation");
+    println!("  Ctrl+R                - Reverse history search");
+    println!("  Tab                   - Auto-complete");
 }
 
 fn cmd_cat(args: &str) {
@@ -463,26 +466,391 @@ fn try_complete(line: &str) -> Completion {
     Completion::None
 }
 
-fn handle_tab(buf: &mut String) {
-    match try_complete(buf) {
-        Completion::Single(text, replace_from) => {
-            let old_len = buf.len() - replace_from;
-            for _ in 0..old_len {
-                print!("\x08 \x08");
+// --- History Ring ---
+
+const HISTORY_MAX: usize = 64;
+const HISTORY_ENTRY_MAX: usize = 256;
+
+struct HistoryRing {
+    entries: Box<[[u8; HISTORY_ENTRY_MAX]; HISTORY_MAX]>,
+    lengths: [usize; HISTORY_MAX],
+    head: usize,
+    count: usize,
+}
+
+impl HistoryRing {
+    fn new() -> Self {
+        HistoryRing {
+            entries: Box::new([[0u8; HISTORY_ENTRY_MAX]; HISTORY_MAX]),
+            lengths: [0; HISTORY_MAX],
+            head: 0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, line: &[u8]) {
+        if line.is_empty() { return; }
+        let store_len = line.len().min(HISTORY_ENTRY_MAX);
+        // Deduplicate consecutive entries
+        if self.count > 0 {
+            let last = if self.head == 0 { HISTORY_MAX - 1 } else { self.head - 1 };
+            if self.lengths[last] == store_len
+                && self.entries[last][..store_len] == line[..store_len]
+            {
+                return;
             }
-            buf.truncate(replace_from);
-            buf.push_str(&text);
-            buf.push(' ');
-            print!("{} ", text);
+        }
+        self.entries[self.head][..store_len].copy_from_slice(&line[..store_len]);
+        self.lengths[self.head] = store_len;
+        self.head = (self.head + 1) % HISTORY_MAX;
+        if self.count < HISTORY_MAX {
+            self.count += 1;
+        }
+    }
+
+    /// Get entry by index (0 = most recent).
+    fn get(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.count { return None; }
+        let pos = if self.head > index {
+            self.head - 1 - index
+        } else {
+            HISTORY_MAX + self.head - 1 - index
+        };
+        Some(&self.entries[pos][..self.lengths[pos]])
+    }
+
+    /// Search for needle as substring, starting from `start_index`.
+    fn search(&self, needle: &[u8], start_index: usize) -> Option<usize> {
+        for i in start_index..self.count {
+            if let Some(entry) = self.get(i) {
+                if bytes_contains(entry, needle) {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() { return true; }
+    if needle.len() > haystack.len() { return false; }
+    for i in 0..=haystack.len() - needle.len() {
+        if haystack[i..i + needle.len()] == *needle {
+            return true;
+        }
+    }
+    false
+}
+
+// --- Line Editor ---
+
+const LINE_MAX: usize = 256;
+const SEARCH_MAX: usize = 64;
+const PROMPT: &str = "rvos> ";
+
+struct LineEditor {
+    buf: [u8; LINE_MAX],
+    len: usize,
+    cursor: usize,
+    // History navigation state
+    hist_index: Option<usize>,
+    saved_buf: [u8; LINE_MAX],
+    saved_len: usize,
+    // Reverse search state
+    search_mode: bool,
+    search_buf: [u8; SEARCH_MAX],
+    search_len: usize,
+    search_match: Option<usize>,
+    search_saved_buf: [u8; LINE_MAX],
+    search_saved_len: usize,
+}
+
+impl LineEditor {
+    fn new() -> Self {
+        LineEditor {
+            buf: [0; LINE_MAX],
+            len: 0,
+            cursor: 0,
+            hist_index: None,
+            saved_buf: [0; LINE_MAX],
+            saved_len: 0,
+            search_mode: false,
+            search_buf: [0; SEARCH_MAX],
+            search_len: 0,
+            search_match: None,
+            search_saved_buf: [0; LINE_MAX],
+            search_saved_len: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.cursor = 0;
+        self.hist_index = None;
+        self.search_mode = false;
+        self.search_len = 0;
+        self.search_match = None;
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+
+    /// Redraw the entire line (prompt + buffer + erase trailing + reposition cursor).
+    fn refresh_line(&self) {
+        let mut out = io::stdout();
+        write!(out, "\r{}", PROMPT).ok();
+        out.write_all(&self.buf[..self.len]).ok();
+        write!(out, "\x1b[K").ok();
+        let back = self.len - self.cursor;
+        if back > 0 {
+            write!(out, "\x1b[{}D", back).ok();
+        }
+        out.flush().ok();
+    }
+
+    fn insert_char(&mut self, ch: u8) {
+        if self.len >= LINE_MAX { return; }
+        if self.cursor == self.len {
+            self.buf[self.len] = ch;
+            self.len += 1;
+            self.cursor += 1;
+            io::stdout().write_all(&[ch]).ok();
             io::stdout().flush().ok();
+        } else {
+            // Shift right to make room
+            let mut i = self.len;
+            while i > self.cursor {
+                self.buf[i] = self.buf[i - 1];
+                i -= 1;
+            }
+            self.buf[self.cursor] = ch;
+            self.len += 1;
+            self.cursor += 1;
+            self.refresh_line();
+        }
+    }
+
+    fn delete_at_cursor(&mut self) {
+        if self.cursor >= self.len { return; }
+        for i in self.cursor..self.len - 1 {
+            self.buf[i] = self.buf[i + 1];
+        }
+        self.len -= 1;
+        self.refresh_line();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 { return; }
+        self.cursor -= 1;
+        self.delete_at_cursor();
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            write!(io::stdout(), "\x1b[D").ok();
+            io::stdout().flush().ok();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor < self.len {
+            self.cursor += 1;
+            write!(io::stdout(), "\x1b[C").ok();
+            io::stdout().flush().ok();
+        }
+    }
+
+    fn move_home(&mut self) {
+        if self.cursor > 0 {
+            write!(io::stdout(), "\x1b[{}D", self.cursor).ok();
+            self.cursor = 0;
+            io::stdout().flush().ok();
+        }
+    }
+
+    fn move_end(&mut self) {
+        if self.cursor < self.len {
+            write!(io::stdout(), "\x1b[{}C", self.len - self.cursor).ok();
+            self.cursor = self.len;
+            io::stdout().flush().ok();
+        }
+    }
+
+    /// Replace the entire line buffer with new content and redraw.
+    fn set_line(&mut self, line: &[u8]) {
+        let copy_len = line.len().min(LINE_MAX);
+        self.buf[..copy_len].copy_from_slice(&line[..copy_len]);
+        self.len = copy_len;
+        self.cursor = copy_len;
+        self.refresh_line();
+    }
+
+    fn history_prev(&mut self, history: &HistoryRing) {
+        if history.count == 0 { return; }
+        match self.hist_index {
+            None => {
+                // Save current line before entering history
+                self.saved_buf[..self.len].copy_from_slice(&self.buf[..self.len]);
+                self.saved_len = self.len;
+                self.hist_index = Some(0);
+            }
+            Some(i) => {
+                if i + 1 >= history.count { return; }
+                self.hist_index = Some(i + 1);
+            }
+        }
+        if let Some(entry) = history.get(self.hist_index.unwrap()) {
+            // Copy through a temp to avoid aliasing issues
+            let mut tmp = [0u8; LINE_MAX];
+            let tlen = entry.len().min(LINE_MAX);
+            tmp[..tlen].copy_from_slice(&entry[..tlen]);
+            self.set_line(&tmp[..tlen]);
+        }
+    }
+
+    fn history_next(&mut self, history: &HistoryRing) {
+        match self.hist_index {
+            None => return,
+            Some(0) => {
+                // Restore the saved original line
+                self.hist_index = None;
+                let len = self.saved_len;
+                // Copy saved → buf (fields don't alias)
+                self.buf[..len].copy_from_slice(&self.saved_buf[..len]);
+                self.len = len;
+                self.cursor = len;
+                self.refresh_line();
+            }
+            Some(i) => {
+                self.hist_index = Some(i - 1);
+                if let Some(entry) = history.get(i - 1) {
+                    let mut tmp = [0u8; LINE_MAX];
+                    let tlen = entry.len().min(LINE_MAX);
+                    tmp[..tlen].copy_from_slice(&entry[..tlen]);
+                    self.set_line(&tmp[..tlen]);
+                }
+            }
+        }
+    }
+
+    // --- Reverse search ---
+
+    fn enter_search(&mut self) {
+        self.search_saved_buf[..self.len].copy_from_slice(&self.buf[..self.len]);
+        self.search_saved_len = self.len;
+        self.search_mode = true;
+        self.search_len = 0;
+        self.search_match = None;
+        self.refresh_search_prompt(None);
+    }
+
+    fn refresh_search_prompt(&self, history: Option<&HistoryRing>) {
+        let mut out = io::stdout();
+        write!(out, "\r\x1b[K(reverse-i-search)'").ok();
+        out.write_all(&self.search_buf[..self.search_len]).ok();
+        write!(out, "': ").ok();
+        if let (Some(idx), Some(hist)) = (self.search_match, history) {
+            if let Some(entry) = hist.get(idx) {
+                out.write_all(entry).ok();
+            }
+        }
+        out.flush().ok();
+    }
+
+    fn search_push_char(&mut self, ch: u8, history: &HistoryRing) {
+        if self.search_len >= SEARCH_MAX { return; }
+        self.search_buf[self.search_len] = ch;
+        self.search_len += 1;
+        // Search from the beginning (or from current match)
+        let start = 0;
+        self.search_match = history.search(&self.search_buf[..self.search_len], start);
+        self.refresh_search_prompt(Some(history));
+    }
+
+    fn search_backspace(&mut self, history: &HistoryRing) {
+        if self.search_len == 0 { return; }
+        self.search_len -= 1;
+        // Re-search from beginning with shorter query
+        if self.search_len > 0 {
+            self.search_match = history.search(&self.search_buf[..self.search_len], 0);
+        } else {
+            self.search_match = None;
+        }
+        self.refresh_search_prompt(Some(history));
+    }
+
+    fn search_next(&mut self, history: &HistoryRing) {
+        if self.search_len == 0 { return; }
+        let start = match self.search_match {
+            Some(i) => i + 1,
+            None => 0,
+        };
+        if let Some(idx) = history.search(&self.search_buf[..self.search_len], start) {
+            self.search_match = Some(idx);
+        }
+        self.refresh_search_prompt(Some(history));
+    }
+
+    /// Accept the current search result: copy matched line into buffer, exit search.
+    fn accept_search(&mut self, history: &HistoryRing) {
+        self.search_mode = false;
+        if let Some(idx) = self.search_match {
+            if let Some(entry) = history.get(idx) {
+                let copy_len = entry.len().min(LINE_MAX);
+                self.buf[..copy_len].copy_from_slice(&entry[..copy_len]);
+                self.len = copy_len;
+                self.cursor = copy_len;
+            }
+        }
+        // Redraw with normal prompt
+        self.hist_index = None;
+        self.refresh_line();
+    }
+
+    /// Cancel search: restore original line, exit search.
+    fn cancel_search(&mut self) {
+        self.search_mode = false;
+        let len = self.search_saved_len;
+        self.buf[..len].copy_from_slice(&self.search_saved_buf[..len]);
+        self.len = len;
+        self.cursor = len;
+        self.refresh_line();
+    }
+}
+
+// --- Tab completion (cursor-aware) ---
+
+fn handle_tab(editor: &mut LineEditor) {
+    let line_str = core::str::from_utf8(&editor.buf[..editor.len]).unwrap_or("");
+    match try_complete(line_str) {
+        Completion::Single(text, replace_from) => {
+            // Replace from replace_from to end of line with the completion + space
+            editor.len = replace_from;
+            let text_bytes = text.as_bytes();
+            let avail = LINE_MAX - editor.len;
+            let copy = text_bytes.len().min(avail);
+            editor.buf[editor.len..editor.len + copy]
+                .copy_from_slice(&text_bytes[..copy]);
+            editor.len += copy;
+            if editor.len < LINE_MAX {
+                editor.buf[editor.len] = b' ';
+                editor.len += 1;
+            }
+            editor.cursor = editor.len;
+            editor.refresh_line();
         }
         Completion::Multiple(matches) => {
             print!("\r\n");
             for m in &matches {
                 print!("{}  ", m);
             }
-            print!("\r\nrvos> {}", buf);
+            print!("\r\n");
             io::stdout().flush().ok();
+            // Reprint prompt + current line
+            editor.refresh_line();
         }
         Completion::None => {}
     }
@@ -499,59 +867,163 @@ fn set_raw_mode(enable: bool) {
     }
 }
 
+// --- Escape sequence parser state ---
+
+enum EscState {
+    Normal,
+    Escape,
+    Csi,
+}
+
 // --- Main shell loop ---
 
 pub fn run() {
-    println!("\nrvOS shell v0.1");
+    println!("\nrvOS shell v0.2");
     println!("Type 'help' for available commands.\n");
 
     set_raw_mode(true);
 
-    let mut buf = String::new();
+    let mut history = HistoryRing::new();
+    let mut editor = LineEditor::new();
     let mut byte = [0u8; 1];
 
     loop {
-        print!("rvos> ");
+        print!("{}", PROMPT);
         io::stdout().flush().ok();
-        buf.clear();
+        editor.clear();
+
+        let mut esc_state = EscState::Normal;
+        let mut csi_param: u32 = 0;
+        let mut submit = false;
 
         loop {
             if io::stdin().lock().read(&mut byte).unwrap_or(0) == 0 {
                 continue;
             }
-            match byte[0] {
-                b'\r' | b'\n' => {
-                    print!("\r\n");
-                    io::stdout().flush().ok();
-                    break;
-                }
-                0x7F | 0x08 => {
-                    if !buf.is_empty() {
-                        buf.pop();
-                        print!("\x08 \x08");
-                        io::stdout().flush().ok();
+            let ch = byte[0];
+
+            match esc_state {
+                EscState::Normal => {
+                    if ch == 0x1B {
+                        esc_state = EscState::Escape;
+                        continue;
+                    }
+                    if editor.search_mode {
+                        match ch {
+                            b'\r' | b'\n' => {
+                                editor.accept_search(&history);
+                                print!("\r\n");
+                                io::stdout().flush().ok();
+                                submit = true;
+                                break;
+                            }
+                            0x7F | 0x08 => editor.search_backspace(&history),
+                            0x12 => editor.search_next(&history), // Ctrl+R
+                            0x07 => editor.cancel_search(),        // Ctrl+G
+                            0x03 => {
+                                // Ctrl+C: cancel search + clear + new prompt
+                                editor.search_mode = false;
+                                editor.clear();
+                                print!("^C\r\n");
+                                io::stdout().flush().ok();
+                                break;
+                            }
+                            c if c >= 0x20 && c < 0x7F => {
+                                editor.search_push_char(c, &history);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match ch {
+                            b'\r' | b'\n' => {
+                                print!("\r\n");
+                                io::stdout().flush().ok();
+                                submit = true;
+                                break;
+                            }
+                            0x7F | 0x08 => editor.backspace(),
+                            0x09 => handle_tab(&mut editor),     // Tab
+                            0x01 => editor.move_home(),           // Ctrl+A
+                            0x02 => editor.move_left(),           // Ctrl+B
+                            0x05 => editor.move_end(),            // Ctrl+E
+                            0x06 => editor.move_right(),          // Ctrl+F
+                            0x10 => editor.history_prev(&history), // Ctrl+P
+                            0x0E => editor.history_next(&history), // Ctrl+N
+                            0x12 => editor.enter_search(),        // Ctrl+R
+                            0x03 => {
+                                print!("^C\r\n");
+                                io::stdout().flush().ok();
+                                editor.clear();
+                                break;
+                            }
+                            c if c >= 0x20 && c < 0x7F => {
+                                editor.insert_char(c);
+                            }
+                            _ => {}
+                        }
                     }
                 }
-                0x09 => handle_tab(&mut buf),
-                0x03 => {
-                    print!("^C\r\n");
-                    io::stdout().flush().ok();
-                    buf.clear();
-                    break;
+                EscState::Escape => {
+                    if ch == b'[' {
+                        esc_state = EscState::Csi;
+                        csi_param = 0;
+                    } else if ch == 0x1B {
+                        // Double-escape: stay in escape state
+                    } else {
+                        esc_state = EscState::Normal;
+                        // Bare Escape: cancel search if active
+                        if editor.search_mode {
+                            editor.cancel_search();
+                        }
+                        // Don't re-process byte (it was consumed as part of escape)
+                    }
                 }
-                ch if ch >= 0x20 && ch < 0x7F => {
-                    buf.push(ch as char);
-                    io::stdout().write_all(&[ch]).ok();
-                    io::stdout().flush().ok();
+                EscState::Csi => {
+                    if ch >= b'0' && ch <= b'9' {
+                        csi_param = csi_param * 10 + (ch - b'0') as u32;
+                        continue;
+                    }
+                    esc_state = EscState::Normal;
+
+                    // If in search mode, exit search on arrow keys
+                    if editor.search_mode {
+                        if ch == b'A' || ch == b'B' {
+                            editor.accept_search(&history);
+                        } else {
+                            continue; // ignore other CSI sequences in search
+                        }
+                    }
+
+                    match ch {
+                        b'A' => editor.history_prev(&history), // Up
+                        b'B' => editor.history_next(&history), // Down
+                        b'C' => editor.move_right(),           // Right
+                        b'D' => editor.move_left(),            // Left
+                        b'H' => editor.move_home(),            // Home
+                        b'F' => editor.move_end(),             // End
+                        b'~' => match csi_param {
+                            3 => editor.delete_at_cursor(), // Delete
+                            1 => editor.move_home(),        // Home (alt)
+                            4 => editor.move_end(),         // End (alt)
+                            _ => {}
+                        },
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
 
-        let line = buf.trim().to_string();
+        if !submit {
+            continue;
+        }
+
+        let line = editor.as_str().trim().to_string();
         if line.is_empty() {
             continue;
         }
+
+        // Push to history before executing
+        history.push(line.as_bytes());
 
         let cmd = line.split_whitespace().next().unwrap_or("");
         match cmd {

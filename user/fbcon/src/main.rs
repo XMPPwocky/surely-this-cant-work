@@ -80,6 +80,12 @@ struct FbConsole {
     fg: u32,
     bg: u32,
     dirty: bool,
+    // ANSI escape sequence parser state
+    esc_state: u8,         // 0=normal, 1=saw ESC, 2=in CSI
+    esc_params: [u32; 4],
+    esc_nparam: usize,
+    esc_cur_param: u32,
+    esc_has_digit: bool,
 }
 
 impl FbConsole {
@@ -97,6 +103,11 @@ impl FbConsole {
             fg: 0xFF00FF00, // green on black (opaque)
             bg: 0xFF000000, // opaque black
             dirty: true,
+            esc_state: 0,
+            esc_params: [0; 4],
+            esc_nparam: 0,
+            esc_cur_param: 0,
+            esc_has_digit: false,
         }
     }
 
@@ -120,7 +131,8 @@ impl FbConsole {
         }
     }
 
-    fn write_char(&mut self, ch: u8) {
+    /// Render a character directly (no escape sequence parsing).
+    fn emit_char(&mut self, ch: u8) {
         match ch {
             b'\n' => {
                 self.col = 0;
@@ -134,7 +146,6 @@ impl FbConsole {
                 self.col = 0;
             }
             0x08 => {
-                // Backspace: move cursor back
                 if self.col > 0 {
                     self.col -= 1;
                 }
@@ -168,6 +179,114 @@ impl FbConsole {
             }
         }
         self.dirty = true;
+    }
+
+    /// Process a byte through the ANSI escape sequence parser.
+    fn write_char(&mut self, ch: u8) {
+        match self.esc_state {
+            1 => {
+                // Saw ESC
+                if ch == b'[' {
+                    self.esc_state = 2;
+                    self.esc_nparam = 0;
+                    self.esc_cur_param = 0;
+                    self.esc_has_digit = false;
+                } else {
+                    self.esc_state = 0;
+                    // Unknown escape, ignore
+                }
+            }
+            2 => {
+                // In CSI: accumulate params and dispatch
+                if ch >= b'0' && ch <= b'9' {
+                    self.esc_cur_param = self.esc_cur_param * 10 + (ch - b'0') as u32;
+                    self.esc_has_digit = true;
+                } else if ch == b';' {
+                    if self.esc_nparam < 4 {
+                        self.esc_params[self.esc_nparam] = self.esc_cur_param;
+                        self.esc_nparam += 1;
+                    }
+                    self.esc_cur_param = 0;
+                    self.esc_has_digit = false;
+                } else {
+                    // Final byte: store last param and dispatch
+                    if self.esc_has_digit && self.esc_nparam < 4 {
+                        self.esc_params[self.esc_nparam] = self.esc_cur_param;
+                        self.esc_nparam += 1;
+                    }
+                    self.esc_state = 0;
+                    self.dispatch_csi(ch);
+                }
+            }
+            _ => {
+                // Normal: check for ESC
+                if ch == 0x1B {
+                    self.esc_state = 1;
+                } else {
+                    self.emit_char(ch);
+                }
+            }
+        }
+    }
+
+    fn dispatch_csi(&mut self, ch: u8) {
+        let p0 = if self.esc_nparam > 0 { self.esc_params[0] } else { 0 };
+        let p1 = if self.esc_nparam > 1 { self.esc_params[1] } else { 0 };
+
+        match ch {
+            b'A' => {
+                // Cursor up
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.row = self.row.saturating_sub(n);
+                self.dirty = true;
+            }
+            b'B' => {
+                // Cursor down
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.row = (self.row + n).min(self.rows - 1);
+                self.dirty = true;
+            }
+            b'C' => {
+                // Cursor right
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.col = (self.col + n).min(self.cols - 1);
+                self.dirty = true;
+            }
+            b'D' => {
+                // Cursor left
+                let n = if p0 == 0 { 1 } else { p0 };
+                self.col = self.col.saturating_sub(n);
+                self.dirty = true;
+            }
+            b'H' | b'f' => {
+                // Cursor position (1-based: ESC[row;colH)
+                let row = if p0 == 0 { 0 } else { p0 - 1 };
+                let col = if p1 == 0 { 0 } else { p1 - 1 };
+                self.row = row.min(self.rows - 1);
+                self.col = col.min(self.cols - 1);
+                self.dirty = true;
+            }
+            b'J' => {
+                if p0 == 2 {
+                    // Clear entire screen
+                    let total = (self.stride * self.height) as usize;
+                    for i in 0..total {
+                        unsafe { *self.fb.add(i) = self.bg; }
+                    }
+                    self.dirty = true;
+                }
+            }
+            b'K' => {
+                if p0 == 0 {
+                    // Erase from cursor to end of line
+                    for c in self.col..self.cols {
+                        self.put_char(c, self.row, b' ');
+                    }
+                    self.dirty = true;
+                }
+            }
+            _ => {} // ignore unknown CSI sequences
+        }
     }
 
     fn scroll_up(&mut self) {
@@ -453,6 +572,16 @@ fn main() {
                         let code = code as usize;
                         if code == 42 || code == 54 {
                             shift_pressed = true;
+                        } else if let Some(seq) = escape_seq_for_keycode(code) {
+                            // Special key: send full escape sequence in raw mode
+                            if line_disc.raw_mode {
+                                if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+                                    fb_send_data(clients[stdin_idx].stdin_handle, seq);
+                                    fb_send_sentinel(clients[stdin_idx].stdin_handle);
+                                    clients[stdin_idx].has_pending_read = false;
+                                }
+                            }
+                            // In cooked mode, arrow keys are ignored
                         } else if code < 128 {
                             let ascii = if shift_pressed {
                                 KEYMAP_SHIFT[code]
@@ -583,6 +712,20 @@ fn main() {
 }
 
 /// Handle a single ASCII keypress: echo + line discipline + fulfill pending reads
+/// Map Linux keycodes for special keys to ANSI escape sequences.
+fn escape_seq_for_keycode(code: usize) -> Option<&'static [u8]> {
+    match code {
+        103 => Some(b"\x1b[A"),  // KEY_UP
+        108 => Some(b"\x1b[B"),  // KEY_DOWN
+        106 => Some(b"\x1b[C"),  // KEY_RIGHT
+        105 => Some(b"\x1b[D"),  // KEY_LEFT
+        102 => Some(b"\x1b[H"),  // KEY_HOME
+        107 => Some(b"\x1b[F"),  // KEY_END
+        111 => Some(b"\x1b[3~"), // KEY_DELETE
+        _ => None,
+    }
+}
+
 fn handle_key_input(
     ascii: u8,
     console: &mut FbConsole,
