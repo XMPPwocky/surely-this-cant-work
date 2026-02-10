@@ -307,6 +307,27 @@ impl FbConsole {
         }
     }
 
+    /// XOR the cursor cell to toggle block cursor visibility.
+    /// Call before swap to show cursor, after swap+copy to erase from back buffer.
+    fn toggle_cursor(&mut self) {
+        let px = self.col * FONT_WIDTH;
+        let py = self.row * FONT_HEIGHT;
+        let xor = self.fg ^ self.bg;
+        for row in 0..FONT_HEIGHT {
+            let y = py + row;
+            if y >= self.height { break; }
+            for col in 0..FONT_WIDTH {
+                let x = px + col;
+                if x >= self.width { break; }
+                let offset = (y * self.stride + x) as usize;
+                unsafe {
+                    let p = self.fb.add(offset);
+                    *p = *p ^ xor;
+                }
+            }
+        }
+    }
+
     fn write_str(&mut self, s: &[u8]) {
         for &ch in s {
             self.write_char(ch);
@@ -690,8 +711,10 @@ fn main() {
 
         // If console is dirty, present the frame
         if console.dirty {
+            console.toggle_cursor(); // draw cursor on back buffer
             do_swap(&mut window_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
             update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
+            console.toggle_cursor(); // erase cursor from new back buffer
             console.dirty = false;
             handled = true;
         }
