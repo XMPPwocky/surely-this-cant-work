@@ -446,14 +446,10 @@ fn main() {
                         2 => clients[idx].stdout_handle = msg.cap(),
                         _ => clients[idx].stdout_handle = msg.cap(),
                     }
-                    // Once both endpoints are set, push onto stdin stack
-                    if clients[idx].is_complete() {
-                        let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == idx);
-                        if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
-                            stdin_stack[stdin_stack_len] = idx;
-                            stdin_stack_len += 1;
-                        }
-                    }
+                    // Don't auto-push onto stdin_stack here.
+                    // Clients are added only when they first issue a Read
+                    // request — prevents non-reading processes (like triangle)
+                    // from stealing keyboard input from the shell.
                 } else {
                     println!("[fbcon] WARN: too many console clients, dropping PID {}", pid);
                     raw::sys_chan_close(msg.cap());
@@ -513,6 +509,12 @@ fn main() {
                 match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
                     Ok(FileRequest::Read { offset: _, len: _ }) => {
                         clients[i].has_pending_read = true;
+                        // Push onto stdin_stack on first Read (lazy)
+                        let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == i);
+                        if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
+                            stdin_stack[stdin_stack_len] = i;
+                            stdin_stack_len += 1;
+                        }
                     }
                     Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
                         match cmd {
