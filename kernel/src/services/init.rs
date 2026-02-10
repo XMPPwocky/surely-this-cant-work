@@ -148,7 +148,7 @@ fn register_boot_with_overrides(
             return;
         }
     }
-    panic!("Too many boot registrations");
+    crate::println!("[init] WARNING: boot registration table full, skipping");
 }
 
 /// Register a console service endpoint (called from kmain before spawning init).
@@ -160,7 +160,7 @@ pub fn register_console(console_type: ConsoleType, control_ep: usize) {
             return;
         }
     }
-    panic!("Too many service registrations");
+    crate::println!("[init] WARNING: service registration table full, skipping");
 }
 
 /// Whether a GPU is present (set by kmain before init starts).
