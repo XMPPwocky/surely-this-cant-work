@@ -161,6 +161,18 @@ pub fn sys_mmap(shm_handle: usize, length: usize) -> usize {
     syscall2(SYS_MMAP, shm_handle, length)
 }
 
+/// Map memory into process address space with error handling.
+/// `shm_handle`: SHM handle to map, or 0 for anonymous pages.
+/// Returns a pointer to the mapped region on success.
+pub fn mmap(shm_handle: usize, length: usize) -> Result<*mut u8, crate::SysError> {
+    let addr = syscall2(SYS_MMAP, shm_handle, length);
+    if addr == usize::MAX {
+        Err(crate::SysError::NoResources)
+    } else {
+        Ok(addr as *mut u8)
+    }
+}
+
 /// Unmap pages from process address space.
 pub fn sys_munmap(addr: usize, length: usize) -> usize {
     syscall2(SYS_MUNMAP, addr, length)

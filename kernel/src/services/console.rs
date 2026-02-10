@@ -267,15 +267,11 @@ pub fn serial_console_server() {
                                     }
                                 }
 
-                                // Once both endpoints are set, push onto stdin stack
-                                if clients[idx].is_complete() {
-                                    // Only push if not already in stack
-                                    let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == idx);
-                                    if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
-                                        stdin_stack[stdin_stack_len] = idx;
-                                        stdin_stack_len += 1;
-                                    }
-                                }
+                                // Don't auto-push onto stdin_stack here.
+                                // Clients are added to stdin_stack only when they
+                                // first issue a Read request — this prevents processes
+                                // that only need stdout (e.g. window-srv, fbcon) from
+                                // stealing serial input from the actual shell.
                             } else {
                                 ipc::channel_close(ep);
                             }
@@ -341,6 +337,12 @@ pub fn serial_console_server() {
                             Ok(FileRequest::Read { offset: _, len }) => {
                                 clients[i].has_pending_read = true;
                                 clients[i].pending_read_len = len;
+                                // Push onto stdin_stack on first Read (lazy)
+                                let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == i);
+                                if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
+                                    stdin_stack[stdin_stack_len] = i;
+                                    stdin_stack_len += 1;
+                                }
                             }
                             Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
                                 match cmd {

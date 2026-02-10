@@ -426,9 +426,11 @@ pub fn exit_current() -> ! {
     unreachable!("exit_current: schedule returned to dead task");
 }
 
-/// Mark current task as dead (called from syscall context, may return).
-/// Cleans up all handles (channel + SHM), mmap regions, and physical frames.
-pub fn exit_current_from_syscall() {
+/// Terminate the current process: clean up all resources (handles, mmap regions,
+/// physical frames), send exit notification to init, mark Dead, and schedule away.
+/// Used by both the exit syscall and the fault handler for U-mode faults.
+/// Never returns (schedule() switches away from the Dead process permanently).
+pub fn terminate_current_process() {
     use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
     use crate::mm::heap::PGTB_ALLOC;
 
@@ -543,6 +545,11 @@ pub fn exit_current_from_syscall() {
     drop(pt_frames);
 
     schedule();
+}
+
+/// Convenience alias: terminate from syscall context (SYS_EXIT).
+pub fn exit_current_from_syscall() {
+    terminate_current_process();
 }
 
 /// Set the exit notification endpoint for a process.

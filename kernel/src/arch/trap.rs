@@ -55,10 +55,20 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
         match code {
             8 => handle_syscall(tf),
             2 => {
+                let sstatus_val = tf.sstatus;
+                let spp = (sstatus_val >> 8) & 1;
                 crate::println!(
-                    "Illegal instruction at sepc={:#x}, stval={:#x}",
-                    tf.sepc, stval
+                    "Illegal instruction at sepc={:#x}, stval={:#x}, SPP={} ({})",
+                    tf.sepc, stval, spp,
+                    if spp == 1 { "S-mode" } else { "U-mode" }
                 );
+                if spp == 0 {
+                    if let Some(pid) = crate::task::try_current_pid() {
+                        crate::println!("  Killing user process PID {} due to illegal instruction", pid);
+                    }
+                    crate::task::exit_current_from_syscall();
+                    return;
+                }
                 panic!("Illegal instruction exception");
             }
             12 | 13 | 15 => {
@@ -79,27 +89,40 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     sstatus_val, tf.regs[1], tf.regs[2]);
                 crate::println!("  s0={:#x} s1={:#x} s2={:#x}",
                     tf.regs[8], tf.regs[9], tf.regs[10]);
-                // Detect kernel stack overflow: S-mode store fault near sp
+                if let Some(pid) = crate::task::try_current_pid() {
+                    crate::println!("  current_pid={}", pid);
+                }
+                if spp == 0 {
+                    // U-mode fault: kill the faulting process, not the kernel
+                    crate::println!("  Killing user process due to page fault");
+                    crate::task::terminate_current_process();
+                    return;
+                }
+                // S-mode fault: kernel bug, unrecoverable
                 let sp = tf.regs[2];
-                let is_stack_overflow = spp == 1 && code == 15
+                let is_stack_overflow = code == 15
                     && stval < sp.wrapping_add(2 * crate::mm::address::PAGE_SIZE);
                 if is_stack_overflow {
                     crate::println!("  >>> KERNEL STACK OVERFLOW <<<");
-                }
-                // current_pid() acquires SCHEDULER lock — skip if the fault
-                // occurred while that lock was held (e.g. during spawn) to
-                // avoid deadlock. try_current_pid returns None on lock failure.
-                if let Some(pid) = crate::task::try_current_pid() {
-                    crate::println!("  current_pid={}", pid);
                 }
                 print_backtrace(tf.regs[8]);
                 panic!("Unhandled page fault");
             }
             _ => {
+                let sstatus_val = tf.sstatus;
+                let spp = (sstatus_val >> 8) & 1;
                 crate::println!(
-                    "Unhandled exception: code={}, sepc={:#x}, stval={:#x}",
-                    code, tf.sepc, stval
+                    "Unhandled exception: code={}, sepc={:#x}, stval={:#x}, SPP={} ({})",
+                    code, tf.sepc, stval, spp,
+                    if spp == 1 { "S-mode" } else { "U-mode" }
                 );
+                if spp == 0 {
+                    if let Some(pid) = crate::task::try_current_pid() {
+                        crate::println!("  Killing user process PID {} due to unhandled exception", pid);
+                    }
+                    crate::task::terminate_current_process();
+                    return;
+                }
                 panic!("Unhandled exception");
             }
         }

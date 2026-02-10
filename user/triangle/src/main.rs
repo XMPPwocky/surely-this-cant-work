@@ -65,7 +65,17 @@ fn main() {
 
     // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
     let fb_size = (stride as usize) * (height as usize) * 4 * 2;
-    let fb_base = raw::sys_mmap(shm_handle, fb_size) as *mut u32;
+    if shm_handle == rvos::NO_CAP {
+        println!("[triangle] ERROR: no SHM capability received from window server");
+        return;
+    }
+    let fb_base = match raw::mmap(shm_handle, fb_size) {
+        Ok(ptr) => ptr as *mut u32,
+        Err(_) => {
+            println!("[triangle] ERROR: mmap failed (shm_handle={}, size={})", shm_handle, fb_size);
+            return;
+        }
+    };
     let pixels_per_buffer = (stride as usize) * (height as usize);
 
     println!("[triangle] window ready ({}x{}, stride={})", width, height, stride);

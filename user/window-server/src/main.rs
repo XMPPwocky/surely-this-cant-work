@@ -122,7 +122,10 @@ fn main() {
 
     let gpu_shm_handle = resp.cap();
     let fb_size = (stride as usize) * (height as usize) * 4;
-    let display_fb = raw::sys_mmap(gpu_shm_handle, fb_size) as *mut u32;
+    let display_fb = match raw::mmap(gpu_shm_handle, fb_size) {
+        Ok(ptr) => ptr as *mut u32,
+        Err(_) => panic!("[window-srv] mmap failed for display SHM"),
+    };
 
     let mut server = Server {
         gpu_handle,
@@ -254,7 +257,14 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
 
     let fb_size = (stride as usize) * (height as usize) * 4 * 2;
     let shm_handle = raw::sys_shm_create(fb_size);
-    let fb_ptr = raw::sys_mmap(shm_handle, fb_size) as *mut u32;
+    let fb_ptr = match raw::mmap(shm_handle, fb_size) {
+        Ok(ptr) => ptr as *mut u32,
+        Err(_) => {
+            println!("[window-srv] ERROR: mmap failed for window SHM");
+            raw::sys_chan_close(per_client_handle);
+            return;
+        }
+    };
 
     unsafe {
         let total_pixels = (stride as usize) * (height as usize) * 2;
