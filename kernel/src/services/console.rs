@@ -152,9 +152,6 @@ impl ConsoleClient {
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.stdin_ep != usize::MAX && self.stdout_ep != usize::MAX
-    }
 }
 
 /// Find or create a client entry for the given PID. Returns index.

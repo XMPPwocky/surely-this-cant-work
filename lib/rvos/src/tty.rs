@@ -2,7 +2,7 @@
 
 use crate::message::Message;
 use crate::raw;
-use rvos_proto::fs::{FileRequest, FileResponse, FileOffset};
+use rvos_proto::fs::{FileRequest, FileResponse};
 
 /// Send a FileRequest::Ioctl on the given handle and wait for the response.
 /// Returns the result field from IoctlOk, or -1 on error.

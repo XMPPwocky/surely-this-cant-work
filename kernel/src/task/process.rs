@@ -3,8 +3,6 @@ use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
 use crate::mm::frame;
 use crate::mm::page_table::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U};
 use crate::mm::heap::{PgtbAlloc, PGTB_ALLOC};
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 const KERNEL_STACK_PAGES: usize = 16; // 64 KiB
 const KERNEL_STACK_SIZE: usize = KERNEL_STACK_PAGES * PAGE_SIZE;
 pub const KERNEL_GUARD_PAGES: usize = 1; // guard page at bottom of each kernel stack
@@ -40,13 +38,6 @@ pub fn rdtime() -> u64 {
     t
 }
 
-static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
-
-/// Allocate a monotonically increasing PID (fallback when no dead slots available).
-pub fn alloc_pid() -> usize {
-    NEXT_PID.fetch_add(1, Ordering::Relaxed)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     Ready,
@@ -56,7 +47,6 @@ pub enum ProcessState {
 }
 
 pub struct Process {
-    pub pid: usize,
     pub state: ProcessState,
     pub context: TaskContext,
     #[allow(dead_code)]
@@ -138,7 +128,7 @@ pub fn restore_guard_page(guard_addr: usize) {
 
 impl Process {
     /// Create a new kernel task with the given entry function
-    pub fn new_kernel(pid: usize, entry: fn()) -> Self {
+    pub fn new_kernel(entry: fn()) -> Self {
         let alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
             .expect("Failed to allocate kernel stack");
         let alloc_base = alloc_ppn.0 * PAGE_SIZE;
@@ -151,7 +141,7 @@ impl Process {
         let context = TaskContext::new(entry as usize, stack_top);
 
         Process {
-            pid,
+
             state: ProcessState::Ready,
             context,
             kernel_stack_base: stack_base,
@@ -181,7 +171,7 @@ impl Process {
     /// User code and stack are identity-mapped (VA=PA) in a per-process
     /// page table, so addresses work under both kernel and user page tables.
     #[allow(dead_code)]
-    pub fn new_user(pid: usize, user_code: &[u8]) -> Self {
+    pub fn new_user(user_code: &[u8]) -> Self {
         // Allocate kernel stack for this process (used during traps)
         let kstack_alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
             .expect("Failed to allocate kernel stack for user process");
@@ -222,7 +212,7 @@ impl Process {
         let context = TaskContext::new_user_entry(kstack_top);
 
         Process {
-            pid,
+
             state: ProcessState::Ready,
             context,
             kernel_stack_base: kstack_base,
@@ -249,7 +239,7 @@ impl Process {
 
     /// Create a user process from an ELF binary.
     /// Parses ELF, loads PT_LOAD segments, creates page table.
-    pub fn new_user_elf(pid: usize, elf_data: &[u8]) -> Self {
+    pub fn new_user_elf(elf_data: &[u8]) -> Self {
         crate::trace::trace_kernel(b"new_user_elf-enter");
 
         // Allocate kernel stack
@@ -282,7 +272,7 @@ impl Process {
 
         crate::trace::trace_kernel(b"new_user_elf-exit");
         Process {
-            pid,
+
             state: ProcessState::Ready,
             context,
             kernel_stack_base: kstack_base,
@@ -310,7 +300,6 @@ impl Process {
     /// Create a "dummy" process representing the boot/idle task (PID 0)
     pub fn new_idle() -> Self {
         let mut p = Process {
-            pid: 0,
             state: ProcessState::Running,
             context: TaskContext::zero(),
             kernel_stack_base: 0,

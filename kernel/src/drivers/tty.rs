@@ -46,14 +46,8 @@ impl RingBuffer {
 /// Serial (UART) input ring buffer — filled by UART IRQ handler
 pub static SERIAL_INPUT: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
 
-/// Keyboard input ring buffer — filled by VirtIO keyboard IRQ handler
-pub static KBD_INPUT: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
-
 /// PID of the serial console server to wake when serial input arrives (0 = none)
 static SERIAL_WAKE_PID: SpinLock<usize> = SpinLock::new(0);
-
-/// PID of the FB console server to wake when keyboard input arrives (0 = none)
-static KBD_WAKE_PID: SpinLock<usize> = SpinLock::new(0);
 
 // ============================================================
 // Raw keyboard events (press + release, with Linux keycode)
@@ -138,23 +132,9 @@ pub fn push_serial_char(ch: u8) {
     }
 }
 
-/// Push a character from keyboard IRQ handler.
-pub fn push_kbd_char(ch: u8) {
-    KBD_INPUT.lock().push(ch);
-    let pid = *KBD_WAKE_PID.lock();
-    if pid != 0 {
-        crate::task::wake_process(pid);
-    }
-}
-
 /// Set the PID to wake when serial input arrives.
 pub fn set_serial_wake_pid(pid: usize) {
     *SERIAL_WAKE_PID.lock() = pid;
-}
-
-/// Set the PID to wake when keyboard input arrives.
-pub fn set_kbd_wake_pid(pid: usize) {
-    *KBD_WAKE_PID.lock() = pid;
 }
 
 // ============================================================

@@ -3,7 +3,6 @@
 use crate::channel::RawChannel;
 use crate::error::{SysError, SysResult};
 use crate::message::Message;
-use crate::raw;
 use crate::transport::UserTransport;
 use rvos_proto::boot::{BootRequest, BootResponse};
 use rvos_wire::{Transport, NO_CAP, MAX_MSG_SIZE};

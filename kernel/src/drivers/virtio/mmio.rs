@@ -88,27 +88,6 @@ pub fn probe(device_id: u32) -> Option<usize> {
     None
 }
 
-/// Probe all 8 VirtIO MMIO slots and return the base address and slot index
-/// of the first device matching `device_id`, or None.
-pub fn probe_with_slot(device_id: u32) -> Option<(usize, usize)> {
-    for i in 0..VIRTIO_MMIO_SLOTS {
-        let base = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
-        let magic = read_reg(base, REG_MAGIC);
-        if magic != VIRTIO_MAGIC {
-            continue;
-        }
-        let version = read_reg(base, REG_VERSION);
-        let id = read_reg(base, REG_DEVICE_ID);
-        if id == 0 {
-            continue;
-        }
-        if id == device_id && (version == 1 || version == 2) {
-            return Some((base, i));
-        }
-    }
-    None
-}
-
 /// Initialise a VirtIO MMIO device through the standard handshake.
 /// Detects v1 (legacy) vs v2 (modern) and uses the appropriate sequence.
 pub fn init_device(base: usize) -> bool {

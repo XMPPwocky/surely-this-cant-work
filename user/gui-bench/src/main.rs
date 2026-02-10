@@ -75,7 +75,6 @@ struct WinContext {
     event_chan: usize,
     width: u32,
     height: u32,
-    stride: u32,
     fb_base: *mut u32,
     pixels_per_buffer: usize,
 }
@@ -111,7 +110,7 @@ fn connect_window(width: u32, height: u32) -> WinContext {
     };
     let pixels_per_buffer = (stride as usize) * (h as usize);
 
-    WinContext { client, event_chan, width: w, height: h, stride, fb_base, pixels_per_buffer }
+    WinContext { client, event_chan, width: w, height: h, fb_base, pixels_per_buffer }
 }
 
 fn close_window(ctx: &mut WinContext) {
@@ -220,13 +219,12 @@ fn bench_fullscreen_fill_swap() {
 fn bench_swap_only() {
     let iters = 60u32;
     let mut ctx = connect_window(400, 300);
-    let mut back = 1u8;
 
     // Fill both buffers once with same color
     fill_solid(ctx.fb_base, 0, ctx.pixels_per_buffer, 0xFF444444);
     fill_solid(ctx.fb_base, ctx.pixels_per_buffer, ctx.pixels_per_buffer, 0xFF444444);
     let _ = ctx.client.swap_buffers(0);
-    back = 0;
+    let mut back = 0u8;
 
     println!("[gui-bench] small window (400x300) swap-only (no fill) x{}", iters);
 

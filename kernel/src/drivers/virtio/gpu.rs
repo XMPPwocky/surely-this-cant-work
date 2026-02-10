@@ -393,18 +393,6 @@ fn resource_flush(gpu: &mut Gpu, width: u32, height: u32) {
     assert!(resp.type_ == VIRTIO_GPU_RESP_OK_NODATA, "resource_flush failed: {:#x}", resp.type_);
 }
 
-/// Flush the entire framebuffer to the display.
-/// Call this after writing pixels to the framebuffer.
-pub fn flush() {
-    unsafe {
-        let ptr = core::ptr::addr_of_mut!(GPU);
-        if let Some(ref mut gpu) = *ptr {
-            transfer_to_host_2d(gpu, gpu.width, gpu.height);
-            resource_flush(gpu, gpu.width, gpu.height);
-        }
-    }
-}
-
 /// Get framebuffer info: (pointer, width, height).
 /// Returns None if GPU is not initialised.
 pub fn framebuffer() -> Option<(*mut u32, u32, u32)> {

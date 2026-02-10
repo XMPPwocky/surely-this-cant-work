@@ -153,7 +153,7 @@ fn find_free_slot(sched: &mut Scheduler) -> usize {
 pub fn spawn(entry: fn()) -> usize {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched);
-    let proc = Process::new_kernel(pid, entry);
+    let proc = Process::new_kernel(entry);
 
     sched.processes[pid] = Some(proc);
     sched.ready_queue.push_back(pid);
@@ -177,7 +177,7 @@ pub fn spawn_named(entry: fn(), name: &str) -> usize {
 pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user(pid, user_code);
+    let mut proc = Process::new_user(user_code);
     proc.set_name(name);
 
     sched.processes[pid] = Some(proc);
@@ -192,7 +192,7 @@ pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
 pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize) -> usize {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user(pid, user_code);
+    let mut proc = Process::new_user(user_code);
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
@@ -208,7 +208,7 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
 pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user_elf(pid, elf_data);
+    let mut proc = Process::new_user_elf(elf_data);
     proc.set_name(name);
 
     sched.processes[pid] = Some(proc);
@@ -222,7 +222,7 @@ pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
 pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: usize) -> usize {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user_elf(pid, elf_data);
+    let mut proc = Process::new_user_elf(elf_data);
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
@@ -237,7 +237,7 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: us
 pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, extra_ep: usize) -> usize {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user_elf(pid, elf_data);
+    let mut proc = Process::new_user_elf(elf_data);
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
     proc.handles[1] = Some(HandleObject::Channel(extra_ep));

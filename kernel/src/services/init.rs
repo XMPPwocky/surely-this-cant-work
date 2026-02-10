@@ -12,7 +12,6 @@ use rvos_proto::fs::{FsRequest, FsResponse, FileRequest, FileResponse, FileOffse
 pub enum ConsoleType {
     Serial,
     Framebuffer,
-    GpuConsole,
 }
 
 const MAX_ARGS_LEN: usize = 512;

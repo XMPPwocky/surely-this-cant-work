@@ -18,10 +18,6 @@ impl KernelTransport {
         Self { endpoint, pid }
     }
 
-    /// Get the underlying endpoint.
-    pub fn endpoint(&self) -> usize {
-        self.endpoint
-    }
 }
 
 impl Transport for KernelTransport {
