@@ -9,8 +9,9 @@ use rvos_proto::window::{
     WindowReply, WindowEvent, WindowClient,
 };
 
+/// Simple paint demo: click to draw colored dots, right-click to clear.
 fn main() {
-    println!("[winclient] starting");
+    println!("[winclient] starting — paint demo (left-click=draw, right-click=clear)");
 
     // 1. Connect to "window" service via boot channel
     let win_ctl = rvos::connect_to_service("window")
@@ -49,130 +50,207 @@ fn main() {
     };
     let pixels_per_buffer = (stride as usize) * (height as usize);
 
-    println!("[winclient] window ready ({}x{}, stride={}, fb={:#x})", width, height, stride, fb_base as usize);
+    println!("[winclient] window ready ({}x{}, stride={})", width, height, stride);
 
-    // 7. Draw and animate
-    let mut frame: u32 = 0;
-    let mut current_back = 1u8; // start drawing in buffer 1
+    let mut current_back = 1u8;
+    let mut swap_seq: u32 = 10;
+    let mut color_idx: u8 = 0;
+    let mut mouse_down = false;
+    let mut need_present;
 
+    // Clear to dark background
+    clear_fb(fb_base, pixels_per_buffer, stride, width, height, 0xFF1A1A2E);
+
+    // Initial present
+    do_swap(&mut win_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
+    need_present = false;
+
+    // Main event loop — event-driven, no animation
     loop {
-        // Calculate back buffer offset
-        let back_offset = if current_back == 0 { 0 } else { pixels_per_buffer };
-
-        // Draw a color gradient with animation
-        draw_gradient(fb_base, back_offset, width, height, stride, frame);
-
-        // SwapBuffers
-        let _ = win_client.swap_buffers(frame);
-
-        // After swap, what was back becomes front, toggle back
-        current_back = 1 - current_back;
-        frame = frame.wrapping_add(1);
-
-        // Drain any pending key events from event channel between frames
+        // Drain all pending events
+        let mut got_event = false;
         loop {
             let mut msg = rvos::Message::new();
             let ret = raw::sys_chan_recv(event_chan, &mut msg);
             if ret != 0 { break; }
-            if msg.len > 0 {
-                match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
-                    Ok(WindowEvent::KeyDown { code }) => print_key_event("down", code),
-                    Ok(WindowEvent::KeyUp { code }) => print_key_event("up", code),
-                    _ => {}
+            if msg.len == 0 { continue; }
+            got_event = true;
+
+            match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
+                Ok(WindowEvent::MouseButtonDown { x, y, button }) => {
+                    if button == 0 {
+                        // Left click: draw a dot
+                        mouse_down = true;
+                        let color = palette(color_idx);
+                        draw_dot(fb_base, pixels_per_buffer,
+                                 stride, width, height, x, y, 6, color);
+                        need_present = true;
+                    } else if button == 1 {
+                        // Right click: clear canvas and cycle color
+                        clear_fb(fb_base, pixels_per_buffer, stride, width, height, 0xFF1A1A2E);
+                        color_idx = color_idx.wrapping_add(1);
+                        need_present = true;
+                    }
                 }
+                Ok(WindowEvent::MouseButtonUp { button, .. }) => {
+                    if button == 0 {
+                        mouse_down = false;
+                        // Cycle color after each stroke
+                        color_idx = color_idx.wrapping_add(1);
+                    }
+                }
+                Ok(WindowEvent::MouseMove { x, y }) => {
+                    if mouse_down {
+                        // Draw while dragging
+                        let color = palette(color_idx);
+                        draw_dot(fb_base, pixels_per_buffer,
+                                 stride, width, height, x, y, 6, color);
+                    }
+                    // Draw a small crosshair at cursor position
+                    draw_crosshair(fb_base, pixels_per_buffer, current_back,
+                                   stride, width, height, x, y);
+                    need_present = true;
+                }
+                Ok(WindowEvent::KeyDown { code }) => {
+                    println!("[winclient] key down: {}", code);
+                }
+                Ok(WindowEvent::CloseRequested {}) => {
+                    println!("[winclient] close requested, exiting");
+                    return;
+                }
+                _ => {}
             }
         }
 
-        // Small delay between frames
-        for _ in 0..5 {
-            raw::sys_yield();
+        // Present if anything changed
+        if need_present {
+            do_swap(&mut win_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
+            need_present = false;
+        }
+
+        if !got_event {
+            // Block until next event
+            raw::sys_chan_poll_add(event_chan);
+            raw::sys_chan_poll_add(req_chan);
+            raw::sys_block();
         }
     }
 }
 
-fn print_key_event(action: &str, code: u16) {
-    let name = keycode_name(code);
-    println!("[winclient] key {}: {} ({})", action, name, code);
-}
-
-fn keycode_name(code: u16) -> &'static str {
-    match code {
-        1 => "Esc", 2 => "1", 3 => "2", 4 => "3", 5 => "4",
-        6 => "5", 7 => "6", 8 => "7", 9 => "8", 10 => "9", 11 => "0",
-        12 => "-", 13 => "=", 14 => "Backspace", 15 => "Tab",
-        16 => "Q", 17 => "W", 18 => "E", 19 => "R", 20 => "T",
-        21 => "Y", 22 => "U", 23 => "I", 24 => "O", 25 => "P",
-        26 => "[", 27 => "]", 28 => "Enter", 29 => "LCtrl",
-        30 => "A", 31 => "S", 32 => "D", 33 => "F", 34 => "G",
-        35 => "H", 36 => "J", 37 => "K", 38 => "L", 39 => ";", 40 => "'",
-        41 => "`", 42 => "LShift", 43 => "\\",
-        44 => "Z", 45 => "X", 46 => "C", 47 => "V", 48 => "B",
-        49 => "N", 50 => "M", 51 => ",", 52 => ".", 53 => "/",
-        54 => "RShift", 56 => "LAlt", 57 => "Space", 58 => "CapsLock",
-        59 => "F1", 60 => "F2", 61 => "F3", 62 => "F4",
-        63 => "F5", 64 => "F6", 65 => "F7", 66 => "F8",
-        67 => "F9", 68 => "F10", 87 => "F11", 88 => "F12",
-        96 => "KpEnter", 97 => "RCtrl", 100 => "RAlt",
-        102 => "Home", 103 => "Up", 104 => "PgUp",
-        105 => "Left", 106 => "Right", 107 => "End",
-        108 => "Down", 109 => "PgDn", 110 => "Insert", 111 => "Delete",
-        _ => "?",
+/// Cycle through bright colors for drawing.
+fn palette(idx: u8) -> u32 {
+    match idx % 8 {
+        0 => 0xFFFF4444, // red
+        1 => 0xFF44FF44, // green
+        2 => 0xFF4488FF, // blue
+        3 => 0xFFFFFF44, // yellow
+        4 => 0xFFFF44FF, // magenta
+        5 => 0xFF44FFFF, // cyan
+        6 => 0xFFFF8844, // orange
+        _ => 0xFFFFFFFF, // white
     }
 }
 
-fn draw_gradient(fb: *mut u32, offset: usize, width: u32, height: u32, stride: u32, frame: u32) {
+/// Draw a filled circle at (cx, cy) with given radius and color.
+/// Draws into both buffers so the dot persists across swaps.
+fn draw_dot(
+    fb_base: *mut u32, pixels_per_buffer: usize,
+    stride: u32, width: u32, height: u32,
+    cx: u32, cy: u32, radius: i32, color: u32,
+) {
+    let w = width as i32;
+    let h = height as i32;
+    let s = stride as usize;
+    let icx = cx as i32;
+    let icy = cy as i32;
+
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            if dx * dx + dy * dy > radius * radius { continue; }
+            let px = icx + dx;
+            let py = icy + dy;
+            if px < 0 || px >= w || py < 0 || py >= h { continue; }
+            let idx = py as usize * s + px as usize;
+            unsafe {
+                // Draw into both buffers so dots persist
+                *fb_base.add(idx) = color;
+                *fb_base.add(pixels_per_buffer + idx) = color;
+            }
+        }
+    }
+}
+
+/// Draw a small crosshair at cursor position (into current back buffer only).
+fn draw_crosshair(
+    fb_base: *mut u32, pixels_per_buffer: usize, current_back: u8,
+    stride: u32, width: u32, height: u32,
+    cx: u32, cy: u32,
+) {
+    let w = width as i32;
+    let h = height as i32;
+    let s = stride as usize;
+    let back_offset = if current_back == 0 { 0 } else { pixels_per_buffer };
+    let icx = cx as i32;
+    let icy = cy as i32;
+    let color: u32 = 0x80FFFFFF; // semi-transparent white
+
+    // Horizontal line (5 pixels)
+    for dx in -2i32..=2 {
+        let px = icx + dx;
+        if px >= 0 && px < w && icy >= 0 && icy < h {
+            unsafe { *fb_base.add(back_offset + icy as usize * s + px as usize) = color; }
+        }
+    }
+    // Vertical line (5 pixels)
+    for dy in -2i32..=2 {
+        let py = icy + dy;
+        if icx >= 0 && icx < w && py >= 0 && py < h {
+            unsafe { *fb_base.add(back_offset + py as usize * s + icx as usize) = color; }
+        }
+    }
+}
+
+/// Clear both framebuffers to a solid color.
+fn clear_fb(
+    fb_base: *mut u32, pixels_per_buffer: usize,
+    stride: u32, width: u32, height: u32, color: u32,
+) {
+    let s = stride as usize;
     let w = width as usize;
     let h = height as usize;
-    let s = stride as usize;
-    let shift = (frame as usize) % w;
-
     for y in 0..h {
         for x in 0..w {
-            let px = (x + shift) % w;
-            // Create a rainbow gradient: map x position to hue
-            let hue = ((px * 360) / w) as u16;
-            let (r, g, b) = hsv_to_rgb(hue, 255, 200);
-
-            // Add vertical brightness variation
-            let vy = ((y * 255) / h) as u8;
-            let r = ((r as u16 * vy as u16) / 255) as u8;
-            let g = ((g as u16 * vy as u16) / 255) as u8;
-            let b = ((b as u16 * vy as u16) / 255) as u8;
-
-            // BGRA32 as u32 (little-endian): 0xAARRGGBB
-            let pixel = 0xFF000000 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+            let idx = y * s + x;
             unsafe {
-                *fb.add(offset + y * s + x) = pixel;
+                *fb_base.add(idx) = color;
+                *fb_base.add(pixels_per_buffer + idx) = color;
             }
         }
     }
 }
 
-/// Simple HSV to RGB conversion (S and V are 0-255)
-fn hsv_to_rgb(h: u16, s: u8, v: u8) -> (u8, u8, u8) {
-    if s == 0 {
-        return (v, v, v);
+/// Swap buffers, wait for swap reply, then copy front→new-back.
+fn do_swap(
+    window_client: &mut WindowClient<UserTransport>,
+    seq: &mut u32,
+    fb_base: *mut u32,
+    pixels_per_buffer: usize,
+    current_back: &mut u8,
+) {
+    let _ = window_client.swap_buffers(*seq);
+    *seq = seq.wrapping_add(1);
+
+    // Toggle back buffer
+    *current_back = 1 - *current_back;
+
+    // Copy front (what was just presented) → new back buffer
+    let front_offset = if *current_back == 0 { pixels_per_buffer } else { 0 };
+    let back_offset = if *current_back == 0 { 0 } else { pixels_per_buffer };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            fb_base.add(front_offset),
+            fb_base.add(back_offset),
+            pixels_per_buffer,
+        );
     }
-
-    let h = (h % 360) as u32;
-    let s = s as u32;
-    let v = v as u32;
-
-    let region = h / 60;
-    let remainder = (h - region * 60) * 255 / 60;
-
-    let p = (v * (255 - s)) / 255;
-    let q = (v * (255 - (s * remainder) / 255)) / 255;
-    let t = (v * (255 - (s * (255 - remainder)) / 255)) / 255;
-
-    let (r, g, b) = match region {
-        0 => (v, t, p),
-        1 => (q, v, p),
-        2 => (p, v, t),
-        3 => (p, q, v),
-        4 => (t, p, v),
-        _ => (v, p, q),
-    };
-
-    (r as u8, g as u8, b as u8)
 }

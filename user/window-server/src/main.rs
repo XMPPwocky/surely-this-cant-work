@@ -524,12 +524,7 @@ fn handle_mouse_event(server: &mut Server, msg: &Message) {
                         }
                     }
 
-                    // Click in content area -> drag + forward (not fullscreen)
-                    if !is_fs {
-                        server.dragging = Some(idx);
-                        server.drag_offset_x = cx - win_x;
-                        server.drag_offset_y = cy - win_y;
-                    }
+                    // Click in content area -> forward to client
                 }
             }
             forward_mouse_button(server, true, button);
@@ -584,8 +579,8 @@ fn forward_mouse_move(server: &Server, x: i32, y: i32) {
     if let Some(ref win) = server.windows[fg] {
         if !win.active { return; }
         let y_offset = if win.fullscreen { 0 } else { TITLE_BAR_HEIGHT };
-        let local_x = (x - win.x).max(0) as u32;
-        let local_y = (y - win.y - y_offset).max(0) as u32;
+        let local_x = (x - win.x).max(0).min(win.width as i32 - 1).max(0) as u32;
+        let local_y = (y - win.y - y_offset).max(0).min(win.height as i32 - 1).max(0) as u32;
         send_event(win.event_channel, &WindowEvent::MouseMove { x: local_x, y: local_y });
     }
 }
@@ -595,8 +590,8 @@ fn forward_mouse_button(server: &Server, down: bool, button: u8) {
     if let Some(ref win) = server.windows[fg] {
         if !win.active { return; }
         let y_offset = if win.fullscreen { 0 } else { TITLE_BAR_HEIGHT };
-        let local_x = (server.cursor_x - win.x).max(0) as u32;
-        let local_y = (server.cursor_y - win.y - y_offset).max(0) as u32;
+        let local_x = (server.cursor_x - win.x).max(0).min(win.width as i32 - 1).max(0) as u32;
+        let local_y = (server.cursor_y - win.y - y_offset).max(0).min(win.height as i32 - 1).max(0) as u32;
         let ev = if down {
             WindowEvent::MouseButtonDown { x: local_x, y: local_y, button }
         } else {
