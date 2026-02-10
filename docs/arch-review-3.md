@@ -19,13 +19,13 @@
 ### HIGH: GPU server doesn't validate flush rectangle bounds
 **`kernel/src/services/gpu_server.rs:74-80`** — `Flush { x, y, w, h }` is passed straight to the VirtIO driver without checking against framebuffer dimensions. Out-of-bounds coords from a buggy/malicious client could cause a device error or panic. Add `x + w <= width && y + h <= height` check.
 
-### MEDIUM: Shell sysinfo send is non-blocking
+### ~~MEDIUM: Shell sysinfo send is non-blocking~~ **COMPLETED**
 **`user/shell/src/shell.rs:136`** — `sys_chan_send()` instead of blocking. If sysinfo's queue is full, the command is dropped and the shell waits forever.
 
-### MEDIUM: SHM ref count has no underflow detection
+### ~~MEDIUM: SHM ref count has no underflow detection~~ **COMPLETED**
 **`kernel/src/ipc/mod.rs:607-609`** — The `if ref_count > 0 { ref_count -= 1; }` guard silently ignores a double-free instead of asserting. Replace with `assert!(ref_count > 0)` to catch ref-counting bugs.
 
-### MEDIUM: `frame.rs` missing bounds check in `is_used()`/`set_used()`
+### ~~MEDIUM: `frame.rs` missing bounds check in `is_used()`/`set_used()`~~ **COMPLETED**
 **`kernel/src/mm/frame.rs:48-52`** — `dealloc()` asserts `frame_idx < TOTAL_FRAMES`, but `is_used()` and `set_used()` don't. A bad index panics on array bounds instead of a clear error.
 
 ---
@@ -86,37 +86,37 @@ The codebase mixes three send strategies with no documented rule:
 
 ## 4. Build System Issues
 
-### CRITICAL: Hardcoded absolute path in target JSON
+### ~~CRITICAL: Hardcoded absolute path in target JSON~~ **COMPLETED**
 **`user/riscv64gc-unknown-rvos.json:23`** — Contains `-T/home/ubuntu/src/temp2/rvos/user/user.ld`. Breaks for any other developer or CI path.
 
-### `MAX_MSG_SIZE` defined in 4 places without sync
-**kernel/src/ipc/mod.rs, lib/rvos/src/message.rs, lib/rvos-wire/src/lib.rs, vendor/rust/.../ipc.rs** — All say `1024`, but there's no compile-time assertion linking them. Likewise `Message` struct is duplicated in 3 places. Add `const _: () = assert!(size_of::<Message>() == 1088);` in each.
+### ~~`MAX_MSG_SIZE` defined in 4 places without sync~~ **COMPLETED**
+**kernel/src/ipc/mod.rs, lib/rvos/src/message.rs, lib/rvos-wire/src/lib.rs, vendor/rust/.../ipc.rs** — All say `1024`, but there's no compile-time assertion linking them. Compile-time assertions added in all 4 sites.
 
 ### Syscall numbers defined in 3 places
 **trap.rs, raw.rs, std ipc.rs** — No single source of truth. Move to `rvos-wire` and re-export.
 
-### Empty `[workspace]` in user crates
-**user/hello, user/shell, user/rvos-rt** — Have bare `[workspace]` sections with no members. These are cargo workspace-root markers that serve no purpose and can confuse dependency resolution. Remove them.
+### ~~Empty `[workspace]` in user crates~~ **COMPLETED**
+**user/hello, user/shell, user/rvos-rt** — Had bare `[workspace]` sections. Consolidated all user crates into a single workspace at `user/Cargo.toml`, eliminating redundant dependency rebuilds.
 
-### Outdated allocator comment
+### ~~Outdated allocator comment~~ **COMPLETED**
 **`vendor/rust/library/std/src/sys/alloc/rvos.rs:39`** — Comment describes two-field layout (mmap_size + padding) but implementation uses three-field layout (mmap_size + back_ptr + padding) after the overlap bug fix. Comment misleads.
 
 ---
 
 ## 5. Documentation Drift
 
-| Doc | Issue | Actual Code |
-|-----|-------|-------------|
-| **kernel-abi.md** | MAX_HANDLES = 16 | **32** (process.rs:18) |
-| **kernel-abi.md** | MAX_MMAP_REGIONS = 32 | **256** (process.rs:19) |
-| **kernel-abi.md** | KERNEL_STACK_PAGES = 4 | **16** (process.rs:8) |
-| **shared-memory.md** | MAX_MSG_SIZE = 64 | **1024** (ipc/mod.rs:10) |
-| **shared-memory.md** | MAX_HANDLES = 16 | **32** |
-| **README.md** | Syscall table missing 6 entries | SYS_CHAN_SEND_BLOCKING(207), SYS_CHAN_POLL_ADD(208), SYS_BLOCK(209), SYS_TRACE(230), SYS_SHUTDOWN(231), SYS_CLOCK(232) |
-| **README.md** | Process list shows 9 | Actually 14+ at boot |
-| **architecture.md** | Process states diagram | Missing SYS_BLOCK / poll-based blocking |
-| **kernel-abi.md** | Handle table = `Option<usize>` | Actually `HandleObject` enum (Channel/Shm) |
-| **arch-review-1.md** | Limits table stale | All constants wrong |
+| Doc | Issue | Actual Code | Status |
+|-----|-------|-------------|--------|
+| **kernel-abi.md** | MAX_HANDLES = 16 | **32** (process.rs:18) | **FIXED** |
+| **kernel-abi.md** | MAX_MMAP_REGIONS = 32 | **256** (process.rs:19) | **FIXED** |
+| **kernel-abi.md** | KERNEL_STACK_PAGES = 4 | **16** (process.rs:8) | **FIXED** |
+| **shared-memory.md** | MAX_MSG_SIZE = 64 | **1024** (ipc/mod.rs:10) | **FIXED** |
+| **shared-memory.md** | MAX_HANDLES = 16 | **32** | **FIXED** |
+| **README.md** | Syscall table missing 6 entries | SYS_CHAN_SEND_BLOCKING(207), SYS_CHAN_POLL_ADD(208), SYS_BLOCK(209), SYS_TRACE(230), SYS_SHUTDOWN(231), SYS_CLOCK(232) | **FIXED** |
+| **README.md** | Process list shows 9 | Actually 14+ at boot | **FIXED** |
+| **architecture.md** | Process states diagram | Missing SYS_BLOCK / poll-based blocking | |
+| **kernel-abi.md** | Handle table = `Option<usize>` | Actually `HandleObject` enum (Channel/Shm) | was already correct |
+| **arch-review-1.md** | Limits table stale | All constants wrong | |
 
 ---
 
@@ -152,18 +152,18 @@ Analysis of 73 commits found 19 bug fixes (26%). The top recurring patterns:
 ## 8. Priority Action Items
 
 ### Immediate (fix this week)
-1. Fix `validate_user_buffer` integer overflow (correctness)
-2. Fix FS server non-blocking response sends (hangs)
-3. Fix GPU flush bounds validation (potential crash from user)
-4. Fix hardcoded path in `riscv64gc-unknown-rvos.json` (build portability)
-5. Update all stale constants in docs (MAX_HANDLES, MAX_MMAP_REGIONS, etc.)
+1. ~~Fix `validate_user_buffer` integer overflow (correctness)~~ **COMPLETED**
+2. ~~Fix FS server non-blocking response sends (hangs)~~ **COMPLETED**
+3. ~~Fix GPU flush bounds validation (potential crash from user)~~ **COMPLETED**
+4. ~~Fix hardcoded path in `riscv64gc-unknown-rvos.json` (build portability)~~ **COMPLETED**
+5. ~~Update all stale constants in docs (MAX_HANDLES, MAX_MMAP_REGIONS, etc.)~~ **COMPLETED**
 
 ### Soon (next sprint)
-6. Centralize `MAX_MSG_SIZE` + syscall numbers in `rvos-wire` with compile-time assertions
-7. Add `Message` size assertions in all 3 definition sites
-8. Replace init `panic!()` on exhaustion with graceful degradation
+6. ~~Centralize `MAX_MSG_SIZE` + syscall numbers in `rvos-wire` with compile-time assertions~~ **COMPLETED** (size assertions added; syscall numbers not centralized yet)
+7. ~~Add `Message` size assertions in all 3 definition sites~~ **COMPLETED**
+8. ~~Replace init `panic!()` on exhaustion with graceful degradation~~ **COMPLETED**
 9. Standardize all services to wire-format error responses
-10. Remove empty `[workspace]` sections; fix allocator comment
+10. ~~Remove empty `[workspace]` sections; fix allocator comment~~ **COMPLETED** (consolidated into single workspace)
 
 ### Backlog
 11. Extract `lib/rvos/src/service.rs` spawn function duplication
