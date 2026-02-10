@@ -3,4 +3,5 @@ pub mod gpu_server;
 pub mod init;
 pub mod kbd_server;
 pub mod math;
+pub mod mouse_server;
 pub mod sysinfo;

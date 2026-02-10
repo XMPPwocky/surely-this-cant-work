@@ -101,9 +101,12 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
-    // ---- Phase 3c: VirtIO keyboard (optional) ----
+    // ---- Phase 3c: VirtIO input devices (keyboard + tablet) ----
     if drivers::virtio::input::init() {
         println!("[boot] VirtIO keyboard initialized");
+    }
+    if drivers::virtio::tablet::init_from_probe() {
+        println!("[boot] VirtIO tablet initialized");
     }
 
     // ---- Phase 4: Scheduler and IPC ----
@@ -134,6 +137,11 @@ pub extern "C" fn kmain() -> ! {
         let (init_kbd_ep, kbd_ctl_ep) = ipc::channel_create_pair().expect("boot: kbd channel");
         services::kbd_server::set_control_ep(kbd_ctl_ep);
         services::init::register_service("kbd", init_kbd_ep);
+
+        // Mouse server kernel task
+        let (init_mouse_ep, mouse_ctl_ep) = ipc::channel_create_pair().expect("boot: mouse channel");
+        services::mouse_server::set_control_ep(mouse_ctl_ep);
+        services::init::register_service("mouse", init_mouse_ep);
 
         // No fb-con control channel — window server takes over the display
         None
@@ -172,9 +180,10 @@ pub extern "C" fn kmain() -> ! {
     task::spawn_named(services::init::init_server, "init");
     task::spawn_named(services::console::serial_console_server, "serial-con");
     if gpu_present {
-        // GPU present: spawn gpu-server + kbd-server (window-server loaded from fs)
+        // GPU present: spawn gpu-server + kbd-server + mouse-server (window-server loaded from fs)
         task::spawn_named(services::gpu_server::gpu_server, "gpu-server");
         task::spawn_named(services::kbd_server::kbd_server, "kbd-server");
+        task::spawn_named(services::mouse_server::mouse_server, "mouse-server");
         // fb-con and shell-fb are replaced by the window server
     }
     task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo");

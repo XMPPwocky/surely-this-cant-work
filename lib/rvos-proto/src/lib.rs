@@ -13,5 +13,6 @@ pub mod boot;
 pub mod process;
 pub mod gpu;
 pub mod kbd;
+pub mod mouse;
 pub mod window;
 pub mod service_control;

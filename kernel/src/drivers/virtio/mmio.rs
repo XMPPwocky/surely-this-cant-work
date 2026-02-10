@@ -167,3 +167,61 @@ pub fn driver_ok(base: usize) {
     let status = read_reg(base, REG_STATUS);
     write_reg(base, REG_STATUS, status | STATUS_DRIVER_OK);
 }
+
+// ── Config space access (offset 0x100 from device base) ──────────
+
+const REG_CONFIG: usize = 0x100;
+
+pub fn write_config_u8(base: usize, offset: usize, val: u8) {
+    unsafe { ((base + REG_CONFIG + offset) as *mut u8).write_volatile(val) }
+}
+
+pub fn read_config_u8(base: usize, offset: usize) -> u8 {
+    unsafe { ((base + REG_CONFIG + offset) as *const u8).read_volatile() }
+}
+
+pub fn read_config_u16_le(base: usize, offset: usize) -> u16 {
+    let lo = read_config_u8(base, offset) as u16;
+    let hi = read_config_u8(base, offset + 1) as u16;
+    lo | (hi << 8)
+}
+
+#[allow(dead_code)]
+pub fn read_config_u32_le(base: usize, offset: usize) -> u32 {
+    let lo = read_config_u16_le(base, offset) as u32;
+    let hi = read_config_u16_le(base, offset + 2) as u32;
+    lo | (hi << 16)
+}
+
+// ── Multi-device probe ───────────────────────────────────────────
+
+/// Result of probe_all: an array of (base, slot) pairs and a count.
+pub struct ProbeResult {
+    pub entries: [(usize, usize); VIRTIO_MMIO_SLOTS],
+    pub count: usize,
+}
+
+/// Probe all 8 VirtIO MMIO slots and return ALL devices matching `device_id`.
+pub fn probe_all(device_id: u32) -> ProbeResult {
+    let mut result = ProbeResult {
+        entries: [(0, 0); VIRTIO_MMIO_SLOTS],
+        count: 0,
+    };
+    for i in 0..VIRTIO_MMIO_SLOTS {
+        let base = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
+        let magic = read_reg(base, REG_MAGIC);
+        if magic != VIRTIO_MAGIC {
+            continue;
+        }
+        let version = read_reg(base, REG_VERSION);
+        let id = read_reg(base, REG_DEVICE_ID);
+        if id == 0 {
+            continue;
+        }
+        if id == device_id && (version == 1 || version == 2) {
+            result.entries[result.count] = (base, i);
+            result.count += 1;
+        }
+    }
+    result
+}

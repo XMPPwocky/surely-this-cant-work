@@ -157,6 +157,81 @@ pub fn set_kbd_wake_pid(pid: usize) {
     *KBD_WAKE_PID.lock() = pid;
 }
 
+// ============================================================
+// Raw mouse events (from VirtIO tablet/mouse IRQ handler)
+// ============================================================
+
+const RAW_MOUSE_BUF_SIZE: usize = 64;
+
+/// A raw mouse event from the tablet/mouse device.
+#[derive(Clone, Copy)]
+pub enum RawMouseEvent {
+    Move { abs_x: u16, abs_y: u16 },
+    ButtonDown { button: u8 },  // 0=Left, 1=Right, 2=Middle
+    ButtonUp { button: u8 },
+}
+
+/// Ring buffer for raw mouse events.
+pub struct RawMouseRingBuffer {
+    buf: [RawMouseEvent; RAW_MOUSE_BUF_SIZE],
+    head: usize,
+    tail: usize,
+}
+
+impl RawMouseRingBuffer {
+    pub const fn new() -> Self {
+        RawMouseRingBuffer {
+            buf: [RawMouseEvent::Move { abs_x: 0, abs_y: 0 }; RAW_MOUSE_BUF_SIZE],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    pub fn push(&mut self, event: RawMouseEvent) -> bool {
+        let next = (self.head + 1) % RAW_MOUSE_BUF_SIZE;
+        if next != self.tail {
+            self.buf[self.head] = event;
+            self.head = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<RawMouseEvent> {
+        if self.head == self.tail {
+            None
+        } else {
+            let ev = self.buf[self.tail];
+            self.tail = (self.tail + 1) % RAW_MOUSE_BUF_SIZE;
+            Some(ev)
+        }
+    }
+}
+
+/// Raw mouse events ring buffer — filled by VirtIO tablet IRQ handler
+pub static RAW_MOUSE_EVENTS: SpinLock<RawMouseRingBuffer> = SpinLock::new(RawMouseRingBuffer::new());
+
+/// PID of the mouse server to wake when raw mouse events arrive (0 = none)
+static RAW_MOUSE_WAKE_PID: SpinLock<usize> = SpinLock::new(0);
+
+/// Push a raw mouse event from the IRQ handler.
+pub fn push_raw_mouse_event(event: RawMouseEvent) {
+    let ok = RAW_MOUSE_EVENTS.lock().push(event);
+    if !ok {
+        // Buffer full — drop silently (mouse events are high-frequency)
+    }
+    let pid = *RAW_MOUSE_WAKE_PID.lock();
+    if pid != 0 {
+        crate::task::wake_process(pid);
+    }
+}
+
+/// Set the PID to wake when raw mouse events arrive.
+pub fn set_raw_mouse_wake_pid(pid: usize) {
+    *RAW_MOUSE_WAKE_PID.lock() = pid;
+}
+
 /// Raw UART putchar that bypasses the UART SpinLock.
 /// Safe to call from interrupt context where interrupts are already disabled
 /// and we are single-threaded on a single-hart system.

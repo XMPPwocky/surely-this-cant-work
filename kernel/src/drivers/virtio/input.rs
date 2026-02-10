@@ -152,19 +152,77 @@ static KEYMAP_SHIFT: [u8; 128] = {
     map
 };
 
+// VirtIO input config selectors
+const VIRTIO_INPUT_CFG_ID_DEVIDS: u8 = 0x03;
+
+// Config space offsets (within VirtIO input config at REG_CONFIG)
+const CFG_SELECT: usize = 0x00;
+const CFG_SUBSEL: usize = 0x01;
+// Product ID is at data offset 4 (data starts at 0x08, product at 0x0C)
+const CFG_DATA_PRODUCT: usize = 0x0C;
+
+// Known product IDs from QEMU virtio-input
+const PRODUCT_KEYBOARD: u16 = 0x0001;
+const PRODUCT_TABLET: u16 = 0x0003;
+
+/// Stored tablet (base, slot) for deferred initialization by tablet.rs.
+static mut TABLET_INFO: Option<(usize, usize)> = None;
+
+/// Return tablet (base, slot) if one was found during init().
+pub fn tablet_base_and_slot() -> Option<(usize, usize)> {
+    unsafe { *core::ptr::addr_of!(TABLET_INFO) }
+}
+
+/// Read the product ID from a VirtIO input device's config space.
+fn read_product_id(base: usize) -> u16 {
+    mmio::write_config_u8(base, CFG_SELECT, VIRTIO_INPUT_CFG_ID_DEVIDS);
+    mmio::write_config_u8(base, CFG_SUBSEL, 0);
+    // Small delay for config to settle (read size byte as fence)
+    let _size = mmio::read_config_u8(base, 0x02);
+    mmio::read_config_u16_le(base, CFG_DATA_PRODUCT)
+}
+
 /// Initialize the VirtIO keyboard driver.
+/// Probes ALL VirtIO input devices, identifies keyboard vs tablet,
+/// initializes the keyboard, and stores tablet info for later init.
 /// Returns true if a keyboard device was found and initialized.
 pub fn init() -> bool {
-    let (base, slot) = match mmio::probe_with_slot(mmio::DEVICE_ID_INPUT) {
-        Some(v) => v,
-        None => {
-            crate::println!("[keyboard] No VirtIO input device found");
-            return false;
-        }
-    };
+    let probe = mmio::probe_all(mmio::DEVICE_ID_INPUT);
+    if probe.count == 0 {
+        crate::println!("[keyboard] No VirtIO input devices found");
+        return false;
+    }
 
+    let mut kbd_found = false;
+
+    for i in 0..probe.count {
+        let (base, slot) = probe.entries[i];
+        let product = read_product_id(base);
+        crate::println!("[input] slot {} @ {:#x}: product={:#06x}", slot, base, product);
+
+        match product {
+            PRODUCT_KEYBOARD => {
+                if !kbd_found {
+                    kbd_found = init_keyboard(base, slot);
+                }
+            }
+            PRODUCT_TABLET => {
+                unsafe { core::ptr::addr_of_mut!(TABLET_INFO).write(Some((base, slot))); }
+                crate::println!("[input] tablet found at slot {} (deferred init)", slot);
+            }
+            _ => {
+                crate::println!("[input] unknown input device product={:#06x}, skipping", product);
+            }
+        }
+    }
+
+    kbd_found
+}
+
+/// Initialize a VirtIO keyboard at the given base/slot.
+fn init_keyboard(base: usize, slot: usize) -> bool {
     let irq = 1 + slot as u32;
-    crate::println!("[keyboard] Found VirtIO input at {:#x} (slot {}, IRQ {})", base, slot, irq);
+    crate::println!("[keyboard] Found VirtIO keyboard at {:#x} (slot {}, IRQ {})", base, slot, irq);
 
     if !mmio::init_device(base) {
         crate::println!("[keyboard] Device init failed");
