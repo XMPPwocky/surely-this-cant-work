@@ -236,6 +236,12 @@ fn main() {
             loop {
                 let mut wmsg = Message::new();
                 let ret = raw::sys_chan_recv(ch, &mut wmsg);
+                if ret == 2 {
+                    // ChannelClosed — client disconnected
+                    did_work = true;
+                    destroy_window(&mut server, i);
+                    break;
+                }
                 if ret != 0 { break; }
                 did_work = true;
                 handle_window_msg(&mut server, i, &wmsg);
@@ -379,6 +385,11 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
     resp.cap_count = 2;
     raw::sys_chan_send_blocking(per_client_handle, &resp);
 
+    // Close handles we sent as caps — sending did inc_ref, so the
+    // receiver's copies are independent.  Without this, 2 handles
+    // leak per window creation, eventually filling the handle table.
+    raw::sys_chan_close(client_req_ep);
+    raw::sys_chan_close(client_evt_ep);
     raw::sys_chan_close(per_client_handle);
 }
 
@@ -601,6 +612,33 @@ fn mark_any_dirty(server: &mut Server) {
     }
 }
 
+/// Clean up a window when the client disconnects without sending CloseWindow.
+fn destroy_window(server: &mut Server, slot: usize) {
+    let win = match server.windows[slot].take() {
+        Some(w) => w,
+        None => return,
+    };
+    raw::sys_chan_close(win.req_channel);
+    raw::sys_chan_close(win.event_channel);
+    let fb = win.fb_ptr as usize;
+    if fb != 0 {
+        let fb_size = (win.stride as usize) * (win.height as usize) * 4 * 2;
+        raw::sys_munmap(fb, fb_size);
+    }
+    raw::sys_chan_close(win.shm_handle);
+    // If foreground was this window, pick another
+    if server.foreground == slot {
+        server.foreground = 0;
+        for i in 0..MAX_WINDOWS {
+            if server.windows[i].is_some() {
+                server.foreground = i;
+                break;
+            }
+        }
+    }
+    mark_any_dirty(server);
+}
+
 fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
     if msg.len == 0 { return; }
 
@@ -637,6 +675,7 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
         WindowRequest::CloseWindow {} => {
             let req_ch = win.req_channel;
             let evt_ch = win.event_channel;
+            let shm_h = win.shm_handle;
             let fb = win.fb_ptr as usize;
             let fb_size = (win.stride as usize) * (win.height as usize) * 4 * 2;
             // Send ack before closing
@@ -648,6 +687,7 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
             if fb != 0 {
                 raw::sys_munmap(fb, fb_size);
             }
+            raw::sys_chan_close(shm_h);
             mark_any_dirty(server);
         }
     }
