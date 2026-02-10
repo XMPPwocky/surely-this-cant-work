@@ -717,6 +717,10 @@ static BENCH_ELF: &[u8] = include_bytes!(
     "../../../user/bench/target/riscv64gc-unknown-rvos/release/bench"
 );
 
+static TRIANGLE_ELF: &[u8] = include_bytes!(
+    "../../../user/triangle/target/riscv64gc-unknown-rvos/release/triangle"
+);
+
 // --- Multiplexed client state ---
 
 const MAX_CLIENTS: usize = 8;
@@ -742,6 +746,7 @@ fn main() {
     fs().add_static_file(b"/bin/fbcon", FBCON_ELF);
     fs().add_static_file(b"/bin/shell", SHELL_ELF);
     fs().add_static_file(b"/bin/bench", BENCH_ELF);
+    fs().add_static_file(b"/bin/triangle", TRIANGLE_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)

@@ -30,7 +30,7 @@ name = "rvos-wire"
 version = "0.1.0"
 
 [[package]]
-name = "window-server"
+name = "triangle"
 version = "0.1.0"
 dependencies = [
  "rvos",

@@ -1,0 +1,6 @@
+[package]
+name = "rvos-gfx"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

@@ -6,7 +6,7 @@ OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 # build-std flags (moved out of .cargo/config.toml to avoid leaking into x.py)
 BUILD_STD = -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem
 
-.PHONY: build build-shell build-hello build-bench build-fs build-fbcon build-window-server build-winclient build-ipc-torture build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench
+.PHONY: build build-shell build-hello build-bench build-fs build-fbcon build-window-server build-winclient build-ipc-torture build-triangle build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench
 
 build-shell:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
@@ -43,13 +43,18 @@ build-ipc-torture:
 		--manifest-path user/ipc-torture/Cargo.toml \
 		--target riscv64gc-unknown-rvos
 
+build-triangle:
+	. $$HOME/.cargo/env && cargo +rvos build --release \
+		--manifest-path user/triangle/Cargo.toml \
+		--target riscv64gc-unknown-rvos
+
 build-fbcon:
 	. $$HOME/.cargo/env && cargo +rvos build --release \
 		--manifest-path user/fbcon/Cargo.toml \
 		--target riscv64gc-unknown-rvos
 
 # fs embeds user binaries via include_bytes!, so build them first
-build-fs: build-window-server build-winclient build-ipc-torture build-fbcon build-shell build-bench
+build-fs: build-window-server build-winclient build-ipc-torture build-fbcon build-shell build-bench build-triangle
 	. $$HOME/.cargo/env && cargo +rvos build --release \
 		--manifest-path user/fs/Cargo.toml \
 		--target riscv64gc-unknown-rvos
@@ -70,6 +75,7 @@ run-gui: build
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
+		-device virtio-tablet-device \
 		-display gtk \
 		-kernel $(KERNEL_BIN)
 
@@ -79,6 +85,7 @@ run-vnc: build
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
+		-device virtio-tablet-device \
 		-display vnc=:0 \
 		-kernel $(KERNEL_BIN)
 
@@ -92,6 +99,7 @@ run-gpu-screenshot: build
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
+		-device virtio-tablet-device \
 		-display vnc=:0 \
 		-kernel $(KERNEL_BIN) \
 		-monitor unix:/tmp/qemu-monitor.sock,server,nowait &

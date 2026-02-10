@@ -68,5 +68,13 @@ define_message! {
         KeyDown(192) { code: u16 },
         /// Keyboard event: key released (forwarded from kbd server).
         KeyUp(193) { code: u16 },
+        /// Mouse moved (window-local coordinates).
+        MouseMove(194) { x: u32, y: u32 },
+        /// Mouse button pressed (window-local coordinates).
+        MouseButtonDown(195) { x: u32, y: u32, button: u8 },
+        /// Mouse button released (window-local coordinates).
+        MouseButtonUp(196) { x: u32, y: u32, button: u8 },
+        /// Close button was clicked by user; client should exit gracefully.
+        CloseRequested(197) {},
     }
 }

@@ -9,6 +9,7 @@ edition = "2021"
 rvos-rt = { path = "../rvos-rt" }
 rvos = { path = "../../lib/rvos" }
 rvos-proto = { path = "../../lib/rvos-proto" }
+rvos-gfx = { path = "../../lib/rvos-gfx" }
 
 [profile.release]
 panic = "abort"
