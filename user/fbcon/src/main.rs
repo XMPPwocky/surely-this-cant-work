@@ -7,7 +7,7 @@ use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED};
 use rvos_proto::service_control::NewConnection;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
-    WindowRequest, WindowServerMsg,
+    WindowRequest, WindowReply, WindowEvent,
 };
 
 // --- Font data (shared from rvos-gfx) ---
@@ -329,24 +329,25 @@ fn main() {
     ).unwrap_or(0);
     raw::sys_chan_send_blocking(win_ctl, &req);
 
-    // 3. Receive CreateWindow reply with window channel capability
+    // 3. Receive CreateWindow reply with two per-window channel capabilities
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(win_ctl, &mut resp);
-    let win_chan = resp.cap();
     let _create_resp = rvos_wire::from_bytes::<CreateWindowResponse>(&resp.data[..resp.len]);
+    let req_chan = resp.caps[0];
+    let event_chan = resp.caps[1];
 
-    // 4. GetInfo on window channel
+    // 4. GetInfo on request channel
     let mut req = Message::new();
     req.len = rvos_wire::to_bytes(
         &WindowRequest::GetInfo { seq: 1 },
         &mut req.data,
     ).unwrap_or(0);
-    raw::sys_chan_send_blocking(win_chan, &req);
+    raw::sys_chan_send_blocking(req_chan, &req);
 
     let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(win_chan, &mut resp);
-    let (width, height, stride) = match rvos_wire::from_bytes::<WindowServerMsg>(&resp.data[..resp.len]) {
-        Ok(WindowServerMsg::InfoReply { width, height, stride, .. }) => (width, height, stride),
+    raw::sys_chan_recv_blocking(req_chan, &mut resp);
+    let (width, height, stride) = match rvos_wire::from_bytes::<WindowReply>(&resp.data[..resp.len]) {
+        Ok(WindowReply::InfoReply { width, height, stride, .. }) => (width, height, stride),
         _ => (1024, 768, 1024),
     };
 
@@ -356,10 +357,10 @@ fn main() {
         &WindowRequest::GetFramebuffer { seq: 2 },
         &mut req.data,
     ).unwrap_or(0);
-    raw::sys_chan_send_blocking(win_chan, &req);
+    raw::sys_chan_send_blocking(req_chan, &req);
 
     let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(win_chan, &mut resp);
+    raw::sys_chan_recv_blocking(req_chan, &mut resp);
     let shm_handle = resp.cap();
 
     // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
@@ -392,10 +393,7 @@ fn main() {
     console.write_str(b"================\r\n\r\n");
 
     // Do initial present
-    let mut deferred_msgs: [Message; MAX_DEFERRED_MSGS] = [const { Message::new() }; MAX_DEFERRED_MSGS];
-    let mut deferred_count: usize = 0;
-    do_swap(win_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back,
-            &mut deferred_msgs, &mut deferred_count);
+    do_swap(req_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
     // Re-point console to new back buffer
     update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
     console.dirty = false;
@@ -459,15 +457,15 @@ fn main() {
 
         let stdin_idx = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
 
-        // Check for keyboard events on window channel
+        // Check for keyboard events on event channel
         loop {
             let mut msg = Message::new();
-            let ret = raw::sys_chan_recv(win_chan, &mut msg);
+            let ret = raw::sys_chan_recv(event_chan, &mut msg);
             if ret != 0 { break; }
             handled = true;
             if msg.len > 0 {
-                match rvos_wire::from_bytes::<WindowServerMsg>(&msg.data[..msg.len]) {
-                    Ok(WindowServerMsg::KeyDown { code }) => {
+                match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
+                    Ok(WindowEvent::KeyDown { code }) => {
                         println!("[fbcon] recv D{}", code);
                         let code = code as usize;
                         if code == 42 || code == 54 {
@@ -483,7 +481,7 @@ fn main() {
                             }
                         }
                     }
-                    Ok(WindowServerMsg::KeyUp { code }) => {
+                    Ok(WindowEvent::KeyUp { code }) => {
                         println!("[fbcon] recv U{}", code);
                         let code = code as usize;
                         if code == 42 || code == 54 {
@@ -581,56 +579,17 @@ fn main() {
 
         // If console is dirty, present the frame
         if console.dirty {
-            do_swap(win_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back,
-                    &mut deferred_msgs, &mut deferred_count);
+            do_swap(req_chan, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
             update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
             console.dirty = false;
             handled = true;
-
-            // Process any keyboard events that arrived during the swap
-            if deferred_count > 0 {
-                println!("[fbcon] processing {} deferred msgs from swap", deferred_count);
-            }
-            let stdin_idx_now = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
-            for di in 0..deferred_count {
-                let msg = &deferred_msgs[di];
-                if msg.len > 0 {
-                    match rvos_wire::from_bytes::<WindowServerMsg>(&msg.data[..msg.len]) {
-                        Ok(WindowServerMsg::KeyDown { code }) => {
-                            println!("[fbcon] deferred D{}", code);
-                            let code = code as usize;
-                            if code == 42 || code == 54 {
-                                shift_pressed = true;
-                            } else if code < 128 {
-                                let ascii = if shift_pressed {
-                                    KEYMAP_SHIFT[code]
-                                } else {
-                                    KEYMAP[code]
-                                };
-                                if ascii != 0 {
-                                    handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx_now);
-                                }
-                            }
-                        }
-                        Ok(WindowServerMsg::KeyUp { code }) => {
-                            println!("[fbcon] deferred U{}", code);
-                            let code = code as usize;
-                            if code == 42 || code == 54 {
-                                shift_pressed = false;
-                            }
-                        }
-                        _ => {
-                            println!("[fbcon] deferred OTHER (len={})", msg.len);
-                        }
-                    }
-                }
-            }
         }
 
         if !handled {
             // Register interest on all channels then block
             raw::sys_chan_poll_add(CONSOLE_CONTROL_HANDLE);
-            raw::sys_chan_poll_add(win_chan);
+            raw::sys_chan_poll_add(req_chan);
+            raw::sys_chan_poll_add(event_chan);
             for i in 0..MAX_CONSOLE_CLIENTS {
                 if !clients[i].active { continue; }
                 if clients[i].stdin_handle != usize::MAX { raw::sys_chan_poll_add(clients[i].stdin_handle); }
@@ -690,45 +649,25 @@ fn handle_key_input(
     }
 }
 
-const MAX_DEFERRED_MSGS: usize = 16;
-
-/// Swap buffers, wait for swap reply (buffering key events), then copy front→new-back.
-/// Returns the number of deferred messages stored in `deferred`.
+/// Swap buffers, wait for swap reply, then copy front→new-back.
 fn do_swap(
-    win_chan: usize,
+    req_chan: usize,
     seq: &mut u32,
     fb_base: *mut u32,
     pixels_per_buffer: usize,
     current_back: &mut u8,
-    deferred: &mut [Message; MAX_DEFERRED_MSGS],
-    deferred_count: &mut usize,
 ) {
-    *deferred_count = 0;
-
     let mut req = Message::new();
     req.len = rvos_wire::to_bytes(
         &WindowRequest::SwapBuffers { seq: *seq },
         &mut req.data,
     ).unwrap_or(0);
-    raw::sys_chan_send_blocking(win_chan, &req);
+    raw::sys_chan_send_blocking(req_chan, &req);
     *seq = seq.wrapping_add(1);
 
-    // Wait for swap reply, buffering any keyboard events that arrive
-    loop {
-        let mut resp = Message::new();
-        raw::sys_chan_recv_blocking(win_chan, &mut resp);
-        if resp.len == 0 { break; }
-        match rvos_wire::from_bytes::<WindowServerMsg>(&resp.data[..resp.len]) {
-            Ok(WindowServerMsg::SwapReply { .. }) => break,
-            _ => {
-                // Buffer keyboard events instead of dropping them
-                if *deferred_count < MAX_DEFERRED_MSGS {
-                    deferred[*deferred_count] = resp;
-                    *deferred_count += 1;
-                }
-            }
-        }
-    }
+    // Wait for swap reply — events arrive on separate event_chan, no buffering needed
+    let mut resp = Message::new();
+    raw::sys_chan_recv_blocking(req_chan, &mut resp);
 
     // Toggle back buffer
     *current_back = 1 - *current_back;

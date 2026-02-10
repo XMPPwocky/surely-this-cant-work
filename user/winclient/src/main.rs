@@ -5,7 +5,7 @@ use rvos::Message;
 use rvos::rvos_wire;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
-    WindowRequest, WindowServerMsg,
+    WindowRequest, WindowReply, WindowEvent,
 };
 
 fn main() {
@@ -24,25 +24,26 @@ fn main() {
     ).unwrap_or(0);
     raw::sys_chan_send_blocking(win_ctl, &req);
 
-    // 3. Receive CreateWindow reply with window channel capability
+    // 3. Receive CreateWindow reply with two channel capabilities
     let mut resp = Message::new();
     raw::sys_chan_recv_blocking(win_ctl, &mut resp);
-    let win_chan = resp.cap(); // window channel handle
+    let req_chan = resp.caps[0];   // request channel
+    let event_chan = resp.caps[1]; // event channel
 
     let _create_resp = rvos_wire::from_bytes::<CreateWindowResponse>(&resp.data[..resp.len]);
 
-    // 4. GetInfo on window channel
+    // 4. GetInfo on request channel
     let mut req = Message::new();
     req.len = rvos_wire::to_bytes(
         &WindowRequest::GetInfo { seq: 1 },
         &mut req.data,
     ).unwrap_or(0);
-    raw::sys_chan_send_blocking(win_chan, &req);
+    raw::sys_chan_send_blocking(req_chan, &req);
 
     let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(win_chan, &mut resp);
-    let (width, height, stride) = match rvos_wire::from_bytes::<WindowServerMsg>(&resp.data[..resp.len]) {
-        Ok(WindowServerMsg::InfoReply { width, height, stride, .. }) => (width, height, stride),
+    raw::sys_chan_recv_blocking(req_chan, &mut resp);
+    let (width, height, stride) = match rvos_wire::from_bytes::<WindowReply>(&resp.data[..resp.len]) {
+        Ok(WindowReply::InfoReply { width, height, stride, .. }) => (width, height, stride),
         _ => (1024, 768, 1024),
     };
 
@@ -52,10 +53,10 @@ fn main() {
         &WindowRequest::GetFramebuffer { seq: 2 },
         &mut req.data,
     ).unwrap_or(0);
-    raw::sys_chan_send_blocking(win_chan, &req);
+    raw::sys_chan_send_blocking(req_chan, &req);
 
     let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(win_chan, &mut resp);
+    raw::sys_chan_recv_blocking(req_chan, &mut resp);
     let shm_handle = resp.cap();
 
     // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
@@ -88,17 +89,15 @@ fn main() {
             &WindowRequest::SwapBuffers { seq: frame },
             &mut req.data,
         ).unwrap_or(0);
-        raw::sys_chan_send_blocking(win_chan, &req);
+        raw::sys_chan_send_blocking(req_chan, &req);
 
-        // Wait for swap reply, handling any key events that arrive first
+        // Wait for swap reply on request channel
         loop {
             let mut resp = Message::new();
-            raw::sys_chan_recv_blocking(win_chan, &mut resp);
+            raw::sys_chan_recv_blocking(req_chan, &mut resp);
             if resp.len == 0 { break; }
-            match rvos_wire::from_bytes::<WindowServerMsg>(&resp.data[..resp.len]) {
-                Ok(WindowServerMsg::SwapReply { .. }) => break,
-                Ok(WindowServerMsg::KeyDown { code }) => print_key_event("down", code),
-                Ok(WindowServerMsg::KeyUp { code }) => print_key_event("up", code),
+            match rvos_wire::from_bytes::<WindowReply>(&resp.data[..resp.len]) {
+                Ok(WindowReply::SwapReply { .. }) => break,
                 _ => {}
             }
         }
@@ -107,15 +106,15 @@ fn main() {
         current_back = 1 - current_back;
         frame = frame.wrapping_add(1);
 
-        // Drain any pending key events between frames
+        // Drain any pending key events from event channel between frames
         loop {
             let mut msg = Message::new();
-            let ret = raw::sys_chan_recv(win_chan, &mut msg);
+            let ret = raw::sys_chan_recv(event_chan, &mut msg);
             if ret != 0 { break; }
             if msg.len > 0 {
-                match rvos_wire::from_bytes::<WindowServerMsg>(&msg.data[..msg.len]) {
-                    Ok(WindowServerMsg::KeyDown { code }) => print_key_event("down", code),
-                    Ok(WindowServerMsg::KeyUp { code }) => print_key_event("up", code),
+                match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
+                    Ok(WindowEvent::KeyDown { code }) => print_key_event("down", code),
+                    Ok(WindowEvent::KeyUp { code }) => print_key_event("up", code),
                     _ => {}
                 }
             }

@@ -8,11 +8,22 @@ use rvos_proto::kbd::KbdEvent;
 use rvos_proto::mouse::MouseEvent;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
-    WindowRequest, WindowServerMsg,
+    WindowRequest, WindowReply, WindowEvent,
 };
 use rvos_gfx::framebuffer::Framebuffer;
 use rvos_gfx::text;
 use rvos_gfx::font::GLYPH_HEIGHT;
+
+// --- Timing ---
+
+#[inline(always)]
+fn rdtime() -> u64 {
+    let t: u64;
+    unsafe { core::arch::asm!("rdtime {}", out(reg) t, options(nomem, nostack)) };
+    t
+}
+
+const TICKS_PER_SEC: u64 = 10_000_000; // 10 MHz RISC-V timer
 
 // --- Constants ---
 const CONTROL_HANDLE: usize = 1; // window service control channel
@@ -63,7 +74,8 @@ static CURSOR_BITMAP: [u16; CURSOR_H] = [
 
 struct Window {
     id: u32,
-    channel_handle: usize,
+    req_channel: usize,
+    event_channel: usize,
     shm_handle: usize,
     fb_ptr: *mut u32,
     width: u32,
@@ -95,6 +107,35 @@ struct Server {
     drag_offset_x: i32,
     drag_offset_y: i32,
     alt_held: bool,
+}
+
+/// Send a WindowEvent on the event channel (non-blocking, best-effort).
+fn send_event(handle: usize, event: &WindowEvent) {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(event, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send(handle, &msg);
+}
+
+/// Send a WindowEvent on the event channel (blocking).
+fn send_event_blocking(handle: usize, event: &WindowEvent) {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(event, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(handle, &msg);
+}
+
+/// Send a WindowReply on the request channel (blocking).
+fn send_reply(handle: usize, reply: &WindowReply) {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(reply, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(handle, &msg);
+}
+
+/// Send a WindowReply with a capability on the request channel (blocking).
+fn send_reply_with_cap(handle: usize, reply: &WindowReply, cap: usize) {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(reply, &mut msg.data).unwrap_or(0);
+    msg.set_cap(cap);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn main() {
@@ -147,6 +188,12 @@ fn main() {
         alt_held: false,
     };
 
+    // FPS tracking
+    let mut fps_frame_count: u32 = 0;
+    let mut fps_composite_ticks: u64 = 0;
+    let mut fps_flush_ticks: u64 = 0;
+    let mut fps_last_print: u64 = rdtime();
+
     loop {
         let mut did_work = false;
 
@@ -180,10 +227,10 @@ fn main() {
             handle_mouse_event(&mut server, &mmsg);
         }
 
-        // 4. Drain window channel messages
+        // 4. Drain window request channel messages
         for i in 0..MAX_WINDOWS {
             let ch = match server.windows[i] {
-                Some(ref win) if win.active => win.channel_handle,
+                Some(ref win) if win.active => win.req_channel,
                 _ => continue,
             };
             loop {
@@ -203,8 +250,32 @@ fn main() {
             }
         }
         if any_dirty {
+            let t0 = rdtime();
             composite(&mut server);
+            let t1 = rdtime();
             flush_display(&server);
+            let t2 = rdtime();
+
+            fps_frame_count += 1;
+            fps_composite_ticks += t1 - t0;
+            fps_flush_ticks += t2 - t1;
+        }
+
+        // Print FPS stats every second
+        let now = rdtime();
+        if now - fps_last_print >= TICKS_PER_SEC {
+            if fps_frame_count > 0 {
+                let comp_avg_us = fps_composite_ticks / (10 * fps_frame_count as u64);
+                let flush_avg_us = fps_flush_ticks / (10 * fps_frame_count as u64);
+                println!(
+                    "[compositor] fps={} composite={}us flush={}us",
+                    fps_frame_count, comp_avg_us, flush_avg_us
+                );
+            }
+            fps_frame_count = 0;
+            fps_composite_ticks = 0;
+            fps_flush_ticks = 0;
+            fps_last_print = now;
         }
 
         if !did_work {
@@ -214,7 +285,7 @@ fn main() {
             for i in 0..MAX_WINDOWS {
                 if let Some(ref win) = server.windows[i] {
                     if win.active {
-                        raw::sys_chan_poll_add(win.channel_handle);
+                        raw::sys_chan_poll_add(win.req_channel);
                     }
                 }
             }
@@ -273,11 +344,15 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
         }
     }
 
-    let (our_ep, client_ep) = raw::sys_chan_create();
+    // Create request/reply channel pair
+    let (our_req_ep, client_req_ep) = raw::sys_chan_create();
+    // Create event channel pair
+    let (our_evt_ep, client_evt_ep) = raw::sys_chan_create();
 
     server.windows[slot] = Some(Window {
         id: win_id,
-        channel_handle: our_ep,
+        req_channel: our_req_ep,
+        event_channel: our_evt_ep,
         shm_handle,
         fb_ptr,
         width,
@@ -298,7 +373,10 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
     };
     let mut resp = Message::new();
     resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
-    resp.set_cap(client_ep);
+    // caps[0] = request channel, caps[1] = event channel
+    resp.caps[0] = client_req_ep;
+    resp.caps[1] = client_evt_ep;
+    resp.cap_count = 2;
     raw::sys_chan_send_blocking(per_client_handle, &resp);
 
     raw::sys_chan_close(per_client_handle);
@@ -340,17 +418,15 @@ fn handle_kbd_event(server: &mut Server, msg: &Message) {
         }
     }
 
-    // Forward to foreground window
+    // Forward to foreground window's EVENT channel
     let fg = server.foreground;
     if let Some(ref win) = server.windows[fg] {
         if !win.active { return; }
         let win_event = match event {
-            KbdEvent::KeyDown { code } => WindowServerMsg::KeyDown { code },
-            KbdEvent::KeyUp { code } => WindowServerMsg::KeyUp { code },
+            KbdEvent::KeyDown { code } => WindowEvent::KeyDown { code },
+            KbdEvent::KeyUp { code } => WindowEvent::KeyUp { code },
         };
-        let mut fwd = Message::new();
-        fwd.len = rvos_wire::to_bytes(&win_event, &mut fwd.data).unwrap_or(0);
-        raw::sys_chan_send_blocking(win.channel_handle, &fwd);
+        send_event_blocking(win.event_channel, &win_event);
     }
 }
 
@@ -422,7 +498,7 @@ fn handle_mouse_event(server: &mut Server, msg: &Message) {
                         if local_x >= close_x && local_x < close_x + CLOSE_BTN_SIZE
                             && local_y >= close_y && local_y < close_y + CLOSE_BTN_SIZE
                         {
-                            // Send CloseRequested to client
+                            // Send CloseRequested to client on event channel
                             send_close_requested(server, idx);
                             return;
                         }
@@ -458,10 +534,7 @@ fn handle_mouse_event(server: &mut Server, msg: &Message) {
 fn send_close_requested(server: &Server, idx: usize) {
     if let Some(ref win) = server.windows[idx] {
         if !win.active { return; }
-        let ev = WindowServerMsg::CloseRequested {};
-        let mut msg = Message::new();
-        msg.len = rvos_wire::to_bytes(&ev, &mut msg.data).unwrap_or(0);
-        raw::sys_chan_send(win.channel_handle, &msg);
+        send_event(win.event_channel, &WindowEvent::CloseRequested {});
     }
 }
 
@@ -501,10 +574,7 @@ fn forward_mouse_move(server: &Server, x: i32, y: i32) {
         let y_offset = if win.fullscreen { 0 } else { TITLE_BAR_HEIGHT };
         let local_x = (x - win.x).max(0) as u32;
         let local_y = (y - win.y - y_offset).max(0) as u32;
-        let ev = WindowServerMsg::MouseMove { x: local_x, y: local_y };
-        let mut fwd = Message::new();
-        fwd.len = rvos_wire::to_bytes(&ev, &mut fwd.data).unwrap_or(0);
-        raw::sys_chan_send(win.channel_handle, &fwd);
+        send_event(win.event_channel, &WindowEvent::MouseMove { x: local_x, y: local_y });
     }
 }
 
@@ -516,13 +586,11 @@ fn forward_mouse_button(server: &Server, down: bool, button: u8) {
         let local_x = (server.cursor_x - win.x).max(0) as u32;
         let local_y = (server.cursor_y - win.y - y_offset).max(0) as u32;
         let ev = if down {
-            WindowServerMsg::MouseButtonDown { x: local_x, y: local_y, button }
+            WindowEvent::MouseButtonDown { x: local_x, y: local_y, button }
         } else {
-            WindowServerMsg::MouseButtonUp { x: local_x, y: local_y, button }
+            WindowEvent::MouseButtonUp { x: local_x, y: local_y, button }
         };
-        let mut fwd = Message::new();
-        fwd.len = rvos_wire::to_bytes(&ev, &mut fwd.data).unwrap_or(0);
-        raw::sys_chan_send(win.channel_handle, &fwd);
+        send_event(win.event_channel, &ev);
     }
 }
 
@@ -548,7 +616,7 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
 
     match req {
         WindowRequest::GetInfo { seq } => {
-            let reply = WindowServerMsg::InfoReply {
+            let reply = WindowReply::InfoReply {
                 seq,
                 window_id: win.id,
                 width: win.width,
@@ -556,30 +624,30 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
                 stride: win.stride,
                 format: 0,
             };
-            let mut resp = Message::new();
-            resp.len = rvos_wire::to_bytes(&reply, &mut resp.data).unwrap_or(0);
-            raw::sys_chan_send_blocking(win.channel_handle, &resp);
+            send_reply(win.req_channel, &reply);
         }
         WindowRequest::GetFramebuffer { seq } => {
-            let reply = WindowServerMsg::FbReply { seq };
-            let mut resp = Message::new();
-            resp.len = rvos_wire::to_bytes(&reply, &mut resp.data).unwrap_or(0);
-            resp.set_cap(win.shm_handle);
-            raw::sys_chan_send_blocking(win.channel_handle, &resp);
+            send_reply_with_cap(win.req_channel, &WindowReply::FbReply { seq }, win.shm_handle);
         }
         WindowRequest::SwapBuffers { seq } => {
             win.front_buffer = 1 - win.front_buffer;
             win.dirty = true;
-
-            let reply = WindowServerMsg::SwapReply { seq, ok: 0 };
-            let mut resp = Message::new();
-            resp.len = rvos_wire::to_bytes(&reply, &mut resp.data).unwrap_or(0);
-            raw::sys_chan_send_blocking(win.channel_handle, &resp);
+            send_reply(win.req_channel, &WindowReply::SwapReply { seq, ok: 0 });
         }
         WindowRequest::CloseWindow {} => {
-            raw::sys_chan_close(win.channel_handle);
-            win.active = false;
-            // Trigger recomposite to remove the closed window
+            let req_ch = win.req_channel;
+            let evt_ch = win.event_channel;
+            let fb = win.fb_ptr as usize;
+            let fb_size = (win.stride as usize) * (win.height as usize) * 4 * 2;
+            // Send ack before closing
+            send_reply(req_ch, &WindowReply::CloseAck {});
+            // Free the slot so it can be reused by new windows
+            server.windows[slot] = None;
+            raw::sys_chan_close(req_ch);
+            raw::sys_chan_close(evt_ch);
+            if fb != 0 {
+                raw::sys_munmap(fb, fb_size);
+            }
             mark_any_dirty(server);
         }
     }

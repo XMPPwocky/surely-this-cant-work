@@ -247,6 +247,13 @@ pub trait Deserialize<'a>: Sized {
     fn deserialize(r: &mut Reader<'a>) -> Result<Self, WireError>;
 }
 
+/// Marker for types that can be deserialized without borrowing from the buffer.
+///
+/// Analogous to serde's `DeserializeOwned`. All types produced by
+/// `define_message!` without a lifetime parameter satisfy this bound.
+pub trait DeserializeOwned: for<'a> Deserialize<'a> {}
+impl<T: for<'a> Deserialize<'a>> DeserializeOwned for T {}
+
 // ---------------------------------------------------------------------------
 // Blanket impls: primitives
 // ---------------------------------------------------------------------------

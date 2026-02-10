@@ -1,6 +1,6 @@
 //! Service discovery and process spawning via the boot channel.
 
-use crate::channel::Channel;
+use crate::channel::RawChannel;
 use crate::error::{SysError, SysResult};
 use crate::message::Message;
 use crate::raw;
@@ -10,12 +10,12 @@ use rvos_proto::boot::{BootRequest, BootResponse};
 ///
 /// Sends a ConnectService request on the boot channel and receives a capability
 /// handle for the service's channel.
-pub fn connect_to_service(name: &str) -> SysResult<Channel> {
+pub fn connect_to_service(name: &str) -> SysResult<RawChannel> {
     connect_to_service_on(0, name)
 }
 
 /// Connect to a named service via a specific boot handle.
-pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<Channel> {
+pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<RawChannel> {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&BootRequest::ConnectService { name }, &mut msg.data)
         .map_err(|_| SysError::BadAddress)?;
@@ -48,19 +48,19 @@ pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<Channe
         return Err(SysError::NoResources);
     }
 
-    Ok(Channel::from_raw_handle(reply.cap()))
+    Ok(RawChannel::from_raw_handle(reply.cap()))
 }
 
 /// Spawn a process from a filesystem path via the boot channel (handle 0).
 ///
 /// Returns a process handle channel that will receive an exit notification
 /// (i32 exit code) when the spawned process exits.
-pub fn spawn_process(path: &str) -> SysResult<Channel> {
+pub fn spawn_process(path: &str) -> SysResult<RawChannel> {
     spawn_process_on(0, path)
 }
 
 /// Spawn a process via a specific boot handle.
-pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
+pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<RawChannel> {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(
         &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
@@ -94,19 +94,19 @@ pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<Channel> {
         return Err(SysError::NoResources);
     }
 
-    Ok(Channel::from_raw_handle(reply.cap()))
+    Ok(RawChannel::from_raw_handle(reply.cap()))
 }
 
 /// Spawn a process with an extra capability channel passed as handle 1.
 ///
 /// Like `spawn_process`, but additionally sends `cap_handle` as a capability
 /// with the Spawn request. The spawned process receives this as handle 1.
-pub fn spawn_process_with_cap(path: &str, cap_handle: usize) -> SysResult<Channel> {
+pub fn spawn_process_with_cap(path: &str, cap_handle: usize) -> SysResult<RawChannel> {
     spawn_process_with_cap_on(0, path, cap_handle)
 }
 
 /// Spawn a process with an extra capability via a specific boot handle.
-pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usize) -> SysResult<Channel> {
+pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usize) -> SysResult<RawChannel> {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(
         &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
@@ -141,19 +141,19 @@ pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usi
         return Err(SysError::NoResources);
     }
 
-    Ok(Channel::from_raw_handle(reply.cap()))
+    Ok(RawChannel::from_raw_handle(reply.cap()))
 }
 
 /// Spawn a process with command-line arguments via the boot channel (handle 0).
 ///
 /// `args` is a null-separated blob (e.g., b"arg1\0arg2"). The spawned process
 /// retrieves these via `GetArgs` on its boot channel (used by `std::env::args()`).
-pub fn spawn_process_with_args(path: &str, args: &[u8]) -> SysResult<Channel> {
+pub fn spawn_process_with_args(path: &str, args: &[u8]) -> SysResult<RawChannel> {
     spawn_process_with_args_on(0, path, args)
 }
 
 /// Spawn a process with args via a specific boot handle.
-pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -> SysResult<Channel> {
+pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -> SysResult<RawChannel> {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(
         &BootRequest::Spawn { path, args, ns_overrides: &[] },
@@ -187,7 +187,7 @@ pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -
         return Err(SysError::NoResources);
     }
 
-    Ok(Channel::from_raw_handle(reply.cap()))
+    Ok(RawChannel::from_raw_handle(reply.cap()))
 }
 
 /// Spawn a process with args and namespace overrides.
@@ -200,7 +200,7 @@ pub fn spawn_process_with_overrides(
     args: &[u8],
     ns_overrides: &[u8],
     caps: &[usize],
-) -> SysResult<Channel> {
+) -> SysResult<RawChannel> {
     spawn_process_with_overrides_on(0, path, args, ns_overrides, caps)
 }
 
@@ -211,7 +211,7 @@ pub fn spawn_process_with_overrides_on(
     args: &[u8],
     ns_overrides: &[u8],
     caps: &[usize],
-) -> SysResult<Channel> {
+) -> SysResult<RawChannel> {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(
         &BootRequest::Spawn { path, args, ns_overrides },
@@ -250,7 +250,7 @@ pub fn spawn_process_with_overrides_on(
         return Err(SysError::NoResources);
     }
 
-    Ok(Channel::from_raw_handle(reply.cap()))
+    Ok(RawChannel::from_raw_handle(reply.cap()))
 }
 
 /// Read the error message from a boot channel Error response.
