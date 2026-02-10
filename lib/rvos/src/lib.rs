@@ -14,8 +14,6 @@ pub mod channel;
 pub mod service;
 pub mod transport;
 pub mod tty;
-// TODO: Port to ChannelCap-based protocols — currently uses deprecated raw cap sideband.
-#[allow(deprecated)]
 pub mod fs;
 
 pub use error::{SysError, SysResult};

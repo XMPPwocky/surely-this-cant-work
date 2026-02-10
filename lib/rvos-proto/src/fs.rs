@@ -4,6 +4,7 @@
 //! See docs/protocols/filesystem.md for the full protocol specification.
 
 use rvos_wire::define_message;
+use rvos_wire::RawChannelCap;
 
 // ── Error codes ──────────────────────────────────────────────────
 
@@ -68,12 +69,13 @@ define_message! {
 
 define_message! {
     /// Responses on the filesystem control channel.
-    pub enum FsResponse {
-        /// Success. For Open: msg.cap carries file channel.
-        /// For Stat: includes metadata fields.
+    pub owned enum FsResponse {
+        /// Success (Stat, Delete — no capability).
         Ok(0) { kind: FsEntryKind, size: u64 },
         /// Error with structured code.
         Error(1) { code: FsError },
+        /// Open succeeded — carries the file channel capability.
+        Opened(2) { kind: FsEntryKind, size: u64, file: RawChannelCap },
     }
 }
 
@@ -141,9 +143,6 @@ pub const TCCOOKED: u32 = 2;
 
 use rvos_wire::define_protocol;
 
-// FileOps must be defined before FsControl so that FileOpsClient
-// is available for the [-> FileOpsClient] typed capability annotation.
-
 define_protocol! {
     /// Per-file data channel protocol.
     pub protocol FileOps => FileOpsClient, FileOpsHandler, file_ops_dispatch {
@@ -165,8 +164,8 @@ define_protocol! {
         type Request<'a> = FsRequest;
         type Response = FsResponse;
 
-        /// Open/create a file. Returns (response, FileOpsClient).
-        rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse [-> FileOpsClient];
+        /// Open/create a file. Returns FsResponse::Opened with file channel cap.
+        rpc open as Open(flags: OpenFlags, path: &str) -> FsResponse;
         /// Delete a file or empty directory.
         rpc delete as Delete(path: &str) -> FsResponse;
         /// Get file metadata.

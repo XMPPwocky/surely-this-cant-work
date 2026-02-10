@@ -1004,21 +1004,24 @@ fn poll_fs_launch(
             let (resp, send_wake) = ipc::channel_recv(ctx.ctl_ep);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             if let Some(resp) = resp {
-                let is_ok = matches!(
-                    rvos_wire::from_bytes::<FsResponse>(&resp.data[..resp.len]),
-                    Ok(FsResponse::Ok { .. })
+                let parsed = rvos_wire::from_bytes_with_caps::<FsResponse>(
+                    &resp.data[..resp.len],
+                    &resp.caps[..resp.cap_count],
                 );
-                if !is_ok || resp.cap_count == 0 || resp.caps[0] == NO_CAP {
-                    crate::println!("[init] fs: open {} failed", ctx.name());
-                    if ctx.requester_ep != 0 {
-                        send_error(ctx.requester_ep, "open failed", my_pid);
+                let file_cap = match parsed {
+                    Ok(FsResponse::Opened { file, .. }) => file.raw(),
+                    _ => {
+                        crate::println!("[init] fs: open {} failed", ctx.name());
+                        if ctx.requester_ep != 0 {
+                            send_error(ctx.requester_ep, "open failed", my_pid);
+                        }
+                        ipc::channel_close(ctx.ctl_ep);
+                        ctx.state = FsLaunchState::Done;
+                        return true;
                     }
-                    ipc::channel_close(ctx.ctl_ep);
-                    ctx.state = FsLaunchState::Done;
-                    return true;
-                }
+                };
                 // Decode the file channel endpoint from the cap
-                match ipc::decode_cap_channel(resp.caps[0]) {
+                match ipc::decode_cap_channel(file_cap) {
                     Some(ep) => ctx.file_ep = ep,
                     None => {
                         crate::println!("[init] fs: open {} bad cap", ctx.name());

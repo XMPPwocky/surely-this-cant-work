@@ -404,14 +404,18 @@ impl<'a> Iterator for PathSplitter<'a> {
 
 // --- Message helpers ---
 
-fn send_ok(handle: usize, cap: usize) {
+fn send_open_ok(handle: usize, cap: usize) {
     let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
-        &FsResponse::Ok { kind: FsEntryKind::File {}, size: 0 },
-        &mut msg.data,
-    ).unwrap_or(0);
-    msg.caps[0] = cap;
-    if cap != rvos::NO_CAP { msg.cap_count = 1; }
+    let resp = FsResponse::Opened {
+        kind: FsEntryKind::File {},
+        size: 0,
+        file: rvos_wire::RawChannelCap::new(cap),
+    };
+    let (data_len, cap_count) = rvos_wire::to_bytes_with_caps(
+        &resp, &mut msg.data, &mut msg.caps,
+    ).unwrap_or((0, 0));
+    msg.len = data_len;
+    msg.cap_count = cap_count;
     raw::sys_chan_send_blocking(handle, &msg);
 }
 
@@ -997,8 +1001,8 @@ fn do_open(client: &mut ClientState, flags: OpenFlags, path_bytes: &[u8]) {
         return;
     }
 
-    // Send Ok with the file handle as capability
-    send_ok(client_handle, client_file_handle);
+    // Send Opened with the file handle as capability
+    send_open_ok(client_handle, client_file_handle);
     // Close our local handle for the client's file endpoint. The channel
     // stays alive because the client still holds a reference (ref counting
     // was incremented when the capability was sent via IPC).
