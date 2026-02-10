@@ -44,6 +44,7 @@ fn cmd_help() {
     println!("  write <path> <text>   - Write to file");
     println!("  stat <path>           - Show file metadata");
     println!("  run <path> [args...]   - Run a program and wait for it to exit");
+    println!("  run <path> [args...] & - Run a program in the background");
     println!("  run <path> > <file>   - Run with stdout redirected (truncate)");
     println!("  run <path> >> <file>  - Run with stdout redirected (append)");
     println!("  clear                 - Clear screen");
@@ -253,9 +254,16 @@ fn wait_for_exit(proc_handle: usize) {
 fn cmd_run(args: &str) {
     let args_str = args.trim();
     if args_str.is_empty() {
-        println!("Usage: run <path> [args...]");
+        println!("Usage: run <path> [args...]  (append & to run in background)");
         return;
     }
+
+    // Check for trailing '&' (background execution)
+    let (args_str, background) = if args_str.ends_with('&') {
+        (args_str[..args_str.len() - 1].trim(), true)
+    } else {
+        (args_str, false)
+    };
 
     // Split into path and arguments
     let (path, rest) = match args_str.split_once(' ') {
@@ -355,7 +363,12 @@ fn cmd_run(args: &str) {
         match proc_chan {
             Ok(ch) => {
                 let proc_handle = ch.into_raw_handle();
-                wait_for_exit(proc_handle);
+                if background {
+                    println!("Started in background");
+                    raw::sys_chan_close(proc_handle);
+                } else {
+                    wait_for_exit(proc_handle);
+                }
             }
             Err(_) => {
                 println!("Spawn failed");
@@ -393,7 +406,12 @@ fn cmd_run(args: &str) {
         return;
     }
 
-    wait_for_exit(reply.cap());
+    if background {
+        println!("Started in background");
+        raw::sys_chan_close(reply.cap());
+    } else {
+        wait_for_exit(reply.cap());
+    }
 }
 
 // --- Tab completion ---

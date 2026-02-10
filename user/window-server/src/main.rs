@@ -94,6 +94,7 @@ struct Server {
     dragging: Option<usize>,
     drag_offset_x: i32,
     drag_offset_y: i32,
+    alt_held: bool,
 }
 
 fn main() {
@@ -140,6 +141,7 @@ fn main() {
         dragging: None,
         drag_offset_x: 0,
         drag_offset_y: 0,
+        alt_held: false,
     };
 
     loop {
@@ -292,6 +294,11 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
     raw::sys_chan_close(per_client_handle);
 }
 
+// Linux evdev keycodes
+const KEY_TAB: u16 = 15;
+const KEY_LEFTALT: u16 = 56;
+const KEY_RIGHTALT: u16 = 100;
+
 fn handle_kbd_event(server: &mut Server, msg: &Message) {
     if msg.len < 1 { return; }
 
@@ -300,6 +307,30 @@ fn handle_kbd_event(server: &mut Server, msg: &Message) {
         Err(_) => return,
     };
 
+    // Track Alt key state
+    match event {
+        KbdEvent::KeyDown { code } if code == KEY_LEFTALT || code == KEY_RIGHTALT => {
+            server.alt_held = true;
+            return;
+        }
+        KbdEvent::KeyUp { code } if code == KEY_LEFTALT || code == KEY_RIGHTALT => {
+            server.alt_held = false;
+            return;
+        }
+        _ => {}
+    }
+
+    // Alt+Tab: cycle focus to next active window
+    if server.alt_held {
+        if let KbdEvent::KeyDown { code } = event {
+            if code == KEY_TAB {
+                cycle_focus(server);
+                return;
+            }
+        }
+    }
+
+    // Forward to foreground window
     let fg = server.foreground;
     if let Some(ref win) = server.windows[fg] {
         if !win.active { return; }
@@ -311,6 +342,23 @@ fn handle_kbd_event(server: &mut Server, msg: &Message) {
         fwd.len = rvos_wire::to_bytes(&win_event, &mut fwd.data).unwrap_or(0);
         raw::sys_chan_send_blocking(win.channel_handle, &fwd);
     }
+}
+
+/// Cycle foreground to the next active window.
+fn cycle_focus(server: &mut Server) {
+    let start = server.foreground;
+    let mut next = (start + 1) % MAX_WINDOWS;
+    while next != start {
+        if let Some(ref win) = server.windows[next] {
+            if win.active {
+                server.foreground = next;
+                mark_any_dirty(server);
+                return;
+            }
+        }
+        next = (next + 1) % MAX_WINDOWS;
+    }
+    // No other active window — stay on current
 }
 
 fn handle_mouse_event(server: &mut Server, msg: &Message) {
