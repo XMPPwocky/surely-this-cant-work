@@ -412,13 +412,13 @@ fn send_ok(handle: usize, cap: usize) {
     ).unwrap_or(0);
     msg.caps[0] = cap;
     if cap != rvos::NO_CAP { msg.cap_count = 1; }
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn send_error(handle: usize, code: FsError) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FsResponse::Error { code }, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn send_data_chunk(handle: usize, data: &[u8]) {
@@ -436,13 +436,13 @@ fn send_data_sentinel(handle: usize) {
 fn send_write_ok(handle: usize, written: u32) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FileResponse::WriteOk { written }, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn send_stat_ok(handle: usize, kind: FsEntryKind, size: u64) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FsResponse::Ok { kind, size }, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn send_dir_entry(handle: usize, kind: FsEntryKind, size: u64, name: &str) {
@@ -451,19 +451,19 @@ fn send_dir_entry(handle: usize, kind: FsEntryKind, size: u64, name: &str) {
         &ReaddirResponse::Entry { kind, size, name },
         &mut msg.data,
     ).unwrap_or(0);
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn send_dir_sentinel(handle: usize) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&ReaddirResponse::End {}, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 fn send_file_error(handle: usize, code: FsError) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FileResponse::Error { code }, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send(handle, &msg);
+    raw::sys_chan_send_blocking(handle, &msg);
 }
 
 // --- Main server ---
