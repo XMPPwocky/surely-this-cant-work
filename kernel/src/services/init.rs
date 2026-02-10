@@ -248,7 +248,7 @@ pub fn init_server() {
     let mut fs_launches = alloc::boxed::Box::new_in(
         [const { None::<FsLaunchCtx> }; MAX_FS_LAUNCHES], INIT_ALLOC);
     let mut dyn_spawns: [Option<DynSpawn>; MAX_DYN_SPAWNS] = [const { None }; MAX_DYN_SPAWNS];
-    init_fs_launches(&mut *fs_launches, my_pid);
+    init_fs_launches(&mut fs_launches, my_pid);
 
     loop {
         // Snapshot boot registrations under the lock
@@ -266,8 +266,7 @@ pub fn init_server() {
 
         // Poll all boot endpoints without holding the lock
         let mut handled = false;
-        for i in 0..count {
-            let (boot_ep_b, console_type, is_shell) = endpoints[i];
+        for &(boot_ep_b, console_type, is_shell) in endpoints.iter().take(count) {
             let (msg, send_wake) = ipc::channel_recv(boot_ep_b);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             if let Some(msg) = msg {
@@ -278,18 +277,32 @@ pub fn init_server() {
         }
 
         // Clean up dead boot registrations (child process exited, boot_a closed)
-        for i in 0..count {
-            let (boot_ep_b, _, _) = endpoints[i];
+        for &(boot_ep_b, _, _) in endpoints.iter().take(count) {
             if !ipc::channel_is_active(boot_ep_b) {
                 ipc::channel_close(boot_ep_b);
-                let mut config = INIT_CONFIG.lock();
-                for slot in config.boot_regs.iter_mut() {
-                    if let Some(ref reg) = slot {
-                        if reg.boot_ep_b == boot_ep_b {
-                            *slot = None;
-                            break;
+                // Collect override endpoints to close (outside config lock to
+                // avoid lock ordering issues with channel_close → wake_process).
+                let mut override_eps = [0usize; MAX_NS_OVERRIDES];
+                let mut override_count = 0;
+                {
+                    let mut config = INIT_CONFIG.lock();
+                    for slot in config.boot_regs.iter_mut() {
+                        if let Some(ref reg) = slot {
+                            if reg.boot_ep_b == boot_ep_b {
+                                for ovr in reg.overrides.iter().flatten() {
+                                    if !ovr.removed {
+                                        override_eps[override_count] = ovr.endpoint;
+                                        override_count += 1;
+                                    }
+                                }
+                                *slot = None;
+                                break;
+                            }
                         }
                     }
+                }
+                for &ep in override_eps.iter().take(override_count) {
+                    ipc::channel_close(ep);
                 }
             }
         }
@@ -330,23 +343,19 @@ pub fn init_server() {
 
         if !handled {
             // Register as blocked on ALL boot endpoints, fs launch endpoints, and dyn spawn notify endpoints
-            for i in 0..count {
-                ipc::channel_set_blocked(endpoints[i].0, my_pid);
+            for ep in endpoints.iter().take(count) {
+                ipc::channel_set_blocked(ep.0, my_pid);
             }
-            for slot in fs_launches.iter() {
-                if let Some(ref ctx) = slot {
-                    let ep = match ctx.state {
-                        FsLaunchState::WaitStat | FsLaunchState::WaitOpen => ctx.ctl_ep,
-                        FsLaunchState::WaitRead => ctx.file_ep,
-                        FsLaunchState::Done => continue,
-                    };
-                    ipc::channel_set_blocked(ep, my_pid);
-                }
+            for ctx in fs_launches.iter().flatten() {
+                let ep = match ctx.state {
+                    FsLaunchState::WaitStat | FsLaunchState::WaitOpen => ctx.ctl_ep,
+                    FsLaunchState::WaitRead => ctx.file_ep,
+                    FsLaunchState::Done => continue,
+                };
+                ipc::channel_set_blocked(ep, my_pid);
             }
-            for slot in dyn_spawns.iter() {
-                if let Some(ref ds) = slot {
-                    ipc::channel_set_blocked(ds.notify_ep, my_pid);
-                }
+            for ds in dyn_spawns.iter().flatten() {
+                ipc::channel_set_blocked(ds.notify_ep, my_pid);
             }
             crate::task::block_process(my_pid);
             crate::task::schedule();
@@ -378,6 +387,9 @@ fn handle_request(
         BootRequest::ConnectService { name } => {
             // Check namespace overrides first
             if let Some(override_ep) = find_ns_override(boot_ep_b, name) {
+                // Inc ref for the cap being transferred — init's kernel-internal send
+                // bypasses translate_cap_for_send which normally does this.
+                ipc::channel_inc_ref(override_ep);
                 send_ok_with_cap(boot_ep_b, override_ep, my_pid);
             } else if name == "stdin" {
                 handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid, 1);
@@ -394,7 +406,17 @@ fn handle_request(
         }
         BootRequest::Spawn { path, args, ns_overrides } => {
             let spawn_cap = if msg.cap_count > 0 { msg.caps[0] } else { NO_CAP };
-            handle_spawn_request(boot_ep_b, console_type, path, spawn_cap, args, ns_overrides, &msg, fs_launches, my_pid);
+            handle_spawn_request(SpawnContext {
+                boot_ep_b,
+                console_type,
+                path,
+                spawn_cap,
+                args,
+                ns_overrides,
+                orig_msg: msg,
+                fs_launches,
+                my_pid,
+            });
         }
         BootRequest::GetArgs {} => {
             handle_get_args(boot_ep_b, my_pid);
@@ -408,8 +430,7 @@ fn handle_request(
 fn find_named_service_by_name(name: &str) -> Option<&'static NamedService> {
     let count = NAMED_SERVICE_COUNT.load(Ordering::Relaxed);
     let name_bytes = name.as_bytes();
-    for i in 0..count {
-        let svc = &NAMED_SERVICES[i];
+    for svc in NAMED_SERVICES.iter().take(count) {
         let nlen = svc.name_len.load(Ordering::Relaxed);
         if nlen > 0 && nlen == name_bytes.len() {
             // SAFETY: name was written during boot before init_server started.
@@ -425,8 +446,7 @@ fn find_named_service_by_name(name: &str) -> Option<&'static NamedService> {
 /// Find a named service whose name matches the request prefix (used by fs launch).
 fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
     let count = NAMED_SERVICE_COUNT.load(Ordering::Relaxed);
-    for i in 0..count {
-        let svc = &NAMED_SERVICES[i];
+    for svc in NAMED_SERVICES.iter().take(count) {
         let nlen = svc.name_len.load(Ordering::Relaxed);
         if nlen > 0 {
             // SAFETY: name was written during boot before init_server started.
@@ -443,20 +463,16 @@ fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
 /// Returns None for removed entries (falls through to global registry).
 fn find_ns_override(boot_ep_b: usize, name: &str) -> Option<usize> {
     let config = INIT_CONFIG.lock();
-    for slot in config.boot_regs.iter() {
-        if let Some(ref reg) = slot {
-            if reg.boot_ep_b == boot_ep_b {
-                let name_bytes = name.as_bytes();
-                for ovr in reg.overrides.iter() {
-                    if let Some(ref o) = ovr {
-                        if o.name_len == name_bytes.len() && &o.name[..o.name_len] == name_bytes {
-                            if o.removed { return None; }
-                            return Some(o.endpoint);
-                        }
-                    }
+    for reg in config.boot_regs.iter().flatten() {
+        if reg.boot_ep_b == boot_ep_b {
+            let name_bytes = name.as_bytes();
+            for o in reg.overrides.iter().flatten() {
+                if o.name_len == name_bytes.len() && &o.name[..o.name_len] == name_bytes {
+                    if o.removed { return None; }
+                    return Some(o.endpoint);
                 }
-                return None;
             }
+            return None;
         }
     }
     None
@@ -599,11 +615,9 @@ fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid
 /// Copy the parent's namespace overrides from INIT_CONFIG.
 fn get_parent_overrides(boot_ep_b: usize) -> [Option<NsOverride>; MAX_NS_OVERRIDES] {
     let config = INIT_CONFIG.lock();
-    for slot in config.boot_regs.iter() {
-        if let Some(ref reg) = slot {
-            if reg.boot_ep_b == boot_ep_b {
-                return reg.overrides.clone();
-            }
+    for reg in config.boot_regs.iter().flatten() {
+        if reg.boot_ep_b == boot_ep_b {
+            return reg.overrides.clone();
         }
     }
     [const { None }; MAX_NS_OVERRIDES]
@@ -636,6 +650,11 @@ fn merge_overrides(
                 }
             });
             if !already {
+                // Inc ref for the inherited endpoint — the child's boot registration
+                // holds its own reference, separate from the parent's.
+                if !p.removed {
+                    ipc::channel_inc_ref(p.endpoint);
+                }
                 // Find a free slot and insert
                 for slot in result.iter_mut() {
                     if slot.is_none() {
@@ -651,29 +670,32 @@ fn merge_overrides(
     result
 }
 
-/// Handle a spawn request: load an ELF from the filesystem and spawn it.
-fn handle_spawn_request(
+/// Bundles the arguments for `handle_spawn_request` to avoid too many parameters.
+struct SpawnContext<'a> {
     boot_ep_b: usize,
     console_type: ConsoleType,
-    path: &str,
+    path: &'a str,
     spawn_cap: usize,
-    args: &[u8],
-    ns_overrides: &[u8],
-    orig_msg: &Message,
-    fs_launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
+    args: &'a [u8],
+    ns_overrides: &'a [u8],
+    orig_msg: &'a Message,
+    fs_launches: &'a mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
     my_pid: usize,
-) {
-    let path_bytes = path.as_bytes();
+}
+
+/// Handle a spawn request: load an ELF from the filesystem and spawn it.
+fn handle_spawn_request(ctx: SpawnContext<'_>) {
+    let path_bytes = ctx.path.as_bytes();
     if path_bytes.is_empty() || path_bytes.len() > PATH_BUF_LEN {
-        send_error(boot_ep_b, "bad path", my_pid);
+        send_error(ctx.boot_ep_b, "bad path", ctx.my_pid);
         return;
     }
 
     // Find a free fs_launch slot
-    let slot_idx = match fs_launches.iter().position(|s| s.is_none()) {
+    let slot_idx = match ctx.fs_launches.iter().position(|s| s.is_none()) {
         Some(i) => i,
         None => {
-            send_error(boot_ep_b, "busy", my_pid);
+            send_error(ctx.boot_ep_b, "busy", ctx.my_pid);
             return;
         }
     };
@@ -682,20 +704,20 @@ fn handle_spawn_request(
     let fs_svc = match find_named_service(b"fs") {
         Some(svc) => svc,
         None => {
-            send_error(boot_ep_b, "no fs", my_pid);
+            send_error(ctx.boot_ep_b, "no fs", ctx.my_pid);
             return;
         }
     };
     let fs_ctl_ep = fs_svc.control_ep.load(Ordering::Relaxed);
     if fs_ctl_ep == usize::MAX {
-        send_error(boot_ep_b, "no fs", my_pid);
+        send_error(ctx.boot_ep_b, "no fs", ctx.my_pid);
         return;
     }
 
     let (my_ctl_ep, server_ep) = match ipc::channel_create_pair() {
         Some(pair) => pair,
         None => {
-            send_error(boot_ep_b, "no channels", my_pid);
+            send_error(ctx.boot_ep_b, "no channels", ctx.my_pid);
             return;
         }
     };
@@ -705,10 +727,10 @@ fn handle_spawn_request(
     ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
     ctl_msg.cap_count = 1;
     ctl_msg.len = rvos_wire::to_bytes(
-        &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
+        &rvos_proto::service_control::NewConnection { client_pid: ctx.my_pid as u32, channel_role: 0 },
         &mut ctl_msg.data,
     ).unwrap_or(0);
-    ctl_msg.sender_pid = my_pid;
+    ctl_msg.sender_pid = ctx.my_pid;
     send_and_wake(fs_ctl_ep, ctl_msg);
 
     // Send the initial Stat request
@@ -718,7 +740,7 @@ fn handle_spawn_request(
         &FsRequest::Stat { path: path_str },
         &mut msg.data,
     ).unwrap_or(0);
-    msg.sender_pid = my_pid;
+    msg.sender_pid = ctx.my_pid;
     send_and_wake(my_ctl_ep, msg);
 
     // Derive name from path (everything after last '/')
@@ -726,25 +748,22 @@ fn handle_spawn_request(
     let name_bytes = &path_bytes[name_start..];
     let name_len = name_bytes.len().min(NAME_BUF_LEN);
 
-    let extra_cap = if spawn_cap != NO_CAP {
-        match ipc::decode_cap_channel(spawn_cap) {
-            Some(ep) => ep,
-            None => 0,
-        }
+    let extra_cap = if ctx.spawn_cap != NO_CAP {
+        ipc::decode_cap_channel(ctx.spawn_cap).unwrap_or_default()
     } else {
         0
     };
 
     let mut args_buf = [0u8; MAX_ARGS_LEN];
-    let args_len = args.len().min(MAX_ARGS_LEN);
-    args_buf[..args_len].copy_from_slice(&args[..args_len]);
+    let args_len = ctx.args.len().min(MAX_ARGS_LEN);
+    args_buf[..args_len].copy_from_slice(&ctx.args[..args_len]);
 
     // Parse namespace overrides from the packed blob, then merge with parent's overrides
-    let explicit_overrides = parse_ns_overrides(ns_overrides, orig_msg);
-    let parent_overrides = get_parent_overrides(boot_ep_b);
+    let explicit_overrides = parse_ns_overrides(ctx.ns_overrides, ctx.orig_msg);
+    let parent_overrides = get_parent_overrides(ctx.boot_ep_b);
     let parsed_overrides = merge_overrides(&parent_overrides, explicit_overrides);
 
-    let mut ctx = FsLaunchCtx {
+    let mut launch_ctx = FsLaunchCtx {
         state: FsLaunchState::WaitStat,
         ctl_ep: my_ctl_ep,
         file_ep: 0,
@@ -754,9 +773,9 @@ fn handle_spawn_request(
         path_len: path_bytes.len(),
         name_buf: [0u8; NAME_BUF_LEN],
         name_len,
-        console_type,
+        console_type: ctx.console_type,
         service_name: None,
-        requester_ep: boot_ep_b,
+        requester_ep: ctx.boot_ep_b,
         extra_cap,
         provides_console: None,
         is_shell: false,
@@ -764,28 +783,26 @@ fn handle_spawn_request(
         args_len,
         ns_overrides: parsed_overrides,
     };
-    ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
-    ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
+    launch_ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
+    launch_ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
-    fs_launches[slot_idx] = Some(ctx);
+    ctx.fs_launches[slot_idx] = Some(launch_ctx);
 }
 
 /// Handle GetArgs: respond with the stored args for this process.
 fn handle_get_args(boot_ep_b: usize, my_pid: usize) {
     let config = INIT_CONFIG.lock();
-    for slot in config.boot_regs.iter() {
-        if let Some(ref reg) = slot {
-            if reg.boot_ep_b == boot_ep_b {
-                let mut resp = Message::new();
-                resp.len = rvos_wire::to_bytes(
-                    &BootResponse::Args { args: &reg.args[..reg.args_len] },
-                    &mut resp.data,
-                ).unwrap_or(0);
-                resp.sender_pid = my_pid;
-                drop(config);
-                send_and_wake(boot_ep_b, resp);
-                return;
-            }
+    for reg in config.boot_regs.iter().flatten() {
+        if reg.boot_ep_b == boot_ep_b {
+            let mut resp = Message::new();
+            resp.len = rvos_wire::to_bytes(
+                &BootResponse::Args { args: &reg.args[..reg.args_len] },
+                &mut resp.data,
+            ).unwrap_or(0);
+            resp.sender_pid = my_pid;
+            drop(config);
+            send_and_wake(boot_ep_b, resp);
+            return;
         }
     }
     // Not found — send empty args
@@ -835,11 +852,20 @@ fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
 // Filesystem client: launch ELF binaries from the fs service
 // ============================================================
 
+/// Descriptor for a program to launch from the filesystem at boot time.
+struct FsProgram {
+    path: &'static [u8],
+    name: &'static str,
+    console_type: ConsoleType,
+    service_name: Option<&'static str>,
+    requires_gpu: bool,
+    provides_console: Option<ConsoleType>,
+}
+
 /// Programs to launch from the filesystem at boot time.
-/// (path, name, console_type, service_name, requires_gpu, provides_console)
-const FS_PROGRAMS: &[(&[u8], &str, ConsoleType, Option<&str>, bool, Option<ConsoleType>)] = &[
-    (b"/bin/window-server", "window-srv", ConsoleType::Serial, Some("window"), true, None),
-    (b"/bin/fbcon", "fbcon", ConsoleType::Serial, None, true, None),
+const FS_PROGRAMS: &[FsProgram] = &[
+    FsProgram { path: b"/bin/window-server", name: "window-srv", console_type: ConsoleType::Serial, service_name: Some("window"), requires_gpu: true, provides_console: None },
+    FsProgram { path: b"/bin/fbcon", name: "fbcon", console_type: ConsoleType::Serial, service_name: None, requires_gpu: true, provides_console: None },
 ];
 
 /// Initialize fs launch state machines. For each program, create a client
@@ -856,9 +882,14 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
 
     let gpu = GPU_PRESENT.load(core::sync::atomic::Ordering::Relaxed);
     let mut slot_idx = 0;
-    for &(path, name, console_type, service_name, requires_gpu, provides_console) in FS_PROGRAMS.iter() {
+    for prog in FS_PROGRAMS.iter() {
         if slot_idx >= MAX_FS_LAUNCHES { break; }
-        if requires_gpu && !gpu { continue; }
+        if prog.requires_gpu && !gpu { continue; }
+        let path = prog.path;
+        let name = prog.name;
+        let console_type = prog.console_type;
+        let service_name = prog.service_name;
+        let provides_console = prog.provides_console;
 
         let (my_ctl_ep, server_ep) = match ipc::channel_create_pair() {
             Some(pair) => pair,
