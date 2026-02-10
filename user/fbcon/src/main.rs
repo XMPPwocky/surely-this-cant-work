@@ -463,14 +463,11 @@ fn main() {
         .into_raw_handle();
 
     // 2. Send CreateWindow request and receive per-window channels
-    let ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
+    let mut ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
     ch.send(&CreateWindowRequest { width: req_width, height: req_height }).expect("CreateWindow send failed");
-    let (_create_resp, caps, cap_count) = ch.recv_with_caps_blocking().expect("CreateWindow recv failed");
-    if cap_count < 2 {
-        panic!("[fbcon] CreateWindow response missing channels");
-    }
-    let req_chan = caps[0];
-    let event_chan = caps[1];
+    let create_resp = ch.recv_blocking().expect("CreateWindow recv failed");
+    let req_chan = create_resp.req_channel.raw();
+    let event_chan = create_resp.event_channel.raw();
 
     // 3. Use WindowClient for typed RPC
     let mut window_client = WindowClient::new(UserTransport::new(req_chan));
@@ -483,7 +480,7 @@ fn main() {
 
     // 5. GetFramebuffer → receive SHM handle
     let shm_handle = match window_client.get_framebuffer(2) {
-        Ok((WindowReply::FbReply { .. }, shm_handle)) => shm_handle.0,
+        Ok(WindowReply::FbReply { fb, .. }) => fb.0,
         _ => panic!("[fbcon] GetFramebuffer failed"),
     };
 

@@ -2,6 +2,7 @@ extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
+use rvos::Channel;
 use rvos::rvos_wire::{self};
 use rvos_proto::fs::{
     FsRequest, FsResponse, FsEntryKind, FsError, OpenFlags,
@@ -405,18 +406,14 @@ impl<'a> Iterator for PathSplitter<'a> {
 // --- Message helpers ---
 
 fn send_open_ok(handle: usize, cap: usize) {
-    let mut msg = Message::new();
     let resp = FsResponse::Opened {
         kind: FsEntryKind::File {},
         size: 0,
         file: rvos_wire::RawChannelCap::new(cap),
     };
-    let (data_len, cap_count) = rvos_wire::to_bytes_with_caps(
-        &resp, &mut msg.data, &mut msg.caps,
-    ).unwrap_or((0, 0));
-    msg.len = data_len;
-    msg.cap_count = cap_count;
-    raw::sys_chan_send_blocking(handle, &msg);
+    let ch = Channel::<FsResponse, FsRequest>::from_raw_handle(handle);
+    let _ = ch.send(&resp);
+    ch.into_raw_handle(); // don't close — handle is still in use
 }
 
 fn send_error(handle: usize, code: FsError) {

@@ -2,7 +2,6 @@ use crate::ipc::{self, Message};
 use crate::ipc::transport::KernelTransport;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::math::{MathResponse, MathHandler, math_dispatch};
-use rvos_wire::NO_CAP;
 
 static MATH_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
 
@@ -13,14 +12,14 @@ pub fn set_control_ep(ep: usize) {
 struct MathImpl;
 
 impl MathHandler for MathImpl {
-    fn add(&mut self, a: u32, b: u32) -> (MathResponse, usize) {
-        (MathResponse { answer: a.wrapping_add(b) }, NO_CAP)
+    fn add(&mut self, a: u32, b: u32) -> MathResponse {
+        MathResponse { answer: a.wrapping_add(b) }
     }
-    fn mul(&mut self, a: u32, b: u32) -> (MathResponse, usize) {
-        (MathResponse { answer: a.wrapping_mul(b) }, NO_CAP)
+    fn mul(&mut self, a: u32, b: u32) -> MathResponse {
+        MathResponse { answer: a.wrapping_mul(b) }
     }
-    fn sub(&mut self, a: u32, b: u32) -> (MathResponse, usize) {
-        (MathResponse { answer: a.wrapping_sub(b) }, NO_CAP)
+    fn sub(&mut self, a: u32, b: u32) -> MathResponse {
+        MathResponse { answer: a.wrapping_sub(b) }
     }
 }
 

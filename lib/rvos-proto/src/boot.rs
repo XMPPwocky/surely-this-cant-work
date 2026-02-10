@@ -11,7 +11,7 @@ use rvos_wire::define_message;
 
 define_message! {
     /// Requests on the boot channel (client → init).
-    pub enum BootRequest<'a> {
+    pub enum BootRequest<'a> => BootRequestMsg {
         /// Connect to a named service (e.g., "stdio", "sysinfo", "math", "fs").
         /// Response cap = client endpoint of the service channel.
         ConnectService(0) { name: &'a str },
@@ -28,7 +28,7 @@ define_message! {
 
 define_message! {
     /// Responses on the boot channel (init → client).
-    pub enum BootResponse<'a> {
+    pub enum BootResponse<'a> => BootResponseMsg {
         /// Success. The message cap field carries the requested handle.
         Ok(0) {},
         /// Failure. `message` is a human-readable error string.

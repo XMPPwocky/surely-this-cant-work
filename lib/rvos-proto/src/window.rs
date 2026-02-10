@@ -13,6 +13,8 @@
 //! See docs/protocols/window.md for the full spec.
 
 use rvos_wire::define_message;
+use rvos_wire::RawChannelCap;
+use rvos_wire::ShmHandle;
 
 // ── Control channel (one-shot handshake) ─────────────────────────
 
@@ -26,12 +28,13 @@ define_message! {
 
 define_message! {
     /// CreateWindow response (server → client on control channel).
-    /// caps[0] = per-window request/reply channel.
-    /// caps[1] = per-window event channel.
-    pub struct CreateWindowResponse {
+    /// Embeds the per-window request channel and event channel as typed caps.
+    pub owned struct CreateWindowResponse {
         window_id: u32,
         width: u32,
         height: u32,
+        req_channel: RawChannelCap,
+        event_channel: RawChannelCap,
     }
 }
 
@@ -55,11 +58,11 @@ define_message! {
 
 define_message! {
     /// Replies from the window server on the request channel.
-    pub enum WindowReply {
+    pub owned enum WindowReply {
         /// Reply to GetInfo.
         InfoReply(128) { seq: u32, window_id: u32, width: u32, height: u32, stride: u32, format: u8 },
-        /// Reply to GetFramebuffer. Cap = SHM handle for the double-buffered framebuffer.
-        FbReply(129) { seq: u32 },
+        /// Reply to GetFramebuffer. SHM handle embedded in the message.
+        FbReply(129) { seq: u32, fb: ShmHandle },
         /// Reply to SwapBuffers.
         SwapReply(130) { seq: u32, ok: u8 },
         /// Reply to CloseWindow.
@@ -95,12 +98,12 @@ rvos_wire::define_protocol! {
     /// Clients use `WindowClient<T>` for type-safe RPC calls.
     /// The server may use `WindowHandler` + `window_dispatch` or
     /// handle `WindowRequest`/`WindowReply` manually.
-    pub protocol Window => WindowClient, WindowHandler, window_dispatch {
+    pub protocol Window => WindowClient, WindowHandler, window_dispatch, window_handle {
         type Request = WindowRequest;
         type Response = WindowReply;
 
         rpc get_info as GetInfo(seq: u32) -> WindowReply;
-        rpc get_framebuffer as GetFramebuffer(seq: u32) -> WindowReply [-> shm];
+        rpc get_framebuffer as GetFramebuffer(seq: u32) -> WindowReply;
         rpc swap_buffers as SwapBuffers(seq: u32) -> WindowReply;
         rpc close_window as CloseWindow() -> WindowReply;
     }

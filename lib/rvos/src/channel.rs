@@ -2,7 +2,7 @@
 
 use core::marker::PhantomData;
 
-use crate::error::{SysError, SysResult};
+use crate::error::{RecvError, SysError, SysResult};
 use crate::message::Message;
 use crate::raw;
 
@@ -63,6 +63,19 @@ impl RawChannel {
         raw::sys_chan_recv(self.handle, msg)
     }
 
+    /// Non-blocking receive with three-way status.
+    ///
+    /// On `Ok(())`, the message has been written to `msg`.
+    /// On `Err(RecvError::Empty)`, no message was available.
+    /// On `Err(RecvError::Closed)`, the peer closed the channel.
+    pub fn try_recv_status(&self, msg: &mut Message) -> Result<(), RecvError> {
+        match raw::sys_chan_recv(self.handle, msg) {
+            0 => Ok(()),
+            2 => Err(RecvError::Closed),
+            _ => Err(RecvError::Empty),
+        }
+    }
+
     /// Register this channel for poll-based wakeup.
     pub fn poll_add(&self) {
         raw::sys_chan_poll_add(self.handle);
@@ -81,19 +94,37 @@ impl Drop for RawChannel {
 
 /// A typed IPC channel that sends messages of type `S` and receives type `R`.
 ///
+/// `S` and `R` implement [`MessageType`](rvos_wire::MessageType), which maps
+/// a borrow lifetime to the concrete message type via a GAT.  For owned
+/// types (e.g. `FsResponse`), the type itself serves as the `MessageType`
+/// through a blanket impl.  For borrowed types (e.g. `FsRequest<'a>`),
+/// `define_message!` generates a zero-sized companion (e.g. `FsRequestMsg`).
+///
+/// The channel embeds an internal receive buffer.  The `try_recv` and
+/// `recv_blocking` methods deserialize into `R::Msg<'a>` where `'a` is
+/// borrowed from `&'a mut self`, so the returned value can reference
+/// zero-copy data (like `&str` path fields) directly from the buffer.
+/// The `&mut self` borrow naturally prevents a second recv until the
+/// caller is done with the previous message.
+///
 /// Both endpoints of a channel pair carry inverse type parameters:
 /// if one side is `Channel<A, B>`, the other is `Channel<B, A>`.
 ///
 /// Use `channel_pair::<A, B>()` to create a matched pair.
 pub struct Channel<S, R> {
     inner: RawChannel,
-    _phantom: PhantomData<fn(S) -> R>,
+    recv_buf: Message,
+    _phantom: PhantomData<(S, R)>,
 }
 
 impl<S, R> Channel<S, R> {
     /// Wrap a raw handle into a typed channel (takes ownership).
     pub fn from_raw_handle(handle: usize) -> Self {
-        Channel { inner: RawChannel::from_raw_handle(handle), _phantom: PhantomData }
+        Channel {
+            inner: RawChannel::from_raw_handle(handle),
+            recv_buf: Message::new(),
+            _phantom: PhantomData,
+        }
     }
 
     /// Create a Channel from a received [`ChannelCap`](rvos_wire::ChannelCap)
@@ -134,6 +165,10 @@ impl<S, R> Channel<S, R> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Send — requires S: Serialize
+// ---------------------------------------------------------------------------
+
 impl<S: rvos_wire::Serialize, R> Channel<S, R> {
     /// Send a typed message (blocking).
     ///
@@ -172,18 +207,69 @@ impl<S: rvos_wire::Serialize, R> Channel<S, R> {
     }
 }
 
-impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
-    /// Blocking receive, returning the deserialized value.
+// ---------------------------------------------------------------------------
+// Recv — requires R: MessageType (GAT-based)
+// ---------------------------------------------------------------------------
+//
+// These methods use the channel's internal `recv_buf` and return
+// `R::Msg<'a>` borrowing from `&'a mut self`.  For owned message types
+// (where `R::Msg<'a> = R`), the value doesn't actually borrow anything
+// and can be moved freely.  For borrowed types (like `FsRequest<'a>`),
+// the returned value holds references into `self.recv_buf.data` — the
+// `&mut self` borrow prevents calling recv again until it's dropped.
+
+impl<S, R: rvos_wire::MessageType> Channel<S, R> {
+    /// Non-blocking receive.
     ///
-    /// Any [`ChannelCap`](rvos_wire::ChannelCap) fields in the result are
-    /// populated from the message's capability sideband.
-    pub fn recv_blocking(&self) -> SysResult<R> {
-        let mut msg = Message::new();
-        self.inner.recv_blocking(&mut msg)?;
-        rvos_wire::from_bytes_with_caps::<R>(&msg.data[..msg.len], &msg.caps[..msg.cap_count])
-            .map_err(|_| SysError::BadAddress)
+    /// Returns the deserialized message on success, `Err(RecvError::Empty)`
+    /// if no message is available, or `Err(RecvError::Closed)` if the peer
+    /// closed the channel.
+    ///
+    /// The returned value may borrow from the channel's internal receive
+    /// buffer (for zero-copy message types like `FsRequest<'a>`).  The
+    /// `&mut self` borrow prevents a second recv until the caller is done
+    /// processing the message.
+    pub fn try_recv<'a>(&'a mut self) -> Result<R::Msg<'a>, RecvError> {
+        match raw::sys_chan_recv(self.inner.raw_handle(), &mut self.recv_buf) {
+            0 => self.decode_recv_buf(),
+            2 => Err(RecvError::Closed),
+            _ => Err(RecvError::Empty),
+        }
     }
 
+    /// Blocking receive.
+    ///
+    /// Blocks until a message arrives, then deserializes and returns it.
+    /// Returns `Err(RecvError::Closed)` if the peer closed the channel.
+    ///
+    /// The returned value may borrow from the channel's internal receive
+    /// buffer.  See [`try_recv`](Self::try_recv) for details.
+    pub fn recv_blocking<'a>(&'a mut self) -> Result<R::Msg<'a>, RecvError> {
+        let ret = raw::sys_chan_recv_blocking(self.inner.raw_handle(), &mut self.recv_buf);
+        match ret {
+            0 => self.decode_recv_buf(),
+            2 => Err(RecvError::Closed),
+            _ => Err(RecvError::Closed),
+        }
+    }
+
+    /// Decode the contents of `recv_buf` into `R::Msg<'a>`.
+    ///
+    /// On decode failure, returns `Err(RecvError::Decode(..))` — the caller
+    /// should log the error and close the channel.
+    fn decode_recv_buf<'a>(&'a self) -> Result<R::Msg<'a>, RecvError> {
+        rvos_wire::from_bytes_with_caps(
+            &self.recv_buf.data[..self.recv_buf.len],
+            &self.recv_buf.caps[..self.recv_buf.cap_count],
+        ).map_err(RecvError::Decode)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deprecated recv methods (sideband cap APIs)
+// ---------------------------------------------------------------------------
+
+impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     /// Blocking receive, returning the deserialized value and the last
     /// explicit capability (after any caps consumed by [`ChannelCap`] fields).
     ///
@@ -214,13 +300,6 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
         Ok((val, msg.caps, msg.cap_count))
     }
 
-    /// Non-blocking receive. Returns `None` if no message is available.
-    pub fn try_recv(&self) -> Option<R> {
-        let mut msg = Message::new();
-        if self.inner.try_recv(&mut msg) != 0 { return None; }
-        rvos_wire::from_bytes_with_caps::<R>(&msg.data[..msg.len], &msg.caps[..msg.cap_count]).ok()
-    }
-
     /// Non-blocking receive with capability. Returns `None` if no message is available.
     ///
     /// **Deprecated:** Embed [`ChannelCap`](rvos_wire::ChannelCap) fields in
@@ -236,6 +315,10 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// channel_pair
+// ---------------------------------------------------------------------------
+
 /// Create a bidirectional typed channel pair.
 ///
 /// Returns `(Channel<A, B>, Channel<B, A>)` — side A sends `A` and
@@ -243,7 +326,7 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
 pub fn channel_pair<A, B>() -> SysResult<(Channel<A, B>, Channel<B, A>)> {
     let (a, b) = RawChannel::create_pair()?;
     Ok((
-        Channel { inner: a, _phantom: PhantomData },
-        Channel { inner: b, _phantom: PhantomData },
+        Channel { inner: a, recv_buf: Message::new(), _phantom: PhantomData },
+        Channel { inner: b, recv_buf: Message::new(), _phantom: PhantomData },
     ))
 }

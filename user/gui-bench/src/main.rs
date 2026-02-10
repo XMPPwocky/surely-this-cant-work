@@ -84,13 +84,13 @@ fn connect_window(width: u32, height: u32) -> WinContext {
         .expect("failed to connect to window service")
         .into_raw_handle();
 
-    // CreateWindow handshake (returns 2 caps in sideband)
-    let win_ctl_ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
+    // CreateWindow handshake (returns embedded channel caps)
+    let mut win_ctl_ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
     win_ctl_ch.send(&CreateWindowRequest { width, height }).expect("CreateWindow send");
-    let (_create_resp, caps, _cap_count) = win_ctl_ch.recv_with_caps_blocking()
+    let create_resp = win_ctl_ch.recv_blocking()
         .expect("CreateWindow recv");
-    let req_chan = caps[0];
-    let event_chan = caps[1];
+    let req_chan = create_resp.req_channel.raw();
+    let event_chan = create_resp.event_channel.raw();
 
     // Typed WindowClient for subsequent RPCs
     let mut client = WindowClient::new(UserTransport::new(req_chan));
@@ -101,10 +101,13 @@ fn connect_window(width: u32, height: u32) -> WinContext {
         _ => (width, height, width),
     };
 
-    let (_, shm) = client.get_framebuffer(2).expect("GetFramebuffer failed");
+    let shm_handle = match client.get_framebuffer(2) {
+        Ok(WindowReply::FbReply { fb, .. }) => fb.0,
+        _ => panic!("gui-bench: GetFramebuffer failed"),
+    };
 
     let fb_size = (stride as usize) * (h as usize) * 4 * 2;
-    let fb_base = match raw::mmap(shm.0, fb_size) {
+    let fb_base = match raw::mmap(shm_handle, fb_size) {
         Ok(ptr) => ptr as *mut u32,
         Err(_) => panic!("gui-bench: mmap failed"),
     };

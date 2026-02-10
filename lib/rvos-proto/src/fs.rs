@@ -55,7 +55,7 @@ define_message! {
 
 define_message! {
     /// Requests on the filesystem control channel.
-    pub enum FsRequest<'a> {
+    pub enum FsRequest<'a> => FsRequestMsg {
         /// Open/create a file. Response cap = file channel endpoint.
         Open(0) { flags: OpenFlags, path: &'a str },
         /// Delete a file or empty directory.
@@ -84,7 +84,7 @@ define_message! {
 define_message! {
     /// Individual messages in a readdir response stream.
     /// Sent on the control channel after a Readdir request.
-    pub enum ReaddirResponse<'a> {
+    pub enum ReaddirResponse<'a> => ReaddirResponseMsg {
         /// A directory entry.
         Entry(0) { kind: FsEntryKind, size: u64, name: &'a str },
         /// Error (same codes as FsResponse::Error).
@@ -110,7 +110,7 @@ define_message! {
 
 define_message! {
     /// Requests on a per-file channel.
-    pub enum FileRequest<'a> {
+    pub enum FileRequest<'a> => FileRequestMsg {
         /// Read up to `len` bytes starting at `offset`.
         Read(0) { offset: FileOffset, len: u32 },
         /// Write `data` starting at `offset`.
@@ -122,7 +122,7 @@ define_message! {
 
 define_message! {
     /// Responses on a per-file channel.
-    pub enum FileResponse<'a> {
+    pub enum FileResponse<'a> => FileResponseMsg {
         /// Data chunk. Empty chunk = end-of-stream sentinel.
         Data(0) { chunk: &'a [u8] },
         /// Write succeeded.
@@ -145,7 +145,7 @@ use rvos_wire::define_protocol;
 
 define_protocol! {
     /// Per-file data channel protocol.
-    pub protocol FileOps => FileOpsClient, FileOpsHandler, file_ops_dispatch {
+    pub protocol FileOps => FileOpsClient, FileOpsHandler, file_ops_dispatch, file_ops_handle {
         type Request<'a> = FileRequest;
         type Response<'a> = FileResponse;
 
@@ -160,7 +160,7 @@ define_protocol! {
 
 define_protocol! {
     /// Filesystem control channel protocol.
-    pub protocol FsControl => FsControlClient, FsControlHandler, fs_control_dispatch {
+    pub protocol FsControl => FsControlClient, FsControlHandler, fs_control_dispatch, fs_control_handle {
         type Request<'a> = FsRequest;
         type Response = FsResponse;
 

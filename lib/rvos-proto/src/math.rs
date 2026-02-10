@@ -25,7 +25,7 @@ use rvos_wire::define_protocol;
 
 define_protocol! {
     /// Math service protocol.
-    pub protocol Math => MathClient, MathHandler, math_dispatch {
+    pub protocol Math => MathClient, MathHandler, math_dispatch, math_handle {
         type Request = MathRequest;
         type Response = MathResponse;
 

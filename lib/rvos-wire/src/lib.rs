@@ -317,6 +317,59 @@ pub trait DeserializeOwned: for<'a> Deserialize<'a> {}
 impl<T: for<'a> Deserialize<'a>> DeserializeOwned for T {}
 
 // ---------------------------------------------------------------------------
+// MessageType — GAT-based message family trait
+// ---------------------------------------------------------------------------
+
+/// Type-level representation of a message family.
+///
+/// This trait uses a GAT (generic associated type) to map a borrow lifetime
+/// to the concrete deserialized message type.  It exists to solve a specific
+/// problem with typed IPC channels: message types like `FsRequest<'a>` borrow
+/// from the receive buffer, so they can't appear directly as a type parameter
+/// on `Channel<S, R>` — there's no lifetime to name at the struct definition
+/// site.
+///
+/// Instead, `Channel` is parameterised by a *message type marker* that
+/// implements `MessageType`.  When the channel receives a message, it
+/// deserialises into `R::Msg<'a>` where `'a` is the borrow of the channel's
+/// internal receive buffer (tied to `&'a mut self`).
+///
+/// # Owned types (blanket impl)
+///
+/// Types that implement `DeserializeOwned` (i.e. don't borrow from the
+/// buffer) get a blanket impl automatically — `Msg<'a>` is just `Self`.
+/// So `Channel<FsResponse, SomeOwnedMsg>` works with no extra boilerplate.
+///
+/// # Borrowed types (generated companion)
+///
+/// For types like `FsRequest<'a>` that *do* borrow from the buffer,
+/// `define_message!` generates a zero-sized companion struct (e.g.
+/// `FsRequestMsg`) that maps the lifetime:
+///
+/// ```ignore
+/// define_message! {
+///     pub enum FsRequest<'a> => FsRequestMsg { ... }
+/// }
+/// // generates:
+/// //   pub struct FsRequestMsg;
+/// //   impl MessageType for FsRequestMsg {
+/// //       type Msg<'a> = FsRequest<'a>;
+/// //   }
+/// ```
+///
+/// Then `Channel<FsResponse, FsRequestMsg>` can receive `FsRequest<'a>`
+/// where `'a` is tied to the channel's buffer.
+pub trait MessageType {
+    type Msg<'a>: Deserialize<'a>;
+}
+
+/// Blanket impl: any `DeserializeOwned` type is trivially its own
+/// `MessageType` — the lifetime parameter is unused.
+impl<T: DeserializeOwned> MessageType for T {
+    type Msg<'a> = T;
+}
+
+// ---------------------------------------------------------------------------
 // Blanket impls: primitives
 // ---------------------------------------------------------------------------
 
@@ -581,8 +634,26 @@ pub enum RpcError {
 }
 
 /// A shared memory region handle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// On the wire, serializes as a `u8` index into the message's caps sideband,
+/// just like [`RawChannelCap`].
+#[derive(Debug)]
 pub struct ShmHandle(pub usize);
+
+impl Serialize for ShmHandle {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
+        let idx = w.push_cap(self.0)?;
+        w.write_u8(idx)
+    }
+}
+
+impl<'a> Deserialize<'a> for ShmHandle {
+    fn deserialize(r: &mut Reader<'a>) -> Result<Self, WireError> {
+        let idx = r.read_u8()?;
+        let handle = r.read_cap(idx)?;
+        Ok(ShmHandle(handle))
+    }
+}
 
 /// Maximum number of capabilities per message.
 pub const MAX_CAPS: usize = 4;
@@ -953,7 +1024,7 @@ macro_rules! define_message {
     // ── Owned struct form (with lifetime) ──────────────────────────
     (
         $(#[$meta:meta])*
-        $vis:vis owned struct $name:ident <$lt:lifetime> {
+        $vis:vis owned struct $name:ident <$lt:lifetime> => $companion:ident {
             $($field:ident : $fty:ty),* $(,)?
         }
     ) => {
@@ -977,12 +1048,19 @@ macro_rules! define_message {
                 })
             }
         }
+
+        #[doc = concat!("[`MessageType`](crate::MessageType) marker for [`", stringify!($name), "`].")]
+        $vis struct $companion;
+
+        impl $crate::MessageType for $companion {
+            type Msg<'__mt> = $name<'__mt>;
+        }
     };
 
     // ── Owned enum form (with lifetime) ────────────────────────────
     (
         $(#[$meta:meta])*
-        $vis:vis owned enum $name:ident <$lt:lifetime> {
+        $vis:vis owned enum $name:ident <$lt:lifetime> => $companion:ident {
             $(
                 $(#[$vmeta:meta])*
                 $variant:ident ($tag:expr) { $($field:ident : $fty:ty),* $(,)? }
@@ -1025,6 +1103,13 @@ macro_rules! define_message {
                     _ => Err($crate::WireError::InvalidTag(tag)),
                 }
             }
+        }
+
+        #[doc = concat!("[`MessageType`](crate::MessageType) marker for [`", stringify!($name), "`].")]
+        $vis struct $companion;
+
+        impl $crate::MessageType for $companion {
+            type Msg<'__mt> = $name<'__mt>;
         }
     };
 
@@ -1109,7 +1194,7 @@ macro_rules! define_message {
     // ── Enum form (with lifetime) ────────────────────────────────
     (
         $(#[$meta:meta])*
-        $vis:vis enum $name:ident <$lt:lifetime> {
+        $vis:vis enum $name:ident <$lt:lifetime> => $companion:ident {
             $(
                 $(#[$vmeta:meta])*
                 $variant:ident ($tag:expr) { $($field:ident : $fty:ty),* $(,)? }
@@ -1153,12 +1238,19 @@ macro_rules! define_message {
                 }
             }
         }
+
+        #[doc = concat!("[`MessageType`](crate::MessageType) marker for [`", stringify!($name), "`].")]
+        $vis struct $companion;
+
+        impl $crate::MessageType for $companion {
+            type Msg<'__mt> = $name<'__mt>;
+        }
     };
 
     // ── Struct form (with lifetime) ──────────────────────────────
     (
         $(#[$meta:meta])*
-        $vis:vis struct $name:ident <$lt:lifetime> {
+        $vis:vis struct $name:ident <$lt:lifetime> => $companion:ident {
             $($field:ident : $fty:ty),* $(,)?
         }
     ) => {
@@ -1182,6 +1274,13 @@ macro_rules! define_message {
                 })
             }
         }
+
+        #[doc = concat!("[`MessageType`](crate::MessageType) marker for [`", stringify!($name), "`].")]
+        $vis struct $companion;
+
+        impl $crate::MessageType for $companion {
+            type Msg<'__mt> = $name<'__mt>;
+        }
     };
 }
 
@@ -1197,7 +1296,7 @@ macro_rules! define_message {
 /// ```ignore
 /// define_protocol! {
 ///     /// Math service protocol.
-///     pub protocol Math => MathClient, MathHandler, math_dispatch {
+///     pub protocol Math => MathClient, MathHandler, math_dispatch, math_handle {
 ///         type Request = MathRequest;
 ///         type Response = MathResponse;
 ///
@@ -1207,9 +1306,9 @@ macro_rules! define_message {
 /// }
 /// ```
 ///
-/// The `=> ClientName, HandlerName, dispatch_fn` syntax provides the names
-/// of the generated items explicitly (since `macro_rules!` cannot concatenate
-/// or capitalize identifiers).
+/// The `=> ClientName, HandlerName, dispatch_fn, handle_fn` syntax provides
+/// the names of the generated items explicitly (since `macro_rules!` cannot
+/// concatenate or capitalize identifiers).
 ///
 /// Each `rpc` line maps to one variant of the Request enum. The `as Variant`
 /// syntax provides the enum variant name.
@@ -1220,15 +1319,20 @@ macro_rules! define_message {
 ///
 /// Without `[+cap]`, client method returns `Result<Response, RpcError>`.
 ///
-/// The handler trait always returns `(Response, usize)` so handlers can
-/// attach capabilities on any method.
+/// The handler trait returns just `Response`.  Capabilities are embedded in
+/// the response type via [`RawChannelCap`] / [`ChannelCap`] fields — no
+/// sideband needed.
+///
+/// Two dispatch entry points are generated:
+/// - `dispatch_fn`: blocking recv → dispatch → send reply (simple servers)
+/// - `handle_fn`: pure dispatch, no I/O (multiplexed servers)
 #[macro_export]
 macro_rules! define_protocol {
     // ── Arm 1: Request without lifetime, Response without lifetime ──
     (
         $(#[$meta:meta])*
         $vis:vis protocol $name:ident =>
-            $client:ident, $handler:ident, $dispatch:ident
+            $client:ident, $handler:ident, $dispatch:ident, $handle:ident
         {
             type Request = $req_ty:ident;
             type Response = $resp_ty:ident;
@@ -1264,14 +1368,32 @@ macro_rules! define_protocol {
             )*
         }
 
+        /// Handler trait for the protocol.  Implement this on your server
+        /// state to handle each request variant.  Capabilities in the
+        /// response are embedded via [`RawChannelCap`](crate::RawChannelCap)
+        /// / [`ChannelCap`](crate::ChannelCap) fields — no sideband needed.
         $vis trait $handler {
             $(
-                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+                fn $method(&mut self, $($arg: $arg_ty),*) -> $resp_ty;
             )*
         }
 
-        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
-        // replaced once all protocols embed ChannelCap fields directly.
+        /// Pure dispatch: match on a pre-deserialized request and call the
+        /// appropriate handler method.  No I/O — the caller is responsible
+        /// for receiving the request and sending the response.
+        $vis fn $handle<H: $handler>(
+            handler: &mut H,
+            req: $req_ty,
+        ) -> $resp_ty {
+            match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            }
+        }
+
+        /// Blocking dispatch: receive one request, dispatch to handler,
+        /// send the response.  Convenience wrapper around [`$handle`].
         #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
@@ -1279,12 +1401,8 @@ macro_rules! define_protocol {
         ) -> Result<(), $crate::RpcError> {
             let mut buf = [0u8; $crate::MAX_MSG_SIZE];
             let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
-            let (resp, resp_cap) = match req {
-                $(
-                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
-                )*
-            };
-            $crate::rpc_reply(transport, &resp, resp_cap)
+            let resp = $handle(handler, req);
+            $crate::rpc_reply(transport, &resp, $crate::NO_CAP)
         }
     };
 
@@ -1292,7 +1410,7 @@ macro_rules! define_protocol {
     (
         $(#[$meta:meta])*
         $vis:vis protocol $name:ident =>
-            $client:ident, $handler:ident, $dispatch:ident
+            $client:ident, $handler:ident, $dispatch:ident, $handle:ident
         {
             type Request<$lt:lifetime> = $req_ty:ident;
             type Response = $resp_ty:ident;
@@ -1328,14 +1446,26 @@ macro_rules! define_protocol {
             )*
         }
 
+        /// Handler trait — see arm 1 docs.
         $vis trait $handler {
             $(
-                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+                fn $method(&mut self, $($arg: $arg_ty),*) -> $resp_ty;
             )*
         }
 
-        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
-        // replaced once all protocols embed ChannelCap fields directly.
+        /// Pure dispatch — see arm 1 docs.
+        $vis fn $handle<H: $handler>(
+            handler: &mut H,
+            req: $req_ty<'_>,
+        ) -> $resp_ty {
+            match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            }
+        }
+
+        /// Blocking dispatch — see arm 1 docs.
         #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
@@ -1343,12 +1473,8 @@ macro_rules! define_protocol {
         ) -> Result<(), $crate::RpcError> {
             let mut buf = [0u8; $crate::MAX_MSG_SIZE];
             let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
-            let (resp, resp_cap) = match req {
-                $(
-                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
-                )*
-            };
-            $crate::rpc_reply(transport, &resp, resp_cap)
+            let resp = $handle(handler, req);
+            $crate::rpc_reply(transport, &resp, $crate::NO_CAP)
         }
     };
 
@@ -1356,7 +1482,7 @@ macro_rules! define_protocol {
     (
         $(#[$meta:meta])*
         $vis:vis protocol $name:ident =>
-            $client:ident, $handler:ident, $dispatch:ident
+            $client:ident, $handler:ident, $dispatch:ident, $handle:ident
         {
             type Request<$lt:lifetime> = $req_ty:ident;
             type Response<$lt2:lifetime> = $resp_ty:ident;
@@ -1392,14 +1518,28 @@ macro_rules! define_protocol {
             )*
         }
 
+        /// Handler trait — see arm 1 docs.
+        /// The response lifetime is tied to `&mut self` via elision.
         $vis trait $handler {
             $(
-                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+                fn $method(&mut self, $($arg: $arg_ty),*) -> $resp_ty;
             )*
         }
 
-        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
-        // replaced once all protocols embed ChannelCap fields directly.
+        /// Pure dispatch — see arm 1 docs.
+        /// The response borrows from the handler (`'__h`), not the request.
+        $vis fn $handle<'__h, H: $handler>(
+            handler: &'__h mut H,
+            req: $req_ty<'_>,
+        ) -> $resp_ty<'__h> {
+            match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            }
+        }
+
+        /// Blocking dispatch — see arm 1 docs.
         #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
@@ -1407,12 +1547,8 @@ macro_rules! define_protocol {
         ) -> Result<(), $crate::RpcError> {
             let mut buf = [0u8; $crate::MAX_MSG_SIZE];
             let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
-            let (resp, resp_cap) = match req {
-                $(
-                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
-                )*
-            };
-            $crate::rpc_reply(transport, &resp, resp_cap)
+            let resp = $handle(handler, req);
+            $crate::rpc_reply(transport, &resp, $crate::NO_CAP)
         }
     };
 
@@ -1420,7 +1556,7 @@ macro_rules! define_protocol {
     (
         $(#[$meta:meta])*
         $vis:vis protocol $name:ident =>
-            $client:ident, $handler:ident, $dispatch:ident
+            $client:ident, $handler:ident, $dispatch:ident, $handle:ident
         {
             type Request = $req_ty:ty;
             type Response<$lt:lifetime> = $resp_ty:ident;
@@ -1456,14 +1592,27 @@ macro_rules! define_protocol {
             )*
         }
 
+        /// Handler trait — see arm 1 docs.
+        /// The response lifetime is tied to `&mut self` via elision.
         $vis trait $handler {
             $(
-                fn $method(&mut self, $($arg: $arg_ty),*) -> ($resp_ty, usize);
+                fn $method(&mut self, $($arg: $arg_ty),*) -> $resp_ty;
             )*
         }
 
-        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
-        // replaced once all protocols embed ChannelCap fields directly.
+        /// Pure dispatch — see arm 1 docs.
+        $vis fn $handle<'__h, H: $handler>(
+            handler: &'__h mut H,
+            req: $req_ty,
+        ) -> $resp_ty<'__h> {
+            match req {
+                $(
+                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
+                )*
+            }
+        }
+
+        /// Blocking dispatch — see arm 1 docs.
         #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
@@ -1471,12 +1620,8 @@ macro_rules! define_protocol {
         ) -> Result<(), $crate::RpcError> {
             let mut buf = [0u8; $crate::MAX_MSG_SIZE];
             let (req, _cap) = $crate::rpc_recv(transport, &mut buf)?;
-            let (resp, resp_cap) = match req {
-                $(
-                    $req_ty::$variant { $($arg),* } => handler.$method($($arg),*),
-                )*
-            };
-            $crate::rpc_reply(transport, &resp, resp_cap)
+            let resp = $handle(handler, req);
+            $crate::rpc_reply(transport, &resp, $crate::NO_CAP)
         }
     };
 }
@@ -2132,7 +2277,7 @@ mod tests {
     #[test]
     fn test_define_message_borrowed() {
         define_message! {
-            pub enum Cmd<'a> {
+            pub enum Cmd<'a> => CmdMsg {
                 Open(0) { flags: u8, path: &'a str },
                 Data(1) { chunk: &'a [u8] },
             }
@@ -2432,7 +2577,7 @@ mod tests {
         }
 
         define_protocol! {
-            pub protocol Calc => CalcClient, CalcHandler, calc_dispatch {
+            pub protocol Calc => CalcClient, CalcHandler, calc_dispatch, calc_handle {
                 type Request = CalcReq;
                 type Response = CalcResp;
 
@@ -2480,7 +2625,7 @@ mod tests {
         }
 
         define_protocol! {
-            pub protocol Op => OpClient, OpHandler, op_dispatch {
+            pub protocol Op => OpClient, OpHandler, op_dispatch, op_handle {
                 type Request = OpReq;
                 type Response = OpResp;
 
@@ -2491,11 +2636,11 @@ mod tests {
 
         struct OpImpl;
         impl OpHandler for OpImpl {
-            fn double(&mut self, val: u32) -> (OpResp, usize) {
-                (OpResp { out: val * 2 }, NO_CAP)
+            fn double(&mut self, val: u32) -> OpResp {
+                OpResp { out: val * 2 }
             }
-            fn inc(&mut self, val: u32) -> (OpResp, usize) {
-                (OpResp { out: val + 1 }, NO_CAP)
+            fn inc(&mut self, val: u32) -> OpResp {
+                OpResp { out: val + 1 }
             }
         }
 
@@ -2569,7 +2714,7 @@ mod tests {
         }
 
         define_protocol! {
-            pub protocol File => FileClient, FileHandler, file_dispatch {
+            pub protocol File => FileClient, FileHandler, file_dispatch, file_handle {
                 type Request = FileReq;
                 type Response = FileResp;
 
@@ -2635,7 +2780,7 @@ mod tests {
         }
 
         define_protocol! {
-            pub protocol Child => ChildClient, ChildHandler, child_dispatch {
+            pub protocol Child => ChildClient, ChildHandler, child_dispatch, child_handle {
                 type Request = ChildReq;
                 type Response = ChildResp;
 
@@ -2670,7 +2815,7 @@ mod tests {
         }
 
         define_protocol! {
-            pub protocol Parent => ParentClient, ParentHandler, parent_dispatch {
+            pub protocol Parent => ParentClient, ParentHandler, parent_dispatch, parent_handle {
                 type Request = ParentReq;
                 type Response = ParentResp;
 
@@ -2733,7 +2878,7 @@ mod tests {
         }
 
         define_protocol! {
-            pub protocol Buf => BufClient, BufHandler, buf_dispatch {
+            pub protocol Buf => BufClient, BufHandler, buf_dispatch, buf_handle {
                 type Request = BufReq;
                 type Response = BufResp;
 
@@ -2754,7 +2899,7 @@ mod tests {
         let mut client = BufClient::new(transport);
         let (result, shm) = client.create(4096).unwrap();
         assert_eq!(result.ok, 1);
-        assert_eq!(shm, ShmHandle(77));
+        assert_eq!(shm.0, 77);
     }
 
     // 36. ChannelCap round-trip via to_bytes_with_caps / from_bytes_with_caps

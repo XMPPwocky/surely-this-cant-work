@@ -2,6 +2,7 @@ extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
+use rvos::Channel;
 use rvos::rvos_wire;
 use rvos_proto::gpu::{GpuRequest, GpuResponse};
 use rvos_proto::kbd::KbdEvent;
@@ -132,19 +133,12 @@ fn send_event_blocking(handle: usize, event: &WindowEvent) {
 }
 
 /// Send a WindowReply on the request channel (blocking).
+///
+/// Uses Channel::send() which handles embedded cap serialization automatically.
 fn send_reply(handle: usize, reply: &WindowReply) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(reply, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send_blocking(handle, &msg);
-}
-
-/// Send a WindowReply with a capability on the request channel (blocking).
-fn send_reply_with_cap(handle: usize, reply: &WindowReply, cap: usize) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(reply, &mut msg.data).unwrap_or(0);
-    msg.caps[0] = cap;
-    msg.cap_count = 1;
-    raw::sys_chan_send_blocking(handle, &msg);
+    let ch = Channel::<WindowReply, WindowRequest>::from_raw_handle(handle);
+    let _ = ch.send(reply);
+    ch.into_raw_handle(); // don't close — handle is still in use
 }
 
 fn main() {
@@ -385,21 +379,18 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
 
     let resp_data = CreateWindowResponse {
         window_id: win_id, width, height,
+        req_channel: rvos_wire::RawChannelCap::new(client_req_ep),
+        event_channel: rvos_wire::RawChannelCap::new(client_evt_ep),
     };
-    let mut resp = Message::new();
-    resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
-    // caps[0] = request channel, caps[1] = event channel
-    resp.caps[0] = client_req_ep;
-    resp.caps[1] = client_evt_ep;
-    resp.cap_count = 2;
-    raw::sys_chan_send_blocking(per_client_handle, &resp);
+    let resp_ch = Channel::<CreateWindowResponse, CreateWindowRequest>::from_raw_handle(per_client_handle);
+    let _ = resp_ch.send(&resp_data);
+    // Drop resp_ch to close per_client_handle (one-shot control channel).
 
     // Close handles we sent as caps — sending did inc_ref, so the
     // receiver's copies are independent.  Without this, 2 handles
     // leak per window creation, eventually filling the handle table.
     raw::sys_chan_close(client_req_ep);
     raw::sys_chan_close(client_evt_ep);
-    raw::sys_chan_close(per_client_handle);
 }
 
 // Linux evdev keycodes
@@ -669,7 +660,7 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
             send_reply(win.req_channel, &reply);
         }
         WindowRequest::GetFramebuffer { seq } => {
-            send_reply_with_cap(win.req_channel, &WindowReply::FbReply { seq }, win.shm_handle);
+            send_reply(win.req_channel, &WindowReply::FbReply { seq, fb: rvos_wire::ShmHandle(win.shm_handle) });
         }
         WindowRequest::SwapBuffers { seq } => {
             win.front_buffer = 1 - win.front_buffer;
