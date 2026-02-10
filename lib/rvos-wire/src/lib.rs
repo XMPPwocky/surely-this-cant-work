@@ -729,8 +729,11 @@ where
 ///
 /// Like [`rpc_call`] but appends `cap` to the send sideband (after any caps
 /// embedded in `req`) and returns the first received cap alongside the
-/// response. Kept for backward compatibility — prefer embedding
-/// [`ChannelCap`] fields in the request/response types instead.
+/// response.
+///
+/// **Deprecated:** Embed [`ChannelCap`] fields in the request/response types
+/// instead for type-safe capability transfer.
+#[deprecated(note = "embed ChannelCap fields in the message type instead")]
 pub fn rpc_call_with_cap<'buf, T, Req, Resp>(
     transport: &mut T,
     req: &Req,
@@ -770,6 +773,10 @@ where
 /// Returns `(request, cap)` where cap is the last capability from the
 /// message (after any caps consumed by [`ChannelCap`] fields in the
 /// request). Returns `NO_CAP` if no extra caps remain.
+///
+/// **Deprecated:** Embed [`ChannelCap`] fields in the request type instead.
+/// The raw cap return value is then unnecessary.
+#[deprecated(note = "embed ChannelCap fields in the request type instead")]
 pub fn rpc_recv<'buf, T, Req>(
     transport: &mut T,
     buf: &'buf mut [u8],
@@ -790,6 +797,10 @@ where
 ///
 /// Any [`ChannelCap`] fields in `resp` are automatically included in the
 /// sideband. If `cap` is not `NO_CAP`, it is appended after them.
+///
+/// **Deprecated:** Embed [`ChannelCap`] fields in the response type instead.
+/// The raw cap parameter is then unnecessary.
+#[deprecated(note = "embed ChannelCap fields in the response type instead")]
 pub fn rpc_reply<T, Resp>(
     transport: &mut T,
     resp: &Resp,
@@ -1259,6 +1270,9 @@ macro_rules! define_protocol {
             )*
         }
 
+        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
+        // replaced once all protocols embed ChannelCap fields directly.
+        #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
             handler: &mut H,
@@ -1320,6 +1334,9 @@ macro_rules! define_protocol {
             )*
         }
 
+        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
+        // replaced once all protocols embed ChannelCap fields directly.
+        #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
             handler: &mut H,
@@ -1381,6 +1398,9 @@ macro_rules! define_protocol {
             )*
         }
 
+        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
+        // replaced once all protocols embed ChannelCap fields directly.
+        #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
             handler: &mut H,
@@ -1442,6 +1462,9 @@ macro_rules! define_protocol {
             )*
         }
 
+        // Uses deprecated rpc_recv/rpc_reply — the dispatch macro itself will be
+        // replaced once all protocols embed ChannelCap fields directly.
+        #[allow(deprecated)]
         $vis fn $dispatch<T: $crate::Transport, H: $handler>(
             transport: &mut T,
             handler: &mut H,
@@ -1463,14 +1486,18 @@ macro_rules! define_protocol {
 #[macro_export]
 macro_rules! __define_protocol_client_method {
     // With [+cap] — raw untyped capability
+    // Uses deprecated rpc_call_with_cap — will be removed when [+cap] annotation is retired.
     ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident, [+ cap]) => {
+        #[allow(deprecated)]
         pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<($ret_ty, usize), $crate::RpcError> {
             let req = $req_ty::$variant { $($arg),* };
             $crate::rpc_call_with_cap(&mut self.transport, &req, $crate::NO_CAP, &mut self.buf)
         }
     };
     // With [-> shm] — shared memory handle
+    // Uses deprecated rpc_call_with_cap — will be removed when [-> shm] annotation is retired.
     ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident, [-> shm]) => {
+        #[allow(deprecated)]
         pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<($ret_ty, $crate::ShmHandle), $crate::RpcError> {
             let req = $req_ty::$variant { $($arg),* };
             let (resp, cap) = $crate::rpc_call_with_cap(
@@ -1479,7 +1506,9 @@ macro_rules! __define_protocol_client_method {
         }
     };
     // With [-> ClientType] — typed channel capability
+    // Uses deprecated rpc_call_with_cap — will be removed when [-> Client] annotation is retired.
     ($method:ident, $variant:ident, ($($arg:ident : $arg_ty:ty),*), $ret_ty:ty, $req_ty:ident, [-> $child:ident]) => {
+        #[allow(deprecated)]
         pub fn $method(&mut self, $($arg: $arg_ty),*) -> Result<($ret_ty, $child<T>), $crate::RpcError> {
             let req = $req_ty::$variant { $($arg),* };
             let (resp, cap) = $crate::rpc_call_with_cap(
@@ -2232,7 +2261,9 @@ mod tests {
     }
 
     // 29. RPC with capability passthrough
+    // Tests the deprecated rpc_call_with_cap API itself.
     #[test]
+    #[allow(deprecated)]
     fn test_rpc_with_cap() {
         define_message! {
             pub struct Ping { val: u32 }
@@ -2290,7 +2321,9 @@ mod tests {
     }
 
     // 30. rpc_recv + rpc_reply server-side roundtrip
+    // Tests the deprecated rpc_recv/rpc_reply APIs themselves.
     #[test]
+    #[allow(deprecated)]
     fn test_rpc_recv_reply() {
         define_message! {
             pub struct Req { x: u32 }

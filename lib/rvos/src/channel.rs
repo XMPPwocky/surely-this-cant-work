@@ -153,8 +153,10 @@ impl<S: rvos_wire::Serialize, R> Channel<S, R> {
     /// (blocking).
     ///
     /// The explicit `cap` is appended after any caps embedded in `val`.
-    /// Prefer embedding [`ChannelCap`](rvos_wire::ChannelCap) fields in the
-    /// message type instead.
+    ///
+    /// **Deprecated:** Embed [`ChannelCap`](rvos_wire::ChannelCap) fields in
+    /// the message type instead.
+    #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn send_with_cap(&self, val: &S, cap: usize) -> SysResult<()> {
         let mut msg = Message::new();
         let (data_len, cap_count) =
@@ -184,6 +186,10 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
 
     /// Blocking receive, returning the deserialized value and the last
     /// explicit capability (after any caps consumed by [`ChannelCap`] fields).
+    ///
+    /// **Deprecated:** Embed [`ChannelCap`](rvos_wire::ChannelCap) fields in
+    /// the message type instead.
+    #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn recv_with_cap_blocking(&self) -> SysResult<(R, usize)> {
         let mut msg = Message::new();
         self.inner.recv_blocking(&mut msg)?;
@@ -195,6 +201,10 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     }
 
     /// Blocking receive, returning the deserialized value and all capabilities.
+    ///
+    /// **Deprecated:** Embed [`ChannelCap`](rvos_wire::ChannelCap) fields in
+    /// the message type instead.
+    #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn recv_with_caps_blocking(&self) -> SysResult<(R, [usize; crate::message::MAX_CAPS], usize)> {
         let mut msg = Message::new();
         self.inner.recv_blocking(&mut msg)?;
@@ -212,6 +222,10 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     }
 
     /// Non-blocking receive with capability. Returns `None` if no message is available.
+    ///
+    /// **Deprecated:** Embed [`ChannelCap`](rvos_wire::ChannelCap) fields in
+    /// the message type instead.
+    #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn try_recv_with_cap(&self) -> Option<(R, usize)> {
         let mut msg = Message::new();
         if self.inner.try_recv(&mut msg) != 0 { return None; }
