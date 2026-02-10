@@ -20,5 +20,5 @@
   "target-pointer-width": 64,
   "disable-redzone": true,
   "executables": true,
-  "pre-link-args": { "gnu-lld": ["-T/home/ubuntu/src/temp2/rvos/user/user.ld", "--gc-sections"] }
+  "pre-link-args": { "gnu-lld": ["--gc-sections"] }
 }
