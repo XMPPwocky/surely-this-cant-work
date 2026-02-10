@@ -496,6 +496,11 @@ pub struct ShmHandle(pub usize);
 /// Maximum number of capabilities per message.
 pub const MAX_CAPS: usize = 4;
 
+// Compile-time assertions: these constants must stay in sync with the kernel
+// and all Message struct definitions (kernel/ipc, lib/rvos, vendor/rust std).
+const _: () = assert!(MAX_MSG_SIZE == 1024);
+const _: () = assert!(MAX_CAPS == 4);
+
 /// Abstraction over kernel-side and user-side IPC transports.
 ///
 /// Implementors wrap a channel endpoint and provide send/recv.

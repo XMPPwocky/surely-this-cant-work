@@ -94,6 +94,11 @@ pub struct Message {
     pub cap_count: usize,
 }
 
+// Compile-time assertions: MAX_MSG_SIZE and Message layout must match all
+// other definitions (lib/rvos, vendor/rust std, rvos-wire).
+const _: () = assert!(MAX_MSG_SIZE == 1024);
+const _: () = assert!(core::mem::size_of::<Message>() == 1080);
+
 impl Message {
     pub fn new() -> Self {
         Message {

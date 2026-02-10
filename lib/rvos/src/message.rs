@@ -22,6 +22,10 @@ pub struct Message {
     pub cap_count: usize,
 }
 
+// Compile-time assertions: must match kernel's ipc::Message layout exactly.
+const _: () = assert!(MAX_MSG_SIZE == 1024);
+const _: () = assert!(core::mem::size_of::<Message>() == 1080);
+
 impl Message {
     /// Create a new empty message.
     pub const fn new() -> Self {
