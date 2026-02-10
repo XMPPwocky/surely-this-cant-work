@@ -889,7 +889,8 @@ pub fn run() {
 
         loop {
             if io::stdin().lock().read(&mut byte).unwrap_or(0) == 0 {
-                continue;
+                // EOF on stdin — parent process (e.g. fbcon) exited
+                return;
             }
             let ch = byte[0];
 
