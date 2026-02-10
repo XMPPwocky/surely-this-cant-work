@@ -105,18 +105,26 @@ pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -
     boot_response_cap(resp, cap)
 }
 
+/// A namespace override for process spawning.
+pub enum NsOverride<'a> {
+    /// Redirect: the child's lookup of `name` yields the given channel handle.
+    Redirect(&'a str, usize),
+    /// Remove: explicitly clear an inherited override so the child falls
+    /// through to the global service registry.
+    Remove(&'a str),
+}
+
 /// Spawn a process with args and namespace overrides.
 ///
-/// `ns_overrides` is a packed blob: `[count: u8] then count * [name_len: u8, name_bytes..., cap_index: u8]`
-/// Each cap_index references `msg.caps[cap_index]`.
-/// `caps` contains the handles to send as capabilities with the spawn message.
+/// Each `NsOverride::Redirect(name, handle)` maps a service name to a channel
+/// handle in the child. Each `NsOverride::Remove(name)` blocks inheritance of
+/// that name from the parent.
 pub fn spawn_process_with_overrides(
     path: &str,
     args: &[u8],
-    ns_overrides: &[u8],
-    caps: &[usize],
+    overrides: &[NsOverride<'_>],
 ) -> SysResult<RawChannel> {
-    spawn_process_with_overrides_on(0, path, args, ns_overrides, caps)
+    spawn_process_with_overrides_on(0, path, args, overrides)
 }
 
 /// Spawn with overrides via a specific boot handle.
@@ -124,28 +132,72 @@ pub fn spawn_process_with_overrides_on(
     boot_handle: usize,
     path: &str,
     args: &[u8],
-    ns_overrides: &[u8],
-    caps: &[usize],
+    overrides: &[NsOverride<'_>],
 ) -> SysResult<RawChannel> {
+    // Build the packed ns_overrides blob and caps array from the typed overrides.
+    // Blob format: [count: u8] then count * [name_len: u8, name..., action: u8, cap_index: u8]
+    let mut blob = [0u8; 320];
+    let mut caps = [0usize; rvos_wire::MAX_CAPS];
+    let mut cap_count = 0usize;
+    let mut pos = 1usize; // skip count byte
+    let mut count = 0u8;
+
+    for ovr in overrides {
+        match ovr {
+            NsOverride::Redirect(name, handle) => {
+                if cap_count >= rvos_wire::MAX_CAPS { break; }
+                let nb = name.as_bytes();
+                let nlen = nb.len().min(16);
+                if pos + 1 + nlen + 2 > blob.len() { break; }
+                blob[pos] = nlen as u8;
+                pos += 1;
+                blob[pos..pos + nlen].copy_from_slice(&nb[..nlen]);
+                pos += nlen;
+                blob[pos] = 0; // action = redirect
+                pos += 1;
+                blob[pos] = cap_count as u8;
+                pos += 1;
+                caps[cap_count] = *handle;
+                cap_count += 1;
+                count += 1;
+            }
+            NsOverride::Remove(name) => {
+                let nb = name.as_bytes();
+                let nlen = nb.len().min(16);
+                if pos + 1 + nlen + 2 > blob.len() { break; }
+                blob[pos] = nlen as u8;
+                pos += 1;
+                blob[pos..pos + nlen].copy_from_slice(&nb[..nlen]);
+                pos += nlen;
+                blob[pos] = 1; // action = remove
+                pos += 1;
+                blob[pos] = 0; // placeholder cap_index
+                pos += 1;
+                count += 1;
+            }
+        }
+    }
+    blob[0] = count;
+
     // Multi-cap send — use Transport directly since rpc_call_with_cap
     // only supports a single capability.
     let mut transport = UserTransport::new(boot_handle);
     let mut send_buf = [0u8; MAX_MSG_SIZE];
     let n = rvos_wire::to_bytes(
-        &BootRequest::Spawn { path, args, ns_overrides },
+        &BootRequest::Spawn { path, args, ns_overrides: &blob[..pos] },
         &mut send_buf,
     ).map_err(|_| SysError::BadAddress)?;
-    transport.send(&send_buf[..n], caps)
+    transport.send(&send_buf[..n], &caps[..cap_count])
         .map_err(|_| SysError::NoResources)?;
 
     let mut recv_buf = [0u8; MAX_MSG_SIZE];
     let mut recv_caps = [0usize; rvos_wire::MAX_CAPS];
-    let (len, cap_count) = transport.recv(&mut recv_buf, &mut recv_caps)
+    let (len, rcap_count) = transport.recv(&mut recv_buf, &mut recv_caps)
         .map_err(|_| SysError::NoResources)?;
 
     let resp = rvos_wire::from_bytes::<BootResponse<'_>>(&recv_buf[..len])
         .map_err(|_| SysError::BadAddress)?;
-    let cap = if cap_count > 0 { recv_caps[0] } else { NO_CAP };
+    let cap = if rcap_count > 0 { recv_caps[0] } else { NO_CAP };
     boot_response_cap(resp, cap)
 }
 

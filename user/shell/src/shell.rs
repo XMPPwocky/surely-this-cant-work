@@ -313,10 +313,8 @@ fn cmd_run(args: &str) {
         actual_args_len = rebuild_args(&mut args_blob, argv0, clean_rest);
     }
 
-    // If redirecting, open the file and build ns_overrides
-    let mut ns_overrides_blob = [0u8; 32];
-    let mut ns_overrides_len = 0usize;
-    let mut redirect_handle: usize = 0;
+    // If redirecting, open the file and spawn with ns_overrides
+    let mut redirect_handle: Option<usize> = None;
 
     if let Some(redir_path) = redirect_path {
         if redir_path.is_empty() {
@@ -331,13 +329,7 @@ fn cmd_run(args: &str) {
         };
         match rvos::fs::file_open_raw(redir_path, flags) {
             Ok(fh) => {
-                redirect_handle = fh;
-                // Build ns_overrides blob: [count=1, name_len=6, "stdout", cap_index=0]
-                ns_overrides_blob[0] = 1; // count
-                ns_overrides_blob[1] = 6; // name_len
-                ns_overrides_blob[2..8].copy_from_slice(b"stdout");
-                ns_overrides_blob[8] = 0; // cap_index = 0
-                ns_overrides_len = 9;
+                redirect_handle = Some(fh);
             }
             Err(_) => {
                 println!("Error: could not open {} for redirect", redir_path);
@@ -347,15 +339,14 @@ fn cmd_run(args: &str) {
     }
 
     // Send Spawn request on boot channel (handle 0)
-    if ns_overrides_len > 0 {
-        // Spawn with namespace overrides
+    if let Some(rh) = redirect_handle {
+        // Spawn with stdout redirected to file
         let proc_chan = rvos::spawn_process_with_overrides(
             path,
             &args_blob[..actual_args_len],
-            &ns_overrides_blob[..ns_overrides_len],
-            &[redirect_handle],
+            &[rvos::NsOverride::Redirect("stdout", rh)],
         );
-        raw::sys_chan_close(redirect_handle);
+        raw::sys_chan_close(rh);
         match proc_chan {
             Ok(ch) => {
                 let proc_handle = ch.into_raw_handle();

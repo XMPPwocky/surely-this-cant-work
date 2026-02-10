@@ -441,6 +441,7 @@ fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
 }
 
 /// Find a namespace override for the given service name in the boot registration.
+/// Returns None for removed entries (falls through to global registry).
 fn find_ns_override(boot_ep_b: usize, name: &str) -> Option<usize> {
     let config = INIT_CONFIG.lock();
     for slot in config.boot_regs.iter() {
@@ -450,6 +451,7 @@ fn find_ns_override(boot_ep_b: usize, name: &str) -> Option<usize> {
                 for ovr in reg.overrides.iter() {
                     if let Some(ref o) = ovr {
                         if o.name_len == name_bytes.len() && &o.name[..o.name_len] == name_bytes {
+                            if o.removed { return None; }
                             return Some(o.endpoint);
                         }
                     }
@@ -462,7 +464,8 @@ fn find_ns_override(boot_ep_b: usize, name: &str) -> Option<usize> {
 }
 
 /// Parse namespace overrides from the packed blob.
-/// Format: [count: u8] then count * [name_len: u8, name_bytes..., cap_index: u8]
+/// Format: [count: u8] then count * [name_len: u8, name_bytes..., action: u8, cap_index: u8]
+/// action=0: redirect (use caps[cap_index]), action=1: remove (cap_index ignored).
 /// Each cap_index references orig_msg.caps[cap_index] (already encoded by kernel).
 fn parse_ns_overrides(blob: &[u8], orig_msg: &Message) -> [Option<NsOverride>; MAX_NS_OVERRIDES] {
     let mut result: [Option<NsOverride>; MAX_NS_OVERRIDES] = [const { None }; MAX_NS_OVERRIDES];
@@ -480,28 +483,42 @@ fn parse_ns_overrides(blob: &[u8], orig_msg: &Message) -> [Option<NsOverride>; M
         }
         let name_len = blob[pos] as usize;
         pos += 1;
-        if pos + name_len >= blob.len() {
+        if pos + name_len + 2 > blob.len() {
             break;
         }
         let name_bytes = &blob[pos..pos + name_len];
         pos += name_len;
+        let action = blob[pos];
+        pos += 1;
         let cap_index = blob[pos] as usize;
         pos += 1;
 
-        // Decode the capability from the message's cap array
-        if cap_index < orig_msg.cap_count {
-            let encoded = orig_msg.caps[cap_index];
-            if let Some(ep) = ipc::decode_cap_channel(encoded) {
-                let mut name = [0u8; SERVICE_NAME_LEN];
-                let nlen = name_len.min(SERVICE_NAME_LEN);
-                name[..nlen].copy_from_slice(&name_bytes[..nlen]);
-                result[out_idx] = Some(NsOverride {
-                    name,
-                    name_len: nlen,
-                    endpoint: ep,
-                    removed: false,
-                });
-                out_idx += 1;
+        let mut name = [0u8; SERVICE_NAME_LEN];
+        let nlen = name_len.min(SERVICE_NAME_LEN);
+        name[..nlen].copy_from_slice(&name_bytes[..nlen]);
+
+        if action == 1 {
+            // Removal entry: blocks inheritance of this name
+            result[out_idx] = Some(NsOverride {
+                name,
+                name_len: nlen,
+                endpoint: 0,
+                removed: true,
+            });
+            out_idx += 1;
+        } else {
+            // Redirect entry: decode the capability from the message's cap array
+            if cap_index < orig_msg.cap_count {
+                let encoded = orig_msg.caps[cap_index];
+                if let Some(ep) = ipc::decode_cap_channel(encoded) {
+                    result[out_idx] = Some(NsOverride {
+                        name,
+                        name_len: nlen,
+                        endpoint: ep,
+                        removed: false,
+                    });
+                    out_idx += 1;
+                }
             }
         }
     }
@@ -578,6 +595,61 @@ fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid
     } else {
         send_error(boot_ep_b, "no console", my_pid);
     }
+}
+
+/// Copy the parent's namespace overrides from INIT_CONFIG.
+fn get_parent_overrides(boot_ep_b: usize) -> [Option<NsOverride>; MAX_NS_OVERRIDES] {
+    let config = INIT_CONFIG.lock();
+    for slot in config.boot_regs.iter() {
+        if let Some(ref reg) = slot {
+            if reg.boot_ep_b == boot_ep_b {
+                return reg.overrides.clone();
+            }
+        }
+    }
+    [const { None }; MAX_NS_OVERRIDES]
+}
+
+/// Merge parent and explicit overrides. Explicit entries take priority.
+/// A removal entry in explicit blocks the parent's override with the same name.
+fn merge_overrides(
+    parent: &[Option<NsOverride>; MAX_NS_OVERRIDES],
+    explicit: [Option<NsOverride>; MAX_NS_OVERRIDES],
+) -> [Option<NsOverride>; MAX_NS_OVERRIDES] {
+    let mut result = explicit;
+
+    // Count how many explicit entries we have
+    let mut count = 0;
+    for slot in result.iter() {
+        if slot.is_some() { count += 1; }
+    }
+
+    // Fill remaining slots with parent entries not already present in explicit
+    for p_slot in parent.iter() {
+        if count >= MAX_NS_OVERRIDES { break; }
+        if let Some(ref p) = p_slot {
+            // Check if this name is already in the explicit set
+            let already = result.iter().any(|slot| {
+                if let Some(ref e) = slot {
+                    e.name_len == p.name_len && e.name[..e.name_len] == p.name[..p.name_len]
+                } else {
+                    false
+                }
+            });
+            if !already {
+                // Find a free slot and insert
+                for slot in result.iter_mut() {
+                    if slot.is_none() {
+                        *slot = Some(p.clone());
+                        count += 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 /// Handle a spawn request: load an ELF from the filesystem and spawn it.
@@ -668,8 +740,10 @@ fn handle_spawn_request(
     let args_len = args.len().min(MAX_ARGS_LEN);
     args_buf[..args_len].copy_from_slice(&args[..args_len]);
 
-    // Parse namespace overrides from the packed blob
-    let parsed_overrides = parse_ns_overrides(ns_overrides, orig_msg);
+    // Parse namespace overrides from the packed blob, then merge with parent's overrides
+    let explicit_overrides = parse_ns_overrides(ns_overrides, orig_msg);
+    let parent_overrides = get_parent_overrides(boot_ep_b);
+    let parsed_overrides = merge_overrides(&parent_overrides, explicit_overrides);
 
     let mut ctx = FsLaunchCtx {
         state: FsLaunchState::WaitStat,

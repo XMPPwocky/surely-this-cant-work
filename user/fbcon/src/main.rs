@@ -526,18 +526,14 @@ fn main() {
     let (stdin_our, stdin_shell) = raw::sys_chan_create();
     let (stdout_our, stdout_shell) = raw::sys_chan_create();
 
-    // Build namespace overrides: redirect shell's stdin and stdout to our channels
-    // Format: [count: u8] then count * [name_len: u8, name_bytes..., cap_index: u8]
-    let ns_overrides: [u8; 16] = [
-        2,                                         // count = 2
-        5, b's', b't', b'd', b'i', b'n', 0,       // "stdin" -> cap_index 0
-        6, b's', b't', b'd', b'o', b'u', b't', 1, // "stdout" -> cap_index 1
-    ];
+    // Spawn shell with stdin/stdout redirected to our channels
     match rvos::spawn_process_with_overrides(
         "/bin/shell",
         b"shell",
-        &ns_overrides,
-        &[stdin_shell, stdout_shell],
+        &[
+            rvos::NsOverride::Redirect("stdin", stdin_shell),
+            rvos::NsOverride::Redirect("stdout", stdout_shell),
+        ],
     ) {
         Ok(_proc_chan) => {
             println!("[fbcon] spawned /bin/shell");
