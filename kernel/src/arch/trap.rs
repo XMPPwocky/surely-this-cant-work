@@ -970,8 +970,18 @@ fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
     };
 
     // For cross-page buffers, verify all pages are mapped and contiguous in PA
+    let end = match ptr.checked_add(len - 1) {
+        Some(e) => e,
+        None => {
+            crate::println!(
+                "[syscall] PID {}: user buffer {:#x}+{} overflows address space",
+                crate::task::current_pid(), ptr, len
+            );
+            return None;
+        }
+    };
     let start_page = ptr / crate::mm::address::PAGE_SIZE;
-    let end_page = (ptr + len - 1) / crate::mm::address::PAGE_SIZE;
+    let end_page = end / crate::mm::address::PAGE_SIZE;
     let pa_base_page = pa / crate::mm::address::PAGE_SIZE;
     for i in 1..=(end_page - start_page) {
         match translate_user_va((start_page + i) * crate::mm::address::PAGE_SIZE) {
