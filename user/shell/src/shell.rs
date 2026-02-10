@@ -129,7 +129,7 @@ fn send_sysinfo_cmd(cmd: &SysinfoCommand) {
 
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(cmd, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send(sysinfo_handle, &msg);
+    raw::sys_chan_send_blocking(sysinfo_handle, &msg);
 
     loop {
         let mut resp = Message::new();
