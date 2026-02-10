@@ -450,7 +450,6 @@ fn main() {
             if msg.len > 0 {
                 match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
                     Ok(WindowEvent::KeyDown { code }) => {
-                        println!("[fbcon] recv D{}", code);
                         let code = code as usize;
                         if code == 42 || code == 54 {
                             shift_pressed = true;
@@ -466,14 +465,13 @@ fn main() {
                         }
                     }
                     Ok(WindowEvent::KeyUp { code }) => {
-                        println!("[fbcon] recv U{}", code);
                         let code = code as usize;
                         if code == 42 || code == 54 {
                             shift_pressed = false;
                         }
                     }
                     _ => {
-                        println!("[fbcon] recv OTHER (len={})", msg.len);
+                        // Ignore mouse events and other window events
                     }
                 }
             }
