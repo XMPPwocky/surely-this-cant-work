@@ -96,6 +96,23 @@ impl<S, R> Channel<S, R> {
         Channel { inner: RawChannel::from_raw_handle(handle), _phantom: PhantomData }
     }
 
+    /// Create a Channel from a received [`ChannelCap`](rvos_wire::ChannelCap)
+    /// (takes RAII ownership of the handle).
+    pub fn from_cap(cap: rvos_wire::ChannelCap<S, R>) -> Self {
+        Channel::from_raw_handle(cap.raw())
+    }
+
+    /// Create a [`ChannelCap`](rvos_wire::ChannelCap) wire representation
+    /// from this Channel.
+    ///
+    /// Does NOT consume the Channel — the caller is responsible for ensuring
+    /// the handle remains valid for the message recipient (typically by
+    /// sending it immediately and not closing this Channel until the
+    /// recipient has received it).
+    pub fn as_cap(&self) -> rvos_wire::ChannelCap<S, R> {
+        rvos_wire::ChannelCap::new(self.raw_handle())
+    }
+
     /// Get the raw handle value.
     pub fn raw_handle(&self) -> usize {
         self.inner.raw_handle()
@@ -119,40 +136,61 @@ impl<S, R> Channel<S, R> {
 
 impl<S: rvos_wire::Serialize, R> Channel<S, R> {
     /// Send a typed message (blocking).
+    ///
+    /// Any [`ChannelCap`](rvos_wire::ChannelCap) fields in `val` are
+    /// automatically transferred via the message's capability sideband.
     pub fn send(&self, val: &S) -> SysResult<()> {
         let mut msg = Message::new();
-        msg.len = rvos_wire::to_bytes(val, &mut msg.data)
-            .map_err(|_| SysError::BadAddress)?;
+        let (data_len, cap_count) =
+            rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
+                .map_err(|_| SysError::BadAddress)?;
+        msg.len = data_len;
+        msg.cap_count = cap_count;
         self.inner.send(&msg)
     }
 
-    /// Send a typed message with a capability handle attached (blocking).
+    /// Send a typed message with an explicit capability handle attached
+    /// (blocking).
+    ///
+    /// The explicit `cap` is appended after any caps embedded in `val`.
+    /// Prefer embedding [`ChannelCap`](rvos_wire::ChannelCap) fields in the
+    /// message type instead.
     pub fn send_with_cap(&self, val: &S, cap: usize) -> SysResult<()> {
         let mut msg = Message::new();
-        msg.len = rvos_wire::to_bytes(val, &mut msg.data)
-            .map_err(|_| SysError::BadAddress)?;
-        msg.caps[0] = cap;
-        msg.cap_count = 1;
+        let (data_len, cap_count) =
+            rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
+                .map_err(|_| SysError::BadAddress)?;
+        msg.len = data_len;
+        msg.cap_count = cap_count;
+        if cap_count < crate::message::MAX_CAPS {
+            msg.caps[cap_count] = cap;
+            msg.cap_count = cap_count + 1;
+        }
         self.inner.send(&msg)
     }
 }
 
 impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     /// Blocking receive, returning the deserialized value.
+    ///
+    /// Any [`ChannelCap`](rvos_wire::ChannelCap) fields in the result are
+    /// populated from the message's capability sideband.
     pub fn recv_blocking(&self) -> SysResult<R> {
         let mut msg = Message::new();
         self.inner.recv_blocking(&mut msg)?;
-        rvos_wire::from_bytes::<R>(&msg.data[..msg.len])
+        rvos_wire::from_bytes_with_caps::<R>(&msg.data[..msg.len], &msg.caps[..msg.cap_count])
             .map_err(|_| SysError::BadAddress)
     }
 
-    /// Blocking receive, returning the deserialized value and first capability.
+    /// Blocking receive, returning the deserialized value and the last
+    /// explicit capability (after any caps consumed by [`ChannelCap`] fields).
     pub fn recv_with_cap_blocking(&self) -> SysResult<(R, usize)> {
         let mut msg = Message::new();
         self.inner.recv_blocking(&mut msg)?;
-        let val = rvos_wire::from_bytes::<R>(&msg.data[..msg.len])
+        let val = rvos_wire::from_bytes_with_caps::<R>(
+            &msg.data[..msg.len], &msg.caps[..msg.cap_count])
             .map_err(|_| SysError::BadAddress)?;
-        let cap = if msg.cap_count > 0 { msg.caps[0] } else { crate::raw::NO_CAP };
+        let cap = if msg.cap_count > 0 { msg.caps[msg.cap_count - 1] } else { crate::raw::NO_CAP };
         Ok((val, cap))
     }
 
@@ -160,7 +198,8 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     pub fn recv_with_caps_blocking(&self) -> SysResult<(R, [usize; crate::message::MAX_CAPS], usize)> {
         let mut msg = Message::new();
         self.inner.recv_blocking(&mut msg)?;
-        let val = rvos_wire::from_bytes::<R>(&msg.data[..msg.len])
+        let val = rvos_wire::from_bytes_with_caps::<R>(
+            &msg.data[..msg.len], &msg.caps[..msg.cap_count])
             .map_err(|_| SysError::BadAddress)?;
         Ok((val, msg.caps, msg.cap_count))
     }
@@ -169,15 +208,16 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     pub fn try_recv(&self) -> Option<R> {
         let mut msg = Message::new();
         if self.inner.try_recv(&mut msg) != 0 { return None; }
-        rvos_wire::from_bytes::<R>(&msg.data[..msg.len]).ok()
+        rvos_wire::from_bytes_with_caps::<R>(&msg.data[..msg.len], &msg.caps[..msg.cap_count]).ok()
     }
 
     /// Non-blocking receive with capability. Returns `None` if no message is available.
     pub fn try_recv_with_cap(&self) -> Option<(R, usize)> {
         let mut msg = Message::new();
         if self.inner.try_recv(&mut msg) != 0 { return None; }
-        let val = rvos_wire::from_bytes::<R>(&msg.data[..msg.len]).ok()?;
-        let cap = if msg.cap_count > 0 { msg.caps[0] } else { crate::raw::NO_CAP };
+        let val = rvos_wire::from_bytes_with_caps::<R>(
+            &msg.data[..msg.len], &msg.caps[..msg.cap_count]).ok()?;
+        let cap = if msg.cap_count > 0 { msg.caps[msg.cap_count - 1] } else { crate::raw::NO_CAP };
         Some((val, cap))
     }
 }

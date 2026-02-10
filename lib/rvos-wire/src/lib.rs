@@ -18,6 +18,8 @@ pub enum WireError {
     InvalidUtf8,
     /// Bool byte was not 0 or 1.
     InvalidBool(u8),
+    /// Capability sideband full (serialization) or index out of bounds (deserialization).
+    CapOverflow,
 }
 
 // ---------------------------------------------------------------------------
@@ -25,14 +27,48 @@ pub enum WireError {
 // ---------------------------------------------------------------------------
 
 /// A cursor for serializing values into a byte buffer.
+///
+/// Also accumulates capability handles in a sideband array. When a
+/// [`ChannelCap`] or [`RawChannelCap`] is serialized, its handle is pushed
+/// into this sideband via [`push_cap`](Writer::push_cap).
 pub struct Writer<'a> {
     buf: &'a mut [u8],
     pos: usize,
+    caps: [Option<usize>; MAX_CAPS],
+    cap_count: usize,
 }
 
 impl<'a> Writer<'a> {
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self { buf, pos: 0, caps: [None; MAX_CAPS], cap_count: 0 }
+    }
+
+    /// Push a capability handle into the sideband. Returns the assigned index.
+    ///
+    /// Fails with [`WireError::CapOverflow`] if all `MAX_CAPS` slots are full.
+    pub fn push_cap(&mut self, handle: usize) -> Result<u8, WireError> {
+        if self.cap_count >= MAX_CAPS {
+            return Err(WireError::CapOverflow);
+        }
+        let idx = self.cap_count as u8;
+        self.caps[self.cap_count] = Some(handle);
+        self.cap_count += 1;
+        Ok(idx)
+    }
+
+    /// Number of capabilities accumulated so far.
+    pub fn cap_count(&self) -> usize {
+        self.cap_count
+    }
+
+    /// Copy accumulated capability handles into a raw array (for transport).
+    /// Returns the number of caps written.
+    pub fn copy_caps_to(&self, out: &mut [usize]) -> usize {
+        for i in 0..self.cap_count {
+            // Safety: caps[0..cap_count] are always Some via push_cap.
+            out[i] = self.caps[i].unwrap();
+        }
+        self.cap_count
     }
 
     pub fn position(&self) -> usize {
@@ -121,14 +157,40 @@ impl<'a> Writer<'a> {
 // ---------------------------------------------------------------------------
 
 /// A cursor for deserializing values from a byte buffer.
+///
+/// Optionally carries a capability sideband populated from a received
+/// message. When a [`ChannelCap`] or [`RawChannelCap`] is deserialized, the
+/// handle is resolved from this sideband via [`read_cap`](Reader::read_cap).
 pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    caps: [Option<usize>; MAX_CAPS],
 }
 
 impl<'a> Reader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self { buf, pos: 0, caps: [None; MAX_CAPS] }
+    }
+
+    /// Create a reader with a capability sideband from a received message.
+    pub fn with_caps(buf: &'a [u8], caps: &[usize]) -> Self {
+        let mut r = Self::new(buf);
+        for (i, &c) in caps.iter().enumerate().take(MAX_CAPS) {
+            r.caps[i] = Some(c);
+        }
+        r
+    }
+
+    /// Read a capability handle by sideband index.
+    ///
+    /// Returns [`WireError::CapOverflow`] if the index is out of range or
+    /// no capability was provided at that index.
+    pub fn read_cap(&mut self, index: u8) -> Result<usize, WireError> {
+        let i = index as usize;
+        if i >= MAX_CAPS {
+            return Err(WireError::CapOverflow);
+        }
+        self.caps[i].ok_or(WireError::CapOverflow)
     }
 
     pub fn position(&self) -> usize {
@@ -466,6 +528,35 @@ pub fn from_bytes<'a, T: Deserialize<'a>>(buf: &'a [u8]) -> Result<T, WireError>
     T::deserialize(&mut r)
 }
 
+/// Serialize a value into a buffer, returning `(bytes_written, cap_count)`.
+///
+/// Any [`ChannelCap`] or [`RawChannelCap`] fields in `val` deposit their
+/// handles into `caps`. Use this instead of [`to_bytes`] when the value
+/// may contain capability fields.
+pub fn to_bytes_with_caps<T: Serialize>(
+    val: &T,
+    buf: &mut [u8],
+    caps: &mut [usize],
+) -> Result<(usize, usize), WireError> {
+    let mut w = Writer::new(buf);
+    val.serialize(&mut w)?;
+    let cap_count = w.copy_caps_to(caps);
+    Ok((w.position(), cap_count))
+}
+
+/// Deserialize a value from a buffer with a capability sideband.
+///
+/// Any [`ChannelCap`] or [`RawChannelCap`] fields in the result are
+/// populated from `caps`. Use this instead of [`from_bytes`] when the
+/// type may contain capability fields.
+pub fn from_bytes_with_caps<'a, T: Deserialize<'a>>(
+    buf: &'a [u8],
+    caps: &[usize],
+) -> Result<T, WireError> {
+    let mut r = Reader::with_caps(buf, caps);
+    T::deserialize(&mut r)
+}
+
 // ---------------------------------------------------------------------------
 // Transport trait and RPC helpers
 // ---------------------------------------------------------------------------
@@ -496,6 +587,90 @@ pub struct ShmHandle(pub usize);
 /// Maximum number of capabilities per message.
 pub const MAX_CAPS: usize = 4;
 
+// ---------------------------------------------------------------------------
+// Typed capability handles
+// ---------------------------------------------------------------------------
+
+/// A typed channel capability handle for wire serialization.
+///
+/// `S` is the message type this channel sends; `R` is what it receives.
+/// On the wire, serializes as a `u8` index into the message's caps sideband.
+///
+/// `ChannelCap` is **move-only** — it cannot be copied or cloned. This
+/// prevents accidental double-ownership of the underlying handle. In
+/// user-space code, convert to a `Channel<S, R>` via `Channel::from_cap()`
+/// to get RAII lifetime management.
+#[derive(Debug)]
+pub struct ChannelCap<S, R> {
+    handle: usize,
+    _phantom: core::marker::PhantomData<fn(S) -> R>,
+}
+
+impl<S, R> ChannelCap<S, R> {
+    /// Wrap a raw handle into a typed capability.
+    pub fn new(handle: usize) -> Self {
+        Self { handle, _phantom: core::marker::PhantomData }
+    }
+
+    /// Get the raw handle value.
+    pub fn raw(&self) -> usize {
+        self.handle
+    }
+}
+
+impl<S, R> Serialize for ChannelCap<S, R> {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
+        let idx = w.push_cap(self.handle)?;
+        w.write_u8(idx)
+    }
+}
+
+impl<'a, S, R> Deserialize<'a> for ChannelCap<S, R> {
+    fn deserialize(r: &mut Reader<'a>) -> Result<Self, WireError> {
+        let idx = r.read_u8()?;
+        let handle = r.read_cap(idx)?;
+        Ok(ChannelCap::new(handle))
+    }
+}
+
+/// An untyped channel capability handle for wire serialization.
+///
+/// Use this when the protocol spoken by the channel is not known at compile
+/// time. Prefer [`ChannelCap<S, R>`] when the protocol is known.
+///
+/// Like `ChannelCap`, this is move-only.
+#[derive(Debug)]
+pub struct RawChannelCap {
+    handle: usize,
+}
+
+impl RawChannelCap {
+    /// Wrap a raw handle into an untyped capability.
+    pub fn new(handle: usize) -> Self {
+        Self { handle }
+    }
+
+    /// Get the raw handle value.
+    pub fn raw(&self) -> usize {
+        self.handle
+    }
+}
+
+impl Serialize for RawChannelCap {
+    fn serialize(&self, w: &mut Writer<'_>) -> Result<(), WireError> {
+        let idx = w.push_cap(self.handle)?;
+        w.write_u8(idx)
+    }
+}
+
+impl<'a> Deserialize<'a> for RawChannelCap {
+    fn deserialize(r: &mut Reader<'a>) -> Result<Self, WireError> {
+        let idx = r.read_u8()?;
+        let handle = r.read_cap(idx)?;
+        Ok(RawChannelCap::new(handle))
+    }
+}
+
 // Compile-time assertions: these constants must stay in sync with the kernel
 // and all Message struct definitions (kernel/ipc, lib/rvos, vendor/rust std).
 const _: () = assert!(MAX_MSG_SIZE == 1024);
@@ -517,9 +692,11 @@ pub trait Transport: Sized {
     fn from_cap(&self, cap: usize) -> Self;
 }
 
-/// Send a request and receive a response (no capabilities).
+/// Send a request and receive a response.
 ///
-/// Serializes `req`, sends it, waits for a response, and deserializes it.
+/// Serializes `req` (including any embedded [`ChannelCap`] fields) into the
+/// data buffer and caps sideband, sends both, waits for a response, and
+/// deserializes it (resolving any caps from the received sideband).
 pub fn rpc_call<'buf, T, Req, Resp>(
     transport: &mut T,
     req: &Req,
@@ -531,18 +708,29 @@ where
     Resp: Deserialize<'buf>,
 {
     let mut send_buf = [0u8; MAX_MSG_SIZE];
-    let n = to_bytes(req, &mut send_buf).map_err(RpcError::Wire)?;
-    transport.send(&send_buf[..n], &[])?;
+    let (data_len, send_caps, send_cap_count) = {
+        let mut w = Writer::new(&mut send_buf);
+        req.serialize(&mut w).map_err(RpcError::Wire)?;
+        let mut caps = [0usize; MAX_CAPS];
+        let cc = w.copy_caps_to(&mut caps);
+        (w.position(), caps, cc)
+    };
+    transport.send(&send_buf[..data_len], &send_caps[..send_cap_count])?;
 
-    let mut caps = [0usize; MAX_CAPS];
-    let (len, _cap_count) = transport.recv(buf, &mut caps)?;
-    let resp = from_bytes::<Resp>(&buf[..len]).map_err(RpcError::Wire)?;
+    let mut recv_caps = [0usize; MAX_CAPS];
+    let (len, recv_cap_count) = transport.recv(buf, &mut recv_caps)?;
+    let resp = from_bytes_with_caps::<Resp>(&buf[..len], &recv_caps[..recv_cap_count])
+        .map_err(RpcError::Wire)?;
     Ok(resp)
 }
 
-/// Send a request with a capability and receive a response with a capability.
+/// Send a request with an explicit capability and receive a response with a
+/// capability.
 ///
-/// Like `rpc_call` but passes `cap` on send and returns the first received cap.
+/// Like [`rpc_call`] but appends `cap` to the send sideband (after any caps
+/// embedded in `req`) and returns the first received cap alongside the
+/// response. Kept for backward compatibility — prefer embedding
+/// [`ChannelCap`] fields in the request/response types instead.
 pub fn rpc_call_with_cap<'buf, T, Req, Resp>(
     transport: &mut T,
     req: &Req,
@@ -555,20 +743,33 @@ where
     Resp: Deserialize<'buf>,
 {
     let mut send_buf = [0u8; MAX_MSG_SIZE];
-    let n = to_bytes(req, &mut send_buf).map_err(RpcError::Wire)?;
-    let send_caps = if cap == NO_CAP { &[][..] } else { &[cap][..] };
-    transport.send(&send_buf[..n], send_caps)?;
+    let (data_len, mut send_caps, mut send_cap_count) = {
+        let mut w = Writer::new(&mut send_buf);
+        req.serialize(&mut w).map_err(RpcError::Wire)?;
+        let mut caps = [0usize; MAX_CAPS];
+        let cc = w.copy_caps_to(&mut caps);
+        (w.position(), caps, cc)
+    };
+    // Append the explicit cap if provided.
+    if cap != NO_CAP && send_cap_count < MAX_CAPS {
+        send_caps[send_cap_count] = cap;
+        send_cap_count += 1;
+    }
+    transport.send(&send_buf[..data_len], &send_caps[..send_cap_count])?;
 
-    let mut caps = [0usize; MAX_CAPS];
-    let (len, cap_count) = transport.recv(buf, &mut caps)?;
-    let recv_cap = if cap_count > 0 { caps[0] } else { NO_CAP };
-    let resp = from_bytes::<Resp>(&buf[..len]).map_err(RpcError::Wire)?;
+    let mut recv_caps = [0usize; MAX_CAPS];
+    let (len, recv_cap_count) = transport.recv(buf, &mut recv_caps)?;
+    let recv_cap = if recv_cap_count > 0 { recv_caps[recv_cap_count - 1] } else { NO_CAP };
+    let resp = from_bytes_with_caps::<Resp>(&buf[..len], &recv_caps[..recv_cap_count])
+        .map_err(RpcError::Wire)?;
     Ok((resp, recv_cap))
 }
 
 /// Receive and deserialize a request (server side).
 ///
-/// Returns `(request, cap)` where cap is the first capability from the message.
+/// Returns `(request, cap)` where cap is the last capability from the
+/// message (after any caps consumed by [`ChannelCap`] fields in the
+/// request). Returns `NO_CAP` if no extra caps remain.
 pub fn rpc_recv<'buf, T, Req>(
     transport: &mut T,
     buf: &'buf mut [u8],
@@ -579,12 +780,16 @@ where
 {
     let mut caps = [0usize; MAX_CAPS];
     let (len, cap_count) = transport.recv(buf, &mut caps)?;
-    let cap = if cap_count > 0 { caps[0] } else { NO_CAP };
-    let req = from_bytes::<Req>(&buf[..len]).map_err(RpcError::Wire)?;
+    let cap = if cap_count > 0 { caps[cap_count - 1] } else { NO_CAP };
+    let req = from_bytes_with_caps::<Req>(&buf[..len], &caps[..cap_count])
+        .map_err(RpcError::Wire)?;
     Ok((req, cap))
 }
 
 /// Serialize and send a response (server side).
+///
+/// Any [`ChannelCap`] fields in `resp` are automatically included in the
+/// sideband. If `cap` is not `NO_CAP`, it is appended after them.
 pub fn rpc_reply<T, Resp>(
     transport: &mut T,
     resp: &Resp,
@@ -595,9 +800,18 @@ where
     Resp: Serialize,
 {
     let mut send_buf = [0u8; MAX_MSG_SIZE];
-    let n = to_bytes(resp, &mut send_buf).map_err(RpcError::Wire)?;
-    let send_caps = if cap == NO_CAP { &[][..] } else { &[cap][..] };
-    transport.send(&send_buf[..n], send_caps)
+    let (data_len, mut send_caps, mut send_cap_count) = {
+        let mut w = Writer::new(&mut send_buf);
+        resp.serialize(&mut w).map_err(RpcError::Wire)?;
+        let mut caps = [0usize; MAX_CAPS];
+        let cc = w.copy_caps_to(&mut caps);
+        (w.position(), caps, cc)
+    };
+    if cap != NO_CAP && send_cap_count < MAX_CAPS {
+        send_caps[send_cap_count] = cap;
+        send_cap_count += 1;
+    }
+    transport.send(&send_buf[..data_len], &send_caps[..send_cap_count])
 }
 
 // ---------------------------------------------------------------------------
@@ -632,8 +846,177 @@ where
 ///     }
 /// }
 /// ```
+///
+/// # Owned struct form (for types containing move-only fields like `ChannelCap`)
+/// ```ignore
+/// define_message! {
+///     pub owned struct OpenResp {
+///         status: u32,
+///         file: ChannelCap<FileReq, FileResp>,
+///     }
+/// }
+/// ```
+///
+/// The `owned` keyword suppresses `Copy`, `Clone`, `PartialEq`, and `Eq`
+/// derives — only `Debug` is derived.
 #[macro_export]
 macro_rules! define_message {
+    // ── Owned struct form (no lifetime) ────────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis owned struct $name:ident {
+            $($field:ident : $fty:ty),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug)]
+        $vis struct $name {
+            $(pub $field: $fty),*
+        }
+
+        impl $crate::Serialize for $name {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                $(self.$field.serialize(w)?;)*
+                Ok(())
+            }
+        }
+
+        impl<'__de> $crate::Deserialize<'__de> for $name {
+            fn deserialize(r: &mut $crate::Reader<'__de>) -> Result<Self, $crate::WireError> {
+                Ok(Self {
+                    $($field: <$fty as $crate::Deserialize<'__de>>::deserialize(r)?),*
+                })
+            }
+        }
+    };
+
+    // ── Owned enum form (no lifetime) ──────────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis owned enum $name:ident {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident ($tag:expr) { $($field:ident : $fty:ty),* $(,)? }
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug)]
+        $vis enum $name {
+            $(
+                $(#[$vmeta])*
+                $variant { $($field: $fty),* }
+            ),*
+        }
+
+        impl $crate::Serialize for $name {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                match self {
+                    $(
+                        $name::$variant { $($field),* } => {
+                            w.write_u8($tag)?;
+                            $($field.serialize(w)?;)*
+                            Ok(())
+                        }
+                    ),*
+                }
+            }
+        }
+
+        impl<'__de> $crate::Deserialize<'__de> for $name {
+            fn deserialize(r: &mut $crate::Reader<'__de>) -> Result<Self, $crate::WireError> {
+                let tag = r.read_u8()?;
+                match tag {
+                    $(
+                        $tag => {
+                            $(let $field = <$fty as $crate::Deserialize<'__de>>::deserialize(r)?;)*
+                            Ok($name::$variant { $($field),* })
+                        }
+                    ),*
+                    _ => Err($crate::WireError::InvalidTag(tag)),
+                }
+            }
+        }
+    };
+
+    // ── Owned struct form (with lifetime) ──────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis owned struct $name:ident <$lt:lifetime> {
+            $($field:ident : $fty:ty),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug)]
+        $vis struct $name<$lt> {
+            $(pub $field: $fty),*
+        }
+
+        impl<$lt> $crate::Serialize for $name<$lt> {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                $(self.$field.serialize(w)?;)*
+                Ok(())
+            }
+        }
+
+        impl<$lt> $crate::Deserialize<$lt> for $name<$lt> {
+            fn deserialize(r: &mut $crate::Reader<$lt>) -> Result<Self, $crate::WireError> {
+                Ok(Self {
+                    $($field: <$fty as $crate::Deserialize<$lt>>::deserialize(r)?),*
+                })
+            }
+        }
+    };
+
+    // ── Owned enum form (with lifetime) ────────────────────────────
+    (
+        $(#[$meta:meta])*
+        $vis:vis owned enum $name:ident <$lt:lifetime> {
+            $(
+                $(#[$vmeta:meta])*
+                $variant:ident ($tag:expr) { $($field:ident : $fty:ty),* $(,)? }
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug)]
+        $vis enum $name<$lt> {
+            $(
+                $(#[$vmeta])*
+                $variant { $($field: $fty),* }
+            ),*
+        }
+
+        impl<$lt> $crate::Serialize for $name<$lt> {
+            fn serialize(&self, w: &mut $crate::Writer<'_>) -> Result<(), $crate::WireError> {
+                match self {
+                    $(
+                        $name::$variant { $($field),* } => {
+                            w.write_u8($tag)?;
+                            $($field.serialize(w)?;)*
+                            Ok(())
+                        }
+                    ),*
+                }
+            }
+        }
+
+        impl<$lt> $crate::Deserialize<$lt> for $name<$lt> {
+            fn deserialize(r: &mut $crate::Reader<$lt>) -> Result<Self, $crate::WireError> {
+                let tag = r.read_u8()?;
+                match tag {
+                    $(
+                        $tag => {
+                            $(let $field = <$fty as $crate::Deserialize<$lt>>::deserialize(r)?;)*
+                            Ok($name::$variant { $($field),* })
+                        }
+                    ),*
+                    _ => Err($crate::WireError::InvalidTag(tag)),
+                }
+            }
+        }
+    };
+
     // ── Struct form (no lifetime) ────────────────────────────────
     (
         $(#[$meta:meta])*
@@ -2339,5 +2722,235 @@ mod tests {
         let (result, shm) = client.create(4096).unwrap();
         assert_eq!(result.ok, 1);
         assert_eq!(shm, ShmHandle(77));
+    }
+
+    // 36. ChannelCap round-trip via to_bytes_with_caps / from_bytes_with_caps
+    #[test]
+    fn test_channel_cap_round_trip() {
+        define_message! {
+            pub owned struct OpenResp {
+                status: u32,
+                file: ChannelCap<u8, u16>,
+            }
+        }
+
+        let resp = OpenResp {
+            status: 1,
+            file: ChannelCap::new(42),
+        };
+
+        let mut buf = [0u8; 64];
+        let mut caps = [0usize; MAX_CAPS];
+        let (data_len, cap_count) = to_bytes_with_caps(&resp, &mut buf, &mut caps).unwrap();
+
+        // Data: 4 bytes (u32 status) + 1 byte (cap index 0) = 5
+        assert_eq!(data_len, 5);
+        assert_eq!(cap_count, 1);
+        assert_eq!(caps[0], 42);
+
+        let resp2: OpenResp = from_bytes_with_caps(&buf[..data_len], &caps[..cap_count]).unwrap();
+        assert_eq!(resp2.status, 1);
+        assert_eq!(resp2.file.raw(), 42);
+    }
+
+    // 37. RawChannelCap round-trip
+    #[test]
+    fn test_raw_channel_cap_round_trip() {
+        let cap = RawChannelCap::new(99);
+
+        let mut buf = [0u8; 16];
+        let mut caps = [0usize; MAX_CAPS];
+        let (data_len, cap_count) = to_bytes_with_caps(&cap, &mut buf, &mut caps).unwrap();
+
+        assert_eq!(data_len, 1); // just the u8 index
+        assert_eq!(cap_count, 1);
+        assert_eq!(caps[0], 99);
+
+        let cap2: RawChannelCap = from_bytes_with_caps(&buf[..data_len], &caps[..cap_count]).unwrap();
+        assert_eq!(cap2.raw(), 99);
+    }
+
+    // 38. Multiple ChannelCaps in one message
+    #[test]
+    fn test_multiple_channel_caps() {
+        define_message! {
+            pub owned struct TwoCaps {
+                a: ChannelCap<u8, u8>,
+                b: ChannelCap<u32, u32>,
+            }
+        }
+
+        let val = TwoCaps {
+            a: ChannelCap::new(10),
+            b: ChannelCap::new(20),
+        };
+
+        let mut buf = [0u8; 64];
+        let mut caps = [0usize; MAX_CAPS];
+        let (data_len, cap_count) = to_bytes_with_caps(&val, &mut buf, &mut caps).unwrap();
+
+        assert_eq!(data_len, 2); // two u8 cap indices
+        assert_eq!(cap_count, 2);
+        assert_eq!(caps[0], 10);
+        assert_eq!(caps[1], 20);
+
+        let val2: TwoCaps = from_bytes_with_caps(&buf[..data_len], &caps[..cap_count]).unwrap();
+        assert_eq!(val2.a.raw(), 10);
+        assert_eq!(val2.b.raw(), 20);
+    }
+
+    // 39. CapOverflow on serialize — too many caps
+    #[test]
+    fn test_cap_overflow_serialize() {
+        define_message! {
+            pub owned struct FiveCaps {
+                a: RawChannelCap,
+                b: RawChannelCap,
+                c: RawChannelCap,
+                d: RawChannelCap,
+                e: RawChannelCap,
+            }
+        }
+
+        let val = FiveCaps {
+            a: RawChannelCap::new(1),
+            b: RawChannelCap::new(2),
+            c: RawChannelCap::new(3),
+            d: RawChannelCap::new(4),
+            e: RawChannelCap::new(5), // 5th cap exceeds MAX_CAPS=4
+        };
+
+        let mut buf = [0u8; 64];
+        let mut caps = [0usize; MAX_CAPS];
+        let result = to_bytes_with_caps(&val, &mut buf, &mut caps);
+        assert_eq!(result, Err(WireError::CapOverflow));
+    }
+
+    // 40. CapOverflow on deserialize — not enough caps provided
+    #[test]
+    fn test_cap_overflow_deserialize() {
+        define_message! {
+            pub owned struct HasCap {
+                status: u32,
+                cap: RawChannelCap,
+            }
+        }
+
+        // Serialize with a cap present
+        let val = HasCap { status: 1, cap: RawChannelCap::new(42) };
+        let mut buf = [0u8; 16];
+        let mut caps = [0usize; MAX_CAPS];
+        let (data_len, _) = to_bytes_with_caps(&val, &mut buf, &mut caps).unwrap();
+
+        // Deserialize with no caps — should fail with CapOverflow
+        let result: Result<HasCap, _> = from_bytes_with_caps(&buf[..data_len], &[]);
+        assert!(matches!(result, Err(WireError::CapOverflow)));
+    }
+
+    // 41. ChannelCap in owned enum
+    #[test]
+    fn test_channel_cap_in_owned_enum() {
+        define_message! {
+            pub owned enum ConnResp {
+                Ok(0) { chan: ChannelCap<u8, u16> },
+                Err(1) { code: u32 },
+            }
+        }
+
+        // Test Ok variant with cap
+        let resp = ConnResp::Ok { chan: ChannelCap::new(77) };
+        let mut buf = [0u8; 64];
+        let mut caps = [0usize; MAX_CAPS];
+        let (data_len, cap_count) = to_bytes_with_caps(&resp, &mut buf, &mut caps).unwrap();
+
+        assert_eq!(cap_count, 1);
+        assert_eq!(caps[0], 77);
+
+        let resp2: ConnResp = from_bytes_with_caps(&buf[..data_len], &caps[..cap_count]).unwrap();
+        match resp2 {
+            ConnResp::Ok { chan } => assert_eq!(chan.raw(), 77),
+            _ => panic!("wrong variant"),
+        }
+
+        // Test Err variant (no caps)
+        let resp_err = ConnResp::Err { code: 404 };
+        let (data_len, cap_count) = to_bytes_with_caps(&resp_err, &mut buf, &mut caps).unwrap();
+        assert_eq!(cap_count, 0);
+
+        let resp3: ConnResp = from_bytes_with_caps(&buf[..data_len], &caps[..cap_count]).unwrap();
+        match resp3 {
+            ConnResp::Err { code } => assert_eq!(code, 404),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // 42. Writer push_cap / copy_caps_to
+    #[test]
+    fn test_writer_cap_sideband() {
+        let mut buf = [0u8; 16];
+        let mut w = Writer::new(&mut buf);
+
+        assert_eq!(w.cap_count(), 0);
+
+        let idx0 = w.push_cap(100).unwrap();
+        assert_eq!(idx0, 0);
+        assert_eq!(w.cap_count(), 1);
+
+        let idx1 = w.push_cap(200).unwrap();
+        assert_eq!(idx1, 1);
+        assert_eq!(w.cap_count(), 2);
+
+        let mut out = [0usize; MAX_CAPS];
+        let count = w.copy_caps_to(&mut out);
+        assert_eq!(count, 2);
+        assert_eq!(out[0], 100);
+        assert_eq!(out[1], 200);
+    }
+
+    // 43. Reader read_cap out of bounds
+    #[test]
+    fn test_reader_read_cap_oob() {
+        let buf = [0u8; 4];
+        let caps = [42usize];
+        let mut r = Reader::with_caps(&buf, &caps);
+
+        // Index 0 works
+        assert_eq!(r.read_cap(0).unwrap(), 42);
+        // Index 1 — no cap there
+        assert_eq!(r.read_cap(1), Err(WireError::CapOverflow));
+        // Index 255 — way out of bounds
+        assert_eq!(r.read_cap(255), Err(WireError::CapOverflow));
+    }
+
+    // 44. Mixed data + cap fields
+    #[test]
+    fn test_mixed_data_and_caps() {
+        define_message! {
+            pub owned struct FileOpen {
+                flags: u32,
+                handle: ChannelCap<u8, u16>,
+                size: u64,
+            }
+        }
+
+        let val = FileOpen {
+            flags: 0xFF,
+            handle: ChannelCap::new(55),
+            size: 1024,
+        };
+
+        let mut buf = [0u8; 64];
+        let mut caps = [0usize; MAX_CAPS];
+        let (data_len, cap_count) = to_bytes_with_caps(&val, &mut buf, &mut caps).unwrap();
+
+        // 4 (u32) + 1 (cap idx) + 8 (u64) = 13
+        assert_eq!(data_len, 13);
+        assert_eq!(cap_count, 1);
+        assert_eq!(caps[0], 55);
+
+        let val2: FileOpen = from_bytes_with_caps(&buf[..data_len], &caps[..cap_count]).unwrap();
+        assert_eq!(val2.flags, 0xFF);
+        assert_eq!(val2.handle.raw(), 55);
+        assert_eq!(val2.size, 1024);
     }
 }
