@@ -2,6 +2,9 @@ extern crate rvos_rt;
 
 use rvos::raw::{self};
 use rvos::Message;
+use rvos::Channel;
+use rvos::rvos_wire::Never;
+use rvos_proto::process::ExitNotification;
 
 // --- Timing helpers ---
 
@@ -102,12 +105,32 @@ fn print_row(name: &str, iters: u32, total_us: u64, per_ns: u64) {
     println!();
 }
 
+/// Print a snake_case version of a benchmark name: lowercase, spaces/parens/+ to underscores.
+fn print_bench_key(name: &str) {
+    for &b in name.as_bytes() {
+        match b {
+            b' ' | b'(' | b')' | b'+' => print!("_"),
+            b'A'..=b'Z' => {
+                let lower = (b - b'A' + b'a') as char;
+                print!("{}", lower);
+            }
+            _ => print!("{}", b as char),
+        }
+    }
+}
+
 /// Run a named benchmark, printing name before and results after.
 fn run_bench(name: &str, f: fn() -> (u64, u32)) {
     print!("[bench] {}...", name);
     let (ticks, iters) = f();
     println!(" done");
-    print_row(name, iters, ticks_to_us(ticks), ticks_to_ns(ticks) / iters as u64);
+    let per_ns = ticks_to_ns(ticks) / iters as u64;
+    print_row(name, iters, ticks_to_us(ticks), per_ns);
+    print!("@BENCH ");
+    print_bench_key(name);
+    print!("=");
+    print_u64(per_ns);
+    println!();
 }
 
 // --- Benchmarks ---
@@ -280,10 +303,10 @@ fn bench_process_spawn() -> (u64, u32) {
     let start = rdtime();
     for _ in 0..iters {
         if let Ok(proc_chan) = rvos::spawn_process("/bin/hello-std") {
-            let proc_handle = proc_chan.into_raw_handle();
-            let mut exit_msg = Message::new();
-            raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
-            raw::sys_chan_close(proc_handle);
+            let mut proc_ch = Channel::<Never, ExitNotification>::from_raw_handle(
+                proc_chan.into_raw_handle(),
+            );
+            let _ = proc_ch.next_message();
         }
     }
     (rdtime() - start, iters)
@@ -309,12 +332,16 @@ fn main() {
     println!(" done");
     let total_bytes = iters as u64 * 1000;
     let total_us = ticks_to_us(ticks);
-    print_row("ipc throughput 1KB", iters, total_us, ticks_to_ns(ticks) / iters as u64);
+    let throughput_per_ns = ticks_to_ns(ticks) / iters as u64;
+    print_row("ipc throughput 1KB", iters, total_us, throughput_per_ns);
     if let Some(mb_per_sec) = total_bytes.checked_div(total_us) {
         print!("    => ");
         print_u64(mb_per_sec);
         println!(" MB/s");
     }
+    print!("@BENCH ipc_throughput_1KB=");
+    print_u64(throughput_per_ns);
+    println!();
 
     run_bench("mmap+munmap 4K", bench_mmap_munmap);
     run_bench("file create+write 64B", bench_file_create_write);

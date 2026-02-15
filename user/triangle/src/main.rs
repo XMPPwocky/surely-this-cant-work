@@ -3,7 +3,7 @@ extern crate rvos_rt;
 use rvos::raw;
 use rvos::UserTransport;
 use rvos::Channel;
-use rvos::rvos_wire;
+use rvos::rvos_wire::Never;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
     WindowReply, WindowEvent, WindowClient,
@@ -105,37 +105,38 @@ fn main() {
     println!("[triangle] frame presented, entering event loop");
 
     // 9. Event loop: wait for ESC or CloseRequested on event channel
+    let mut events = Channel::<Never, WindowEvent>::from_raw_handle(event_chan);
+
     loop {
-        let mut msg = rvos::Message::new();
-        let ret = raw::sys_chan_recv(event_chan, &mut msg);
-        if ret == 2 {
-            // Channel closed
-            break;
-        }
-        if ret == 0 && msg.len > 0 {
-            match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
-                Ok(WindowEvent::KeyDown { code }) => {
-                    if code == 1 {
-                        // ESC pressed
-                        println!("[triangle] ESC pressed, exiting");
-                        break;
-                    }
+        // Non-blocking drain
+        let mut got_event = false;
+        let mut should_exit = false;
+        while let Some(event) = events.try_next_message() {
+            got_event = true;
+            match event {
+                WindowEvent::KeyDown { code: 1 } => {
+                    println!("[triangle] ESC pressed, exiting");
+                    should_exit = true;
+                    break;
                 }
-                Ok(WindowEvent::CloseRequested {}) => {
+                WindowEvent::CloseRequested {} => {
                     println!("[triangle] close requested, exiting");
+                    should_exit = true;
                     break;
                 }
                 _ => {}
             }
-            continue;
         }
+        if should_exit { break; }
 
-        // No events — block until something arrives
-        raw::sys_chan_poll_add(event_chan);
-        raw::sys_block();
+        if !got_event {
+            // No events — block until something arrives
+            events.poll_add();
+            raw::sys_block();
+        }
     }
 
     // Close window
     let _ = win_client.close_window();
-    raw::sys_chan_close(event_chan);
+    drop(events);
 }

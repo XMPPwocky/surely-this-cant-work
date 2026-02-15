@@ -2,10 +2,12 @@ use std::io::{self, Read, Write};
 
 use rvos::raw;
 use rvos::Message;
+use rvos::Channel;
 use rvos::UserTransport;
-use rvos::rvos_wire;
+use rvos::rvos_wire::{self, Never};
 use rvos::rvos_proto;
 use rvos_proto::math::MathClient;
+use rvos_proto::process::ExitNotification;
 use rvos_proto::sysinfo::SysinfoCommand;
 
 /// Request a service from the init server via boot channel (handle 0).
@@ -233,18 +235,13 @@ fn rebuild_args(blob: &mut [u8; 512], argv0: &str, rest: &str) -> usize {
 
 /// Wait for a child process to exit via its process handle channel, print exit code.
 fn wait_for_exit(proc_handle: usize) {
-    let mut exit_msg = Message::new();
-    raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
-
-    let exit_code = match rvos_wire::from_bytes::<rvos_proto::process::ExitNotification>(
-        &exit_msg.data[..exit_msg.len],
-    ) {
-        Ok(notif) => notif.exit_code,
-        Err(_) => -1,
+    let mut proc_ch = Channel::<Never, ExitNotification>::from_raw_handle(proc_handle);
+    let exit_code = match proc_ch.next_message() {
+        Some(notif) => notif.exit_code,
+        None => -1,
     };
     println!("Process exited with code {}", exit_code);
-
-    raw::sys_chan_close(proc_handle);
+    // Channel dropped here → handle closed automatically
 }
 
 fn cmd_run(args: &str) {

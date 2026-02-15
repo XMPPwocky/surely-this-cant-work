@@ -1,9 +1,8 @@
 extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
-use rvos::Message;
-use rvos::Channel;
-use rvos::rvos_wire;
+use rvos::{Message, Channel};
+use rvos::rvos_wire::{self, Never};
 use rvos_proto::gpu::{GpuRequest, GpuResponse};
 use rvos_proto::kbd::KbdEvent;
 use rvos_proto::mouse::MouseEvent;
@@ -83,8 +82,8 @@ static CURSOR_BITMAP: [u16; CURSOR_H] = [
 
 struct Window {
     id: u32,
-    req_channel: usize,
-    event_channel: usize,
+    req_channel: Channel<WindowReply, WindowRequest>,
+    event_channel: Channel<WindowEvent, Never>,
     shm_handle: usize,
     fb_ptr: *mut u32,
     width: u32,
@@ -99,9 +98,6 @@ struct Window {
 }
 
 struct Server {
-    gpu_handle: usize,
-    kbd_handle: usize,
-    mouse_handle: usize,
     display_fb: *mut u32,
     display_width: u32,
     display_height: u32,
@@ -119,26 +115,18 @@ struct Server {
 }
 
 /// Send a WindowEvent on the event channel (non-blocking, best-effort).
-fn send_event(handle: usize, event: &WindowEvent) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(event, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send(handle, &msg);
+fn send_event(ch: &Channel<WindowEvent, Never>, event: &WindowEvent) {
+    let _ = ch.try_send(event);
 }
 
 /// Send a WindowEvent on the event channel (blocking).
-fn send_event_blocking(handle: usize, event: &WindowEvent) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(event, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send_blocking(handle, &msg);
+fn send_event_blocking(ch: &Channel<WindowEvent, Never>, event: &WindowEvent) {
+    let _ = ch.send(event);
 }
 
 /// Send a WindowReply on the request channel (blocking).
-///
-/// Uses Channel::send() which handles embedded cap serialization automatically.
-fn send_reply(handle: usize, reply: &WindowReply) {
-    let ch = Channel::<WindowReply, WindowRequest>::from_raw_handle(handle);
+fn send_reply(ch: &Channel<WindowReply, WindowRequest>, reply: &WindowReply) {
     let _ = ch.send(reply);
-    ch.into_raw_handle(); // don't close — handle is still in use
 }
 
 fn main() {
@@ -152,6 +140,7 @@ fn main() {
         .expect("failed to connect to mouse service")
         .into_raw_handle();
 
+    // GPU init: raw recv for SHM cap extraction (can't go through typed channel)
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&GpuRequest::GetDisplayInfo {}, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_blocking(gpu_handle, &msg);
@@ -171,10 +160,12 @@ fn main() {
         Err(_) => panic!("[window-srv] mmap failed for display SHM"),
     };
 
+    // Now wrap device channels as typed (GPU init is done, subsequent calls are typed)
+    let mut gpu = Channel::<GpuRequest, GpuResponse>::from_raw_handle(gpu_handle);
+    let mut kbd = Channel::<Never, KbdEvent>::from_raw_handle(kbd_handle);
+    let mut mouse = Channel::<Never, MouseEvent>::from_raw_handle(mouse_handle);
+
     let mut server = Server {
-        gpu_handle,
-        kbd_handle,
-        mouse_handle,
         display_fb,
         display_width: width,
         display_height: height,
@@ -200,7 +191,7 @@ fn main() {
     loop {
         let mut did_work = false;
 
-        // 1. Drain control channel
+        // 1. Drain control channel (raw — NewConnection cap in sideband)
         loop {
             let mut cmsg = Message::new();
             let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut cmsg);
@@ -212,42 +203,37 @@ fn main() {
             }
         }
 
-        // 2. Drain kbd events
-        loop {
-            let mut kmsg = Message::new();
-            let ret = raw::sys_chan_recv(server.kbd_handle, &mut kmsg);
-            if ret != 0 { break; }
+        // 2. Drain kbd events (typed)
+        while let Some(event) = kbd.try_next_message() {
             did_work = true;
-            handle_kbd_event(&mut server, &kmsg);
+            handle_kbd_event(&mut server, event);
         }
 
-        // 3. Drain mouse events
-        loop {
-            let mut mmsg = Message::new();
-            let ret = raw::sys_chan_recv(server.mouse_handle, &mut mmsg);
-            if ret != 0 { break; }
+        // 3. Drain mouse events (typed)
+        while let Some(event) = mouse.try_next_message() {
             did_work = true;
-            handle_mouse_event(&mut server, &mmsg);
+            handle_mouse_event(&mut server, event);
         }
 
-        // 4. Drain window request channel messages
+        // 4. Drain window request channel messages (typed)
         for i in 0..MAX_WINDOWS {
-            let ch = match server.windows[i] {
-                Some(ref win) if win.active => win.req_channel,
-                _ => continue,
-            };
+            if !matches!(server.windows[i], Some(ref w) if w.active) {
+                continue;
+            }
             loop {
-                let mut wmsg = Message::new();
-                let ret = raw::sys_chan_recv(ch, &mut wmsg);
-                if ret == 2 {
-                    // ChannelClosed — client disconnected
-                    did_work = true;
-                    destroy_window(&mut server, i);
-                    break;
+                let win = server.windows[i].as_mut().unwrap();
+                match win.req_channel.try_recv() {
+                    Ok(req) => {
+                        did_work = true;
+                        handle_window_msg(&mut server, i, req);
+                    }
+                    Err(rvos::RecvError::Closed) => {
+                        did_work = true;
+                        destroy_window(&mut server, i);
+                        break;
+                    }
+                    Err(_) => break,
                 }
-                if ret != 0 { break; }
-                did_work = true;
-                handle_window_msg(&mut server, i, &wmsg);
             }
         }
 
@@ -262,7 +248,7 @@ fn main() {
             let t0 = rdtime();
             composite(&mut server);
             let t1 = rdtime();
-            flush_display(&server);
+            flush_display(&mut gpu, server.display_width, server.display_height);
             let t2 = rdtime();
 
             fps_frame_count += 1;
@@ -289,12 +275,12 @@ fn main() {
 
         if !did_work {
             raw::sys_chan_poll_add(CONTROL_HANDLE);
-            raw::sys_chan_poll_add(server.kbd_handle);
-            raw::sys_chan_poll_add(server.mouse_handle);
+            kbd.poll_add();
+            mouse.poll_add();
             for i in 0..MAX_WINDOWS {
                 if let Some(ref win) = server.windows[i] {
                     if win.active {
-                        raw::sys_chan_poll_add(win.req_channel);
+                        win.req_channel.poll_add();
                     }
                 }
             }
@@ -360,8 +346,8 @@ fn handle_new_client(server: &mut Server, per_client_handle: usize) {
 
     server.windows[slot] = Some(Window {
         id: win_id,
-        req_channel: our_req_ep,
-        event_channel: our_evt_ep,
+        req_channel: Channel::<WindowReply, WindowRequest>::from_raw_handle(our_req_ep),
+        event_channel: Channel::<WindowEvent, Never>::from_raw_handle(our_evt_ep),
         shm_handle,
         fb_ptr,
         width,
@@ -398,14 +384,7 @@ const KEY_TAB: u16 = 15;
 const KEY_LEFTALT: u16 = 56;
 const KEY_RIGHTALT: u16 = 100;
 
-fn handle_kbd_event(server: &mut Server, msg: &Message) {
-    if msg.len < 1 { return; }
-
-    let event: KbdEvent = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
+fn handle_kbd_event(server: &mut Server, event: KbdEvent) {
     // Track Alt key state
     match event {
         KbdEvent::KeyDown { code } if code == KEY_LEFTALT || code == KEY_RIGHTALT => {
@@ -437,7 +416,7 @@ fn handle_kbd_event(server: &mut Server, msg: &Message) {
             KbdEvent::KeyDown { code } => WindowEvent::KeyDown { code },
             KbdEvent::KeyUp { code } => WindowEvent::KeyUp { code },
         };
-        send_event_blocking(win.event_channel, &win_event);
+        send_event_blocking(&win.event_channel, &win_event);
     }
 }
 
@@ -458,14 +437,7 @@ fn cycle_focus(server: &mut Server) {
     // No other active window — stay on current
 }
 
-fn handle_mouse_event(server: &mut Server, msg: &Message) {
-    if msg.len < 1 { return; }
-
-    let event: MouseEvent = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
+fn handle_mouse_event(server: &mut Server, event: MouseEvent) {
     match event {
         MouseEvent::Move { abs_x, abs_y } => {
             let new_x = (abs_x as u32 * server.display_width / (TABLET_MAX + 1)) as i32;
@@ -540,7 +512,7 @@ fn handle_mouse_event(server: &mut Server, msg: &Message) {
 fn send_close_requested(server: &Server, idx: usize) {
     if let Some(ref win) = server.windows[idx] {
         if !win.active { return; }
-        send_event(win.event_channel, &WindowEvent::CloseRequested {});
+        send_event(&win.event_channel, &WindowEvent::CloseRequested {});
     }
 }
 
@@ -580,7 +552,7 @@ fn forward_mouse_move(server: &Server, x: i32, y: i32) {
         let y_offset = if win.fullscreen { 0 } else { TITLE_BAR_HEIGHT };
         let local_x = (x - win.x).max(0).min(win.width as i32 - 1).max(0) as u32;
         let local_y = (y - win.y - y_offset).max(0).min(win.height as i32 - 1).max(0) as u32;
-        send_event(win.event_channel, &WindowEvent::MouseMove { x: local_x, y: local_y });
+        send_event(&win.event_channel, &WindowEvent::MouseMove { x: local_x, y: local_y });
     }
 }
 
@@ -596,7 +568,7 @@ fn forward_mouse_button(server: &Server, down: bool, button: u8) {
         } else {
             WindowEvent::MouseButtonUp { x: local_x, y: local_y, button }
         };
-        send_event(win.event_channel, &ev);
+        send_event(&win.event_channel, &ev);
     }
 }
 
@@ -613,8 +585,7 @@ fn destroy_window(server: &mut Server, slot: usize) {
         Some(w) => w,
         None => return,
     };
-    raw::sys_chan_close(win.req_channel);
-    raw::sys_chan_close(win.event_channel);
+    // req_channel and event_channel are closed automatically when win is dropped
     let fb = win.fb_ptr as usize;
     if fb != 0 {
         let fb_size = (win.stride as usize) * (win.height as usize) * 4 * 2;
@@ -634,14 +605,7 @@ fn destroy_window(server: &mut Server, slot: usize) {
     mark_any_dirty(server);
 }
 
-fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
-    if msg.len == 0 { return; }
-
-    let req: WindowRequest = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
+fn handle_window_msg(server: &mut Server, slot: usize, req: WindowRequest) {
     let win = match server.windows[slot].as_mut() {
         Some(w) => w,
         None => return,
@@ -657,28 +621,24 @@ fn handle_window_msg(server: &mut Server, slot: usize, msg: &Message) {
                 stride: win.stride,
                 format: 0,
             };
-            send_reply(win.req_channel, &reply);
+            send_reply(&win.req_channel, &reply);
         }
         WindowRequest::GetFramebuffer { seq } => {
-            send_reply(win.req_channel, &WindowReply::FbReply { seq, fb: rvos_wire::ShmHandle(win.shm_handle) });
+            send_reply(&win.req_channel, &WindowReply::FbReply { seq, fb: rvos_wire::ShmHandle(win.shm_handle) });
         }
         WindowRequest::SwapBuffers { seq } => {
             win.front_buffer = 1 - win.front_buffer;
             win.dirty = true;
-            send_reply(win.req_channel, &WindowReply::SwapReply { seq, ok: 0 });
+            send_reply(&win.req_channel, &WindowReply::SwapReply { seq, ok: 0 });
         }
         WindowRequest::CloseWindow {} => {
-            let req_ch = win.req_channel;
-            let evt_ch = win.event_channel;
             let shm_h = win.shm_handle;
             let fb = win.fb_ptr as usize;
             let fb_size = (win.stride as usize) * (win.height as usize) * 4 * 2;
             // Send ack before closing
-            send_reply(req_ch, &WindowReply::CloseAck {});
-            // Free the slot so it can be reused by new windows
+            send_reply(&win.req_channel, &WindowReply::CloseAck {});
+            // Free the slot — channels closed automatically when Window drops
             server.windows[slot] = None;
-            raw::sys_chan_close(req_ch);
-            raw::sys_chan_close(evt_ch);
             if fb != 0 {
                 raw::sys_munmap(fb, fb_size);
             }
@@ -903,18 +863,7 @@ fn draw_cursor(disp: &Display, cx: i32, cy: i32) {
     }
 }
 
-fn flush_display(server: &Server) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(
-        &GpuRequest::Flush {
-            x: 0, y: 0,
-            w: server.display_width,
-            h: server.display_height,
-        },
-        &mut msg.data,
-    ).unwrap_or(0);
-    raw::sys_chan_send_blocking(server.gpu_handle, &msg);
-
-    let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(server.gpu_handle, &mut resp);
+fn flush_display(gpu: &mut Channel<GpuRequest, GpuResponse>, w: u32, h: u32) {
+    let _ = gpu.send(&GpuRequest::Flush { x: 0, y: 0, w, h });
+    let _ = gpu.recv_blocking();
 }

@@ -3,7 +3,7 @@ extern crate rvos_rt;
 use rvos::raw::{self};
 use rvos::UserTransport;
 use rvos::Channel;
-use rvos::rvos_wire;
+use rvos::rvos_wire::Never;
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
     WindowReply, WindowEvent, WindowClient,
@@ -71,18 +71,16 @@ fn main() {
     need_present = false;
 
     // Main event loop — event-driven, no animation
+    let mut events = Channel::<Never, WindowEvent>::from_raw_handle(event_chan);
+
     loop {
         // Drain all pending events
         let mut got_event = false;
-        loop {
-            let mut msg = rvos::Message::new();
-            let ret = raw::sys_chan_recv(event_chan, &mut msg);
-            if ret != 0 { break; }
-            if msg.len == 0 { continue; }
+        while let Some(event) = events.try_next_message() {
             got_event = true;
 
-            match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
-                Ok(WindowEvent::MouseButtonDown { x, y, button }) => {
+            match event {
+                WindowEvent::MouseButtonDown { x, y, button } => {
                     if button == 0 {
                         // Left click: draw a dot
                         mouse_down = true;
@@ -96,14 +94,14 @@ fn main() {
                         need_present = true;
                     }
                 }
-                Ok(WindowEvent::MouseButtonUp { button, .. }) => {
+                WindowEvent::MouseButtonUp { button, .. } => {
                     if button == 0 {
                         mouse_down = false;
                         // Cycle color after each stroke
                         color_idx = color_idx.wrapping_add(1);
                     }
                 }
-                Ok(WindowEvent::MouseMove { x, y }) => {
+                WindowEvent::MouseMove { x, y } => {
                     if mouse_down {
                         // Draw while dragging
                         let color = palette(color_idx);
@@ -113,10 +111,10 @@ fn main() {
                     draw_crosshair(&fb, current_back, x, y);
                     need_present = true;
                 }
-                Ok(WindowEvent::KeyDown { code }) => {
+                WindowEvent::KeyDown { code } => {
                     println!("[winclient] key down: {}", code);
                 }
-                Ok(WindowEvent::CloseRequested {}) => {
+                WindowEvent::CloseRequested {} => {
                     println!("[winclient] close requested, exiting");
                     return;
                 }
@@ -132,7 +130,7 @@ fn main() {
 
         if !got_event {
             // Block until next event
-            raw::sys_chan_poll_add(event_chan);
+            events.poll_add();
             raw::sys_chan_poll_add(req_chan);
             raw::sys_block();
         }

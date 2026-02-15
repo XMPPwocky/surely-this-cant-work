@@ -1,9 +1,12 @@
 extern crate rvos_rt;
 
 use rvos::raw;
-use rvos::{Message, Channel, UserTransport};
-use rvos::rvos_wire;
-use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED};
+use rvos::{Channel, UserTransport};
+use rvos::rvos_wire::Never;
+use rvos_proto::fs::{
+    FileRequest, FileResponse, FileResponseMsg, FileRequestMsg,
+    FsError, TCRAW, TCCOOKED,
+};
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
     WindowReply, WindowEvent, WindowClient,
@@ -398,48 +401,28 @@ const MAX_CONSOLE_CLIENTS: usize = 8;
 const MAX_DATA_CHUNK: usize = 1021;
 
 struct FbconClient {
-    stdin_handle: usize,     // receives Read/Ioctl requests
-    stdout_handle: usize,    // receives Write requests
+    stdin: Channel<FileResponseMsg, FileRequestMsg>,
+    stdout: Channel<FileResponseMsg, FileRequestMsg>,
     has_pending_read: bool,
-    active: bool,
 }
 
-impl FbconClient {
-    const fn empty() -> Self {
-        FbconClient {
-            stdin_handle: usize::MAX,
-            stdout_handle: usize::MAX,
-            has_pending_read: false,
-            active: false,
-        }
-    }
-}
-
-/// FileOps response helpers for user-space
-fn fb_send_data(handle: usize, data: &[u8]) {
+/// FileOps response helpers for user-space (typed channel)
+fn fb_send_data(ch: &Channel<FileResponseMsg, FileRequestMsg>, data: &[u8]) {
     for chunk in data.chunks(MAX_DATA_CHUNK) {
-        let mut msg = Message::new();
-        msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk }, &mut msg.data).unwrap_or(0);
-        raw::sys_chan_send_blocking(handle, &msg);
+        let _ = ch.send(&FileResponse::Data { chunk });
     }
 }
 
-fn fb_send_sentinel(handle: usize) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk: &[] }, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send_blocking(handle, &msg);
+fn fb_send_sentinel(ch: &Channel<FileResponseMsg, FileRequestMsg>) {
+    let _ = ch.send(&FileResponse::Data { chunk: &[] });
 }
 
-fn fb_send_write_ok(handle: usize, written: u32) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&FileResponse::WriteOk { written }, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send_blocking(handle, &msg);
+fn fb_send_write_ok(ch: &Channel<FileResponseMsg, FileRequestMsg>, written: u32) {
+    let _ = ch.send(&FileResponse::WriteOk { written });
 }
 
-fn fb_send_ioctl_ok(handle: usize, result: u32) {
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&FileResponse::IoctlOk { result }, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send_blocking(handle, &msg);
+fn fb_send_ioctl_ok(ch: &Channel<FileResponseMsg, FileRequestMsg>, result: u32) {
+    let _ = ch.send(&FileResponse::IoctlOk { result });
 }
 
 // --- Main ---
@@ -501,7 +484,7 @@ fn main() {
 
     // Initialize FbConsole on the back buffer
     let mut console = FbConsole::new(back_fb, width, height, stride);
-    let mut clients: [FbconClient; MAX_CONSOLE_CLIENTS] = [const { FbconClient::empty() }; MAX_CONSOLE_CLIENTS];
+    let mut clients: [Option<FbconClient>; MAX_CONSOLE_CLIENTS] = [const { None }; MAX_CONSOLE_CLIENTS];
     // Stdin stack: indices into clients[]; most recent is on top
     let mut stdin_stack: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
     let mut stdin_stack_len: usize = 0;
@@ -543,12 +526,14 @@ fn main() {
     raw::sys_chan_close(stdout_shell);
 
     // Register shell as client 0
-    clients[0] = FbconClient {
-        stdin_handle: stdin_our,
-        stdout_handle: stdout_our,
+    clients[0] = Some(FbconClient {
+        stdin: Channel::<FileResponseMsg, FileRequestMsg>::from_raw_handle(stdin_our),
+        stdout: Channel::<FileResponseMsg, FileRequestMsg>::from_raw_handle(stdout_our),
         has_pending_read: false,
-        active: true,
-    };
+    });
+
+    // Typed event channel
+    let mut events = Channel::<Never, WindowEvent>::from_raw_handle(event_chan);
 
     // Main event loop
     loop {
@@ -556,74 +541,67 @@ fn main() {
 
         let stdin_idx = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
 
-        // Check for keyboard events on event channel
-        loop {
-            let mut msg = Message::new();
-            let ret = raw::sys_chan_recv(event_chan, &mut msg);
-            if ret != 0 { break; }
+        // Check for keyboard events on event channel (typed)
+        while let Some(event) = events.try_next_message() {
             handled = true;
-            if msg.len > 0 {
-                match rvos_wire::from_bytes::<WindowEvent>(&msg.data[..msg.len]) {
-                    Ok(WindowEvent::KeyDown { code }) => {
-                        let code = code as usize;
-                        if code == 42 || code == 54 {
-                            shift_pressed = true;
-                        } else if let Some(seq) = escape_seq_for_keycode(code) {
-                            // Special key: send full escape sequence in raw mode
-                            if line_disc.raw_mode
-                                && stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
-                                    fb_send_data(clients[stdin_idx].stdin_handle, seq);
-                                    fb_send_sentinel(clients[stdin_idx].stdin_handle);
-                                    clients[stdin_idx].has_pending_read = false;
+            match event {
+                WindowEvent::KeyDown { code } => {
+                    let code = code as usize;
+                    if code == 42 || code == 54 {
+                        shift_pressed = true;
+                    } else if let Some(seq) = escape_seq_for_keycode(code) {
+                        // Special key: send full escape sequence in raw mode
+                        if line_disc.raw_mode
+                            && stdin_idx != usize::MAX {
+                                if let Some(ref client) = clients[stdin_idx] {
+                                    if client.has_pending_read {
+                                        fb_send_data(&client.stdin, seq);
+                                        fb_send_sentinel(&client.stdin);
+                                    }
                                 }
-                            // In cooked mode, arrow keys are ignored
-                        } else if code < 128 {
-                            let ascii = if shift_pressed {
-                                KEYMAP_SHIFT[code]
-                            } else {
-                                KEYMAP[code]
-                            };
-                            if ascii != 0 {
-                                handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx);
+                                if let Some(ref mut client) = clients[stdin_idx] {
+                                    client.has_pending_read = false;
+                                }
                             }
+                    } else if code < 128 {
+                        let ascii = if shift_pressed {
+                            KEYMAP_SHIFT[code]
+                        } else {
+                            KEYMAP[code]
+                        };
+                        if ascii != 0 {
+                            handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx);
                         }
                     }
-                    Ok(WindowEvent::KeyUp { code }) => {
-                        let code = code as usize;
-                        if code == 42 || code == 54 {
-                            shift_pressed = false;
-                        }
+                }
+                WindowEvent::KeyUp { code } => {
+                    let code = code as usize;
+                    if code == 42 || code == 54 {
+                        shift_pressed = false;
                     }
-                    Ok(WindowEvent::CloseRequested {}) => {
-                        // Close window and exit
-                        let _ = window_client.close_window();
-                        return;
-                    }
-                    _ => {
-                        // Ignore mouse events and other window events
-                    }
+                }
+                WindowEvent::CloseRequested {} => {
+                    // Close window and exit
+                    let _ = window_client.close_window();
+                    return;
+                }
+                _ => {
+                    // Ignore mouse events and other window events
                 }
             }
         }
 
-        // Poll stdin channels for Read/Ioctl requests.
-        // Also detect closed channels (ret == 2) for dead client cleanup.
-        for (i, client) in clients.iter_mut().enumerate() {
-            if !client.active || client.stdin_handle == usize::MAX { continue; }
+        // Poll stdin channels for Read/Ioctl requests (typed).
+        // Also detect closed channels for dead client cleanup.
+        #[allow(clippy::needless_range_loop)] // index needed for clients[i] = None
+        for i in 0..MAX_CONSOLE_CLIENTS {
+            if clients[i].is_none() { continue; }
+            let mut closed = false;
             loop {
-                let mut msg = Message::new();
-                let ret = raw::sys_chan_recv(client.stdin_handle, &mut msg);
-                if ret == 2 {
-                    // Channel closed — mark client dead
-                    mark_client_dead(client, &mut stdin_stack, &mut stdin_stack_len, i);
-                    handled = true;
-                    break;
-                }
-                if ret != 0 { break; }
-                handled = true;
-                if msg.len == 0 { continue; }
-                match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
+                let client = clients[i].as_mut().unwrap();
+                match client.stdin.try_recv() {
                     Ok(FileRequest::Read { offset: _, len: _ }) => {
+                        handled = true;
                         client.has_pending_read = true;
                         // Push onto stdin_stack on first Read (lazy)
                         let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == i);
@@ -633,39 +611,56 @@ fn main() {
                         }
                     }
                     Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
+                        handled = true;
                         match cmd {
-                            TCRAW => { line_disc.raw_mode = true; fb_send_ioctl_ok(client.stdin_handle, 0); }
-                            TCCOOKED => { line_disc.raw_mode = false; fb_send_ioctl_ok(client.stdin_handle, 0); }
+                            TCRAW => { line_disc.raw_mode = true; fb_send_ioctl_ok(&client.stdin, 0); }
+                            TCCOOKED => { line_disc.raw_mode = false; fb_send_ioctl_ok(&client.stdin, 0); }
                             _ => {
-                                let mut err_msg = Message::new();
-                                err_msg.len = rvos_wire::to_bytes(&FileResponse::Error { code: FsError::Io {} }, &mut err_msg.data).unwrap_or(0);
-                                raw::sys_chan_send_blocking(client.stdin_handle, &err_msg);
+                                let _ = client.stdin.send(&FileResponse::Error { code: FsError::Io {} });
                             }
                         }
                     }
-                    _ => {}
+                    Ok(_) => {} // ignore unexpected requests on stdin
+                    Err(rvos::RecvError::Closed) => { closed = true; handled = true; break; }
+                    Err(_) => break,
                 }
+            }
+            if closed {
+                clients[i] = None; // channels auto-close on drop
+                remove_from_stdin_stack(&mut stdin_stack, &mut stdin_stack_len, i);
             }
         }
 
-        // Poll stdout channels for Write requests.
-        for (i, client) in clients.iter_mut().enumerate() {
-            if !client.active || client.stdout_handle == usize::MAX { continue; }
+        // Poll stdout channels for Write requests (typed).
+        // Use two-phase pattern: recv+process in inner block, respond after.
+        #[allow(clippy::needless_range_loop)] // index needed for clients[i] = None
+        for i in 0..MAX_CONSOLE_CLIENTS {
+            if clients[i].is_none() { continue; }
+            let mut closed = false;
             loop {
-                let mut msg = Message::new();
-                let ret = raw::sys_chan_recv(client.stdout_handle, &mut msg);
-                if ret == 2 {
-                    mark_client_dead(client, &mut stdin_stack, &mut stdin_stack_len, i);
+                // Phase 1: recv and process (data borrows from channel buffer)
+                let written: Option<u32> = {
+                    let client = clients[i].as_mut().unwrap();
+                    match client.stdout.try_recv() {
+                        Ok(FileRequest::Write { offset: _, data }) => {
+                            console.write_str(data);
+                            Some(data.len() as u32)
+                        }
+                        Ok(_) => None,
+                        Err(rvos::RecvError::Closed) => { closed = true; break; }
+                        Err(_) => break,
+                    }
+                };
+                // Phase 2: respond (borrow released)
+                if let Some(w) = written {
                     handled = true;
-                    break;
+                    fb_send_write_ok(&clients[i].as_ref().unwrap().stdout, w);
                 }
-                if ret != 0 { break; }
+            }
+            if closed {
                 handled = true;
-                if msg.len == 0 { continue; }
-                if let Ok(FileRequest::Write { offset: _, data }) = rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
-                    console.write_str(data);
-                    fb_send_write_ok(client.stdout_handle, data.len() as u32);
-                }
+                clients[i] = None;
+                remove_from_stdin_stack(&mut stdin_stack, &mut stdin_stack_len, i);
             }
         }
 
@@ -682,27 +677,22 @@ fn main() {
         if !handled {
             // Register interest on all channels then block
             raw::sys_chan_poll_add(req_chan);
-            raw::sys_chan_poll_add(event_chan);
-            for client in clients.iter() {
-                if !client.active { continue; }
-                if client.stdin_handle != usize::MAX { raw::sys_chan_poll_add(client.stdin_handle); }
-                if client.stdout_handle != usize::MAX { raw::sys_chan_poll_add(client.stdout_handle); }
+            events.poll_add();
+            for client in clients.iter().flatten() {
+                client.stdin.poll_add();
+                client.stdout.poll_add();
             }
             raw::sys_block();
         }
     }
 }
 
-/// Clean up a dead client: close handles, deactivate, remove from stdin stack.
-fn mark_client_dead(
-    client: &mut FbconClient,
+/// Remove a client index from the stdin stack.
+fn remove_from_stdin_stack(
     stdin_stack: &mut [usize; MAX_CONSOLE_CLIENTS],
     stdin_stack_len: &mut usize,
     client_idx: usize,
 ) {
-    if client.stdin_handle != usize::MAX { raw::sys_chan_close(client.stdin_handle); }
-    if client.stdout_handle != usize::MAX { raw::sys_chan_close(client.stdout_handle); }
-    client.active = false;
     let mut j = 0;
     while j < *stdin_stack_len {
         if stdin_stack[j] == client_idx {
@@ -732,16 +722,20 @@ fn handle_key_input(
     ascii: u8,
     console: &mut FbConsole,
     line_disc: &mut LineDiscipline,
-    clients: &mut [FbconClient; MAX_CONSOLE_CLIENTS],
+    clients: &mut [Option<FbconClient>; MAX_CONSOLE_CLIENTS],
     stdin_idx: usize,
 ) {
     if line_disc.raw_mode {
         // Raw mode: no echo, fulfill pending read directly
         if let Some(len) = line_disc.push_char(ascii) {
-            if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
-                fb_send_data(clients[stdin_idx].stdin_handle, line_disc.line_data(len));
-                fb_send_sentinel(clients[stdin_idx].stdin_handle);
-                clients[stdin_idx].has_pending_read = false;
+            if stdin_idx != usize::MAX {
+                if let Some(ref mut client) = clients[stdin_idx] {
+                    if client.has_pending_read {
+                        fb_send_data(&client.stdin, line_disc.line_data(len));
+                        fb_send_sentinel(&client.stdin);
+                        client.has_pending_read = false;
+                    }
+                }
             }
         }
         return;
@@ -768,10 +762,14 @@ fn handle_key_input(
         let mut buf = [0u8; LINE_BUF_SIZE];
         let data = line_disc.line_data(len);
         buf[..len].copy_from_slice(data);
-        if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
-            fb_send_data(clients[stdin_idx].stdin_handle, &buf[..len]);
-            fb_send_sentinel(clients[stdin_idx].stdin_handle);
-            clients[stdin_idx].has_pending_read = false;
+        if stdin_idx != usize::MAX {
+            if let Some(ref mut client) = clients[stdin_idx] {
+                if client.has_pending_read {
+                    fb_send_data(&client.stdin, &buf[..len]);
+                    fb_send_sentinel(&client.stdin);
+                    client.has_pending_read = false;
+                }
+            }
         }
     }
 }
