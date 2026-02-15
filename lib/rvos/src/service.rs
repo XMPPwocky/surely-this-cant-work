@@ -41,25 +41,35 @@ pub fn connect_to_service_on(boot_handle: usize, name: &str) -> SysResult<RawCha
     boot_response_cap(resp, cap)
 }
 
+/// Common implementation for simple spawn variants (no namespace overrides).
+fn spawn_impl(
+    boot_handle: usize,
+    path: &str,
+    args: &[u8],
+    cap_handle: usize,
+) -> SysResult<RawChannel> {
+    let mut transport = UserTransport::new(boot_handle);
+    let mut buf = [0u8; MAX_MSG_SIZE];
+    let (resp, cap) = rvos_wire::rpc_call_with_cap(
+        &mut transport,
+        &BootRequest::Spawn { path, args, ns_overrides: &[] },
+        cap_handle,
+        &mut buf,
+    ).map_err(|_| SysError::NoResources)?;
+    boot_response_cap(resp, cap)
+}
+
 /// Spawn a process from a filesystem path via the boot channel (handle 0).
 ///
 /// Returns a process handle channel that will receive an exit notification
 /// (i32 exit code) when the spawned process exits.
 pub fn spawn_process(path: &str) -> SysResult<RawChannel> {
-    spawn_process_on(0, path)
+    spawn_impl(0, path, &[], NO_CAP)
 }
 
 /// Spawn a process via a specific boot handle.
 pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<RawChannel> {
-    let mut transport = UserTransport::new(boot_handle);
-    let mut buf = [0u8; MAX_MSG_SIZE];
-    let (resp, cap) = rvos_wire::rpc_call_with_cap(
-        &mut transport,
-        &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
-        NO_CAP,
-        &mut buf,
-    ).map_err(|_| SysError::NoResources)?;
-    boot_response_cap(resp, cap)
+    spawn_impl(boot_handle, path, &[], NO_CAP)
 }
 
 /// Spawn a process with an extra capability channel passed as handle 1.
@@ -67,20 +77,12 @@ pub fn spawn_process_on(boot_handle: usize, path: &str) -> SysResult<RawChannel>
 /// Like `spawn_process`, but additionally sends `cap_handle` as a capability
 /// with the Spawn request. The spawned process receives this as handle 1.
 pub fn spawn_process_with_cap(path: &str, cap_handle: usize) -> SysResult<RawChannel> {
-    spawn_process_with_cap_on(0, path, cap_handle)
+    spawn_impl(0, path, &[], cap_handle)
 }
 
 /// Spawn a process with an extra capability via a specific boot handle.
 pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usize) -> SysResult<RawChannel> {
-    let mut transport = UserTransport::new(boot_handle);
-    let mut buf = [0u8; MAX_MSG_SIZE];
-    let (resp, cap) = rvos_wire::rpc_call_with_cap(
-        &mut transport,
-        &BootRequest::Spawn { path, args: &[], ns_overrides: &[] },
-        cap_handle,
-        &mut buf,
-    ).map_err(|_| SysError::NoResources)?;
-    boot_response_cap(resp, cap)
+    spawn_impl(boot_handle, path, &[], cap_handle)
 }
 
 /// Spawn a process with command-line arguments via the boot channel (handle 0).
@@ -88,20 +90,12 @@ pub fn spawn_process_with_cap_on(boot_handle: usize, path: &str, cap_handle: usi
 /// `args` is a null-separated blob (e.g., b"arg1\0arg2"). The spawned process
 /// retrieves these via `GetArgs` on its boot channel (used by `std::env::args()`).
 pub fn spawn_process_with_args(path: &str, args: &[u8]) -> SysResult<RawChannel> {
-    spawn_process_with_args_on(0, path, args)
+    spawn_impl(0, path, args, NO_CAP)
 }
 
 /// Spawn a process with args via a specific boot handle.
 pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -> SysResult<RawChannel> {
-    let mut transport = UserTransport::new(boot_handle);
-    let mut buf = [0u8; MAX_MSG_SIZE];
-    let (resp, cap) = rvos_wire::rpc_call_with_cap(
-        &mut transport,
-        &BootRequest::Spawn { path, args, ns_overrides: &[] },
-        NO_CAP,
-        &mut buf,
-    ).map_err(|_| SysError::NoResources)?;
-    boot_response_cap(resp, cap)
+    spawn_impl(boot_handle, path, args, NO_CAP)
 }
 
 /// A namespace override for process spawning.
