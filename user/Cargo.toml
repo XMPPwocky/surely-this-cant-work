@@ -6,6 +6,7 @@ members = [
     "gui-bench",
     "hello",
     "ipc-torture",
+    "ktest",
     "rvos-rt",
     "shell",
     "triangle",

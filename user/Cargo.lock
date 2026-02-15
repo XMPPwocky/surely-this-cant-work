@@ -55,6 +55,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ktest"
+version = "0.1.0"
+dependencies = [
+ "rvos",
+ "rvos-proto",
+ "rvos-rt",
+]
+
+[[package]]
 name = "rvos"
 version = "0.1.0"
 dependencies = [

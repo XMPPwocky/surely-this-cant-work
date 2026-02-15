@@ -11,7 +11,7 @@ USER_CARGO = . $$HOME/.cargo/env && cargo +rvos
 USER_TARGET = --target riscv64gc-unknown-rvos
 USER_MANIFEST = --manifest-path user/Cargo.toml
 
-.PHONY: build build-user build-fs build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench clippy clippy-kernel clippy-user
+.PHONY: build build-user build-fs build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench test bench-save bench-check clippy clippy-kernel clippy-user
 
 # Build all user crates except fs (which embeds the others via include_bytes!)
 build-user:
@@ -98,6 +98,19 @@ bench: build
 gui-bench: build
 	@echo "Running rvOS GUI benchmarks..."
 	@expect scripts/gui-bench.exp
+
+test: build
+	@echo "Running rvOS kernel tests..."
+	@expect scripts/test.exp
+
+bench-save: build
+	@echo "Running benchmarks and saving baseline..."
+	@expect scripts/bench-save.exp
+
+bench-check: build
+	@echo "Running benchmarks and checking for regressions..."
+	@expect scripts/bench-run.exp > /tmp/rvos-bench-output.txt
+	@scripts/check-bench-regression.sh bench-baseline.txt /tmp/rvos-bench-output.txt
 
 # --- Clippy ---
 

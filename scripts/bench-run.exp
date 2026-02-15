@@ -1,0 +1,31 @@
+#!/usr/bin/expect -f
+# Run the rvOS benchmark suite and output results to stdout.
+# Usage: expect scripts/bench-run.exp
+# Callers can redirect stdout to capture @BENCH lines.
+
+set timeout 120
+log_user 1
+
+cd [file dirname [file dirname [file normalize [info script]]]]
+
+spawn make run
+
+expect {
+    "rvos>" {}
+    timeout { puts "TIMEOUT waiting for shell prompt"; exit 1 }
+}
+
+sleep 1
+send "run /bin/bench\r"
+
+expect {
+    "=== Benchmark Complete ===" {}
+    timeout { puts "TIMEOUT waiting for benchmarks"; exit 1 }
+}
+
+expect {
+    "rvos>" {}
+    timeout {}
+}
+send "shutdown\r"
+expect eof
