@@ -161,3 +161,15 @@ impl TaskContext {
         }
     }
 }
+
+// Compile-time assertions: trap.S uses hardcoded offsets into TrapContext.
+// If you change the layout of TrapFrame or TrapContext, update trap.S too.
+const _: () = {
+    assert!(core::mem::offset_of!(TrapFrame, regs) == 0);
+    assert!(core::mem::size_of::<[usize; 32]>() == 256);
+    assert!(core::mem::offset_of!(TrapFrame, sstatus) == 256);
+    assert!(core::mem::offset_of!(TrapFrame, sepc) == 264);
+    assert!(core::mem::offset_of!(TrapContext, frame) == 0);
+    assert!(core::mem::offset_of!(TrapContext, kernel_stack_top) == 272);
+    assert!(core::mem::offset_of!(TrapContext, user_satp) == 280);
+};
