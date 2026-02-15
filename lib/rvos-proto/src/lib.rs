@@ -7,6 +7,7 @@
 #![no_std]
 
 pub mod math;
+pub mod debug;
 pub mod fs;
 pub mod sysinfo;
 pub mod boot;

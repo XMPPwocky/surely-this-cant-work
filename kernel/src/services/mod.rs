@@ -4,4 +4,5 @@ pub mod init;
 pub mod kbd_server;
 pub mod math;
 pub mod mouse_server;
+pub mod proc_debug;
 pub mod sysinfo;

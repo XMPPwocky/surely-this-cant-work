@@ -159,6 +159,11 @@ pub extern "C" fn kmain() -> ! {
     services::math::set_control_ep(math_ctl_ep);
     services::init::set_math_control_ep(init_math_ep);
 
+    // Process debug service control channel
+    let (init_debug_ep, debug_ctl_ep) = ipc::channel_create_pair().expect("boot: debug channel");
+    services::proc_debug::set_control_ep(debug_ctl_ep);
+    services::init::register_service("process-debug", init_debug_ep);
+
     // Filesystem service: control channel goes to a user-space fs server
     let (init_fs_ep, fs_ctl_ep) = ipc::channel_create_pair().expect("boot: fs channel");
     services::init::set_fs_control_ep(init_fs_ep);
@@ -188,6 +193,7 @@ pub extern "C" fn kmain() -> ! {
     }
     task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo").expect("boot: sysinfo");
     task::spawn_named(services::math::math_service, "math").expect("boot: math");
+    task::spawn_named(services::proc_debug::proc_debug_service, "proc-debug").expect("boot: proc-debug");
 
     // Spawn fs server as a user process with boot channel + control channel
     let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair().expect("boot: fs-boot channel");

@@ -703,6 +703,10 @@ static KTEST_ELF: &[u8] = include_bytes!(
     "../../target/riscv64gc-unknown-rvos/release/ktest"
 );
 
+static DBG_ELF: &[u8] = include_bytes!(
+    "../../target/riscv64gc-unknown-rvos/release/dbg"
+);
+
 // --- Multiplexed client state ---
 
 const MAX_CLIENTS: usize = 8;
@@ -736,6 +740,7 @@ fn main() {
     fs().add_static_file(b"/bin/triangle", TRIANGLE_ELF);
     fs().add_static_file(b"/bin/gui-bench", GUI_BENCH_ELF);
     fs().add_static_file(b"/bin/ktest", KTEST_ELF);
+    fs().add_static_file(b"/bin/dbg", DBG_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)

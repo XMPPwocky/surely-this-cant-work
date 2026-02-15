@@ -1,7 +1,7 @@
 # 0006: Process Debugger
 
 **Date:** 2026-02-12
-**Status:** Design
+**Status:** Implemented
 **Subsystem:** kernel/services, kernel/arch, lib/rvos-proto, user/dbg
 
 ## Motivation
@@ -507,8 +507,45 @@ profiling shows this is too slow, it can be upgraded to an atomic.
 
 ## Implementation Notes
 
-(Updated during Phase 3)
+- **No `debug_trap_frame` field:** The design proposed an `Option<[usize; 34]>`
+  field to save the TrapFrame. In practice this is unnecessary — when a
+  process is blocked (suspended), its registers are already saved in the
+  `TrapContext.frame` by the trap handler. The service reads/writes them
+  directly via scheduler accessors (`read_debug_trap_frame`,
+  `write_debug_register`, `write_debug_sepc`).
+
+- **Register serialization:** The `SessionResponse::Registers` variant
+  carries `data: &[u8]` (264 bytes = 1 u64 PC + 32 u64 GPRs, little-endian
+  packed) rather than `[u64; 32]`, because `rvos-wire` doesn't have
+  `Serialize`/`Deserialize` impls for fixed-size arrays larger than basic
+  types.
+
+- **Capability transfer in attach response:** The kernel service manually
+  builds the response message with `rvos_wire::to_bytes` (using placeholder
+  cap values), then overwrites `msg.caps[]` with
+  `ipc::encode_cap_channel()` and calls `ipc::channel_inc_ref()` for each
+  cap before sending. This follows the kernel-internal cap transfer pattern
+  documented in CLAUDE.md.
+
+- **Shell raw mode fix:** The shell runs in raw mode for line editing. When
+  spawning a child process via `run`, it must switch to cooked mode first
+  so the child's `read_line()` receives `\n`-terminated lines. The shell
+  restores raw mode after the child exits.
+
+- **Event delivery from trap handler:** Uses non-blocking `channel_send`
+  (best-effort). If the event channel is full, the event is silently
+  dropped. The debugger can always query state explicitly.
+
+- **`debug_suspend_pending` is a plain `bool`:** Checked under the scheduler
+  lock in the trap handler. Since rvOS is single-core and the trap handler
+  runs with interrupts disabled, no atomics are needed.
 
 ## Verification
 
-(Updated during Phase 4)
+- `make build` succeeds with no errors
+- `make clippy` passes with no warnings
+- System boots to shell normally (no regression)
+- `run /bin/dbg` launches the debugger, displays prompt (`dbg)`)
+- `help` command shows all available commands
+- `quit` exits the debugger and returns to shell
+- Service registered as PID 5 ("proc-debug") visible in boot log

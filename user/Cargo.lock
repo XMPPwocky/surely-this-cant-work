@@ -12,6 +12,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbg"
+version = "0.1.0"
+dependencies = [
+ "rvos",
+ "rvos-proto",
+ "rvos-rt",
+]
+
+[[package]]
 name = "fbcon"
 version = "0.1.0"
 dependencies = [

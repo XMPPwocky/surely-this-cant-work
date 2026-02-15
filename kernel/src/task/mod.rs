@@ -15,4 +15,11 @@ pub use scheduler::{
     current_process_user_satp, current_process_add_mmap, current_process_remove_mmap,
     current_process_mem_pages, current_process_adjust_mem_pages,
     set_exit_notify_ep,
+    // Debug accessors
+    process_is_user, process_debug_attached, set_process_debug_state,
+    set_debug_suspend_pending, check_and_clear_debug_suspend,
+    mark_debug_suspended, clear_debug_suspended,
+    read_debug_trap_frame, write_debug_register, write_debug_sepc,
+    process_user_satp_by_pid, process_debug_event_ep,
+    process_debug_breakpoints, set_process_debug_breakpoints,
 };

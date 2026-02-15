@@ -15,6 +15,7 @@ const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
 pub const MAX_PROCS: usize = 64;
 pub const MAX_HANDLES: usize = 32;
 pub const MAX_MMAP_REGIONS: usize = 256;
+pub const MAX_BREAKPOINTS: usize = 8;
 const NAME_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +83,13 @@ pub struct Process {
     pub code_ppn: usize,
     /// Number of code pages (0 for kernel tasks)
     pub code_pages: usize,
+    // --- Debug state (used by process-debug service) ---
+    pub debug_attached: bool,
+    pub debug_event_ep: usize,       // event channel endpoint (0 = none)
+    pub debug_suspend_pending: bool,
+    pub debug_suspended: bool,
+    pub debug_breakpoints: [(usize, u16); MAX_BREAKPOINTS], // (addr, original_2_bytes)
+    pub debug_breakpoint_count: usize,
 }
 
 /// Unmap a guard page in the kernel page table so any access causes a fault.
@@ -168,6 +176,12 @@ impl Process {
             pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
             code_ppn: 0,
             code_pages: 0,
+            debug_attached: false,
+            debug_event_ep: 0,
+            debug_suspend_pending: false,
+            debug_suspended: false,
+            debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
+            debug_breakpoint_count: 0,
         })
     }
 
@@ -241,6 +255,12 @@ impl Process {
             pt_frames,
             code_ppn: code_ppn.0,
             code_pages: n_code_pages,
+            debug_attached: false,
+            debug_event_ep: 0,
+            debug_suspend_pending: false,
+            debug_suspended: false,
+            debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
+            debug_breakpoint_count: 0,
         })
     }
 
@@ -302,6 +322,12 @@ impl Process {
             pt_frames,
             code_ppn: loaded.code_ppn.0,
             code_pages: loaded.total_pages,
+            debug_attached: false,
+            debug_event_ep: 0,
+            debug_suspend_pending: false,
+            debug_suspended: false,
+            debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
+            debug_breakpoint_count: 0,
         })
     }
 
@@ -330,6 +356,12 @@ impl Process {
             pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
             code_ppn: 0,
             code_pages: 0,
+            debug_attached: false,
+            debug_event_ep: 0,
+            debug_suspend_pending: false,
+            debug_suspended: false,
+            debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
+            debug_breakpoint_count: 0,
         };
         p.set_name("idle");
         p

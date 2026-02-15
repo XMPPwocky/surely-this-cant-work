@@ -1048,7 +1048,9 @@ pub fn run() {
             }
             "run" => {
                 let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
+                set_raw_mode(false);
                 cmd_run(args);
+                set_raw_mode(true);
             }
             "help" => cmd_help(),
             "clear" => {

@@ -627,6 +627,7 @@ pub fn terminate_current_process() {
     let mut channel_eps: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
     let mut shm_ids: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
     let mut notify_ep = 0usize;
+    let mut debug_event_ep = 0usize;
 
     // Frame cleanup info
     let mut pt_frames: alloc::vec::Vec<PhysPageNum, crate::mm::heap::PgtbAlloc> = alloc::vec::Vec::new_in(PGTB_ALLOC);
@@ -686,10 +687,33 @@ pub fn terminate_current_process() {
                 };
             }
 
+            // Snapshot debug state for cleanup after lock release
+            if proc.debug_attached {
+                debug_event_ep = proc.debug_event_ep;
+                proc.debug_attached = false;
+                proc.debug_event_ep = 0;
+                proc.debug_suspend_pending = false;
+                proc.debug_suspended = false;
+                proc.debug_breakpoint_count = 0;
+            }
+
             proc.state = ProcessState::Dead;
         }
     }
     // SCHEDULER lock released — now safe to call channel_close (which may wake_process)
+
+    // Send ProcessExited debug event and close the event channel
+    if debug_event_ep != 0 {
+        let mut msg = crate::ipc::Message::new();
+        let event = rvos_proto::debug::DebugEvent::ProcessExited { exit_code: 0 };
+        msg.len = rvos_wire::to_bytes(&event, &mut msg.data).unwrap_or(0);
+        if let Ok(wake) = crate::ipc::channel_send(debug_event_ep, msg) {
+            if wake != 0 {
+                crate::task::wake_process(wake);
+            }
+        }
+        crate::ipc::channel_close(debug_event_ep);
+    }
 
     // Send exit notification before closing handles (so the receiver wakes up)
     if notify_ep != 0 {
@@ -935,6 +959,147 @@ pub fn current_process_remove_mmap(base_ppn: usize, page_count: usize) -> Option
         proc.remove_mmap_region(base_ppn, page_count)
     } else {
         None
+    }
+}
+
+// ============================================================
+// Debug accessors (used by process-debug service + trap handler)
+// ============================================================
+
+/// Check if a PID is a user process.
+pub fn process_is_user(pid: usize) -> bool {
+    let sched = SCHEDULER.lock();
+    matches!(sched.processes.get(pid), Some(Some(p)) if p.is_user && p.state != ProcessState::Dead)
+}
+
+/// Check if a process has a debugger attached.
+pub fn process_debug_attached(pid: usize) -> bool {
+    let sched = SCHEDULER.lock();
+    matches!(sched.processes.get(pid), Some(Some(p)) if p.debug_attached)
+}
+
+/// Set or clear the debug-attached state for a process.
+pub fn set_process_debug_state(pid: usize, attached: bool, event_ep: usize) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.debug_attached = attached;
+        proc.debug_event_ep = event_ep;
+        if !attached {
+            proc.debug_suspend_pending = false;
+            proc.debug_suspended = false;
+        }
+    }
+}
+
+/// Set the debug_suspend_pending flag for a process.
+pub fn set_debug_suspend_pending(pid: usize) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.debug_suspend_pending = true;
+    }
+}
+
+/// Check and clear the debug_suspend_pending flag for the current process.
+/// Returns the event endpoint to notify if pending was set.
+pub fn check_and_clear_debug_suspend(pid: usize) -> Option<usize> {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        if proc.debug_suspend_pending {
+            proc.debug_suspend_pending = false;
+            return Some(proc.debug_event_ep);
+        }
+    }
+    None
+}
+
+/// Mark a process as debug-suspended.
+pub fn mark_debug_suspended(pid: usize) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.debug_suspended = true;
+    }
+}
+
+/// Clear the debug-suspended flag.
+pub fn clear_debug_suspended(pid: usize) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.debug_suspended = false;
+    }
+}
+
+/// Read the saved TrapFrame for a suspended process.
+/// Returns None if process doesn't exist or isn't suspended.
+pub fn read_debug_trap_frame(pid: usize) -> Option<TrapFrame> {
+    let sched = SCHEDULER.lock();
+    match sched.processes.get(pid)?.as_ref() {
+        Some(proc) if proc.debug_suspended => Some(proc.trap_ctx.frame),
+        _ => None,
+    }
+}
+
+/// Write a single register in a suspended process's TrapFrame.
+/// reg 0-31 = GPR x0-x31; returns false if invalid.
+pub fn write_debug_register(pid: usize, reg: u8, value: usize) -> bool {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        if proc.debug_suspended && (reg as usize) < 32 {
+            proc.trap_ctx.frame.regs[reg as usize] = value;
+            return true;
+        }
+    }
+    false
+}
+
+/// Write sepc for a suspended process.
+pub fn write_debug_sepc(pid: usize, value: usize) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        if proc.debug_suspended {
+            proc.trap_ctx.frame.sepc = value;
+        }
+    }
+}
+
+/// Get user_satp for a specific process (not just the current one).
+pub fn process_user_satp_by_pid(pid: usize) -> usize {
+    let sched = SCHEDULER.lock();
+    match sched.processes.get(pid) {
+        Some(Some(proc)) => proc.user_satp,
+        _ => 0,
+    }
+}
+
+/// Get the debug event endpoint for a process (for trap handler use).
+pub fn process_debug_event_ep(pid: usize) -> Option<usize> {
+    let sched = SCHEDULER.lock();
+    match sched.processes.get(pid) {
+        Some(Some(proc)) if proc.debug_attached && proc.debug_event_ep != 0 => {
+            Some(proc.debug_event_ep)
+        }
+        _ => None,
+    }
+}
+
+/// Read the breakpoint table for a process.
+pub fn process_debug_breakpoints(pid: usize) -> ([(usize, u16); 8], usize) {
+    let sched = SCHEDULER.lock();
+    match sched.processes.get(pid) {
+        Some(Some(proc)) => (proc.debug_breakpoints, proc.debug_breakpoint_count),
+        _ => ([(0, 0); 8], 0),
+    }
+}
+
+/// Write the breakpoint table for a process.
+pub fn set_process_debug_breakpoints(
+    pid: usize,
+    bp: [(usize, u16); 8],
+    count: usize,
+) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.debug_breakpoints = bp;
+        proc.debug_breakpoint_count = count;
     }
 }
 

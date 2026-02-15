@@ -107,6 +107,34 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 print_backtrace(tf.regs[8]);
                 panic!("Unhandled page fault");
             }
+            3 => {
+                // Breakpoint (ebreak / c.ebreak)
+                let sstatus_val = tf.sstatus;
+                let spp = (sstatus_val >> 8) & 1;
+                if spp == 0 {
+                    // U-mode breakpoint
+                    if let Some(pid) = crate::task::try_current_pid() {
+                        if crate::task::process_debug_attached(pid) {
+                            // Debugger attached: suspend and notify
+                            if let Some(event_ep) = crate::task::process_debug_event_ep(pid) {
+                                send_debug_event(event_ep, &rvos_proto::debug::DebugEvent::BreakpointHit {
+                                    addr: tf.sepc as u64,
+                                });
+                            }
+                            crate::task::mark_debug_suspended(pid);
+                            crate::task::block_process(pid);
+                            crate::task::schedule();
+                            return tf as *mut TrapFrame;
+                        }
+                        // No debugger: kill process
+                        crate::println!("  Killing user process PID {} due to breakpoint (no debugger)", pid);
+                    }
+                    crate::task::terminate_current_process();
+                    return tf as *mut TrapFrame;
+                }
+                // S-mode breakpoint: kernel bug
+                panic!("S-mode breakpoint at sepc={:#x}", tf.sepc);
+            }
             _ => {
                 let sstatus_val = tf.sstatus;
                 let spp = (sstatus_val >> 8) & 1;
@@ -123,6 +151,20 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     return tf as *mut TrapFrame;
                 }
                 panic!("Unhandled exception");
+            }
+        }
+    }
+
+    // After handling the trap: check if debug suspend is pending (U-mode only).
+    let spp = (tf.sstatus >> 8) & 1;
+    if spp == 0 {
+        if let Some(pid) = crate::task::try_current_pid() {
+            if let Some(event_ep) = crate::task::check_and_clear_debug_suspend(pid) {
+                send_debug_event(event_ep, &rvos_proto::debug::DebugEvent::Suspended {});
+                crate::task::mark_debug_suspended(pid);
+                crate::task::block_process(pid);
+                crate::task::schedule();
+                return tf as *mut TrapFrame;
             }
         }
     }
@@ -162,6 +204,17 @@ pub fn print_backtrace(start_fp: usize) {
     }
     if depth == 0 {
         crate::println!("    (no frames — frame pointers may not be enabled)");
+    }
+}
+
+/// Send a debug event on the given endpoint (non-blocking, best-effort).
+fn send_debug_event(event_ep: usize, event: &rvos_proto::debug::DebugEvent) {
+    let mut msg = crate::ipc::Message::new();
+    msg.len = rvos_wire::to_bytes(event, &mut msg.data).unwrap_or(0);
+    if let Ok(wake) = crate::ipc::channel_send(event_ep, msg) {
+        if wake != 0 {
+            crate::task::wake_process(wake);
+        }
     }
 }
 

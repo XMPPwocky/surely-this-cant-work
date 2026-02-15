@@ -1,0 +1,555 @@
+extern crate rvos_rt;
+
+use std::io::Write;
+use rvos::raw;
+use rvos::channel::RawChannel;
+use rvos::rvos_wire;
+use rvos_proto::debug::*;
+
+// Register name table
+const REG_NAMES: [&str; 33] = [
+    "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+    "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+    "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+    "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+    "pc",
+];
+
+fn reg_index(name: &str) -> Option<u8> {
+    // Check named registers
+    for (i, &n) in REG_NAMES.iter().enumerate() {
+        if name.eq_ignore_ascii_case(n) {
+            return Some(i as u8);
+        }
+    }
+    // Also accept "fp" as alias for s0
+    if name.eq_ignore_ascii_case("fp") {
+        return Some(8);
+    }
+    // Also accept x0-x31
+    if let Some(rest) = name.strip_prefix('x') {
+        if let Ok(n) = rest.parse::<u8>() {
+            if n < 32 {
+                return Some(n);
+            }
+        }
+    }
+    // Also accept "sepc" for PC
+    if name.eq_ignore_ascii_case("sepc") {
+        return Some(32);
+    }
+    None
+}
+
+fn parse_hex(s: &str) -> Option<u64> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    u64::from_str_radix(s, 16).ok()
+}
+
+struct Debugger {
+    session_handle: Option<usize>,
+    event_handle: Option<usize>,
+}
+
+impl Debugger {
+    fn new() -> Self {
+        Debugger {
+            session_handle: None,
+            event_handle: None,
+        }
+    }
+
+    fn is_attached(&self) -> bool {
+        self.session_handle.is_some()
+    }
+
+    fn attach(&mut self, pid: u32) {
+        if self.is_attached() {
+            println!("Already attached. Detach first.");
+            return;
+        }
+
+        // Connect to process-debug service
+        let svc = match rvos::connect_to_service("process-debug") {
+            Ok(ch) => ch,
+            Err(_) => {
+                println!("Failed to connect to process-debug service");
+                return;
+            }
+        };
+
+        let svc_handle = svc.into_raw_handle();
+
+        // Send DebugAttachRequest
+        let req = DebugAttachRequest { pid };
+        let mut msg = rvos::Message::new();
+        msg.len = rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+        let ret = raw::sys_chan_send_blocking(svc_handle, &msg);
+        if ret != 0 {
+            println!("Failed to send attach request");
+            raw::syscall1(raw::SYS_CHAN_CLOSE, svc_handle);
+            return;
+        }
+
+        // Receive response
+        let mut resp_msg = rvos::Message::new();
+        let ret = raw::sys_chan_recv_blocking(svc_handle, &mut resp_msg);
+        if ret != 0 {
+            println!("Failed to receive attach response");
+            raw::syscall1(raw::SYS_CHAN_CLOSE, svc_handle);
+            return;
+        }
+
+        // Decode response
+        let resp: DebugAttachResponse = match rvos_wire::from_bytes_with_caps(
+            &resp_msg.data[..resp_msg.len],
+            &resp_msg.caps[..resp_msg.cap_count],
+        ) {
+            Ok(r) => r,
+            Err(_) => {
+                println!("Bad response from service");
+                raw::syscall1(raw::SYS_CHAN_CLOSE, svc_handle);
+                return;
+            }
+        };
+
+        match resp {
+            DebugAttachResponse::Ok { session, events } => {
+                self.session_handle = Some(session.raw());
+                self.event_handle = Some(events.raw());
+                println!("Attached to PID {}", pid);
+            }
+            DebugAttachResponse::Error { code } => {
+                let msg = match code {
+                    DebugError::NotFound {} => "process not found",
+                    DebugError::AlreadyAttached {} => "already attached by another debugger",
+                    DebugError::NotAUserProcess {} => "not a user process",
+                    DebugError::NoResources {} => "no resources",
+                };
+                println!("Attach failed: {}", msg);
+            }
+        }
+
+        // Close the control channel (no longer needed)
+        raw::syscall1(raw::SYS_CHAN_CLOSE, svc_handle);
+    }
+
+    fn detach(&mut self) {
+        if let Some(h) = self.session_handle.take() {
+            raw::syscall1(raw::SYS_CHAN_CLOSE, h);
+        }
+        if let Some(h) = self.event_handle.take() {
+            raw::syscall1(raw::SYS_CHAN_CLOSE, h);
+        }
+        println!("Detached.");
+    }
+
+    fn send_request(&self, req: &SessionRequest) -> Option<Vec<u8>> {
+        let session = match self.session_handle {
+            Some(h) => h,
+            None => {
+                println!("Not attached.");
+                return None;
+            }
+        };
+
+        let mut msg = rvos::Message::new();
+        msg.len = rvos_wire::to_bytes(req, &mut msg.data).unwrap_or(0);
+        let ret = raw::sys_chan_send_blocking(session, &msg);
+        if ret != 0 {
+            println!("Send failed (channel closed?)");
+            return None;
+        }
+
+        let mut resp = rvos::Message::new();
+        let ret = raw::sys_chan_recv_blocking(session, &mut resp);
+        if ret != 0 {
+            println!("Recv failed (channel closed?)");
+            return None;
+        }
+
+        Some(resp.data[..resp.len].to_vec())
+    }
+
+    fn cmd_suspend(&self) {
+        if let Some(data) = self.send_request(&SessionRequest::Suspend {}) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Ok {}) => println!("Suspend requested (waiting for event...)"),
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_resume(&self) {
+        if let Some(data) = self.send_request(&SessionRequest::Resume {}) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Ok {}) => println!("Resumed."),
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_regs(&self) {
+        if let Some(data) = self.send_request(&SessionRequest::ReadRegisters {}) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Registers { data: reg_data }) => {
+                    if reg_data.len() < 264 {
+                        println!("Incomplete register data");
+                        return;
+                    }
+                    let pc = u64::from_le_bytes(reg_data[0..8].try_into().unwrap());
+                    println!("  pc  = {:#018x}", pc);
+                    println!();
+                    for (i, name) in REG_NAMES.iter().enumerate().take(32) {
+                        let off = 8 + i * 8;
+                        let val = u64::from_le_bytes(
+                            reg_data[off..off + 8].try_into().unwrap(),
+                        );
+                        print!("  {:4} = {:#018x}", name, val);
+                        if i % 4 == 3 {
+                            println!();
+                        }
+                    }
+                }
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_setreg(&self, name: &str, val_str: &str) {
+        let reg = match reg_index(name) {
+            Some(r) => r,
+            None => {
+                println!("Unknown register: {}", name);
+                return;
+            }
+        };
+        let value = match parse_hex(val_str) {
+            Some(v) => v,
+            None => {
+                println!("Bad hex value: {}", val_str);
+                return;
+            }
+        };
+
+        if let Some(data) = self.send_request(&SessionRequest::WriteRegister { reg, value }) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Ok {}) => {
+                    println!("Set {} = {:#x}", REG_NAMES[reg as usize], value);
+                }
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_mem(&self, addr_str: &str, len_str: Option<&str>) {
+        let addr = match parse_hex(addr_str) {
+            Some(a) => a,
+            None => {
+                println!("Bad hex address: {}", addr_str);
+                return;
+            }
+        };
+        let len: u32 = match len_str {
+            Some(s) => s.parse().unwrap_or(64),
+            None => 64,
+        };
+        let len = len.min(512);
+
+        if let Some(data) = self.send_request(&SessionRequest::ReadMemory { addr, len }) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Memory { data: mem }) => {
+                    hex_dump(addr, mem);
+                }
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_write(&self, addr_str: &str, hex_str: &str) {
+        let addr = match parse_hex(addr_str) {
+            Some(a) => a,
+            None => {
+                println!("Bad hex address: {}", addr_str);
+                return;
+            }
+        };
+        let bytes = match parse_hex_bytes(hex_str) {
+            Some(b) => b,
+            None => {
+                println!("Bad hex data: {}", hex_str);
+                return;
+            }
+        };
+
+        if let Some(data) =
+            self.send_request(&SessionRequest::WriteMemory { addr, data: &bytes })
+        {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Ok {}) => {
+                    println!("Wrote {} bytes at {:#x}", bytes.len(), addr);
+                }
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_breakpoint(&self, addr_str: &str) {
+        let addr = match parse_hex(addr_str) {
+            Some(a) => a,
+            None => {
+                println!("Bad hex address: {}", addr_str);
+                return;
+            }
+        };
+
+        if let Some(data) = self.send_request(&SessionRequest::SetBreakpoint { addr }) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Ok {}) => println!("Breakpoint set at {:#x}", addr),
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_clear(&self, addr_str: &str) {
+        let addr = match parse_hex(addr_str) {
+            Some(a) => a,
+            None => {
+                println!("Bad hex address: {}", addr_str);
+                return;
+            }
+        };
+
+        if let Some(data) = self.send_request(&SessionRequest::ClearBreakpoint { addr }) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Ok {}) => println!("Breakpoint cleared at {:#x}", addr),
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn cmd_backtrace(&self) {
+        if let Some(data) = self.send_request(&SessionRequest::Backtrace {}) {
+            match rvos_wire::from_bytes::<SessionResponse>(&data) {
+                Ok(SessionResponse::Backtrace { frames }) => {
+                    if frames.is_empty() {
+                        println!("  (no frames)");
+                        return;
+                    }
+                    let count = frames.len() / 16;
+                    for i in 0..count {
+                        let off = i * 16;
+                        let ra =
+                            u64::from_le_bytes(frames[off..off + 8].try_into().unwrap());
+                        let fp = u64::from_le_bytes(
+                            frames[off + 8..off + 16].try_into().unwrap(),
+                        );
+                        println!("  #{}: ra={:#x} fp={:#x}", i, ra, fp);
+                    }
+                }
+                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+                _ => println!("Unexpected response"),
+            }
+        }
+    }
+
+    fn poll_events(&mut self) {
+        let event_h = match self.event_handle {
+            Some(h) => h,
+            None => return,
+        };
+
+        let ev_chan = RawChannel::from_raw_handle(event_h);
+        loop {
+            let mut msg = rvos::Message::new();
+            let ret = ev_chan.try_recv(&mut msg);
+            if ret != 0 {
+                break;
+            }
+            if let Ok(event) = rvos_wire::from_bytes::<DebugEvent>(&msg.data[..msg.len]) {
+                match event {
+                    DebugEvent::BreakpointHit { addr } => {
+                        println!("\n[event] Breakpoint hit at {:#x}", addr);
+                    }
+                    DebugEvent::Suspended {} => {
+                        println!("\n[event] Process suspended");
+                    }
+                    DebugEvent::ProcessExited { exit_code } => {
+                        println!("\n[event] Process exited (code={})", exit_code);
+                        // Don't auto-detach here, let user do it explicitly
+                    }
+                }
+            }
+        }
+        // Prevent the RawChannel from closing the handle on drop
+        let _ = ev_chan.into_raw_handle();
+    }
+}
+
+fn hex_dump(base_addr: u64, data: &[u8]) {
+    let mut offset = 0;
+    while offset < data.len() {
+        print!("  {:08x}: ", base_addr + offset as u64);
+        let line_len = (data.len() - offset).min(16);
+        for i in 0..16 {
+            if i < line_len {
+                print!("{:02x} ", data[offset + i]);
+            } else {
+                print!("   ");
+            }
+            if i == 7 {
+                print!(" ");
+            }
+        }
+        print!(" |");
+        for i in 0..line_len {
+            let b = data[offset + i];
+            if (0x20..0x7f).contains(&b) {
+                print!("{}", b as char);
+            } else {
+                print!(".");
+            }
+        }
+        println!("|");
+        offset += 16;
+    }
+}
+
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        let byte = u8::from_str_radix(&s[i..i + 2], 16).ok()?;
+        bytes.push(byte);
+        i += 2;
+    }
+    Some(bytes)
+}
+
+fn print_help() {
+    println!("Commands:");
+    println!("  attach <pid>         Attach to a process");
+    println!("  detach               Detach from current process");
+    println!("  suspend / s          Suspend the target process");
+    println!("  continue / c         Resume execution");
+    println!("  regs                 Display all registers");
+    println!("  setreg <name> <val>  Set a register (e.g. setreg a0 0x42)");
+    println!("  mem <addr> [len]     Read memory (hex dump)");
+    println!("  write <addr> <hex>   Write hex bytes to memory");
+    println!("  break <addr>         Set breakpoint at address");
+    println!("  clear <addr>         Clear breakpoint at address");
+    println!("  bt                   Show backtrace");
+    println!("  help                 Show this help");
+    println!("  quit / q             Exit debugger");
+}
+
+fn main() {
+    println!("rvOS process debugger");
+    println!("Type 'help' for available commands.");
+    println!();
+
+    let mut dbg = Debugger::new();
+
+    // If we have an event channel, register for poll wakeup
+    // Use stdin (handle obtained from boot channel via stdio) for reading commands
+
+    loop {
+        // Poll for events before showing prompt
+        if dbg.is_attached() {
+            dbg.poll_events();
+        }
+
+        // Read a line from stdin
+        let mut line = String::new();
+        if dbg.is_attached() {
+            print!("dbg> ");
+        } else {
+            print!("dbg) ");
+        }
+        std::io::stdout().flush().ok();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            _ => {}
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let cmd = parts[0];
+
+        match cmd {
+            "help" | "h" | "?" => print_help(),
+            "quit" | "q" => {
+                if dbg.is_attached() {
+                    dbg.detach();
+                }
+                break;
+            }
+            "attach" => {
+                if parts.len() < 2 {
+                    println!("Usage: attach <pid>");
+                    continue;
+                }
+                match parts[1].parse::<u32>() {
+                    Ok(pid) => dbg.attach(pid),
+                    Err(_) => println!("Bad PID: {}", parts[1]),
+                }
+            }
+            "detach" => dbg.detach(),
+            "suspend" | "s" => dbg.cmd_suspend(),
+            "continue" | "c" => dbg.cmd_resume(),
+            "regs" => dbg.cmd_regs(),
+            "setreg" => {
+                if parts.len() < 3 {
+                    println!("Usage: setreg <name> <value>");
+                    continue;
+                }
+                dbg.cmd_setreg(parts[1], parts[2]);
+            }
+            "mem" => {
+                if parts.len() < 2 {
+                    println!("Usage: mem <addr> [len]");
+                    continue;
+                }
+                dbg.cmd_mem(parts[1], parts.get(2).copied());
+            }
+            "write" => {
+                if parts.len() < 3 {
+                    println!("Usage: write <addr> <hex>");
+                    continue;
+                }
+                dbg.cmd_write(parts[1], parts[2]);
+            }
+            "break" | "b" => {
+                if parts.len() < 2 {
+                    println!("Usage: break <addr>");
+                    continue;
+                }
+                dbg.cmd_breakpoint(parts[1]);
+            }
+            "clear" => {
+                if parts.len() < 2 {
+                    println!("Usage: clear <addr>");
+                    continue;
+                }
+                dbg.cmd_clear(parts[1]);
+            }
+            "bt" => dbg.cmd_backtrace(),
+            _ => println!("Unknown command: {}. Type 'help' for commands.", cmd),
+        }
+    }
+}
