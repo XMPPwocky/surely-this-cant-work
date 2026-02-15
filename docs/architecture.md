@@ -22,8 +22,10 @@ The boot sequence has six phases, all orchestrated by `kmain()` in
 
 ### Phase 2: Memory Management
 
-1. **Heap** — a 1 MiB linked-list allocator is initialized, enabling `Vec`,
-   `Box`, `String`, etc. via `#[global_allocator]`.
+1. **Heap** — a 4 MiB buddy allocator is initialized, enabling `Vec`,
+   `Box`, `String`, etc. via `#[global_allocator]`. All heap allocations
+   are tracked under 4-byte ASCII pool tags for per-subsystem memory
+   accounting.
 2. **Frame allocator** — a bitmap allocator scans from `_end` to `0x88000000`
    (128 MiB RAM top). Each bit represents one 4 KiB frame. Supports both
    single-frame and contiguous multi-frame allocation (needed for DMA and mmap).
@@ -64,18 +66,20 @@ The kernel creates channels and spawns all services and user processes:
 
 ```
 kmain
- ├── creates control channels for: serial-con, fb-con, sysinfo, math
- ├── creates boot channels for: shell-serial, shell-fb, hello-std
+ ├── creates control channels for: serial-con, sysinfo, math
+ ├── creates boot channels for: shell-serial
+ ├── (with GPU) creates control channels for: gpu, kbd, mouse
  ├── spawns kernel tasks:
- │   ├── init         (service directory)
+ │   ├── init         (service directory + process loader)
  │   ├── serial-con   (serial console server)
- │   ├── fb-con       (framebuffer console server, if GPU)
- │   ├── sysinfo      (process list service)
- │   └── math         (computation service)
+ │   ├── sysinfo      (process/memory info service)
+ │   ├── math         (computation service)
+ │   ├── gpu-server   (VirtIO GPU wrapper, if GPU)
+ │   ├── kbd-server   (VirtIO keyboard wrapper, if GPU)
+ │   └── mouse-server (VirtIO tablet wrapper, if GPU)
  └── spawns user processes (ELF):
-     ├── hello-std    (test program using Rust std)
-     ├── shell-serial (interactive shell on serial)
-     └── shell-fb     (interactive shell on framebuffer, if GPU)
+     ├── fs           (filesystem server, tmpfs)
+     └── shell-serial (interactive shell on serial)
 ```
 
 ### Phase 6: Preemptive Scheduling
@@ -132,25 +136,58 @@ D (dirty). rvOS sets A and D bits at map time to avoid hardware page faults.
 
 ## 3. Trap Handling
 
+### Per-Task Trap Frames
+
+Each process owns a `TrapContext` embedded directly in its `Process` struct.
+The `TrapContext` contains:
+
+```
+Offset 0..255:   TrapFrame.regs[0..31]  (32 × 8 = 256 bytes)
+Offset 256:      TrapFrame.sstatus      (8 bytes)
+Offset 264:      TrapFrame.sepc         (8 bytes)
+Offset 272:      kernel_stack_top       (8 bytes, per-task)
+Offset 280:      user_satp              (8 bytes, user page table root)
+```
+
+The `sscratch` CSR **always** points to the current task's `TrapContext`.
+This invariant is maintained at four update sites, all with interrupts
+disabled:
+
+1. `init()` — sets sscratch to the idle task's TrapContext
+2. `schedule()` — updates sscratch before and after `switch_context`
+3. `preempt()` — updates sscratch before `switch_context`
+4. Trampolines — `kernel_task_trampoline` and `user_entry_trampoline`
+   write sscratch from the s1 register on first entry
+
 ### Trap Entry (`trap.S`)
 
 The trap vector at `_trap_entry` handles both S-mode and U-mode traps:
 
-1. **Check origin** — reads `sscratch`: if zero, the trap came from S-mode
-   (kernel); if nonzero, it came from U-mode (user).
+1. **Save context** — swaps `t0` with `sscratch` to get the TrapContext
+   pointer, then saves all 32 GPRs + `sstatus` + `sepc` into the per-task
+   TrapContext.
 
-2. **S-mode path** — saves all 32 GPRs + `sstatus` + `sepc` onto the
-   current kernel stack as a `TrapFrame`, calls `trap_handler()`, restores
-   registers, executes `sret`.
+2. **Check origin** — reads `sstatus.SPP` (bit 8) to determine whether
+   the trap came from S-mode (kernel, SPP=1) or U-mode (user, SPP=0).
 
-3. **U-mode path**:
-   - Swaps `sp` and `sscratch` (sscratch held the kernel stack pointer)
-   - Saves all user registers to the kernel stack as a `TrapFrame`
-   - Loads the kernel `satp` from a global variable
-   - Executes `sfence.vma` to flush the TLB
-   - Calls `trap_handler()`
-   - On return: reloads the user `satp`, flushes TLB, restores user
-     registers, restores `sscratch`, and executes `sret` back to U-mode
+3. **S-mode path** — the interrupted task was already running on its own
+   kernel stack. Reload `sp` from the saved regs so call frames survive
+   context switches. Call `trap_handler()`.
+
+4. **U-mode path**:
+   - Load the kernel `satp` from `KERNEL_SATP_RAW`
+   - Execute `sfence.vma` to flush the TLB
+   - Load the per-task `kernel_stack_top` from TrapContext offset 272
+   - Switch `sp` to the task's kernel stack
+   - Call `trap_handler()`
+
+5. **Trap exit** (`_restore_from_trap`):
+   - If returning to U-mode (SPP=0), switch to the user page table
+     (load `user_satp` from TrapContext offset 280, write `satp`,
+     `sfence.vma`)
+   - Restore all 32 GPRs from the TrapContext
+   - Write the TrapContext pointer back to `sscratch`
+   - Execute `sret` back to the interrupted code
 
 ### Trap Dispatch (`trap.rs`)
 
@@ -158,7 +195,7 @@ The Rust trap handler classifies by `scause`:
 
 | scause bit 63 | Code | Handler                          |
 |---------------|------|----------------------------------|
-| 1 (interrupt) | 5    | Timer tick → reschedule          |
+| 1 (interrupt) | 5    | Timer tick → `preempt()`         |
 | 1 (interrupt) | 9    | External → PLIC claim/dispatch   |
 | 0 (exception) | 8    | Environment call → syscall       |
 | 0 (exception) | 2    | Illegal instruction → panic      |
@@ -198,25 +235,25 @@ switch_context:
     ret
 ```
 
-### New Kernel Task Trampoline
+### Task Trampolines
 
-New kernel tasks start via `kernel_task_trampoline`:
-1. Enables interrupts (`csrsi sstatus, 2` — sets SIE)
-2. Jumps to the task's entry function (`jr s0`)
+Both kernel and user tasks start via trampolines that establish the sscratch
+invariant before entering the task. On first schedule, `switch_context` restores
+`s1` to the TrapContext pointer (set up by `fixup_trap_ctx_ptr` in scheduler.rs).
 
-This is needed because new tasks enter via `ret` (not `sret`), so `sstatus.SIE`
-wouldn't be restored from `sstatus.SPIE` automatically.
+**Kernel task trampoline** (`kernel_task_trampoline`):
+1. Writes the TrapContext pointer (from `s1`) to `sscratch`
+2. Jumps to `_restore_from_trap`, which executes `sret` into the entry
+   function (TrapFrame was pre-filled with `sepc` = entry, `SPP=1`, `SPIE=1`)
+3. If the entry function returns, `ra` points to `kernel_task_return_handler`,
+   which marks the process as Dead and calls `schedule()` — the task exits
+   cleanly instead of jumping to address 0.
 
-### User Entry Trampoline
-
-User processes start via `user_task_trampoline`:
-1. Loads the user's `satp` from a global variable
-2. Sets `sstatus.SPP = 0` (return to U-mode)
-3. Sets `sepc` to the user entry point
-4. Flushes TLB
-5. Restores user registers (sp, etc.)
-6. Stores the kernel stack pointer in `sscratch`
-7. Executes `sret` → user code begins at the entry point
+**User entry trampoline** (`user_entry_trampoline`):
+1. Writes the TrapContext pointer (from `s1`) to `sscratch`
+2. Jumps to `_restore_from_trap`, which switches to the user page table
+   (because TrapFrame has `SPP=0`), restores user registers, and `sret`s
+   into user code at the ELF entry point
 
 ---
 
@@ -227,11 +264,19 @@ User processes start via `user_task_trampoline`:
 Round-robin with timer preemption:
 
 1. Timer fires every ~100ms (1,000,000 cycles at QEMU's 10 MHz clock)
-2. `schedule()` is called from the timer handler (preemptive) or from
-   `SYS_YIELD` / blocking operations (cooperative)
+2. Two context-switch paths exist:
+   - **`schedule()`** — cooperative: called from `SYS_YIELD`, blocking
+     operations, and the idle loop
+   - **`preempt()`** — preemptive: called from the timer interrupt handler
+     inside `trap_handler()`; receives the interrupted task's `TrapFrame`
+     and returns it after the switch
 3. The current process is pushed to the back of the ready queue
 4. The next process is popped from the front
-5. `switch_context()` switches kernel stacks
+5. `switch_context()` switches callee-saved registers (kernel stacks)
+
+Both paths maintain the sscratch invariant: before `switch_context`, sscratch
+is set to the new task's TrapContext; after return (for `schedule()`), it is
+restored to the resumed task's TrapContext.
 
 ### Process States
 
@@ -252,10 +297,17 @@ Round-robin with timer preemption:
 ### Interrupt Safety
 
 The scheduler lock (`SpinLock<Scheduler>`) disables interrupts while held.
-A critical invariant: `disable_interrupts()` must be called **before** dropping
-the scheduler lock in `schedule()`, because the `Drop` impl re-enables
-interrupts. Without this, there's a race window where a timer interrupt could
-re-enter `schedule()` between lock release and context switch.
+A critical invariant: the lock's `Drop` impl must **not** re-enable
+interrupts before `switch_context` completes. The `suppress_irq_restore()`
+method on `SpinLockGuard` prevents this by marking the guard so that `Drop`
+leaves interrupts disabled. After `switch_context` returns and state is
+consistent, `schedule()` manually re-enables interrupts if they were
+originally on.
+
+Without this, there is a race: `sched.current = next_pid` is set while
+holding the lock, but if `Drop` re-enables interrupts before
+`switch_context`, a timer interrupt could call `preempt()` which reads
+the wrong `current` PID and corrupts the wrong task's `TaskContext`.
 
 ---
 
@@ -324,15 +376,17 @@ the kernel image at build time. The ELF loader:
 Each user process gets:
 - **Code pages** — loaded from ELF segments, mapped U+R+W+X
 - **Stack** — 8 pages (32 KiB), mapped U+R+W, grows downward
-- **Kernel stack** — 4 pages (16 KiB), mapped without U bit (kernel-only)
+- **Kernel stack** — 16 pages (64 KiB) + 1 guard page, mapped without U bit
+  (kernel-only). The guard page at the bottom is unmapped; any stack overflow
+  triggers a page fault instead of silently corrupting adjacent memory.
 - **mmap regions** — dynamically allocated via `SYS_MMAP`, mapped U+R+W
 
 ### Handle Table
 
-Each process has a 16-slot handle table mapping local indices to global IPC
-endpoint IDs. Handle 0 is the boot channel by convention. Handles are the
-process's capabilities — they determine which channels the process can
-communicate on.
+Each process has a 32-slot handle table mapping local indices to global IPC
+endpoint IDs or SHM region references. Handle 0 is the boot channel by
+convention. Handles are the process's capabilities — they determine which
+channels and shared memory regions the process can access.
 
 ---
 
