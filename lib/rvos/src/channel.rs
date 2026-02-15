@@ -63,6 +63,12 @@ impl RawChannel {
         raw::sys_chan_recv(self.handle, msg)
     }
 
+    /// Non-blocking send. Returns 0 on success, nonzero on full/error.
+    pub fn try_send(&self, msg: &Message) -> SysResult<()> {
+        let ret = raw::sys_chan_send(self.handle, msg);
+        SysError::from_code(ret)
+    }
+
     /// Non-blocking receive with three-way status.
     ///
     /// On `Ok(())`, the message has been written to `msg`.
@@ -166,15 +172,21 @@ impl<S, R> Channel<S, R> {
 }
 
 // ---------------------------------------------------------------------------
-// Send — requires S: Serialize
+// Send — requires S: MessageType (GAT-based)
 // ---------------------------------------------------------------------------
+//
+// These methods use the `MessageType` GAT so that `Channel<FileResponseMsg, _>`
+// can call `send(&FileResponse<'a> { .. })` — the borrowed message type is
+// resolved via `S::Msg<'_>`.  For owned types (e.g. `Channel<FsResponse, _>`),
+// the blanket impl maps `FsResponse::Msg<'a> = FsResponse`, so the call-site
+// signature is unchanged: `send(&FsResponse { .. })`.
 
-impl<S: rvos_wire::Serialize, R> Channel<S, R> {
+impl<S: rvos_wire::MessageType, R> Channel<S, R> {
     /// Send a typed message (blocking).
     ///
     /// Any [`ChannelCap`](rvos_wire::ChannelCap) fields in `val` are
     /// automatically transferred via the message's capability sideband.
-    pub fn send(&self, val: &S) -> SysResult<()> {
+    pub fn send(&self, val: &S::Msg<'_>) -> SysResult<()> {
         let mut msg = Message::new();
         let (data_len, cap_count) =
             rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
@@ -182,6 +194,20 @@ impl<S: rvos_wire::Serialize, R> Channel<S, R> {
         msg.len = data_len;
         msg.cap_count = cap_count;
         self.inner.send(&msg)
+    }
+
+    /// Non-blocking send. Returns `Err` if channel is full or closed.
+    ///
+    /// Any [`ChannelCap`](rvos_wire::ChannelCap) fields in `val` are
+    /// automatically transferred via the message's capability sideband.
+    pub fn try_send(&self, val: &S::Msg<'_>) -> SysResult<()> {
+        let mut msg = Message::new();
+        let (data_len, cap_count) =
+            rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
+                .map_err(|_| SysError::BadAddress)?;
+        msg.len = data_len;
+        msg.cap_count = cap_count;
+        self.inner.try_send(&msg)
     }
 
     /// Send a typed message with an explicit capability handle attached
@@ -192,7 +218,7 @@ impl<S: rvos_wire::Serialize, R> Channel<S, R> {
     /// **Deprecated:** Embed [`ChannelCap`](rvos_wire::ChannelCap) fields in
     /// the message type instead.
     #[deprecated(note = "embed ChannelCap fields in the message type instead")]
-    pub fn send_with_cap(&self, val: &S, cap: usize) -> SysResult<()> {
+    pub fn send_with_cap(&self, val: &S::Msg<'_>, cap: usize) -> SysResult<()> {
         let mut msg = Message::new();
         let (data_len, cap_count) =
             rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
@@ -262,6 +288,43 @@ impl<S, R: rvos_wire::MessageType> Channel<S, R> {
             &self.recv_buf.data[..self.recv_buf.len],
             &self.recv_buf.caps[..self.recv_buf.cap_count],
         ).map_err(RecvError::Decode)
+    }
+
+    /// Blocking receive of next message. Returns `None` on channel close
+    /// or decode error.
+    ///
+    /// The returned message may borrow from the channel's internal buffer
+    /// (for zero-copy message types like `FsRequest<'a>`). The `&mut self`
+    /// borrow prevents a second call until the caller is done with the
+    /// previous message.
+    ///
+    /// Usage:
+    /// ```ignore
+    /// while let Some(req) = channel.next_message() {
+    ///     match req { ... }
+    /// }
+    /// ```
+    pub fn next_message(&mut self) -> Option<R::Msg<'_>> {
+        match self.recv_blocking() {
+            Ok(msg) => Some(msg),
+            Err(_) => None,
+        }
+    }
+
+    /// Non-blocking drain: returns next available message, or `None` if
+    /// the channel is empty or closed.
+    ///
+    /// Usage:
+    /// ```ignore
+    /// while let Some(event) = channel.try_next_message() {
+    ///     handle(event);
+    /// }
+    /// ```
+    pub fn try_next_message(&mut self) -> Option<R::Msg<'_>> {
+        match self.try_recv() {
+            Ok(msg) => Some(msg),
+            Err(_) => None,
+        }
     }
 }
 

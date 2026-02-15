@@ -27,3 +27,21 @@ define_message! {
         FlushOk(1) {},
     }
 }
+
+rvos_wire::define_protocol! {
+    /// GPU request/reply protocol.
+    ///
+    /// Clients use `GpuClient<T>` for type-safe RPC calls.
+    ///
+    /// **Note:** `GetDisplayInfo` returns a SHM capability in the message
+    /// sideband that is not captured by the generated client. For the initial
+    /// `GetDisplayInfo` call, use raw channel recv to extract the SHM cap.
+    /// Subsequent `Flush` calls work through the typed client.
+    pub protocol Gpu => GpuClient, GpuHandler, gpu_dispatch, gpu_handle {
+        type Request = GpuRequest;
+        type Response = GpuResponse;
+
+        rpc get_display_info as GetDisplayInfo() -> GpuResponse;
+        rpc flush as Flush(x: u32, y: u32, w: u32, h: u32) -> GpuResponse;
+    }
+}

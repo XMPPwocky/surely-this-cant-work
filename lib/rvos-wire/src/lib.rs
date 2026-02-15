@@ -360,14 +360,42 @@ impl<T: for<'a> Deserialize<'a>> DeserializeOwned for T {}
 /// Then `Channel<FsResponse, FsRequestMsg>` can receive `FsRequest<'a>`
 /// where `'a` is tied to the channel's buffer.
 pub trait MessageType {
-    type Msg<'a>: Deserialize<'a>;
+    type Msg<'a>: Serialize + Deserialize<'a>;
 }
 
-/// Blanket impl: any `DeserializeOwned` type is trivially its own
-/// `MessageType` — the lifetime parameter is unused.
-impl<T: DeserializeOwned> MessageType for T {
+/// Blanket impl: any owned type that is both `Serialize` and
+/// `DeserializeOwned` is trivially its own `MessageType` — the
+/// lifetime parameter is unused.
+impl<T: Serialize + DeserializeOwned> MessageType for T {
     type Msg<'a> = T;
 }
+
+// ---------------------------------------------------------------------------
+// Never — uninhabited type for one-directional channels
+// ---------------------------------------------------------------------------
+
+/// Uninhabited type for one-directional channels.
+///
+/// - `Channel<Never, R>` = receive-only. `send()` is uncallable because
+///   `&Never` cannot be constructed.
+/// - `Channel<S, Never>` = send-only. `recv()` always returns a decode error.
+pub enum Never {}
+
+impl Serialize for Never {
+    fn serialize(&self, _w: &mut Writer<'_>) -> Result<(), WireError> {
+        match *self {}
+    }
+}
+
+impl<'a> Deserialize<'a> for Never {
+    fn deserialize(_r: &mut Reader<'a>) -> Result<Self, WireError> {
+        Err(WireError::InvalidTag(0xFF))
+    }
+}
+
+// Blanket impl gives: MessageType for Never { type Msg<'a> = Never }
+// - send: requires &Never which can't exist → compile-time blocked
+// - recv: deserialization always fails → RecvError::Decode
 
 // ---------------------------------------------------------------------------
 // Blanket impls: primitives
