@@ -13,6 +13,6 @@ pub use scheduler::{
     process_list, process_mem_list,
     current_process_handle, current_process_alloc_handle, current_process_free_handle,
     current_process_user_satp, current_process_add_mmap, current_process_remove_mmap,
-    current_process_adjust_mem_pages,
+    current_process_mem_pages, current_process_adjust_mem_pages,
     set_exit_notify_ep,
 };

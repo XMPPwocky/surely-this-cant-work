@@ -28,6 +28,7 @@ pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
 pub const SYS_SHUTDOWN: usize = 231;
 pub const SYS_CLOCK: usize = 232;
+pub const SYS_MEMINFO: usize = 233;
 
 #[repr(C)]
 pub struct TrapFrame {
@@ -234,6 +235,9 @@ fn handle_syscall(tf: &mut TrapFrame) {
             tf.regs[10] = wall as usize;
             tf.regs[11] = cpu as usize;
         }
+        SYS_MEMINFO => {
+            tf.regs[10] = sys_meminfo(a0);
+        }
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);
             tf.regs[10] = usize::MAX;
@@ -274,6 +278,7 @@ fn syscall_name(num: usize) -> &'static [u8] {
         SYS_TRACE => b"trace",
         SYS_SHUTDOWN => b"shut",
         SYS_CLOCK => b"clock",
+        SYS_MEMINFO => b"minfo",
         _ => b"?",
     }
 }
@@ -996,6 +1001,29 @@ fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
         }
     }
     Some(pa)
+}
+
+/// SYS_MEMINFO: fill a user-space MemInfo struct with kernel memory statistics.
+/// a0 = pointer to MemInfo (5 × usize = 40 bytes on RV64).
+fn sys_meminfo(buf_ptr: usize) -> usize {
+    let pa = match validate_user_buffer(buf_ptr, 5 * core::mem::size_of::<usize>()) {
+        Some(pa) => pa,
+        None => return usize::MAX,
+    };
+    let (_tags, _count, heap_used) = crate::mm::heap::heap_stats();
+    let heap_total = crate::mm::heap::heap_total_size();
+    let frames_used = crate::mm::frame::frames_allocated();
+    let frames_total = crate::mm::frame::frames_total();
+    let proc_mem_pages = crate::task::current_process_mem_pages() as usize;
+    let out = pa as *mut usize;
+    unsafe {
+        out.write(heap_used);
+        out.add(1).write(heap_total);
+        out.add(2).write(frames_used);
+        out.add(3).write(frames_total);
+        out.add(4).write(proc_mem_pages);
+    }
+    0
 }
 
 fn timer_tick() {

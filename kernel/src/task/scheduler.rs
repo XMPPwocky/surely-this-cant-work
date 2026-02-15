@@ -674,6 +674,16 @@ pub fn process_mem_list() -> String {
     out
 }
 
+/// Read mem_pages for the current process.
+pub fn current_process_mem_pages() -> u32 {
+    let sched = SCHEDULER.lock();
+    let pid = sched.current;
+    match sched.processes[pid].as_ref() {
+        Some(proc) => proc.mem_pages,
+        None => 0,
+    }
+}
+
 /// Adjust mem_pages for the current process by `delta` pages.
 pub fn current_process_adjust_mem_pages(delta: i32) {
     let mut sched = SCHEDULER.lock();

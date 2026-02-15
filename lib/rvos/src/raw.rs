@@ -18,6 +18,7 @@ pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
 pub const SYS_SHUTDOWN: usize = 231;
 pub const SYS_CLOCK: usize = 232;
+pub const SYS_MEMINFO: usize = 233;
 
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
@@ -189,5 +190,21 @@ pub fn sys_chan_poll_add(handle: usize) -> usize {
 /// Typically used after one or more `sys_chan_poll_add()` calls.
 pub fn sys_block() {
     syscall0(SYS_BLOCK);
+}
+
+/// Kernel memory statistics returned by `sys_meminfo()`.
+#[repr(C)]
+pub struct MemInfo {
+    pub heap_used: usize,
+    pub heap_total: usize,
+    pub frames_used: usize,
+    pub frames_total: usize,
+    pub proc_mem_pages: usize,
+}
+
+/// Query kernel memory statistics.
+/// Returns 0 on success, usize::MAX on error.
+pub fn sys_meminfo(info: &mut MemInfo) -> usize {
+    syscall1(SYS_MEMINFO, info as *mut MemInfo as usize)
 }
 

@@ -74,6 +74,7 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 230    | `SYS_TRACE`           | `a0` = label_ptr, `a1` = label_len | `a0` = 0 or `usize::MAX` | Records a timestamped trace event in the kernel ring buffer. |
 | 231    | `SYS_SHUTDOWN`        | (none)                        | Does not return            | Shuts down the machine via SBI.                            |
 | 232    | `SYS_CLOCK`           | (none)                        | `a0` = wall_ticks, `a1` = cpu_ticks | Returns wall-clock and global CPU ticks.           |
+| 233    | `SYS_MEMINFO`         | `a0` = info_ptr               | `a0` = 0 or `usize::MAX` | Fills a MemInfo struct with kernel memory statistics. |
 
 ### Detailed Syscall Descriptions
 
@@ -289,6 +290,28 @@ Returns timing information for benchmarking and profiling.
 
 The ratio `cpu_ticks / wall_ticks` indicates overall CPU utilization. A value
 near 1.0 means the system was fully busy; lower values indicate idle time.
+
+#### SYS_MEMINFO (233)
+
+Fills a user-provided `MemInfo` struct with kernel memory statistics. This is
+a read-only, low-overhead syscall intended for memory leak detection in tests.
+
+- `a0` = pointer to a `MemInfo` struct in user memory (40 bytes on RV64).
+
+The kernel validates the buffer, then writes the following fields:
+
+```rust
+#[repr(C)]
+pub struct MemInfo {
+    pub heap_used: usize,       // kernel heap bytes currently allocated
+    pub heap_total: usize,      // kernel heap total capacity (4 MiB)
+    pub frames_used: usize,     // physical frames currently allocated
+    pub frames_total: usize,    // total manageable frames (32768)
+    pub proc_mem_pages: usize,  // calling process's mem_pages count
+}
+```
+
+Returns 0 on success, `usize::MAX` on error (invalid pointer).
 
 ---
 

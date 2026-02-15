@@ -136,3 +136,7 @@ pub fn frame_alloc_contiguous(count: usize) -> Option<PhysPageNum> {
 pub fn frames_allocated() -> usize {
     FRAME_ALLOCATOR.lock().allocated
 }
+
+pub const fn frames_total() -> usize {
+    TOTAL_FRAMES
+}
