@@ -200,6 +200,7 @@ rvos/
 | `make test` | Run kernel tests via expect scripts |
 | `make bench` | Run benchmark suite |
 | `make bench-check` | Run benchmarks and check for regressions |
+| `make build-std-lib` | Rebuild rvOS std library + clippy (after modifying `lib/` or PAL) |
 | `make clippy` | Run clippy on kernel + user crates |
 | `make clean` | Remove build artifacts |
 
@@ -217,7 +218,7 @@ rvos/
 - **Capability passing** — channel endpoints transferred between processes via messages
 - **Buddy allocator** — efficient O(log n) allocation with contiguous frame support for DMA
 - **Round-robin scheduling** — timer-driven preemption at ~100ms intervals; cooperative yield also available
-- **Custom Rust target** — `riscv64gc-unknown-rvos` enables user programs with full Rust `std` support
+- **Custom Rust target** — `riscv64gc-unknown-rvos` enables user programs with full Rust `std` support via a forked Rust toolchain (`vendor/rust/`). The std PAL (`std/src/sys/pal/rvos/`) uses `rvos-wire` and `rvos-proto` (symlinked from `lib/`) for IPC-based I/O. Run `make build-std-lib` after modifying any of these crates
 
 ## License
 

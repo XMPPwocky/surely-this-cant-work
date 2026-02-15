@@ -22,8 +22,26 @@ build-user:
 build-fs: build-user
 	$(USER_CARGO) build --release $(USER_MANIFEST) $(USER_TARGET) -p fs
 
-# Rebuild the rvOS std library + clippy via x.py (run after modifying vendor/rust/library/)
-# Both must be built together so x.py doesn't remove one when installing the other.
+# Rebuild the rvOS std library + clippy via x.py.
+# Run after modifying vendor/rust/library/ or lib/rvos-wire/ or lib/rvos-proto/.
+#
+# Dependency chain:
+#   lib/rvos, lib/rvos-wire, lib/rvos-proto  (canonical sources)
+#     ↓  symlinked into vendor/rust/library/ via:
+#     ↓    vendor/rust/library/rvos       -> ../../../lib/rvos
+#     ↓    vendor/rust/library/rvos-wire  -> ../../../lib/rvos-wire
+#     ↓    vendor/rust/library/rvos-proto -> ../../../lib/rvos-proto
+#     ↓
+#   vendor/rust/library/std  (Rust std with rvos PAL)
+#     ↓  std/Cargo.toml depends on rvos-wire + rvos-proto for cfg(target_os="rvos")
+#     ↓  std/src/sys/pal/rvos/ implements the platform abstraction layer
+#     ↓
+#   x.py build library + clippy  →  installed into the 'rvos' toolchain
+#     ↓
+#   user/ crates build with `cargo +rvos --target riscv64gc-unknown-rvos`
+#
+# Both std and clippy must be built together so x.py doesn't remove one
+# when installing the other.
 build-std-lib:
 	cd vendor/rust && BOOTSTRAP_SKIP_TARGET_SANITY=1 \
 		python3 x.py build src/tools/clippy library --target riscv64gc-unknown-rvos --keep-stage 0
