@@ -19,17 +19,23 @@ rustup component add rust-src llvm-tools-preview
 
 ### Custom Rust Toolchain (for std programs)
 
-User programs that use Rust `std` (like `hello-std`) require a custom Rust
-compiler with the `riscv64gc-unknown-rvos` target. This compiler lives at
-`vendor/rust/` and must be built once:
+User programs that use Rust `std` require a custom Rust compiler with the
+`riscv64gc-unknown-rvos` target. This compiler lives at `vendor/rust/` and
+must be built once:
 
 ```bash
-cd vendor/rust
-./x build library --target riscv64gc-unknown-rvos
-rustup toolchain link rvos build/host/stage1
+make build-std-lib                              # builds std + clippy via x.py
+rustup toolchain link rvos vendor/rust/build/host/stage1
 ```
 
-After this, `cargo +rvos` will use the custom toolchain.
+After this, `cargo +rvos` will use the custom toolchain. Re-run
+`make build-std-lib` after modifying `lib/rvos-wire/`, `lib/rvos-proto/`, or
+the std PAL at `vendor/rust/library/std/src/sys/pal/rvos/`.
+
+**Dependency chain**: `lib/rvos`, `lib/rvos-wire`, `lib/rvos-proto` are
+symlinked into `vendor/rust/library/`. The Rust std PAL depends on
+`rvos-wire` and `rvos-proto` for IPC-based I/O. See the Makefile comment
+on `build-std-lib` for the full diagram.
 
 ### QEMU
 
@@ -40,6 +46,17 @@ sudo apt-get install -y qemu-system-misc
 The project vendors QEMU source at `vendor/qemu/` for driver reference, but
 the system QEMU package is used for running.
 
+### Test and Benchmark Dependencies
+
+```bash
+sudo apt-get install -y expect socat
+```
+
+- `expect` — required for `make test`, `make bench`, `make bench-check`
+  (drives serial console interaction)
+- `socat` — required for `make run-gpu-screenshot` (sends commands to QEMU
+  monitor socket)
+
 ---
 
 ## 2. Build System
@@ -48,38 +65,38 @@ The top-level `Makefile` orchestrates building all components.
 
 ### Components
 
-| Component | Location | Target | Build Command |
-|-----------|----------|--------|---------------|
-| Kernel | `kernel/` | `riscv64gc-unknown-none-elf` | `cargo build --release` |
-| Shell | `user/shell/` | `riscv64gc-unknown-none-elf` | `cargo build --release` (with `CARGO_ENCODED_RUSTFLAGS=""`) |
-| Hello (std) | `user/hello/` | `riscv64gc-unknown-rvos` | `cargo +rvos build --release` |
-| Runtime | `user/rvos-rt/` | (library) | Built as dependency of hello |
-| Wire format | `lib/rvos-wire/` | (library) | Built as dependency of shell |
+| Component | Location | Target | Toolchain |
+|-----------|----------|--------|-----------|
+| Kernel | `kernel/` | `riscv64gc-unknown-none-elf` | nightly (with `-Zbuild-std`) |
+| User crates | `user/` (shell, bench, ktest, etc.) | `riscv64gc-unknown-rvos` | `cargo +rvos` |
+| FS server | `user/fs/` | `riscv64gc-unknown-rvos` | `cargo +rvos` |
+| Wire format | `lib/rvos-wire/` | (library) | Built as dependency |
+| Protocol defs | `lib/rvos-proto/` | (library) | Built as dependency |
+| Std support | `lib/rvos/` | (library) | Built as dependency |
 
 ### Build Order
 
 ```
-build-shell  ──┐
-build-hello  ──┼──→  build (kernel)  ──→  objcopy (ELF → raw binary)
-               │
+build-user (all user crates except fs)
+       ↓
+build-fs (embeds user binaries via include_bytes!)
+       ↓
+build (kernel, embeds fs ELF via .incbin)  →  objcopy (ELF → raw binary)
 ```
 
-The kernel build depends on the user binaries because they are embedded via
-`.incbin` directives in `arch/user_programs.S`.
+The FS server embeds all other user binaries via `include_bytes!`. The kernel
+embeds the FS ELF via `.incbin` in `arch/user_programs.S`. This two-stage
+embedding means `make build` must build user crates first.
 
 ### Key Build Details
 
-**Shell crate**: Built with `CARGO_ENCODED_RUSTFLAGS=""` to prevent the
-kernel's linker script (`kernel/linker.ld`) from being applied. The shell
-uses its own linker script (`user/shell/linker.ld`).
+**User crates**: Built with `cargo +rvos --target riscv64gc-unknown-rvos`.
+The custom toolchain provides a full Rust `std` with rvOS-specific PAL.
 
-**Hello (std) crate**: Built with `cargo +rvos` using the custom Rust
-toolchain. The workspace `.cargo/config.toml` is temporarily renamed during
-the build to avoid target conflicts.
-
-**Kernel binary**: The ELF is converted to a raw binary via `rust-objcopy
---strip-all -O binary`. QEMU's `-kernel` flag loads this binary at
-`0x80200000`.
+**Kernel**: Built with nightly Rust and `-Zbuild-std=core,alloc` since it
+targets bare metal (`riscv64gc-unknown-none-elf`). The ELF is converted to
+a raw binary via `rust-objcopy --strip-all -O binary`. QEMU's `-kernel`
+flag loads this binary at `0x80200000`.
 
 ---
 
@@ -87,14 +104,22 @@ the build to avoid target conflicts.
 
 | Target | Description |
 |--------|-------------|
-| `make build` | Build everything (shell, hello, kernel, objcopy) |
-| `make build-shell` | Build only the shell user program |
-| `make build-hello` | Build only the hello-std test program |
+| `make build` | Build everything (user crates, fs, kernel, objcopy) |
+| `make build-user` | Build all user crates except fs |
+| `make build-fs` | Build fs server (embeds user binaries) |
+| `make build-std-lib` | Rebuild custom std library + clippy via x.py |
 | `make run` | Build and boot in QEMU with serial on stdio |
 | `make run-gui` | Build and boot with VirtIO GPU (requires X/GTK display) |
 | `make run-vnc` | Build and boot with VirtIO GPU on VNC port 5900 |
 | `make run-gpu-screenshot` | Headless GPU boot + PPM screenshot |
 | `make debug` | Build and boot with GDB stub (`-s -S`) |
+| `make test` | Run kernel tests via expect scripts |
+| `make bench` | Run benchmark suite |
+| `make bench-save` | Run benchmarks and save baseline |
+| `make bench-check` | Run benchmarks and check for regressions |
+| `make clippy` | Run clippy on kernel + user crates |
+| `make clippy-kernel` | Run clippy on kernel only |
+| `make clippy-user` | Run clippy on user crates only |
 | `make clean` | Remove all build artifacts |
 
 ### Screenshot Mode
@@ -136,7 +161,7 @@ rvos/
 │       ├── mm/
 │       │   ├── address.rs        # PhysAddr, VirtAddr newtypes
 │       │   ├── frame.rs          # Bitmap frame allocator
-│       │   ├── heap.rs           # Linked-list kernel heap
+│       │   ├── heap.rs           # Buddy allocator kernel heap
 │       │   └── page_table.rs     # Sv39 page table operations
 │       ├── task/
 │       │   ├── process.rs        # Process struct, ELF loader
