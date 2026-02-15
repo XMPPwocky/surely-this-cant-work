@@ -1,7 +1,15 @@
 # Syscall Implementation
 
-`trap.rs` contains the syscall dispatch (the `match` on `a7`) and all syscall
-number constants (`SYS_EXIT`, `SYS_CHAN_SEND`, `SYS_MMAP`, etc.).
+Syscall handling is split across `syscall/`:
+
+- `syscall/mod.rs` — dispatch table (`handle_syscall`), syscall number
+  constants, shared utilities (validate_user_buffer, cap translate/rollback)
+- `syscall/chan.rs` — channel IPC syscalls (create, send, recv, close, poll)
+- `syscall/mem.rs` — memory mapping (mmap, munmap, shm_create, shm_dup_ro, meminfo)
+- `syscall/misc.rs` — process lifecycle (exit), tracing
+
+`trap.rs` handles the trap entry point, timer ticks, external interrupts,
+exception dispatch (page faults, illegal instructions), and backtrace printing.
 
 **If you change anything user-facing about syscalls** (add a syscall, change
 arguments, change semantics, rename, renumber), you **must** also update:
