@@ -35,7 +35,8 @@ pub fn gpu_server() {
 
     // Wait for a client endpoint from init (via control channel)
     let accepted = ipc::accept_client(control_ep, my_pid);
-    let client_ep = accepted.endpoint;
+    let client = ipc::OwnedEndpoint::new(accepted.endpoint);
+    let client_ep = client.raw();
 
     crate::println!("[gpu-server] client connected");
 

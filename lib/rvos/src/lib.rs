@@ -9,7 +9,6 @@ pub mod raw;
 pub mod error;
 pub mod message;
 pub mod channel;
-// TODO: Port to ChannelCap-based protocols — currently uses deprecated raw cap sideband.
 #[allow(deprecated)]
 pub mod service;
 pub mod transport;

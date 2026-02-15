@@ -1,6 +1,7 @@
 KERNEL_ELF = target/riscv64gc-unknown-none-elf/release/kernel
 KERNEL_BIN = target/riscv64gc-unknown-none-elf/release/kernel.bin
-RUST_TOOLCHAIN_BIN = $(shell . $$HOME/.cargo/env && rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin
+HOST_TRIPLE = $(shell . $$HOME/.cargo/env && rustc -vV | sed -n 's/host: //p')
+RUST_TOOLCHAIN_BIN = $(shell . $$HOME/.cargo/env && rustc --print sysroot)/lib/rustlib/$(HOST_TRIPLE)/bin
 OBJCOPY = $(RUST_TOOLCHAIN_BIN)/rust-objcopy
 
 # build-std flags (moved out of .cargo/config.toml to avoid leaking into x.py)

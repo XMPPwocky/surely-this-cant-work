@@ -821,10 +821,22 @@ fn sys_mmap_anonymous(length: usize) -> usize {
     for i in 0..pages {
         let vpn = crate::mm::address::VirtPageNum(ppn.0 + i);
         let page_ppn = crate::mm::address::PhysPageNum(ppn.0 + i);
-        pt.map(vpn, page_ppn,
+        if pt.map(vpn, page_ppn,
             crate::mm::page_table::PTE_R |
             crate::mm::page_table::PTE_W |
-            crate::mm::page_table::PTE_U);
+            crate::mm::page_table::PTE_U).is_err()
+        {
+            // Rollback: unmap already-mapped pages and free all frames
+            let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
+            for j in 0..i {
+                pt2.unmap(crate::mm::address::VirtPageNum(ppn.0 + j));
+            }
+            for k in 0..pages {
+                crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + k));
+            }
+            unsafe { core::arch::asm!("sfence.vma"); }
+            return usize::MAX;
+        }
     }
 
     // Record mmap region in process (anonymous: shm_id = None)
@@ -893,7 +905,15 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
     for i in 0..map_pages {
         let vpn = crate::mm::address::VirtPageNum(base_ppn.0 + i);
         let page_ppn = crate::mm::address::PhysPageNum(base_ppn.0 + i);
-        pt.map(vpn, page_ppn, flags);
+        if pt.map(vpn, page_ppn, flags).is_err() {
+            // Rollback: unmap already-mapped pages
+            let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
+            for j in 0..i {
+                pt2.unmap(crate::mm::address::VirtPageNum(base_ppn.0 + j));
+            }
+            unsafe { core::arch::asm!("sfence.vma"); }
+            return usize::MAX;
+        }
     }
 
     // Record mmap region (SHM-backed: shm_id = Some(id))

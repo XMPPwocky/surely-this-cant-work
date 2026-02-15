@@ -52,14 +52,14 @@ pub struct PageTable {
 }
 
 impl PageTable {
-    pub fn new() -> Self {
-        let root = frame::frame_alloc().expect("frame_alloc failed for page table root");
+    pub fn new() -> Result<Self, &'static str> {
+        let root = frame::frame_alloc().ok_or("failed to allocate page table root frame")?;
         let mut frames = alloc::vec::Vec::new_in(PGTB_ALLOC);
         frames.push(root);
-        PageTable {
+        Ok(PageTable {
             root_ppn: root,
             frames,
-        }
+        })
     }
 
     /// Wrap an existing page table root for runtime modifications.
@@ -81,7 +81,7 @@ impl PageTable {
     }
 
     /// Map a single virtual page to a physical page
-    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: usize) {
+    pub fn map(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: usize) -> Result<(), &'static str> {
         let indices = vpn.indices();
         let mut current_ppn = self.root_ppn;
 
@@ -91,7 +91,7 @@ impl PageTable {
             let idx = indices[level];
             if !pte_table[idx].is_valid() {
                 // Allocate a new page table frame
-                let new_frame = frame::frame_alloc().expect("frame_alloc failed for page table");
+                let new_frame = frame::frame_alloc().ok_or("failed to allocate page table frame")?;
                 self.frames.push(new_frame);
                 pte_table[idx] = PageTableEntry::new(new_frame, PTE_V);
             }
@@ -102,6 +102,7 @@ impl PageTable {
         let pte_table = current_ppn.as_page_table();
         let idx = indices[0];
         pte_table[idx] = PageTableEntry::new(ppn, flags | PTE_V | PTE_A | PTE_D);
+        Ok(())
     }
 
     /// Unmap a virtual page, returning its physical page number
@@ -158,13 +159,14 @@ impl PageTable {
         pa_start: usize,
         size: usize,
         flags: usize,
-    ) {
+    ) -> Result<(), &'static str> {
         let pages = size.div_ceil(PAGE_SIZE);
         for i in 0..pages {
             let vpn = VirtPageNum((va_start + i * PAGE_SIZE) / PAGE_SIZE);
             let ppn = PhysPageNum((pa_start + i * PAGE_SIZE) / PAGE_SIZE);
-            self.map(vpn, ppn, flags);
+            self.map(vpn, ppn, flags)?;
         }
+        Ok(())
     }
 }
 
