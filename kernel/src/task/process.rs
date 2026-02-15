@@ -1,4 +1,4 @@
-use crate::task::context::TaskContext;
+use crate::task::context::{TaskContext, TrapContext};
 use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
 use crate::mm::frame;
 use crate::mm::page_table::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U};
@@ -48,12 +48,15 @@ pub enum ProcessState {
 
 pub struct Process {
     pub state: ProcessState,
+    pub trap_ctx: TrapContext,
     pub context: TaskContext,
     #[allow(dead_code)]
     pub kernel_stack_base: usize,
+    #[allow(dead_code)]
     pub kernel_stack_top: usize,
     pub is_user: bool,
     pub user_satp: usize,      // satp value for user page table (0 = kernel task)
+    #[allow(dead_code)]
     pub user_entry: usize,     // virtual (= physical) address of user code
     pub user_stack_top: usize, // virtual (= physical) address of user stack top
     pub handles: [Option<HandleObject>; MAX_HANDLES], // local handle -> HandleObject
@@ -139,10 +142,11 @@ impl Process {
         setup_guard_page(guard_addr);
 
         let context = TaskContext::new(entry as usize, stack_top);
+        let trap_ctx = TrapContext::new_kernel(entry as usize, stack_top);
 
         Process {
-
             state: ProcessState::Ready,
+            trap_ctx,
             context,
             kernel_stack_base: stack_base,
             kernel_stack_top: stack_top,
@@ -210,10 +214,11 @@ impl Process {
         let pt_frames = pt.take_frames();
 
         let context = TaskContext::new_user_entry(kstack_top);
+        let trap_ctx = TrapContext::new_user(code_phys, stack_phys_top, kstack_top, satp);
 
         Process {
-
             state: ProcessState::Ready,
+            trap_ctx,
             context,
             kernel_stack_base: kstack_base,
             kernel_stack_top: kstack_top,
@@ -269,11 +274,12 @@ impl Process {
         let pt_frames = pt.take_frames();
 
         let context = TaskContext::new_user_entry(kstack_top);
+        let trap_ctx = TrapContext::new_user(loaded.entry_va, stack_phys_top, kstack_top, satp);
 
         crate::trace::trace_kernel(b"new_user_elf-exit");
         Process {
-
             state: ProcessState::Ready,
+            trap_ctx,
             context,
             kernel_stack_base: kstack_base,
             kernel_stack_top: kstack_top,
@@ -301,6 +307,7 @@ impl Process {
     pub fn new_idle() -> Self {
         let mut p = Process {
             state: ProcessState::Running,
+            trap_ctx: TrapContext::zero(),
             context: TaskContext::zero(),
             kernel_stack_base: 0,
             kernel_stack_top: 0,

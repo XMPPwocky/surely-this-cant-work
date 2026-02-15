@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::arch::csr;
 use crate::arch::sbi;
 use crate::task::HandleObject;
@@ -7,6 +9,11 @@ const TIMER_INTERVAL: u64 = 1_000_000; // 100ms at 10MHz
 /// Set to true to log every syscall (except yield) to the trace ring buffer.
 /// Format: "name(a0,a1)=ret" with hex values.  Disabled by default.
 const TRACE_SYSCALLS: bool = false;
+
+/// Per-CPU preemption flag. Set by timer_tick(), checked by trap_handler()
+/// after handling the trap. If set, trap_handler calls preempt() to switch
+/// to a different task (returning the new task's TrapFrame pointer).
+static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 
 
 // Syscall numbers
@@ -31,14 +38,31 @@ pub const SYS_CLOCK: usize = 232;
 pub const SYS_MEMINFO: usize = 233;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TrapFrame {
     pub regs: [usize; 32],
     pub sstatus: usize,
     pub sepc: usize,
 }
 
+impl TrapFrame {
+    pub const fn zero() -> Self {
+        TrapFrame {
+            regs: [0; 32],
+            sstatus: 0,
+            sepc: 0,
+        }
+    }
+}
+
+/// Trap handler called from trap.S.
+///
+/// Returns a pointer to the TrapFrame to restore on trap exit.  Normally
+/// this is `tf` itself (same task).  When preemption is needed (timer tick
+/// set `NEED_RESCHED`), this calls `preempt()` which returns a *different*
+/// task's TrapFrame pointer — the asm epilogue then restores that task.
 #[no_mangle]
-pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
+pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
     let scause = csr::read_scause();
     let stval = csr::read_stval();
     let is_interrupt = (scause >> 63) & 1 == 1;
@@ -68,7 +92,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                         crate::println!("  Killing user process PID {} due to illegal instruction", pid);
                     }
                     crate::task::exit_current_from_syscall();
-                    return;
+                    return tf as *mut TrapFrame;
                 }
                 panic!("Illegal instruction exception");
             }
@@ -97,7 +121,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                     // U-mode fault: kill the faulting process, not the kernel
                     crate::println!("  Killing user process due to page fault");
                     crate::task::terminate_current_process();
-                    return;
+                    return tf as *mut TrapFrame;
                 }
                 // S-mode fault: kernel bug, unrecoverable
                 let sp = tf.regs[2];
@@ -122,12 +146,19 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                         crate::println!("  Killing user process PID {} due to unhandled exception", pid);
                     }
                     crate::task::terminate_current_process();
-                    return;
+                    return tf as *mut TrapFrame;
                 }
                 panic!("Unhandled exception");
             }
         }
     }
+
+    // After handling the trap: check if preemption is needed.
+    // timer_tick() sets NEED_RESCHED; we atomically consume it here.
+    if NEED_RESCHED.swap(false, Ordering::Relaxed) {
+        return crate::task::preempt(tf);
+    }
+    tf as *mut TrapFrame
 }
 
 /// Walk the frame pointer chain and print a backtrace.
@@ -1035,8 +1066,11 @@ fn timer_tick() {
     }
     sbi::sbi_set_timer(time + TIMER_INTERVAL);
 
-    // Preemptive scheduling
-    crate::task::schedule();
+    // Request preemptive scheduling.  The actual task switch happens in
+    // trap_handler() after this function returns — never from within the
+    // interrupt handler.  This prevents re-entering the trap handler while
+    // a trap frame is live on the shared stack.
+    NEED_RESCHED.store(true, Ordering::Relaxed);
 }
 
 fn external_interrupt() {

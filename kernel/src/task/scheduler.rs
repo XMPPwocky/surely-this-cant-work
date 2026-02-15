@@ -4,6 +4,7 @@ use alloc::string::String;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::SpinLock;
+use crate::arch::trap::TrapFrame;
 use crate::task::context::TaskContext;
 use crate::task::process::{Process, ProcessState, HandleObject, MAX_PROCS};
 use crate::mm::heap::{SchdAlloc, SCHD_ALLOC};
@@ -94,12 +95,21 @@ static mut KERNEL_TRAP_STACK: [u8; TRAP_STACK_SIZE] = [0; TRAP_STACK_SIZE];
 static mut KERNEL_TRAP_STACK_TOP: usize = 0;
 
 pub fn init() {
-    SCHEDULER.lock().init();
+    let mut sched = SCHEDULER.lock();
+    sched.init();
     unsafe {
         KERNEL_TRAP_STACK_TOP =
             core::ptr::addr_of!(KERNEL_TRAP_STACK) as usize + TRAP_STACK_SIZE;
     }
-    crate::println!("Scheduler initialized (max {} processes)", MAX_PROCS);
+    // Set sscratch to the idle task's TrapContext so that any trap
+    // before the first schedule() saves to the right place.
+    let trap_ctx_ptr = &sched.processes[0].as_ref().unwrap().trap_ctx
+        as *const crate::task::context::TrapContext as usize;
+    drop(sched);
+    unsafe {
+        core::arch::asm!("csrw sscratch, {}", in(reg) trap_ctx_ptr);
+    }
+    crate::println!("Scheduler initialized (max {} processes, sscratch={:#x})", MAX_PROCS, trap_ctx_ptr);
 }
 
 /// Save the kernel's satp value (call this after enabling paging)
@@ -148,6 +158,15 @@ fn find_free_slot(sched: &mut Scheduler) -> usize {
     panic!("No free process slots (max {})", MAX_PROCS);
 }
 
+/// After inserting a Process into its slot, set context.s1 to point to the
+/// task's TrapContext.  The trampolines (kernel_task_trampoline and
+/// user_entry_trampoline) use s1 to set sscratch on first run.
+fn fixup_trap_ctx_ptr(sched: &mut Scheduler, pid: usize) {
+    let proc = sched.processes[pid].as_mut().unwrap();
+    let ptr = &proc.trap_ctx as *const crate::task::context::TrapContext as usize;
+    proc.context.s1 = ptr;
+}
+
 /// Spawn a new kernel task. Returns the PID.
 #[allow(dead_code)]
 pub fn spawn(entry: fn()) -> usize {
@@ -156,6 +175,7 @@ pub fn spawn(entry: fn()) -> usize {
     let proc = Process::new_kernel(entry);
 
     sched.processes[pid] = Some(proc);
+    fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
     pid
@@ -181,6 +201,7 @@ pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
     proc.set_name(name);
 
     sched.processes[pid] = Some(proc);
+    fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {})", pid, name, pid);
@@ -197,6 +218,7 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
     sched.processes[pid] = Some(proc);
+    fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
@@ -212,6 +234,7 @@ pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
     proc.set_name(name);
 
     sched.processes[pid] = Some(proc);
+    fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {})", pid, name, pid);
@@ -227,6 +250,7 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: us
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
     sched.processes[pid] = Some(proc);
+    fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
@@ -243,6 +267,7 @@ pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, 
     proc.handles[1] = Some(HandleObject::Channel(extra_ep));
 
     sched.processes[pid] = Some(proc);
+    fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={}, extra_ep={})", pid, name, pid, boot_ep, extra_ep);
@@ -307,6 +332,10 @@ pub fn global_clock() -> (u64, u64) {
 /// (Blocked or Dead), we switch directly to idle.  This prevents idle
 /// from stealing timeslices when real work is available.
 pub fn schedule() {
+    // Capture interrupt state BEFORE acquiring the lock.  The SpinLock
+    // disables SIE internally, so reading SIE after lock() always sees 0.
+    let interrupts_were_on = crate::arch::csr::interrupts_enabled();
+
     let mut sched = SCHEDULER.lock();
     if !sched.initialized {
         return;
@@ -391,25 +420,144 @@ pub fn schedule() {
     let old_ctx = &mut sched.processes[old_pid].as_mut().unwrap().context as *mut TaskContext;
     let new_ctx = &sched.processes[next_pid].as_ref().unwrap().context as *const TaskContext;
 
-    // Disable interrupts BEFORE dropping the lock. This prevents the lock's
-    // Drop from re-enabling interrupts (which could allow a timer to fire
-    // between lock release and switch_context, causing recursive scheduling).
-    // The target task is responsible for re-enabling them:
-    // - kernel_task_trampoline does csrsi sstatus,2
-    // - user_entry_trampoline transitions to U-mode via sret (SPIE -> SIE)
-    crate::arch::csr::disable_interrupts();
+    // Compute TrapContext pointers for sscratch management.
+    // sscratch must ALWAYS point to the running task's TrapContext so that
+    // _trap_entry saves registers to the correct location.
+    let new_trap_ctx = &sched.processes[next_pid].as_ref().unwrap().trap_ctx
+        as *const crate::task::context::TrapContext as usize;
+    let old_trap_ctx = &sched.processes[old_pid].as_ref().unwrap().trap_ctx
+        as *const crate::task::context::TrapContext as usize;
 
     // Drop the lock BEFORE switching (critical!)
     drop(sched);
 
+    // SpinLock::drop() restores SIE to its pre-lock state, which may
+    // re-enable interrupts.  Disable them now to prevent a preemption
+    // between here and switch_context (sscratch is about to change).
+    crate::arch::csr::disable_interrupts();
+
     unsafe {
+        // Set sscratch to the NEW task's TrapContext before switching.
+        // The new task may re-enable interrupts and take a trap — sscratch
+        // must point to its TrapContext so _trap_entry saves correctly.
+        core::arch::asm!("csrw sscratch, {}", in(reg) new_trap_ctx);
         switch_context(old_ctx, new_ctx);
+        // Resumed: restore sscratch for ourselves before re-enabling
+        // interrupts. (Interrupts are still disabled here, so this is safe.)
+        core::arch::asm!("csrw sscratch, {}", in(reg) old_trap_ctx);
     }
 
     // After switch_context returns, we've been switched BACK to this task.
-    // Re-enable interrupts in case we were switched from inside a trap handler
-    // (where sstatus.SIE was cleared by hardware on trap entry).
-    crate::arch::csr::enable_interrupts();
+    // Only re-enable interrupts if they were on before (i.e., we were NOT
+    // called from inside a trap handler).
+    if interrupts_were_on {
+        crate::arch::csr::enable_interrupts();
+    }
+}
+
+/// Preemptive context switch. Called from trap_handler() when NEED_RESCHED
+/// is set (timer tick).
+///
+/// Uses switch_context (just like schedule()) so that the new task resumes
+/// correctly regardless of how it was last suspended — whether by cooperative
+/// yield (schedule) or preemption.  When switch_context returns (the old
+/// task has been resumed), we return old_tf so the asm epilogue restores
+/// from it and srets back to the interrupted code.
+///
+/// The handler stack for S-mode traps is the task's own kernel stack (not
+/// a shared trap stack), so the call frames survive across switch_context.
+pub fn preempt(old_tf: &mut TrapFrame) -> *mut TrapFrame {
+    let mut sched = SCHEDULER.lock();
+    if !sched.initialized {
+        return old_tf as *mut TrapFrame;
+    }
+
+    let old_pid = sched.current;
+
+    // Pick next task from ready queue
+    let next_pid = match sched.ready_queue.pop_front() {
+        Some(pid) => pid,
+        None => {
+            // Nothing else to run — stay on current task
+            return old_tf as *mut TrapFrame;
+        }
+    };
+
+    if next_pid == old_pid {
+        sched.ready_queue.push_back(next_pid);
+        return old_tf as *mut TrapFrame;
+    }
+
+    // CPU accounting (same as schedule)
+    let now = crate::task::process::rdtime();
+    let prev_switch = sched.last_switch_rdtime;
+    if let Some(ref mut old_proc) = sched.processes[old_pid] {
+        let run_time = now.saturating_sub(prev_switch);
+        let idle_time = prev_switch.saturating_sub(old_proc.last_switched_away);
+
+        let idle_ticks = (idle_time / TIMER_INTERVAL) as u32;
+        if idle_ticks > 0 {
+            let decay_1s = pow_scaled(DECAY_1S, idle_ticks);
+            let decay_1m = pow_scaled(DECAY_1M, idle_ticks);
+            old_proc.ewma_1s = mul_scaled(old_proc.ewma_1s, decay_1s);
+            old_proc.ewma_1m = mul_scaled(old_proc.ewma_1m, decay_1m);
+        }
+
+        let run_ticks = (run_time / TIMER_INTERVAL) as u32;
+        if run_ticks > 0 {
+            let decay_1s = pow_scaled(DECAY_1S, run_ticks);
+            let decay_1m = pow_scaled(DECAY_1M, run_ticks);
+            old_proc.ewma_1s = SCALE - mul_scaled(SCALE - old_proc.ewma_1s, decay_1s);
+            old_proc.ewma_1m = SCALE - mul_scaled(SCALE - old_proc.ewma_1m, decay_1m);
+        }
+
+        old_proc.last_switched_away = now;
+
+        if old_pid != 0 {
+            sched.global_cpu_ticks += run_time;
+        }
+    }
+    sched.last_switch_rdtime = now;
+
+    // Put old task back in ready queue if still Running
+    if old_pid != 0 {
+        if let Some(ref mut old_proc) = sched.processes[old_pid] {
+            if old_proc.state == ProcessState::Running {
+                old_proc.state = ProcessState::Ready;
+                sched.ready_queue.push_back(old_pid);
+            }
+        }
+    }
+
+    // Set new task as running
+    if let Some(ref mut new_proc) = sched.processes[next_pid] {
+        new_proc.state = ProcessState::Running;
+    }
+
+    sched.current = next_pid;
+
+    let old_ctx = &mut sched.processes[old_pid].as_mut().unwrap().context as *mut TaskContext;
+    let new_ctx = &sched.processes[next_pid].as_ref().unwrap().context as *const TaskContext;
+
+    // Set sscratch for the new task (same invariant as schedule()).
+    let new_trap_ctx = &sched.processes[next_pid].as_ref().unwrap().trap_ctx
+        as *const crate::task::context::TrapContext as usize;
+
+    // Drop the lock BEFORE switching (critical!)
+    // Don't re-enable interrupts: we're inside the trap handler (SIE=0),
+    // and the eventual sret will restore SIE from SPIE.
+    drop(sched);
+
+    unsafe {
+        core::arch::asm!("csrw sscratch, {}", in(reg) new_trap_ctx);
+        switch_context(old_ctx, new_ctx);
+        // No need to restore sscratch here: SIE=0 (in trap handler), and
+        // the asm epilogue (csrw sscratch, t0) will set it from old_tf.
+    }
+
+    // switch_context returned — we've been resumed.  Return old_tf so the
+    // asm epilogue (after trap_handler returns) restores from it and srets.
+    old_tf as *mut TrapFrame
 }
 
 /// Mark the current task as dead and schedule away (for kernel tasks)
@@ -712,47 +860,6 @@ pub fn is_alive(pid: usize) -> bool {
     )
 }
 
-/// FFI-safe struct for returning user process info to assembly trampoline.
-#[repr(C)]
-pub struct UserReturnInfo {
-    pub satp: usize,
-    pub sepc: usize,
-    pub user_sp: usize,
-    pub kernel_sp: usize,
-}
-
-/// Called from user_entry_trampoline (in switch.S) to get the info needed
-/// to sret into user mode. Takes a pointer to a UserReturnInfo struct
-/// and fills it in (the struct is too large for register return on rv64).
-#[no_mangle]
-pub extern "C" fn prepare_user_return(out: *mut UserReturnInfo) {
-    let sched = SCHEDULER.lock();
-    let pid = sched.current;
-    let proc = sched.processes[pid].as_ref().expect("prepare_user_return: no current process");
-    unsafe {
-        (*out).satp = proc.user_satp;
-        (*out).sepc = proc.user_entry;
-        (*out).user_sp = proc.user_stack_top;
-        (*out).kernel_sp = proc.kernel_stack_top;
-    }
-}
-
-/// Called from trap.S (_from_user path) to switch to kernel page table
-/// before running the trap handler. This ensures kernel data structures
-/// are accessible with the kernel's page table.
-#[no_mangle]
-pub extern "C" fn restore_kernel_satp_asm() {
-    let satp = KERNEL_SATP.load(Ordering::Relaxed);
-    if satp != 0 {
-        unsafe {
-            core::arch::asm!(
-                "csrw satp, {0}",
-                "sfence.vma",
-                in(reg) satp,
-            );
-        }
-    }
-}
 
 /// Get current process's user_satp value (for mmap/munmap).
 pub fn current_process_user_satp() -> usize {
@@ -788,14 +895,3 @@ pub fn current_process_remove_mmap(base_ppn: usize, page_count: usize) -> Option
     }
 }
 
-/// Called from trap.S before returning to user mode to get the
-/// current process's user satp. Returns 0 if current process is not a user process.
-#[no_mangle]
-pub extern "C" fn get_current_user_satp() -> usize {
-    let sched = SCHEDULER.lock();
-    let pid = sched.current;
-    match sched.processes[pid].as_ref() {
-        Some(proc) if proc.is_user => proc.user_satp,
-        _ => 0,
-    }
-}

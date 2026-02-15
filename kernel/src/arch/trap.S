@@ -1,264 +1,190 @@
     .section .text
     .globl _trap_entry
+    .globl _restore_from_trap
     .align 2
+
+# Per-task trap frame design.
+#
+# sscratch ALWAYS holds a pointer to the current task's TrapContext:
+#
+#   Offset 0..255:  TrapFrame.regs[0..31]  (32 × 8 = 256 bytes)
+#   Offset 256:     TrapFrame.sstatus       (8 bytes)
+#   Offset 264:     TrapFrame.sepc          (8 bytes)
+#   Offset 272:     kernel_stack_top        (8 bytes)
+#   Offset 280:     user_satp              (8 bytes)
+#
+# On trap entry, all registers are saved to the current task's TrapContext
+# (not on a stack). The handler stack is chosen based on SPP:
+#   SPP=1 (S-mode): task's own kernel stack (reloaded from saved sp)
+#   SPP=0 (U-mode): per-task kernel stack (from TrapContext.kernel_stack_top)
+#
+# trap_handler() returns a *mut TrapFrame — always the same task's TrapFrame
+# (preemption is handled internally via switch_context, not by returning a
+# different TrapFrame). The asm epilogue restores from it and srets.
+
 _trap_entry:
-    # Check if we came from U-mode or S-mode.
-    # sscratch holds kernel sp when in U-mode, 0 when in S-mode
-    csrrw   sp, sscratch, sp
-    # If sp (now old sscratch) is zero, we came from S-mode
-    bnez    sp, _from_user
-    # Came from S-mode: restore sp from sscratch (which now holds our sp)
-    csrrw   sp, sscratch, sp
+    # Swap t0 with sscratch to get TrapContext pointer in t0.
+    csrrw   t0, sscratch, t0       # t0 = &TrapContext, sscratch = old t0
 
-_from_kernel:
-    # Switch to the dedicated trap stack. This ensures the trap handler
-    # always has a known-good stack, even during kernel stack overflow.
-    #
-    # We need t0 and t1 for the stack switch, but must preserve their
-    # original values for the trap frame. Pre-save them on the task stack
-    # (below current sp), then recover them after switching.
-    sd      t0, -8(sp)
-    sd      t1, -16(sp)
+    # Save t1 FIRST (we need it to save original t0 from sscratch)
+    sd      t1,  48(t0)            # regs[6] = original t1
 
-    # Save original sp in t0, then switch sp to trap stack
-    mv      t0, sp
-1:  auipc   t1, %pcrel_hi(KERNEL_TRAP_STACK_TOP)
-    ld      sp, %pcrel_lo(1b)(t1)
+    # Read original t0 from sscratch and save it
+    csrr    t1, sscratch           # t1 = original t0
+    sd      t1,  40(t0)            # regs[5] = original t0
 
-    # Allocate TrapFrame on trap stack: 32 regs + sstatus + sepc = 34 * 8 = 272 bytes
-    addi    sp, sp, -272
-
-    # Save original sp into regs[2]
-    sd      t0,  16(sp)
-
-    # Recover and save the original t0/t1 from the task stack
-    ld      t1, -8(t0)
-    sd      t1,  40(sp)     # regs[5] = original x5/t0
-    ld      t1, -16(t0)
-    sd      t1,  48(sp)     # regs[6] = original x6/t1
-
-    # Save the rest of x1-x31 (x2/sp and x5/t0 and x6/t1 already done)
-    sd      x1,   8(sp)
-    sd      x3,  24(sp)
-    sd      x4,  32(sp)
-    # x5 (t0) already saved above
-    # x6 (t1) already saved above
-    sd      x7,  56(sp)
-    sd      x8,  64(sp)
-    sd      x9,  72(sp)
-    sd      x10, 80(sp)
-    sd      x11, 88(sp)
-    sd      x12, 96(sp)
-    sd      x13,104(sp)
-    sd      x14,112(sp)
-    sd      x15,120(sp)
-    sd      x16,128(sp)
-    sd      x17,136(sp)
-    sd      x18,144(sp)
-    sd      x19,152(sp)
-    sd      x20,160(sp)
-    sd      x21,168(sp)
-    sd      x22,176(sp)
-    sd      x23,184(sp)
-    sd      x24,192(sp)
-    sd      x25,200(sp)
-    sd      x26,208(sp)
-    sd      x27,216(sp)
-    sd      x28,224(sp)
-    sd      x29,232(sp)
-    sd      x30,240(sp)
-    sd      x31,248(sp)
-
-    # Store zero into regs[0]
-    sd      zero, 0(sp)
+    # Save remaining GPRs
+    sd      zero, 0(t0)            # regs[0] = 0
+    sd      x1,   8(t0)            # regs[1] / ra
+    sd      x2,  16(t0)            # regs[2] / sp
+    sd      x3,  24(t0)            # regs[3] / gp
+    sd      x4,  32(t0)            # regs[4] / tp
+    # x5/t0 at 40(t0) — already saved
+    # x6/t1 at 48(t0) — already saved
+    sd      x7,  56(t0)
+    sd      x8,  64(t0)
+    sd      x9,  72(t0)
+    sd      x10, 80(t0)
+    sd      x11, 88(t0)
+    sd      x12, 96(t0)
+    sd      x13,104(t0)
+    sd      x14,112(t0)
+    sd      x15,120(t0)
+    sd      x16,128(t0)
+    sd      x17,136(t0)
+    sd      x18,144(t0)
+    sd      x19,152(t0)
+    sd      x20,160(t0)
+    sd      x21,168(t0)
+    sd      x22,176(t0)
+    sd      x23,184(t0)
+    sd      x24,192(t0)
+    sd      x25,200(t0)
+    sd      x26,208(t0)
+    sd      x27,216(t0)
+    sd      x28,224(t0)
+    sd      x29,232(t0)
+    sd      x30,240(t0)
+    sd      x31,248(t0)
 
     # Save sstatus and sepc
-    csrr    t0, sstatus
-    sd      t0, 256(sp)
-    csrr    t0, sepc
-    sd      t0, 264(sp)
+    csrr    t1, sstatus
+    sd      t1, 256(t0)            # TrapFrame.sstatus
+    csrr    t1, sepc
+    sd      t1, 264(t0)            # TrapFrame.sepc
 
-    # Call Rust trap handler
-    mv      a0, sp
-    call    trap_handler
+    # Restore sscratch = TrapContext pointer (was clobbered during save)
+    csrw    sscratch, t0
 
-    # Restore sstatus and sepc
-    ld      t0, 256(sp)
-    csrw    sstatus, t0
-    ld      t0, 264(sp)
-    csrw    sepc, t0
+    # Choose handler stack based on SPP (bit 8 of saved sstatus).
+    #   SPP=1 (S-mode trap): task's own kernel stack (resume from saved sp)
+    #   SPP=0 (U-mode trap): per-task kernel stack from TrapContext
+    ld      t1, 256(t0)            # reload sstatus
+    li      t2, (1 << 8)           # SPP mask
+    and     t1, t1, t2
+    beqz    t1, _user_handler_stack
 
-    # Restore all registers except sp
-    ld      x1,   8(sp)
-    ld      x3,  24(sp)
-    ld      x4,  32(sp)
-    ld      x5,  40(sp)
-    ld      x6,  48(sp)
-    ld      x7,  56(sp)
-    ld      x8,  64(sp)
-    ld      x9,  72(sp)
-    ld      x10, 80(sp)
-    ld      x11, 88(sp)
-    ld      x12, 96(sp)
-    ld      x13,104(sp)
-    ld      x14,112(sp)
-    ld      x15,120(sp)
-    ld      x16,128(sp)
-    ld      x17,136(sp)
-    ld      x18,144(sp)
-    ld      x19,152(sp)
-    ld      x20,160(sp)
-    ld      x21,168(sp)
-    ld      x22,176(sp)
-    ld      x23,184(sp)
-    ld      x24,192(sp)
-    ld      x25,200(sp)
-    ld      x26,208(sp)
-    ld      x27,216(sp)
-    ld      x28,224(sp)
-    ld      x29,232(sp)
-    ld      x30,240(sp)
-    ld      x31,248(sp)
+    # --- S-mode trap: use task's own kernel stack ---
+    # The interrupted task was running in S-mode on its own kernel stack.
+    # Reload that sp so the handler's call frames live on the task's stack
+    # (survives context switches, unlike the shared KERNEL_TRAP_STACK).
+    ld      sp, 16(t0)             # reload saved sp from TrapFrame.regs[2]
+    j       _call_trap_handler
 
-    # Restore the task's original sp from regs[2] and return
-    ld      sp, 16(sp)
-    sret
-
-_from_user:
-    # sp = kernel stack pointer (from sscratch)
-    # sscratch = user sp (we swapped)
-    #
-    # IMPORTANT: The kernel stack is identity-mapped in the user page table
-    # (as part of free memory), so we can access it before switching satp.
-    # Save user t0 DIRECTLY into its trap frame slot before clobbering it.
-    # Trap frame will start at sp-272; regs[5] (x5/t0) is at offset 40.
-    # So save at sp - 272 + 40 = sp - 232.
-    sd      t0, -232(sp)
-
-    # Switch to kernel page table using t0 as temporary.
-1:  auipc   t0, %pcrel_hi(KERNEL_SATP_RAW)
-    ld      t0, %pcrel_lo(1b)(t0)
-    csrw    satp, t0
+_user_handler_stack:
+    # --- U-mode trap: switch to kernel page table first ---
+1:  auipc   t1, %pcrel_hi(KERNEL_SATP_RAW)
+    ld      t1, %pcrel_lo(1b)(t1)
+    csrw    satp, t1
     sfence.vma
 
-    # Now kernel page table is active, kernel stack is accessible.
-    # Allocate TrapFrame on kernel stack
-    addi    sp, sp, -272
+    # Handler stack = per-task kernel stack (for blocking syscalls)
+    ld      sp, 272(t0)            # TrapContext.kernel_stack_top
 
-    # Save x1-x31 (t0/x5 was pre-saved at 40(sp) above)
-    sd      x1,   8(sp)
-    sd      x3,  24(sp)
-    sd      x4,  32(sp)
-    # x5/t0 already at 40(sp) -- pre-saved before satp switch
-    sd      x6,  48(sp)
-    sd      x7,  56(sp)
-    sd      x8,  64(sp)
-    sd      x9,  72(sp)
-    sd      x10, 80(sp)
-    sd      x11, 88(sp)
-    sd      x12, 96(sp)
-    sd      x13,104(sp)
-    sd      x14,112(sp)
-    sd      x15,120(sp)
-    sd      x16,128(sp)
-    sd      x17,136(sp)
-    sd      x18,144(sp)
-    sd      x19,152(sp)
-    sd      x20,160(sp)
-    sd      x21,168(sp)
-    sd      x22,176(sp)
-    sd      x23,184(sp)
-    sd      x24,192(sp)
-    sd      x25,200(sp)
-    sd      x26,208(sp)
-    sd      x27,216(sp)
-    sd      x28,224(sp)
-    sd      x29,232(sp)
-    sd      x30,240(sp)
-    sd      x31,248(sp)
-
-    # Save user sp (in sscratch) into regs[2]
-    csrr    t0, sscratch
-    sd      t0,  16(sp)
-
-    # Set sscratch = 0 to indicate we are in S-mode now.
-    # This is critical: if the trap handler calls schedule() and switches
-    # to a kernel task, that kernel task's future traps must see sscratch=0
-    # to take the _from_kernel path.
-    csrw    sscratch, zero
-
-    # Store zero into regs[0]
-    sd      zero, 0(sp)
-
-    # Save sstatus and sepc
-    csrr    t0, sstatus
-    sd      t0, 256(sp)
-    csrr    t0, sepc
-    sd      t0, 264(sp)
-
-    # Call Rust trap handler
-    mv      a0, sp
+_call_trap_handler:
+    # Call trap_handler(&mut TrapFrame) -> *mut TrapFrame
+    # TrapFrame is at offset 0 of TrapContext, so t0 works as both.
+    mv      a0, t0
     call    trap_handler
 
-    # Get user satp (returned in a0)
-    call    get_current_user_satp
+    # a0 = pointer to TrapFrame to restore (may be a different task).
+    # Since TrapFrame is at offset 0 of TrapContext, a0 also serves as
+    # the TrapContext pointer for accessing kernel_stack_top and user_satp.
     mv      t0, a0
 
-    # Restore sstatus and sepc (still under kernel page table)
-    ld      t1, 256(sp)
-    csrw    sstatus, t1
-    ld      t1, 264(sp)
+    # Update sscratch to the (possibly new) task's TrapContext
+    csrw    sscratch, t0
+
+    # Fall through to _restore_from_trap
+
+    .align 2
+_restore_from_trap:
+    # Restore a task from its TrapContext and sret.
+    #
+    # Preconditions (set by caller):
+    #   t0 = pointer to TrapContext to restore
+    #   sscratch = t0
+    #
+    # Entry points:
+    #   - Fall-through from _call_trap_handler (normal trap return)
+    #   - kernel_task_trampoline (first run of a kernel task)
+    #   - user_entry_trampoline (first run of a user task)
+
+    # Load sstatus for SPP check and for writing to CSR
+    ld      t1, 256(t0)            # TrapFrame.sstatus
+
+    # If returning to U-mode (SPP=0), switch to user page table.
+    # Kernel memory is identity-mapped in the user page table (without U
+    # bit), so TrapContext and code remain accessible after the switch.
+    li      t2, (1 << 8)           # SPP mask
+    and     t2, t1, t2
+    bnez    t2, _skip_user_satp
+
+    ld      t2, 280(t0)           # TrapContext.user_satp
+    beqz    t2, _skip_user_satp
+    csrw    satp, t2
+    sfence.vma
+
+_skip_user_satp:
+    # Write sstatus and sepc to CSRs
+    csrw    sstatus, t1            # t1 still holds sstatus
+    ld      t1, 264(t0)           # TrapFrame.sepc
     csrw    sepc, t1
 
-    # Restore user sp into sscratch (so next trap can swap)
-    ld      t1, 16(sp)
-    csrw    sscratch, t1
+    # Restore all GPRs (t0 restored last since it's our base pointer)
+    ld      x1,   8(t0)
+    ld      x2,  16(t0)
+    ld      x3,  24(t0)
+    ld      x4,  32(t0)
+    # x5/t0 — restored last
+    ld      x6,  48(t0)
+    ld      x7,  56(t0)
+    ld      x8,  64(t0)
+    ld      x9,  72(t0)
+    ld      x10, 80(t0)
+    ld      x11, 88(t0)
+    ld      x12, 96(t0)
+    ld      x13,104(t0)
+    ld      x14,112(t0)
+    ld      x15,120(t0)
+    ld      x16,128(t0)
+    ld      x17,136(t0)
+    ld      x18,144(t0)
+    ld      x19,152(t0)
+    ld      x20,160(t0)
+    ld      x21,168(t0)
+    ld      x22,176(t0)
+    ld      x23,184(t0)
+    ld      x24,192(t0)
+    ld      x25,200(t0)
+    ld      x26,208(t0)
+    ld      x27,216(t0)
+    ld      x28,224(t0)
+    ld      x29,232(t0)
+    ld      x30,240(t0)
+    ld      x31,248(t0)
 
-    # Switch to user page table while we still have kernel sp.
-    # The kernel stack is identity-mapped in the user page table,
-    # so we can still access the trap frame after this switch.
-    beqz    t0, _user_skip_satp_switch
-    csrw    satp, t0
-    sfence.vma
-_user_skip_satp_switch:
+    # Restore t0 last (ld computes address before writing destination)
+    ld      t0,  40(t0)
 
-    # Now under user page table. Kernel stack is still accessible
-    # (identity-mapped in user page table as part of free memory).
-    # Restore ALL registers including t0 from the trap frame.
-    ld      x1,   8(sp)
-    ld      x3,  24(sp)
-    ld      x4,  32(sp)
-    ld      x5,  40(sp)    # t0 fully restored!
-    ld      x6,  48(sp)
-    ld      x7,  56(sp)
-    ld      x8,  64(sp)
-    ld      x9,  72(sp)
-    ld      x10, 80(sp)
-    ld      x11, 88(sp)
-    ld      x12, 96(sp)
-    ld      x13,104(sp)
-    ld      x14,112(sp)
-    ld      x15,120(sp)
-    ld      x16,128(sp)
-    ld      x17,136(sp)
-    ld      x18,144(sp)
-    ld      x19,152(sp)
-    ld      x20,160(sp)
-    ld      x21,168(sp)
-    ld      x22,176(sp)
-    ld      x23,184(sp)
-    ld      x24,192(sp)
-    ld      x25,200(sp)
-    ld      x26,208(sp)
-    ld      x27,216(sp)
-    ld      x28,224(sp)
-    ld      x29,232(sp)
-    ld      x30,240(sp)
-    ld      x31,248(sp)
-
-    # Deallocate trap frame and swap sp/sscratch
-    addi    sp, sp, 272
-    csrrw   sp, sscratch, sp
-
-    # User page table already active, all registers restored. Return to user.
     sret
