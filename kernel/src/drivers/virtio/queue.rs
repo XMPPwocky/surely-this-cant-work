@@ -168,8 +168,10 @@ impl Virtqueue {
             return None;
         }
         let idx = self.free_head;
-        let desc = unsafe { &*self.desc.add(idx as usize) };
-        self.free_head = desc.next;
+        let next = unsafe {
+            core::ptr::addr_of!((*self.desc.add(idx as usize)).next).read_volatile()
+        };
+        self.free_head = next;
         self.free_count -= 1;
         Some(idx)
     }
@@ -177,11 +179,11 @@ impl Virtqueue {
     /// Return a descriptor to the free list.
     pub fn free_desc(&mut self, idx: u16) {
         unsafe {
-            let d = &mut *self.desc.add(idx as usize);
-            d.addr = 0;
-            d.len = 0;
-            d.flags = 0;
-            d.next = self.free_head;
+            let d = self.desc.add(idx as usize);
+            core::ptr::addr_of_mut!((*d).addr).write_volatile(0);
+            core::ptr::addr_of_mut!((*d).len).write_volatile(0);
+            core::ptr::addr_of_mut!((*d).flags).write_volatile(0);
+            core::ptr::addr_of_mut!((*d).next).write_volatile(self.free_head);
         }
         self.free_head = idx;
         self.free_count += 1;
@@ -191,9 +193,14 @@ impl Virtqueue {
     pub fn free_chain(&mut self, head: u16) {
         let mut idx = head;
         loop {
-            let d = unsafe { &*self.desc.add(idx as usize) };
-            let has_next = d.flags & VIRTQ_DESC_F_NEXT != 0;
-            let next = d.next;
+            let (flags, next) = unsafe {
+                let d = self.desc.add(idx as usize);
+                (
+                    core::ptr::addr_of!((*d).flags).read_volatile(),
+                    core::ptr::addr_of!((*d).next).read_volatile(),
+                )
+            };
+            let has_next = flags & VIRTQ_DESC_F_NEXT != 0;
             self.free_desc(idx);
             if has_next {
                 idx = next;
@@ -206,33 +213,37 @@ impl Virtqueue {
     /// Write a descriptor entry.
     pub fn write_desc(&mut self, idx: u16, addr: u64, len: u32, flags: u16, next: u16) {
         unsafe {
-            let d = &mut *self.desc.add(idx as usize);
-            d.addr = addr;
-            d.len = len;
-            d.flags = flags;
-            d.next = next;
+            let d = self.desc.add(idx as usize);
+            core::ptr::addr_of_mut!((*d).addr).write_volatile(addr);
+            core::ptr::addr_of_mut!((*d).len).write_volatile(len);
+            core::ptr::addr_of_mut!((*d).flags).write_volatile(flags);
+            core::ptr::addr_of_mut!((*d).next).write_volatile(next);
         }
     }
 
     /// Push a descriptor head index into the available ring.
     pub fn push_avail(&mut self, desc_idx: u16) {
-        let avail = unsafe { &mut *self.avail };
-        let ring_idx = avail.idx as usize % QUEUE_SIZE;
-        avail.ring[ring_idx] = desc_idx;
-        fence(Ordering::SeqCst);
-        avail.idx = avail.idx.wrapping_add(1);
+        unsafe {
+            let idx = core::ptr::addr_of!((*self.avail).idx).read_volatile();
+            let ring_idx = idx as usize % QUEUE_SIZE;
+            core::ptr::addr_of_mut!((*self.avail).ring[ring_idx]).write_volatile(desc_idx);
+            fence(Ordering::SeqCst);
+            core::ptr::addr_of_mut!((*self.avail).idx).write_volatile(idx.wrapping_add(1));
+        }
         fence(Ordering::SeqCst);
     }
 
     /// Pop a completed element from the used ring, returning (desc head, bytes written).
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         fence(Ordering::SeqCst);
-        let used = unsafe { &*self.used };
-        if self.last_used_idx == used.idx {
+        let idx = unsafe { core::ptr::addr_of!((*self.used).idx).read_volatile() };
+        if self.last_used_idx == idx {
             return None;
         }
         let ring_idx = self.last_used_idx as usize % QUEUE_SIZE;
-        let elem = used.ring[ring_idx];
+        let elem = unsafe {
+            core::ptr::addr_of!((*self.used).ring[ring_idx]).read_volatile()
+        };
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
         Some((elem.id as u16, elem.len))
     }

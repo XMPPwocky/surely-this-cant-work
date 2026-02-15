@@ -128,6 +128,7 @@ struct VirtioGpuResourceFlush {
 /// Global GPU state.
 pub struct Gpu {
     base: usize,
+    irq: u32,
     controlq: Virtqueue,
     /// DMA buffer for sending commands/receiving responses (one page)
     cmd_buf: usize,
@@ -157,13 +158,37 @@ fn send_command(gpu: &mut Gpu, cmd_phys: usize, cmd_len: u32, resp_phys: usize, 
     q.push_avail(d0);
     q.notify(gpu.base, 0);
 
-    // Poll used ring
+    // Wait for completion.  The VirtIO GPU device in QEMU processes commands
+    // via a bottom-half (BH), not synchronously during the MMIO notify write.
+    // A tight spin loop prevents QEMU's event loop from running the BH.
+    // We use WFI to yield the CPU, allowing the BH to run.  The GPU's PLIC
+    // interrupt (enabled during init) wakes us when the command completes.
+    let mut attempts: u32 = 0;
     loop {
         if let Some((head, _len)) = q.pop_used() {
             q.free_chain(head);
-            break;
+            return;
         }
-        core::hint::spin_loop();
+        attempts += 1;
+        if attempts > 1000 {
+            let cmd_type = unsafe { core::ptr::read_volatile(cmd_phys as *const u32) };
+            let avail_idx = unsafe {
+                core::ptr::addr_of!((*q.avail).idx).read_volatile()
+            };
+            let used_idx = unsafe {
+                core::ptr::addr_of!((*q.used).idx).read_volatile()
+            };
+            let resp_type = unsafe { core::ptr::read_volatile(resp_phys as *const u32) };
+            let dev_status = mmio::read_reg(gpu.base, mmio::REG_STATUS);
+            let intr_status = mmio::read_reg(gpu.base, mmio::REG_INTERRUPT_STATUS);
+            crate::println!(
+                "[gpu] STUCK: cmd_type={:#x} d0={} d1={} avail_idx={} last_used={} used_idx={} resp_type={:#x} dev_status={:#x} intr_status={:#x}",
+                cmd_type, d0, d1, avail_idx, q.last_used_idx, used_idx, resp_type, dev_status, intr_status
+            );
+            panic!("gpu: send_command stuck — device did not respond after {} WFI cycles", attempts);
+        }
+        // Yield CPU so QEMU can run its event loop and process the VirtIO BH
+        unsafe { core::arch::asm!("wfi"); }
     }
 }
 
@@ -202,14 +227,26 @@ pub fn init() -> bool {
     // Allocate a page for command/response DMA buffers
     let cmd_buf = alloc_dma_buffer(1);
 
+    // Compute IRQ: QEMU virt machine uses IRQ = 1 + slot
+    let irq = 1 + ((base - 0x1000_1000) / 0x1000) as u32;
+
     let mut gpu = Gpu {
         base,
+        irq,
         controlq,
         cmd_buf,
         fb_addr: 0,
         width: 0,
         height: 0,
     };
+
+    // Enable GPU interrupt in PLIC so WFI wakes on command completion
+    crate::drivers::plic::enable_irq(irq);
+    // Ensure SEIE (supervisor external interrupt enable) is set so WFI can
+    // wake on the GPU interrupt.  During early boot this bit hasn't been set
+    // yet by enable_timer().
+    crate::set_csr!("sie", 1 << 9);
+    crate::println!("[gpu] IRQ {} enabled", irq);
 
     // 1. GET_DISPLAY_INFO
     let (width, height) = get_display_info(&mut gpu);
@@ -440,6 +477,25 @@ fn transfer_to_host_2d_rect(gpu: &mut Gpu, x: u32, y: u32, w: u32, h: u32) {
     unsafe { core::ptr::write(buf as *mut VirtioGpuTransferToHost2d, cmd); }
     let cmd_len = core::mem::size_of::<VirtioGpuTransferToHost2d>();
     send_cmd_in_buf(gpu, 0, cmd_len, 256, core::mem::size_of::<VirtioGpuCtrlHdr>());
+}
+
+/// Handle a GPU IRQ. Called from the trap handler.
+pub fn handle_irq() {
+    let gpu = unsafe {
+        match (*core::ptr::addr_of_mut!(GPU)).as_mut() {
+            Some(g) => g,
+            None => return,
+        }
+    };
+
+    // Acknowledge interrupt
+    let intr_status = mmio::read_reg(gpu.base, mmio::REG_INTERRUPT_STATUS);
+    mmio::write_reg(gpu.base, mmio::REG_INTERRUPT_ACK, intr_status);
+}
+
+/// Return the GPU's IRQ number, if initialised.
+pub fn irq_number() -> Option<u32> {
+    unsafe { (*core::ptr::addr_of!(GPU)).as_ref().map(|g| g.irq) }
 }
 
 fn resource_flush_rect(gpu: &mut Gpu, x: u32, y: u32, w: u32, h: u32) {

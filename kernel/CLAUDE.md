@@ -20,3 +20,24 @@ pub const MY_ALLOC: MyAlloc = TaggedAlloc;
 ```
 
 Then use `Vec::new_in(MY_ALLOC)` in your data structures.
+
+## DMA / Volatile Memory Access
+
+All accesses to DMA shared memory (VirtIO descriptor tables, available rings,
+used rings, and device-written data buffers) **must** use `read_volatile` /
+`write_volatile`. Never create Rust references (`&T` / `&mut T`) to DMA
+memory — use raw pointer field access via `core::ptr::addr_of[_mut]!`.
+
+```rust
+// CORRECT: volatile field access without creating a reference
+let idx = unsafe { core::ptr::addr_of!((*ptr).idx).read_volatile() };
+
+// WRONG: creates a shared reference to device-modified DMA memory
+let used = unsafe { &*ptr };
+let idx = used.idx;
+```
+
+DMA memory is external to Rust's memory model. The compiler may assume memory
+behind `&T` doesn't change, and can cache or elide reads even across
+`fence(SeqCst)`. `read_volatile` / `write_volatile` are the only guaranteed
+way to access externally-modified memory. See bug 0004 for details.

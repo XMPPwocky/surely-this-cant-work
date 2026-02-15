@@ -1042,6 +1042,9 @@ fn external_interrupt() {
             tablet_irq if Some(tablet_irq) == crate::drivers::virtio::tablet::irq_number() => {
                 crate::drivers::virtio::tablet::handle_irq();
             }
+            gpu_irq if Some(gpu_irq) == crate::drivers::virtio::gpu::irq_number() => {
+                crate::drivers::virtio::gpu::handle_irq();
+            }
             _ => {
                 crate::println!("Unknown external interrupt: irq={}", irq);
             }
