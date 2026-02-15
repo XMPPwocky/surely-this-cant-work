@@ -18,7 +18,7 @@ A from-scratch RISC-V 64-bit microkernel operating system written in Rust. Targe
 - **UART serial console** — 16550A driver with `print!`/`println!` macros via `core::fmt::Write`
 - **VirtIO GPU driver** — MMIO transport, split virtqueue, framebuffer console with 8x16 bitmap font
 - **Buddy allocator** — physical frame allocator with efficient contiguous allocation for DMA
-- **Kernel heap** — linked-list free-list allocator (`#[global_allocator]`), enabling `Vec`, `Box`, `String`
+- **Kernel heap** — 4 MiB buddy allocator with tagged pool accounting (`#[global_allocator]`), enabling `Vec`, `Box`, `String`
 - **SpinLock** — atomic spinlock with RAII guard and interrupt disable/restore
 
 ## Screenshot
@@ -130,6 +130,7 @@ User Process                     Init Server                 Service
 | 230 | `SYS_TRACE` | Record timestamped trace event |
 | 231 | `SYS_SHUTDOWN` | Shut down machine via SBI |
 | 232 | `SYS_CLOCK` | Read wall-clock and CPU ticks |
+| 233 | `SYS_MEMINFO` | Query physical memory stats |
 
 See [docs/kernel-abi.md](docs/kernel-abi.md) for the full ABI reference.
 
@@ -196,6 +197,10 @@ rvos/
 | `make run-vnc` | Boot with VirtIO GPU on VNC port 5900 |
 | `make run-gpu-screenshot` | Headless GPU boot + PPM screenshot |
 | `make debug` | QEMU with GDB stub (`-s -S`) |
+| `make test` | Run kernel tests via expect scripts |
+| `make bench` | Run benchmark suite |
+| `make bench-check` | Run benchmarks and check for regressions |
+| `make clippy` | Run clippy on kernel + user crates |
 | `make clean` | Remove build artifacts |
 
 ## Documentation
