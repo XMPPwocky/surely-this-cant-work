@@ -122,10 +122,10 @@ pub fn save_kernel_satp() {
 }
 
 /// Find a free process slot: prefer Dead slots for reuse, then None slots.
-/// Returns the PID (slot index). Panics if no slots available.
+/// Returns the PID (slot index), or None if no slots available.
 /// When reusing a Dead slot, frees the old process's kernel stack (which
 /// could not be freed during exit because the dying process was still on it).
-fn find_free_slot(sched: &mut Scheduler) -> usize {
+fn find_free_slot(sched: &mut Scheduler) -> Option<usize> {
     // First pass: look for Dead slots to reuse (skip idle at 0)
     for i in 1..sched.processes.len() {
         if let Some(ref p) = sched.processes[i] {
@@ -145,17 +145,12 @@ fn find_free_slot(sched: &mut Scheduler) -> usize {
                     }
                 }
                 sched.processes[i] = None;
-                return i;
+                return Some(i);
             }
         }
     }
     // Second pass: look for None slots
-    for i in 1..sched.processes.len() {
-        if sched.processes[i].is_none() {
-            return i;
-        }
-    }
-    panic!("No free process slots (max {})", MAX_PROCS);
+    (1..sched.processes.len()).find(|&i| sched.processes[i].is_none())
 }
 
 /// After inserting a Process into its slot, set context.s1 to point to the
@@ -167,37 +162,49 @@ fn fixup_trap_ctx_ptr(sched: &mut Scheduler, pid: usize) {
     proc.context.s1 = ptr;
 }
 
-/// Spawn a new kernel task. Returns the PID.
+/// Spawn a new kernel task. Returns the PID, or None if no slots or allocation failed.
 #[allow(dead_code)]
-pub fn spawn(entry: fn()) -> usize {
+pub fn spawn(entry: fn()) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
-    let pid = find_free_slot(&mut sched);
-    let proc = Process::new_kernel(entry);
+    let pid = find_free_slot(&mut sched)?;
+    let proc = match Process::new_kernel(entry) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::println!("[spawn] kernel task failed: {}", e);
+            return None;
+        }
+    };
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
-    pid
+    Some(pid)
 }
 
 /// Spawn with a name for display purposes
-pub fn spawn_named(entry: fn(), name: &str) -> usize {
-    let pid = spawn(entry);
+pub fn spawn_named(entry: fn(), name: &str) -> Option<usize> {
+    let pid = spawn(entry)?;
     let mut sched = SCHEDULER.lock();
     if let Some(ref mut proc) = sched.processes[pid] {
         proc.set_name(name);
     }
     crate::println!("  Spawned [{}] \"{}\" (PID {})", pid, name, pid);
-    pid
+    Some(pid)
 }
 
 /// Spawn a user-mode process from machine code bytes. Returns the PID.
 #[allow(dead_code)]
-pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
+pub fn spawn_user(user_code: &[u8], name: &str) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
-    let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user(user_code);
+    let pid = find_free_slot(&mut sched)?;
+    let mut proc = match Process::new_user(user_code) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::println!("[spawn] user process '{}' failed: {}", name, e);
+            return None;
+        }
+    };
     proc.set_name(name);
 
     sched.processes[pid] = Some(proc);
@@ -205,15 +212,21 @@ pub fn spawn_user(user_code: &[u8], name: &str) -> usize {
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {})", pid, name, pid);
-    pid
+    Some(pid)
 }
 
 /// Spawn a user-mode process with handle 0 pre-set to boot_ep (boot channel).
 #[allow(dead_code)]
-pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize) -> usize {
+pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
-    let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user(user_code);
+    let pid = find_free_slot(&mut sched)?;
+    let mut proc = match Process::new_user(user_code) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::println!("[spawn] user process '{}' failed: {}", name, e);
+            return None;
+        }
+    };
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
@@ -222,15 +235,21 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
-    pid
+    Some(pid)
 }
 
 /// Spawn a user process from ELF data
 #[allow(dead_code)]
-pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
+pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
-    let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user_elf(elf_data);
+    let pid = find_free_slot(&mut sched)?;
+    let mut proc = match Process::new_user_elf(elf_data) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::println!("[spawn] user ELF '{}' failed: {}", name, e);
+            return None;
+        }
+    };
     proc.set_name(name);
 
     sched.processes[pid] = Some(proc);
@@ -238,14 +257,20 @@ pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> usize {
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {})", pid, name, pid);
-    pid
+    Some(pid)
 }
 
 /// Spawn a user ELF process with handle 0 pre-set to boot_ep (boot channel).
-pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: usize) -> usize {
+pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: usize) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
-    let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user_elf(elf_data);
+    let pid = find_free_slot(&mut sched)?;
+    let mut proc = match Process::new_user_elf(elf_data) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::println!("[spawn] user ELF '{}' failed: {}", name, e);
+            return None;
+        }
+    };
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
@@ -254,14 +279,20 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: us
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
-    pid
+    Some(pid)
 }
 
 /// Spawn a user ELF process with handle 0 = boot_ep and handle 1 = extra_ep.
-pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, extra_ep: usize) -> usize {
+pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, extra_ep: usize) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
-    let pid = find_free_slot(&mut sched);
-    let mut proc = Process::new_user_elf(elf_data);
+    let pid = find_free_slot(&mut sched)?;
+    let mut proc = match Process::new_user_elf(elf_data) {
+        Ok(p) => p,
+        Err(e) => {
+            crate::println!("[spawn] user ELF '{}' failed: {}", name, e);
+            return None;
+        }
+    };
     proc.set_name(name);
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
     proc.handles[1] = Some(HandleObject::Channel(extra_ep));
@@ -271,7 +302,7 @@ pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, 
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={}, extra_ep={})", pid, name, pid, boot_ep, extra_ep);
-    pid
+    Some(pid)
 }
 
 /// Look up a handle in the current process's handle table.
@@ -648,7 +679,11 @@ pub fn terminate_current_process() {
             code_pages = proc.code_pages;
             if proc.is_user && proc.user_stack_top != 0 {
                 ustack_pages = 8; // USER_STACK_PAGES
-                ustack_ppn = (proc.user_stack_top / PAGE_SIZE) - ustack_pages;
+                let stack_top_ppn = proc.user_stack_top / PAGE_SIZE;
+                ustack_ppn = match stack_top_ppn.checked_sub(ustack_pages) {
+                    Some(ppn) => ppn,
+                    None => { ustack_pages = 0; 0 } // skip cleanup if invalid
+                };
             }
 
             proc.state = ProcessState::Dead;

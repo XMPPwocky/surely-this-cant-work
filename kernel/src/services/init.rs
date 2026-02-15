@@ -387,9 +387,8 @@ fn handle_request(
         BootRequest::ConnectService { name } => {
             // Check namespace overrides first
             if let Some(override_ep) = find_ns_override(boot_ep_b, name) {
-                // Inc ref for the cap being transferred — init's kernel-internal send
-                // bypasses translate_cap_for_send which normally does this.
-                ipc::channel_inc_ref(override_ep);
+                // send_ok_with_cap handles inc_ref for the transfer.
+                // No close needed: the BootRegistration still holds its reference.
                 send_ok_with_cap(boot_ep_b, override_ep, my_pid);
             } else if name == "stdin" {
                 handle_stdio_request(boot_ep_b, console_type, client_pid, my_pid, 1);
@@ -556,18 +555,21 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
     let ctl_ep = svc.control_ep.load(Ordering::Relaxed);
     if ctl_ep != usize::MAX {
         // Send server endpoint to the service via its control channel with NewConnection
+        ipc::channel_inc_ref(server_ep);
         let mut ctl_msg = Message::new();
         ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
-    ctl_msg.cap_count = 1;
+        ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid, channel_role: 0 },
             &mut ctl_msg.data,
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
+        ipc::channel_close(server_ep);
 
         // Respond to client with Ok + client endpoint
         send_ok_with_cap(boot_ep_b, client_ep, my_pid);
+        ipc::channel_close(client_ep);
     } else {
         send_error(boot_ep_b, "service not ready", my_pid);
     }
@@ -595,18 +597,21 @@ fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid
 
     if let Some(ctl_ep) = control_ep {
         // Send NewConnection to console server via its control channel with role
+        ipc::channel_inc_ref(server_ep);
         let mut ctl_msg = Message::new();
         ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
-    ctl_msg.cap_count = 1;
+        ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid, channel_role: role },
             &mut ctl_msg.data,
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
+        ipc::channel_close(server_ep);
 
         // Respond to client with Ok + client endpoint
         send_ok_with_cap(boot_ep_b, client_ep, my_pid);
+        ipc::channel_close(client_ep);
     } else {
         send_error(boot_ep_b, "no console", my_pid);
     }
@@ -723,6 +728,7 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
     };
 
     // Send the server endpoint to the fs service via its control channel with NewConnection
+    ipc::channel_inc_ref(server_ep);
     let mut ctl_msg = Message::new();
     ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
     ctl_msg.cap_count = 1;
@@ -732,6 +738,7 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
     ).unwrap_or(0);
     ctl_msg.sender_pid = ctx.my_pid;
     send_and_wake(fs_ctl_ep, ctl_msg);
+    ipc::channel_close(server_ep);
 
     // Send the initial Stat request
     let mut msg = Message::new();
@@ -817,7 +824,11 @@ fn handle_get_args(boot_ep_b: usize, my_pid: usize) {
 }
 
 /// Send an Ok response with a capability on the boot channel.
+/// Increments the ref count for cap_ep to account for the transfer.
+/// Callers that don't retain a reference to cap_ep should call
+/// `channel_close(cap_ep)` after this function returns.
 fn send_ok_with_cap(endpoint: usize, cap_ep: usize, my_pid: usize) {
+    ipc::channel_inc_ref(cap_ep);
     let mut resp = Message::new();
     resp.len = rvos_wire::to_bytes(&BootResponse::Ok {}, &mut resp.data).unwrap_or(0);
     resp.caps[0] = ipc::encode_cap_channel(cap_ep);
@@ -900,15 +911,17 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
         };
 
         // Send the server endpoint to the fs service via its control channel with NewConnection
+        ipc::channel_inc_ref(server_ep);
         let mut ctl_msg = Message::new();
         ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
-    ctl_msg.cap_count = 1;
+        ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
             &mut ctl_msg.data,
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(fs_init_ctl_ep, ctl_msg);
+        ipc::channel_close(server_ep);
 
         // Send the initial Stat request
         let mut msg = Message::new();
@@ -1181,6 +1194,18 @@ fn finish_fs_launch(
         crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name(), boot_a)
     };
 
+    let pid = match pid {
+        Some(p) => p,
+        None => {
+            crate::println!("[init] spawn failed for {}", ctx.name());
+            if ctx.requester_ep != 0 {
+                send_error(ctx.requester_ep, "spawn failed", my_pid);
+            }
+            ctx.state = FsLaunchState::Done;
+            return;
+        }
+    };
+
     // If this is a dynamic spawn, set up exit notification and respond to requester
     if ctx.requester_ep != 0 {
         // Kernel notification channel: kernel sends exit code here
@@ -1233,6 +1258,7 @@ fn finish_fs_launch(
 
         // Send Ok response with process handle capability
         send_ok_with_cap(ctx.requester_ep, client_handle_ep, my_pid);
+        ipc::channel_close(client_handle_ep);
     }
 
     ctx.state = FsLaunchState::Done;

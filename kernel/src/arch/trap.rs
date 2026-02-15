@@ -372,6 +372,8 @@ fn sys_chan_create(tf: &mut TrapFrame) {
     let handle_a = match crate::task::current_process_alloc_handle(HandleObject::Channel(ep_a)) {
         Some(h) => h,
         None => {
+            crate::ipc::channel_close(ep_a);
+            crate::ipc::channel_close(ep_b);
             tf.regs[10] = usize::MAX;
             return;
         }
@@ -379,6 +381,9 @@ fn sys_chan_create(tf: &mut TrapFrame) {
     let handle_b = match crate::task::current_process_alloc_handle(HandleObject::Channel(ep_b)) {
         Some(h) => h,
         None => {
+            crate::task::current_process_free_handle(handle_a);
+            crate::ipc::channel_close(ep_a);
+            crate::ipc::channel_close(ep_b);
             tf.regs[10] = usize::MAX;
             return;
         }

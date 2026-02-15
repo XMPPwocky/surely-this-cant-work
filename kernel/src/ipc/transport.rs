@@ -33,12 +33,25 @@ impl Transport for KernelTransport {
         msg.sender_pid = self.pid;
         msg.cap_count = caps.len().min(MAX_CAPS);
         for (i, &cap) in caps.iter().enumerate().take(msg.cap_count) {
+            if cap != rvos_wire::NO_CAP {
+                ipc::channel_inc_ref(cap);
+            }
             msg.caps[i] = if cap == rvos_wire::NO_CAP { NO_CAP } else { ipc::encode_cap_channel(cap) };
         }
         match ipc::channel_send_blocking(self.endpoint, &msg, self.pid) {
             Ok(()) => Ok(()),
-            Err(ipc::SendError::ChannelClosed) => Err(RpcError::ChannelClosed),
-            Err(ipc::SendError::QueueFull) => Err(RpcError::Transport(5)),
+            Err(e) => {
+                // Rollback: close caps we inc_ref'd
+                for &cap in caps.iter().take(msg.cap_count) {
+                    if cap != rvos_wire::NO_CAP {
+                        ipc::channel_close(cap);
+                    }
+                }
+                match e {
+                    ipc::SendError::ChannelClosed => Err(RpcError::ChannelClosed),
+                    ipc::SendError::QueueFull => Err(RpcError::Transport(5)),
+                }
+            }
         }
     }
 

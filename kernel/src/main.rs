@@ -177,29 +177,29 @@ pub extern "C" fn kmain() -> ! {
     }
 
     // Spawn services
-    task::spawn_named(services::init::init_server, "init");
-    task::spawn_named(services::console::serial_console_server, "serial-con");
+    task::spawn_named(services::init::init_server, "init").expect("boot: init");
+    task::spawn_named(services::console::serial_console_server, "serial-con").expect("boot: serial-con");
     if gpu_present {
         // GPU present: spawn gpu-server + kbd-server + mouse-server (window-server loaded from fs)
-        task::spawn_named(services::gpu_server::gpu_server, "gpu-server");
-        task::spawn_named(services::kbd_server::kbd_server, "kbd-server");
-        task::spawn_named(services::mouse_server::mouse_server, "mouse-server");
+        task::spawn_named(services::gpu_server::gpu_server, "gpu-server").expect("boot: gpu-server");
+        task::spawn_named(services::kbd_server::kbd_server, "kbd-server").expect("boot: kbd-server");
+        task::spawn_named(services::mouse_server::mouse_server, "mouse-server").expect("boot: mouse-server");
         // fb-con and shell-fb are replaced by the window server
     }
-    task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo");
-    task::spawn_named(services::math::math_service, "math");
+    task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo").expect("boot: sysinfo");
+    task::spawn_named(services::math::math_service, "math").expect("boot: math");
 
     // Spawn fs server as a user process with boot channel + control channel
     let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair().expect("boot: fs-boot channel");
     services::init::register_boot(fs_boot_b, services::init::ConsoleType::Serial, false);
-    task::spawn_user_elf_with_handles(user_fs_code(), "fs", fs_boot_a, fs_ctl_ep);
+    task::spawn_user_elf_with_handles(user_fs_code(), "fs", fs_boot_a, fs_ctl_ep).expect("boot: fs");
 
     // hello-std is now loaded from the filesystem by init_server
 
     // Spawn shells with boot channels
-    task::spawn_user_elf_with_boot_channel(user_shell_code(), "shell-serial", shell_serial_boot_a);
+    task::spawn_user_elf_with_boot_channel(user_shell_code(), "shell-serial", shell_serial_boot_a).expect("boot: shell-serial");
     if let Some(boot_a) = shell_fb_boot_a {
-        task::spawn_user_elf_with_boot_channel(user_shell_code(), "shell-fb", boot_a);
+        task::spawn_user_elf_with_boot_channel(user_shell_code(), "shell-fb", boot_a).expect("boot: shell-fb");
     }
 
     // ---- Phase 6: Enable preemptive scheduling ----

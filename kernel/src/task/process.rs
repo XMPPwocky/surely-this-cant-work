@@ -130,10 +130,11 @@ pub fn restore_guard_page(guard_addr: usize) {
 }
 
 impl Process {
-    /// Create a new kernel task with the given entry function
-    pub fn new_kernel(entry: fn()) -> Self {
+    /// Create a new kernel task with the given entry function.
+    /// Returns Err if frame allocation fails.
+    pub fn new_kernel(entry: fn()) -> Result<Self, &'static str> {
         let alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
-            .expect("Failed to allocate kernel stack");
+            .ok_or("failed to allocate kernel stack")?;
         let alloc_base = alloc_ppn.0 * PAGE_SIZE;
         // Guard page at bottom, usable stack above it
         let guard_addr = alloc_base;
@@ -144,7 +145,7 @@ impl Process {
         let context = TaskContext::new(entry as usize, stack_top);
         let trap_ctx = TrapContext::new_kernel(entry as usize, stack_top);
 
-        Process {
+        Ok(Process {
             state: ProcessState::Ready,
             trap_ctx,
             context,
@@ -167,18 +168,19 @@ impl Process {
             pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
             code_ppn: 0,
             code_pages: 0,
-        }
+        })
     }
 
     /// Create a user process.
     /// `user_code` is the machine code bytes to run in U-mode.
     /// User code and stack are identity-mapped (VA=PA) in a per-process
     /// page table, so addresses work under both kernel and user page tables.
+    /// Returns Err if frame allocation fails.
     #[allow(dead_code)]
-    pub fn new_user(user_code: &[u8]) -> Self {
+    pub fn new_user(user_code: &[u8]) -> Result<Self, &'static str> {
         // Allocate kernel stack for this process (used during traps)
         let kstack_alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
-            .expect("Failed to allocate kernel stack for user process");
+            .ok_or("failed to allocate kernel stack")?;
         let kstack_alloc_base = kstack_alloc_ppn.0 * PAGE_SIZE;
         let kstack_base = kstack_alloc_base + KERNEL_GUARD_PAGES * PAGE_SIZE;
         let kstack_top = kstack_base + KERNEL_STACK_SIZE;
@@ -188,7 +190,7 @@ impl Process {
         let n_code_pages = user_code.len().div_ceil(PAGE_SIZE);
         let n_code_pages = if n_code_pages == 0 { 1 } else { n_code_pages };
         let code_ppn = frame::frame_alloc_contiguous(n_code_pages)
-            .expect("Failed to allocate user code pages");
+            .ok_or("failed to allocate user code pages")?;
         let code_phys = code_ppn.0 * PAGE_SIZE;
 
         // Copy user code into the allocated pages
@@ -202,7 +204,7 @@ impl Process {
 
         // Allocate user stack pages
         let stack_ppn = frame::frame_alloc_contiguous(USER_STACK_PAGES)
-            .expect("Failed to allocate user stack pages");
+            .ok_or("failed to allocate user stack pages")?;
         let stack_phys_base = stack_ppn.0 * PAGE_SIZE;
         let stack_phys_top = stack_phys_base + USER_STACK_SIZE;
 
@@ -216,7 +218,7 @@ impl Process {
         let context = TaskContext::new_user_entry(kstack_top);
         let trap_ctx = TrapContext::new_user(code_phys, stack_phys_top, kstack_top, satp);
 
-        Process {
+        Ok(Process {
             state: ProcessState::Ready,
             trap_ctx,
             context,
@@ -239,29 +241,29 @@ impl Process {
             pt_frames,
             code_ppn: code_ppn.0,
             code_pages: n_code_pages,
-        }
+        })
     }
 
     /// Create a user process from an ELF binary.
     /// Parses ELF, loads PT_LOAD segments, creates page table.
-    pub fn new_user_elf(elf_data: &[u8]) -> Self {
+    /// Returns Err if frame allocation or ELF loading fails.
+    pub fn new_user_elf(elf_data: &[u8]) -> Result<Self, &'static str> {
         crate::trace::trace_kernel(b"new_user_elf-enter");
 
         // Allocate kernel stack
         let kstack_alloc_ppn = frame::frame_alloc_contiguous(KERNEL_STACK_ALLOC_PAGES)
-            .expect("Failed to allocate kernel stack for user process");
+            .ok_or("failed to allocate kernel stack")?;
         let kstack_alloc_base = kstack_alloc_ppn.0 * PAGE_SIZE;
         let kstack_base = kstack_alloc_base + KERNEL_GUARD_PAGES * PAGE_SIZE;
         let kstack_top = kstack_base + KERNEL_STACK_SIZE;
         setup_guard_page(kstack_alloc_base);
 
         // Load ELF
-        let loaded = crate::mm::elf::load_elf(elf_data)
-            .expect("Failed to load ELF binary");
+        let loaded = crate::mm::elf::load_elf(elf_data)?;
 
         // Allocate user stack
         let stack_ppn = frame::frame_alloc_contiguous(USER_STACK_PAGES)
-            .expect("Failed to allocate user stack pages");
+            .ok_or("failed to allocate user stack pages")?;
         let stack_phys_base = stack_ppn.0 * PAGE_SIZE;
         let stack_phys_top = stack_phys_base + USER_STACK_SIZE;
 
@@ -277,7 +279,7 @@ impl Process {
         let trap_ctx = TrapContext::new_user(loaded.entry_va, stack_phys_top, kstack_top, satp);
 
         crate::trace::trace_kernel(b"new_user_elf-exit");
-        Process {
+        Ok(Process {
             state: ProcessState::Ready,
             trap_ctx,
             context,
@@ -300,7 +302,7 @@ impl Process {
             pt_frames,
             code_ppn: loaded.code_ppn.0,
             code_pages: loaded.total_pages,
-        }
+        })
     }
 
     /// Create a "dummy" process representing the boot/idle task (PID 0)
