@@ -33,11 +33,15 @@ impl TrapContext {
     /// Create a TrapContext for a kernel task's first run via sret.
     /// sepc = entry function, sstatus has SPP=1 (S-mode) and SPIE=1.
     pub fn new_kernel(entry: usize, stack_top: usize) -> Self {
+        extern "C" {
+            fn kernel_task_return_handler();
+        }
         // sstatus: SPP=1 (return to S-mode), SPIE=1 (enable interrupts after sret)
         let sstatus = csr::SSTATUS_SPP | csr::SSTATUS_SPIE;
         let mut frame = TrapFrame::zero();
         frame.sepc = entry;
         frame.sstatus = sstatus;
+        frame.regs[1] = kernel_task_return_handler as *const () as usize; // ra
         frame.regs[2] = stack_top; // sp
         TrapContext {
             frame,

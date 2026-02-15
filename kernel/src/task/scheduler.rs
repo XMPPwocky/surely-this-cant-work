@@ -428,13 +428,13 @@ pub fn schedule() {
     let old_trap_ctx = &sched.processes[old_pid].as_ref().unwrap().trap_ctx
         as *const crate::task::context::TrapContext as usize;
 
-    // Drop the lock BEFORE switching (critical!)
+    // Suppress interrupt restore: sched.current has already been set to
+    // next_pid, but we haven't switched yet.  If drop() re-enabled
+    // interrupts and a timer fired, preempt() would read the wrong current
+    // PID and corrupt next_pid's TaskContext.  By suppressing the restore,
+    // interrupts stay disabled through switch_context.
+    sched.suppress_irq_restore();
     drop(sched);
-
-    // SpinLock::drop() restores SIE to its pre-lock state, which may
-    // re-enable interrupts.  Disable them now to prevent a preemption
-    // between here and switch_context (sscratch is about to change).
-    crate::arch::csr::disable_interrupts();
 
     unsafe {
         // Set sscratch to the NEW task's TrapContext before switching.
@@ -558,6 +558,14 @@ pub fn preempt(old_tf: &mut TrapFrame) -> *mut TrapFrame {
     // switch_context returned — we've been resumed.  Return old_tf so the
     // asm epilogue (after trap_handler returns) restores from it and srets.
     old_tf as *mut TrapFrame
+}
+
+/// Safe return handler for kernel tasks. When a kernel task's entry
+/// function returns (instead of looping forever), sret set ra to this
+/// function.  Without it, ra=0 and the task jumps to address 0.
+#[no_mangle]
+extern "C" fn kernel_task_return_handler() -> ! {
+    exit_current()
 }
 
 /// Mark the current task as dead and schedule away (for kernel tasks)

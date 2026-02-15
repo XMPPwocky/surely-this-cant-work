@@ -77,6 +77,21 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
     }
 }
 
+impl<T> SpinLockGuard<'_, T> {
+    /// Suppress interrupt restore on drop. After calling this, dropping the
+    /// guard releases the lock but does NOT re-enable interrupts. The caller
+    /// takes responsibility for restoring interrupt state.
+    ///
+    /// Used by `schedule()` to prevent a race: `sched.current` is updated
+    /// while the lock is held, but `switch_context` happens after the lock
+    /// is dropped. If interrupts were briefly re-enabled between these two
+    /// points, a timer interrupt could call `preempt()` which would read the
+    /// wrong `current` PID, corrupting a different task's saved context.
+    pub fn suppress_irq_restore(&mut self) {
+        self.irq_was_enabled = false;
+    }
+}
+
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
