@@ -1,4 +1,4 @@
-use crate::ipc::{self, Message};
+use crate::ipc;
 use crate::ipc::transport::KernelTransport;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::math::{MathResponse, MathHandler, math_dispatch};
@@ -35,15 +35,9 @@ pub fn math_service() {
         let client = ipc::OwnedEndpoint::new(accepted.endpoint);
         let mut transport = KernelTransport::new(client.raw(), my_pid);
 
-        if math_dispatch(&mut transport, &mut handler).is_err() {
-            // Bad request — send error text manually
-            let mut resp = Message::new();
-            let err = b"bad request";
-            resp.data[..err.len()].copy_from_slice(err);
-            resp.len = err.len();
-            resp.sender_pid = my_pid;
-            let _ = ipc::channel_send_blocking(client.raw(), &resp, my_pid);
-        }
+        // On bad request, math_dispatch returns Err and we let the
+        // OwnedEndpoint close the channel — the client sees ChannelClosed.
+        let _ = math_dispatch(&mut transport, &mut handler);
         // OwnedEndpoint closes on drop at end of loop iteration
     }
 }
