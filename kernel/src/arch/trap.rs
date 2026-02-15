@@ -455,15 +455,11 @@ fn translate_cap_for_send(local_handle: usize) -> Option<usize> {
     }
     match crate::task::current_process_handle(local_handle) {
         Some(HandleObject::Channel(global_ep)) => {
-            if !crate::ipc::channel_inc_ref(global_ep) {
-                return None;
-            }
+            crate::ipc::channel_inc_ref(global_ep);
             Some(crate::ipc::encode_cap_channel(global_ep))
         }
         Some(HandleObject::Shm { id, rw }) => {
-            if !crate::ipc::shm_inc_ref(id) {
-                return None;
-            }
+            crate::ipc::shm_inc_ref(id);
             Some(crate::ipc::encode_cap_shm(id, rw))
         }
         None => None,
@@ -754,10 +750,8 @@ fn sys_shm_dup_ro(handle: usize) -> usize {
         _ => return usize::MAX,
     };
 
-    // Increment ref_count
-    if !crate::ipc::shm_inc_ref(shm_id) {
-        return usize::MAX;
-    }
+    // Increment ref_count (panics if shm_id is invalid — would be a kernel bug)
+    crate::ipc::shm_inc_ref(shm_id);
 
     // Install RO handle
     match crate::task::current_process_alloc_handle(HandleObject::Shm { id: shm_id, rw: false }) {

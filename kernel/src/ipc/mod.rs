@@ -452,6 +452,7 @@ impl Drop for OwnedEndpoint {
 }
 
 /// Check if a channel endpoint is still active.
+#[must_use]
 pub fn channel_is_active(endpoint: usize) -> bool {
     let (ch_idx, _) = ep_to_channel(endpoint);
     let mgr = CHANNELS.lock();
@@ -462,23 +463,20 @@ pub fn channel_is_active(endpoint: usize) -> bool {
     }
 }
 
-/// Increment the ref count for a channel endpoint. Returns false if
-/// the channel is inactive or invalid (mirrors `shm_inc_ref`).
-pub fn channel_inc_ref(endpoint: usize) -> bool {
+/// Increment the ref count for a channel endpoint.
+/// Panics if the endpoint refers to an inactive or invalid channel — this
+/// indicates a kernel bug (the caller should only inc_ref endpoints it owns).
+pub fn channel_inc_ref(endpoint: usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
-    if let Some(Some(ref mut ch)) = mgr.channels.get_mut(ch_idx) {
-        if !ch.active {
-            return false;
-        }
-        if is_b {
-            ch.ref_count_b += 1;
-        } else {
-            ch.ref_count_a += 1;
-        }
-        true
+    let ch = mgr.channels.get_mut(ch_idx)
+        .and_then(|slot| slot.as_mut())
+        .unwrap_or_else(|| panic!("channel_inc_ref: invalid endpoint {}", endpoint));
+    assert!(ch.active, "channel_inc_ref: channel {} is inactive", ch_idx);
+    if is_b {
+        ch.ref_count_b += 1;
     } else {
-        false
+        ch.ref_count_a += 1;
     }
 }
 
@@ -589,40 +587,40 @@ pub fn shm_create(base_ppn: PhysPageNum, page_count: usize) -> Option<usize> {
     None
 }
 
-/// Increment the ref_count of a SHM region. Returns false if the region is invalid.
-pub fn shm_inc_ref(shm_id: usize) -> bool {
+/// Increment the ref_count of a SHM region.
+/// Panics if the SHM ID is invalid or inactive — this indicates a kernel bug.
+pub fn shm_inc_ref(shm_id: usize) {
     let mut mgr = SHM_REGIONS.lock();
-    if let Some(Some(ref mut region)) = mgr.regions.get_mut(shm_id) {
-        if region.active {
-            region.ref_count += 1;
-            return true;
-        }
-    }
-    false
+    let region = mgr.regions.get_mut(shm_id)
+        .and_then(|slot| slot.as_mut())
+        .unwrap_or_else(|| panic!("shm_inc_ref: invalid shm_id {}", shm_id));
+    assert!(region.active, "shm_inc_ref: shm_id {} is inactive", shm_id);
+    region.ref_count += 1;
 }
 
-/// Decrement the ref_count of a SHM region. If it reaches 0, free the physical frames
-/// and mark the region as inactive. Returns true if the region was valid.
-pub fn shm_dec_ref(shm_id: usize) -> bool {
+/// Decrement the ref_count of a SHM region. If it reaches 0, free the physical
+/// frames and mark the region as inactive.
+/// Panics if the SHM ID is invalid or inactive — this indicates a kernel bug.
+pub fn shm_dec_ref(shm_id: usize) {
     let mut mgr = SHM_REGIONS.lock();
-    if let Some(Some(ref mut region)) = mgr.regions.get_mut(shm_id) {
-        if !region.active {
-            return false;
+    let region = mgr.regions.get_mut(shm_id)
+        .and_then(|slot| slot.as_mut())
+        .unwrap_or_else(|| panic!("shm_dec_ref: invalid shm_id {}", shm_id));
+    assert!(region.active, "shm_dec_ref: shm_id {} is inactive", shm_id);
+    assert!(region.ref_count > 0, "shm_dec_ref: underflow on shm_id {}", shm_id);
+    region.ref_count -= 1;
+    if region.ref_count == 0 {
+        // Free physical frames
+        let base = region.base_ppn;
+        let count = region.page_count;
+        region.active = false;
+        mgr.regions[shm_id] = None;
+        // Drop lock before dealloc (frame allocator has its own lock)
+        drop(mgr);
+        for i in 0..count {
+            crate::mm::frame::frame_dealloc(PhysPageNum(base.0 + i));
         }
-        assert!(region.ref_count > 0, "shm_dec_ref: underflow on shm_id {}", shm_id);
-        region.ref_count -= 1;
-        if region.ref_count == 0 {
-            // Free physical frames
-            for i in 0..region.page_count {
-                crate::mm::frame::frame_dealloc(PhysPageNum(region.base_ppn.0 + i));
-            }
-            region.active = false;
-            // Remove from table
-            mgr.regions[shm_id] = None;
-        }
-        return true;
     }
-    false
 }
 
 /// Get the base PPN and page count of a SHM region. Returns None if invalid.

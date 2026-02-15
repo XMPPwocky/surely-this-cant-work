@@ -136,7 +136,6 @@ struct ConsoleClient {
     stdout_ep: usize,         // receives Write requests, sends WriteOk responses
     pid: u32,
     has_pending_read: bool,   // true if client sent Read but no data available yet
-    pending_read_len: u32,    // requested read length
     active: bool,
 }
 
@@ -147,7 +146,6 @@ impl ConsoleClient {
             stdout_ep: usize::MAX,
             pid: 0,
             has_pending_read: false,
-            pending_read_len: 0,
             active: false,
         }
     }
@@ -333,7 +331,7 @@ pub fn serial_console_server() {
                         match rvos_wire::from_bytes::<FileRequest>(&msg.data[..msg.len]) {
                             Ok(FileRequest::Read { offset: _, len }) => {
                                 client.has_pending_read = true;
-                                client.pending_read_len = len;
+                                let _ = len; // TODO: limit response to requested length
                                 // Push onto stdin_stack on first Read (lazy)
                                 let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == i);
                                 if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
