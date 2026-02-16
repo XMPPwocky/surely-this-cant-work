@@ -2,9 +2,9 @@ extern crate rvos_rt;
 
 use std::io::Write;
 use rvos::raw;
-use rvos::channel::RawChannel;
 use rvos::rvos_wire;
 use rvos_proto::debug::*;
+use rvos_proto::fs::{FileRequest, FileResponse, FileOffset};
 
 // Register name table
 const REG_NAMES: [&str; 33] = [
@@ -367,11 +367,9 @@ impl Debugger {
             None => return,
         };
 
-        let ev_chan = RawChannel::from_raw_handle(event_h);
         loop {
             let mut msg = rvos::Message::new();
-            let ret = ev_chan.try_recv(&mut msg);
-            if ret != 0 {
+            if raw::sys_chan_recv(event_h, &mut msg) != 0 {
                 break;
             }
             if let Ok(event) = rvos_wire::from_bytes::<DebugEvent>(&msg.data[..msg.len]) {
@@ -389,8 +387,6 @@ impl Debugger {
                 }
             }
         }
-        // Prevent the RawChannel from closing the handle on drop
-        let _ = ev_chan.into_raw_handle();
     }
 }
 
@@ -455,34 +451,90 @@ fn print_help() {
     println!("  quit / q             Exit debugger");
 }
 
+/// Read a line from stdin while also polling for debug events.
+/// Uses sys_chan_poll_add + sys_block to multiplex stdin and event channels,
+/// so events are printed immediately instead of waiting for user input.
+fn read_line_with_events(stdin_h: usize, dbg: &mut Debugger) -> Option<String> {
+    // Send a FileRequest::Read to stdin
+    let mut req_msg = rvos::Message::new();
+    req_msg.len = rvos_wire::to_bytes(&FileRequest::Read {
+        offset: FileOffset::Stream {},
+        len: 1024,
+    }, &mut req_msg.data).unwrap_or(0);
+    if raw::sys_chan_send_blocking(stdin_h, &req_msg) != 0 {
+        return None;
+    }
+
+    // Poll both stdin and event channel until stdin has data
+    loop {
+        raw::sys_chan_poll_add(stdin_h);
+        if let Some(eh) = dbg.event_handle {
+            raw::sys_chan_poll_add(eh);
+        }
+        raw::sys_block();
+
+        // Drain debug events first
+        dbg.poll_events();
+
+        // Try to receive stdin response (non-blocking)
+        let mut resp_msg = rvos::Message::new();
+        if raw::sys_chan_recv(stdin_h, &mut resp_msg) != 0 {
+            continue; // No stdin data yet, keep polling
+        }
+
+        // Parse the FileResponse::Data
+        let data = match rvos_wire::from_bytes::<FileResponse>(&resp_msg.data[..resp_msg.len]) {
+            Ok(FileResponse::Data { chunk }) if !chunk.is_empty() => chunk.to_vec(),
+            _ => return Some(String::new()), // Empty sentinel or error → empty line
+        };
+
+        // Drain remaining Data chunks until sentinel (empty Data)
+        loop {
+            let mut drain_msg = rvos::Message::new();
+            if raw::sys_chan_recv_blocking(stdin_h, &mut drain_msg) != 0 {
+                break;
+            }
+            match rvos_wire::from_bytes::<FileResponse>(&drain_msg.data[..drain_msg.len]) {
+                Ok(FileResponse::Data { chunk }) if !chunk.is_empty() => continue,
+                _ => break,
+            }
+        }
+
+        return Some(String::from_utf8_lossy(&data).into_owned());
+    }
+}
+
 fn main() {
     println!("rvOS process debugger");
     println!("Type 'help' for available commands.");
     println!();
 
     let mut dbg = Debugger::new();
-
-    // If we have an event channel, register for poll wakeup
-    // Use stdin (handle obtained from boot channel via stdio) for reading commands
+    let stdin_h = std::os::rvos::stdin_handle();
 
     loop {
-        // Poll for events before showing prompt
-        if dbg.is_attached() {
-            dbg.poll_events();
-        }
-
-        // Read a line from stdin
-        let mut line = String::new();
+        // Print prompt
         if dbg.is_attached() {
             print!("dbg> ");
         } else {
             print!("dbg) ");
         }
         std::io::stdout().flush().ok();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            _ => {}
-        }
+
+        // Read a line — when attached, poll both stdin and event channels
+        let line = if dbg.is_attached() && stdin_h != 0 {
+            match read_line_with_events(stdin_h, &mut dbg) {
+                Some(l) => l,
+                None => break,
+            }
+        } else {
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                _ => {}
+            }
+            line
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
