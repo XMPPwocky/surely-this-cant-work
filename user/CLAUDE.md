@@ -14,12 +14,6 @@ User-space programs run on top of the rvOS microkernel using the custom Rust std
 - Use `rvos::raw::*` for direct syscalls, `rvos::channel::*` for higher-level IPC
 
 ## Kernel Changes
-Agents working on user-space programs should NOT hesitate to recommend or request
-kernel changes when appropriate. Examples:
-- A bug is discovered in a kernel service or syscall
-- New kernel functionality would significantly simplify a user-space implementation
-- A resource limit is too low (e.g., MAX_CHANNELS, MAX_HANDLES, MAX_CONSOLE_CLIENTS)
-- A kernel API is awkward or error-prone for user-space consumers
-
-When you identify such a case, flag it clearly and ask the user whether a kernel
-change should be made rather than working around the issue in user-space alone.
+Don't hesitate to recommend kernel changes when appropriate (bugs, missing
+functionality, low resource limits, awkward APIs). Flag it and ask the user
+rather than working around the issue in user-space alone.
