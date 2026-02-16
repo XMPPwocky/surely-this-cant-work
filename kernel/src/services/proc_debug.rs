@@ -168,6 +168,12 @@ pub fn proc_debug_service() {
             continue;
         }
 
+        // Drop the service's original references to the B endpoints.
+        // The inc_ref calls above created a second reference for the client;
+        // the service only uses the A endpoints from here on.
+        ipc::channel_close(session_b);
+        ipc::channel_close(event_b);
+
         // Enter session loop
         let session_ep = OwnedEndpoint::new(session_a);
         handle_debug_session(session_ep.raw(), target_pid, event_a, my_pid);
