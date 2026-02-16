@@ -4,7 +4,7 @@
 //! connects and receives the display framebuffer as a SHM capability,
 //! then sends Flush commands to update rectangular regions.
 
-use crate::ipc::{self, Message};
+use crate::ipc::{self, Message, Cap};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::gpu::{GpuRequest, GpuResponse};
 
@@ -27,15 +27,15 @@ pub fn gpu_server() {
     let stride = width; // pixels per row (no padding in our setup)
 
     // Create SHM region from the GPU framebuffer's physical pages
-    let shm_id = ipc::shm_create(fb_ppn, fb_pages)
+    let shm = ipc::shm_create(fb_ppn, fb_pages)
         .expect("gpu_server: failed to create SHM for framebuffer");
 
-    crate::println!("[gpu-server] ready ({}x{}, {} pages, shm={})",
-        width, height, fb_pages, shm_id);
+    crate::println!("[gpu-server] ready ({}x{}, {} pages, shm={:?})",
+        width, height, fb_pages, shm);
 
     // Wait for a client endpoint from init (via control channel)
     let accepted = ipc::accept_client(control_ep, my_pid);
-    let client = ipc::OwnedEndpoint::new(accepted.endpoint);
+    let client = accepted.endpoint;
     let client_ep = client.raw();
 
     crate::println!("[gpu-server] client connected");
@@ -65,11 +65,9 @@ pub fn gpu_server() {
                 let mut resp = Message::new();
                 resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
                 resp.sender_pid = my_pid;
-                // Attach SHM capability (RW)
-                resp.caps[0] = ipc::encode_cap_shm(shm_id, true);
+                // Attach SHM capability (RW) — clone creates a new reference for the receiver
+                resp.caps[0] = Cap::Shm { owned: shm.clone(), rw: true };
                 resp.cap_count = 1;
-                // Inc ref so the SHM stays alive when client maps it
-                ipc::shm_inc_ref(shm_id);
                 send_msg(client_ep, resp);
             }
             GpuRequest::Flush { x, y, w, h } => {
@@ -93,5 +91,5 @@ pub fn gpu_server() {
 
 fn send_msg(ep: usize, msg: Message) {
     let my_pid = crate::task::current_pid();
-    let _ = ipc::channel_send_blocking(ep, &msg, my_pid);
+    let _ = ipc::channel_send_blocking(ep, msg, my_pid);
 }

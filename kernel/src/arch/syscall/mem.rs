@@ -1,6 +1,6 @@
 //! Memory mapping syscalls: mmap, munmap, shm_create, shm_dup_ro, meminfo.
 
-use crate::task::HandleObject;
+use crate::task::{HandleObject, HandleInfo};
 use super::validate_user_buffer;
 
 /// SYS_SHM_CREATE: create a shared memory region and return a RW handle.
@@ -25,8 +25,8 @@ pub fn sys_shm_create(size: usize) -> usize {
         core::ptr::write_bytes(base_pa as *mut u8, 0, page_count * crate::mm::address::PAGE_SIZE);
     }
 
-    let shm_id = match crate::ipc::shm_create(ppn, page_count) {
-        Some(id) => id,
+    let shm = match crate::ipc::shm_create(ppn, page_count) {
+        Some(owned) => owned,
         None => {
             for i in 0..page_count {
                 crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
@@ -35,30 +35,27 @@ pub fn sys_shm_create(size: usize) -> usize {
         }
     };
 
-    match crate::task::current_process_alloc_handle(HandleObject::Shm { id: shm_id, rw: true }) {
+    // alloc_handle takes ownership. On None, shm drops → auto dec_ref.
+    match crate::task::current_process_alloc_handle(HandleObject::Shm { owned: shm, rw: true }) {
         Some(local_handle) => local_handle,
-        None => {
-            crate::ipc::shm_dec_ref(shm_id);
-            usize::MAX
-        }
+        None => usize::MAX,
     }
 }
 
 /// SYS_SHM_DUP_RO: duplicate a SHM handle as read-only.
 pub fn sys_shm_dup_ro(handle: usize) -> usize {
     let shm_id = match crate::task::current_process_handle(handle) {
-        Some(HandleObject::Shm { id, .. }) => id,
+        Some(HandleInfo::Shm { id, .. }) => id,
         _ => return usize::MAX,
     };
 
-    crate::ipc::shm_inc_ref(shm_id);
+    // Create new owned reference (inc_ref via clone_from_raw)
+    let owned = crate::ipc::OwnedShm::clone_from_raw(shm_id);
 
-    match crate::task::current_process_alloc_handle(HandleObject::Shm { id: shm_id, rw: false }) {
+    // alloc_handle takes ownership. On None, owned drops → auto dec_ref.
+    match crate::task::current_process_alloc_handle(HandleObject::Shm { owned, rw: false }) {
         Some(local_handle) => local_handle,
-        None => {
-            crate::ipc::shm_dec_ref(shm_id);
-            usize::MAX
-        }
+        None => usize::MAX,
     }
 }
 
@@ -141,7 +138,7 @@ fn sys_mmap_anonymous(length: usize) -> usize {
 
 fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
     let (shm_id, rw) = match crate::task::current_process_handle(shm_handle) {
-        Some(HandleObject::Shm { id, rw }) => (id, rw),
+        Some(HandleInfo::Shm { id, rw }) => (id, rw),
         _ => return usize::MAX,
     };
 

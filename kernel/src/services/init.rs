@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use crate::ipc::{self, Message, NO_CAP};
+use crate::ipc::{self, Cap, Message};
 use crate::sync::SpinLock;
 use crate::mm::heap::{InitAlloc, INIT_ALLOC};
 use core::cell::UnsafeCell;
@@ -19,17 +19,17 @@ const MAX_NS_OVERRIDES: usize = 16;
 
 /// A single namespace override: maps a service name to a pre-established endpoint,
 /// or marks it as explicitly removed (blocks inheritance from parent).
+/// `endpoint == None` means removal (blocks inheritance); `Some(ep)` means redirect.
 #[derive(Clone)]
 struct NsOverride {
     name: [u8; SERVICE_NAME_LEN],
     name_len: usize,
-    endpoint: usize, // global endpoint ID (decoded from cap); unused if removed
-    removed: bool,   // if true, this entry blocks parent inheritance (endpoint unused)
+    endpoint: Option<ipc::OwnedEndpoint>, // None = removed, Some = redirect
 }
 
 /// A boot channel registration: the init server's end of a user process's boot channel.
 struct BootRegistration {
-    boot_ep_b: usize,        // init server's endpoint of the boot channel
+    boot_ep_b: ipc::OwnedEndpoint, // init server's endpoint of the boot channel
     console_type: ConsoleType, // which console this process should use
     is_shell: bool,           // true = primary stdin recipient
     args: [u8; MAX_ARGS_LEN], // null-separated command-line args
@@ -121,18 +121,18 @@ impl InitConfig {
 static INIT_CONFIG: SpinLock<InitConfig> = SpinLock::new(InitConfig::new());
 
 /// Register a boot channel for a user process (called from kmain before spawning init).
-pub fn register_boot(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool) {
+pub fn register_boot(boot_ep_b: ipc::OwnedEndpoint, console_type: ConsoleType, is_shell: bool) {
     register_boot_with_args(boot_ep_b, console_type, is_shell, &[]);
 }
 
 /// Register a boot channel with command-line arguments.
-pub fn register_boot_with_args(boot_ep_b: usize, console_type: ConsoleType, is_shell: bool, args_blob: &[u8]) {
+pub fn register_boot_with_args(boot_ep_b: ipc::OwnedEndpoint, console_type: ConsoleType, is_shell: bool, args_blob: &[u8]) {
     register_boot_with_overrides(boot_ep_b, console_type, is_shell, args_blob, [const { None }; MAX_NS_OVERRIDES]);
 }
 
 /// Register a boot channel with args and namespace overrides.
 fn register_boot_with_overrides(
-    boot_ep_b: usize,
+    boot_ep_b: ipc::OwnedEndpoint,
     console_type: ConsoleType,
     is_shell: bool,
     args_blob: &[u8],
@@ -227,6 +227,22 @@ impl FsLaunchCtx {
     }
 }
 
+impl Drop for FsLaunchCtx {
+    fn drop(&mut self) {
+        // Close any raw endpoint references this context still holds.
+        // Fields are zeroed after explicit close to prevent double-close.
+        if self.ctl_ep != 0 {
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(self.ctl_ep) });
+        }
+        if self.file_ep != 0 {
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(self.file_ep) });
+        }
+        if self.extra_cap != 0 {
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(self.extra_cap) });
+        }
+    }
+}
+
 const MAX_FS_LAUNCHES: usize = 8;
 
 /// Tracks a dynamically spawned process awaiting exit notification.
@@ -235,6 +251,17 @@ struct DynSpawn {
     notify_ep: usize,
     /// Init's end of the watcher channel (forwards exit code to whoever requested the spawn).
     watcher_ep: usize,
+}
+
+impl Drop for DynSpawn {
+    fn drop(&mut self) {
+        if self.notify_ep != 0 {
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(self.notify_ep) });
+        }
+        if self.watcher_ep != 0 {
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(self.watcher_ep) });
+        }
+    }
 }
 
 const MAX_DYN_SPAWNS: usize = 8;
@@ -258,7 +285,7 @@ pub fn init_server() {
             let config = INIT_CONFIG.lock();
             for i in 0..MAX_BOOT_REGS {
                 if let Some(ref reg) = config.boot_regs[i] {
-                    endpoints[count] = (reg.boot_ep_b, reg.console_type, reg.is_shell);
+                    endpoints[count] = (reg.boot_ep_b.raw(), reg.console_type, reg.is_shell);
                     count += 1;
                 }
             }
@@ -276,33 +303,18 @@ pub fn init_server() {
             }
         }
 
-        // Clean up dead boot registrations (child process exited, boot_a closed)
-        for &(boot_ep_b, _, _) in endpoints.iter().take(count) {
-            if !ipc::channel_is_active(boot_ep_b) {
-                ipc::channel_close(boot_ep_b);
-                // Collect override endpoints to close (outside config lock to
-                // avoid lock ordering issues with channel_close → wake_process).
-                let mut override_eps = [0usize; MAX_NS_OVERRIDES];
-                let mut override_count = 0;
-                {
-                    let mut config = INIT_CONFIG.lock();
-                    for slot in config.boot_regs.iter_mut() {
-                        if let Some(ref reg) = slot {
-                            if reg.boot_ep_b == boot_ep_b {
-                                for ovr in reg.overrides.iter().flatten() {
-                                    if !ovr.removed {
-                                        override_eps[override_count] = ovr.endpoint;
-                                        override_count += 1;
-                                    }
-                                }
-                                *slot = None;
-                                break;
-                            }
+        // Clean up dead boot registrations (child process exited, boot_a closed).
+        // Drop the BootRegistration → drops boot_ep_b + all NsOverride endpoints.
+        for &(raw_boot_ep, _, _) in endpoints.iter().take(count) {
+            if !ipc::channel_is_active(raw_boot_ep) {
+                let mut config = INIT_CONFIG.lock();
+                for slot in config.boot_regs.iter_mut() {
+                    if let Some(ref reg) = slot {
+                        if reg.boot_ep_b.raw() == raw_boot_ep {
+                            *slot = None; // Drop handles all cleanup
+                            break;
                         }
                     }
-                }
-                for &ep in override_eps.iter().take(override_count) {
-                    ipc::channel_close(ep);
                 }
             }
         }
@@ -334,9 +346,7 @@ pub fn init_server() {
                     fwd.len = rvos_wire::to_bytes(&notif, &mut fwd.data).unwrap_or(0);
                     fwd.sender_pid = my_pid;
                     send_and_wake(ds.watcher_ep, fwd);
-                    ipc::channel_close(ds.notify_ep);
-                    ipc::channel_close(ds.watcher_ep);
-                    *slot = None;
+                    *slot = None; // Drop handles notify_ep + watcher_ep cleanup
                 }
             }
         }
@@ -404,7 +414,16 @@ fn handle_request(
             }
         }
         BootRequest::Spawn { path, args, ns_overrides } => {
-            let spawn_cap = if msg.cap_count > 0 { msg.caps[0] } else { NO_CAP };
+            // Extract extra_cap as raw endpoint from the first cap in the message.
+            // clone_from_raw creates a new reference that FsLaunchCtx will own.
+            let spawn_cap: usize = if msg.cap_count > 0 {
+                match &msg.caps[0] {
+                    Cap::Channel(ep) => ipc::OwnedEndpoint::clone_from_raw(ep.raw()).into_raw(),
+                    _ => 0,
+                }
+            } else {
+                0
+            };
             handle_spawn_request(SpawnContext {
                 boot_ep_b,
                 console_type,
@@ -463,12 +482,11 @@ fn find_named_service(request: &[u8]) -> Option<&'static NamedService> {
 fn find_ns_override(boot_ep_b: usize, name: &str) -> Option<usize> {
     let config = INIT_CONFIG.lock();
     for reg in config.boot_regs.iter().flatten() {
-        if reg.boot_ep_b == boot_ep_b {
+        if reg.boot_ep_b.raw() == boot_ep_b {
             let name_bytes = name.as_bytes();
             for o in reg.overrides.iter().flatten() {
                 if o.name_len == name_bytes.len() && &o.name[..o.name_len] == name_bytes {
-                    if o.removed { return None; }
-                    return Some(o.endpoint);
+                    return o.endpoint.as_ref().map(|ep| ep.raw());
                 }
             }
             return None;
@@ -480,7 +498,7 @@ fn find_ns_override(boot_ep_b: usize, name: &str) -> Option<usize> {
 /// Parse namespace overrides from the packed blob.
 /// Format: [count: u8] then count * [name_len: u8, name_bytes..., action: u8, cap_index: u8]
 /// action=0: redirect (use caps[cap_index]), action=1: remove (cap_index ignored).
-/// Each cap_index references orig_msg.caps[cap_index] (already encoded by kernel).
+/// Each cap_index references orig_msg.caps[cap_index] (RAII Cap in the message).
 fn parse_ns_overrides(blob: &[u8], orig_msg: &Message) -> [Option<NsOverride>; MAX_NS_OVERRIDES] {
     let mut result: [Option<NsOverride>; MAX_NS_OVERRIDES] = [const { None }; MAX_NS_OVERRIDES];
     if blob.is_empty() {
@@ -516,26 +534,18 @@ fn parse_ns_overrides(blob: &[u8], orig_msg: &Message) -> [Option<NsOverride>; M
             result[out_idx] = Some(NsOverride {
                 name,
                 name_len: nlen,
-                endpoint: 0,
-                removed: true,
+                endpoint: None,
             });
             out_idx += 1;
         } else {
-            // Redirect entry: decode the capability from the message's cap array.
-            // Inc_ref the endpoint so the BootRegistration holds its own reference.
-            // The IPC transfer's inc_ref covers the extra_cap (handle 1) usage;
-            // this additional inc_ref covers the override stored in BootRegistration.
-            // Without this, cleanup of both extra_cap and the override would
-            // double-close a single reference, deactivating the endpoint prematurely.
+            // Redirect entry: clone the RAII endpoint from the message's cap array.
+            // The clone performs inc_ref so the BootRegistration holds its own reference.
             if cap_index < orig_msg.cap_count {
-                let encoded = orig_msg.caps[cap_index];
-                if let Some(ep) = ipc::decode_cap_channel(encoded) {
-                    ipc::channel_inc_ref(ep);
+                if let Cap::Channel(ref ep) = orig_msg.caps[cap_index] {
                     result[out_idx] = Some(NsOverride {
                         name,
                         name_len: nlen,
-                        endpoint: ep,
-                        removed: false,
+                        endpoint: Some(ep.clone()), // clone = inc_ref
                     });
                     out_idx += 1;
                 }
@@ -560,10 +570,10 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
 
     let ctl_ep = svc.control_ep.load(Ordering::Relaxed);
     if ctl_ep != usize::MAX {
-        // Send server endpoint to the service via its control channel with NewConnection
-        ipc::channel_inc_ref(server_ep);
+        // Send server endpoint to the service via its control channel with NewConnection.
+        // clone = inc_ref for the transfer; drop server_ep closes our reference.
         let mut ctl_msg = Message::new();
-        ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+        ctl_msg.caps[0] = Cap::Channel(server_ep.clone());
         ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid, channel_role: 0 },
@@ -571,11 +581,11 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
-        ipc::channel_close(server_ep);
+        drop(server_ep); // close our reference (clone in msg has the receiver's)
 
         // Respond to client with Ok + client endpoint
-        send_ok_with_cap(boot_ep_b, client_ep, my_pid);
-        ipc::channel_close(client_ep);
+        send_ok_with_cap(boot_ep_b, client_ep.raw(), my_pid);
+        drop(client_ep); // close our reference
     } else {
         send_error(boot_ep_b, "service not ready", my_pid);
     }
@@ -602,10 +612,10 @@ fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid
     };
 
     if let Some(ctl_ep) = control_ep {
-        // Send NewConnection to console server via its control channel with role
-        ipc::channel_inc_ref(server_ep);
+        // Send NewConnection to console server via its control channel with role.
+        // clone = inc_ref for the transfer; drop server_ep closes our reference.
         let mut ctl_msg = Message::new();
-        ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+        ctl_msg.caps[0] = Cap::Channel(server_ep.clone());
         ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid, channel_role: role },
@@ -613,11 +623,11 @@ fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(ctl_ep, ctl_msg);
-        ipc::channel_close(server_ep);
+        drop(server_ep); // close our reference
 
         // Respond to client with Ok + client endpoint
-        send_ok_with_cap(boot_ep_b, client_ep, my_pid);
-        ipc::channel_close(client_ep);
+        send_ok_with_cap(boot_ep_b, client_ep.raw(), my_pid);
+        drop(client_ep); // close our reference
     } else {
         send_error(boot_ep_b, "no console", my_pid);
     }
@@ -627,7 +637,7 @@ fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid
 fn get_parent_overrides(boot_ep_b: usize) -> [Option<NsOverride>; MAX_NS_OVERRIDES] {
     let config = INIT_CONFIG.lock();
     for reg in config.boot_regs.iter().flatten() {
-        if reg.boot_ep_b == boot_ep_b {
+        if reg.boot_ep_b.raw() == boot_ep_b {
             return reg.overrides.clone();
         }
     }
@@ -661,12 +671,7 @@ fn merge_overrides(
                 }
             });
             if !already {
-                // Inc ref for the inherited endpoint — the child's boot registration
-                // holds its own reference, separate from the parent's.
-                if !p.removed {
-                    ipc::channel_inc_ref(p.endpoint);
-                }
-                // Find a free slot and insert
+                // Clone the NsOverride — OwnedEndpoint::clone does inc_ref automatically.
                 for slot in result.iter_mut() {
                     if slot.is_none() {
                         *slot = Some(p.clone());
@@ -696,8 +701,18 @@ struct SpawnContext<'a> {
 
 /// Handle a spawn request: load an ELF from the filesystem and spawn it.
 fn handle_spawn_request(ctx: SpawnContext<'_>) {
+    // Helper to clean up spawn_cap on early return. spawn_cap is a raw owned
+    // endpoint (0 = none) that will be transferred to FsLaunchCtx on success.
+    // On error, we must close it to avoid leaking the reference.
+    let close_spawn_cap = |cap: usize| {
+        if cap != 0 {
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(cap) });
+        }
+    };
+
     let path_bytes = ctx.path.as_bytes();
     if path_bytes.is_empty() || path_bytes.len() > PATH_BUF_LEN {
+        close_spawn_cap(ctx.spawn_cap);
         send_error(ctx.boot_ep_b, "bad path", ctx.my_pid);
         return;
     }
@@ -706,6 +721,7 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
     let slot_idx = match ctx.fs_launches.iter().position(|s| s.is_none()) {
         Some(i) => i,
         None => {
+            close_spawn_cap(ctx.spawn_cap);
             send_error(ctx.boot_ep_b, "busy", ctx.my_pid);
             return;
         }
@@ -715,12 +731,14 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
     let fs_svc = match find_named_service(b"fs") {
         Some(svc) => svc,
         None => {
+            close_spawn_cap(ctx.spawn_cap);
             send_error(ctx.boot_ep_b, "no fs", ctx.my_pid);
             return;
         }
     };
     let fs_ctl_ep = fs_svc.control_ep.load(Ordering::Relaxed);
     if fs_ctl_ep == usize::MAX {
+        close_spawn_cap(ctx.spawn_cap);
         send_error(ctx.boot_ep_b, "no fs", ctx.my_pid);
         return;
     }
@@ -728,15 +746,16 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
     let (my_ctl_ep, server_ep) = match ipc::channel_create_pair() {
         Some(pair) => pair,
         None => {
+            close_spawn_cap(ctx.spawn_cap);
             send_error(ctx.boot_ep_b, "no channels", ctx.my_pid);
             return;
         }
     };
 
-    // Send the server endpoint to the fs service via its control channel with NewConnection
-    ipc::channel_inc_ref(server_ep);
+    // Send the server endpoint to the fs service via its control channel with NewConnection.
+    // clone = inc_ref for the transfer; drop server_ep closes our reference.
     let mut ctl_msg = Message::new();
-    ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+    ctl_msg.caps[0] = Cap::Channel(server_ep.clone());
     ctl_msg.cap_count = 1;
     ctl_msg.len = rvos_wire::to_bytes(
         &rvos_proto::service_control::NewConnection { client_pid: ctx.my_pid as u32, channel_role: 0 },
@@ -744,7 +763,7 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
     ).unwrap_or(0);
     ctl_msg.sender_pid = ctx.my_pid;
     send_and_wake(fs_ctl_ep, ctl_msg);
-    ipc::channel_close(server_ep);
+    drop(server_ep); // close our reference
 
     // Send the initial Stat request
     let mut msg = Message::new();
@@ -754,18 +773,15 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
         &mut msg.data,
     ).unwrap_or(0);
     msg.sender_pid = ctx.my_pid;
-    send_and_wake(my_ctl_ep, msg);
+    send_and_wake(my_ctl_ep.raw(), msg);
 
     // Derive name from path (everything after last '/')
     let name_start = path_bytes.iter().rposition(|&b| b == b'/').map(|i| i + 1).unwrap_or(0);
     let name_bytes = &path_bytes[name_start..];
     let name_len = name_bytes.len().min(NAME_BUF_LEN);
 
-    let extra_cap = if ctx.spawn_cap != NO_CAP {
-        ipc::decode_cap_channel(ctx.spawn_cap).unwrap_or_default()
-    } else {
-        0
-    };
+    // spawn_cap is already a raw endpoint ID (0 = none), set up in handle_request.
+    let extra_cap = ctx.spawn_cap;
 
     let mut args_buf = [0u8; MAX_ARGS_LEN];
     let args_len = ctx.args.len().min(MAX_ARGS_LEN);
@@ -778,7 +794,7 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
 
     let mut launch_ctx = FsLaunchCtx {
         state: FsLaunchState::WaitStat,
-        ctl_ep: my_ctl_ep,
+        ctl_ep: my_ctl_ep.into_raw(),
         file_ep: 0,
         file_size: 0,
         data: Vec::new_in(INIT_ALLOC),
@@ -806,7 +822,7 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
 fn handle_get_args(boot_ep_b: usize, my_pid: usize) {
     let config = INIT_CONFIG.lock();
     for reg in config.boot_regs.iter().flatten() {
-        if reg.boot_ep_b == boot_ep_b {
+        if reg.boot_ep_b.raw() == boot_ep_b {
             let mut resp = Message::new();
             resp.len = rvos_wire::to_bytes(
                 &BootResponse::Args { args: &reg.args[..reg.args_len] },
@@ -830,14 +846,11 @@ fn handle_get_args(boot_ep_b: usize, my_pid: usize) {
 }
 
 /// Send an Ok response with a capability on the boot channel.
-/// Increments the ref count for cap_ep to account for the transfer.
-/// Callers that don't retain a reference to cap_ep should call
-/// `channel_close(cap_ep)` after this function returns.
+/// Uses clone_from_raw to create a new RAII reference (inc_ref) for the transfer.
 fn send_ok_with_cap(endpoint: usize, cap_ep: usize, my_pid: usize) {
-    ipc::channel_inc_ref(cap_ep);
     let mut resp = Message::new();
     resp.len = rvos_wire::to_bytes(&BootResponse::Ok {}, &mut resp.data).unwrap_or(0);
-    resp.caps[0] = ipc::encode_cap_channel(cap_ep);
+    resp.caps[0] = Cap::Channel(ipc::OwnedEndpoint::clone_from_raw(cap_ep));
     resp.cap_count = 1;
     resp.sender_pid = my_pid;
     send_and_wake(endpoint, resp);
@@ -855,7 +868,7 @@ fn send_error(endpoint: usize, error_msg: &str, my_pid: usize) {
 /// blocking send to prevent silent drops on critical control messages.
 fn send_and_wake(endpoint: usize, msg: Message) {
     let my_pid = crate::task::current_pid();
-    let _ = ipc::channel_send_blocking(endpoint, &msg, my_pid);
+    let _ = ipc::channel_send_blocking(endpoint, msg, my_pid);
 }
 
 fn starts_with(data: &[u8], prefix: &[u8]) -> bool {
@@ -916,10 +929,10 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             }
         };
 
-        // Send the server endpoint to the fs service via its control channel with NewConnection
-        ipc::channel_inc_ref(server_ep);
+        // Send the server endpoint to the fs service via its control channel with NewConnection.
+        // clone = inc_ref for the transfer; drop server_ep closes our reference.
         let mut ctl_msg = Message::new();
-        ctl_msg.caps[0] = ipc::encode_cap_channel(server_ep);
+        ctl_msg.caps[0] = Cap::Channel(server_ep.clone());
         ctl_msg.cap_count = 1;
         ctl_msg.len = rvos_wire::to_bytes(
             &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
@@ -927,7 +940,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
         ).unwrap_or(0);
         ctl_msg.sender_pid = my_pid;
         send_and_wake(fs_init_ctl_ep, ctl_msg);
-        ipc::channel_close(server_ep);
+        drop(server_ep); // close our reference
 
         // Send the initial Stat request
         let mut msg = Message::new();
@@ -937,7 +950,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             &mut msg.data,
         ).unwrap_or(0);
         msg.sender_pid = my_pid;
-        send_and_wake(my_ctl_ep, msg);
+        send_and_wake(my_ctl_ep.raw(), msg);
 
         let mut path_buf = [0u8; PATH_BUF_LEN];
         let plen = path.len().min(PATH_BUF_LEN);
@@ -949,7 +962,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
 
         launches[slot_idx] = Some(FsLaunchCtx {
             state: FsLaunchState::WaitStat,
-            ctl_ep: my_ctl_ep,
+            ctl_ep: my_ctl_ep.into_raw(),
             file_ep: 0,
             file_size: 0,
             data: Vec::new_in(INIT_ALLOC),
@@ -991,8 +1004,7 @@ fn poll_fs_launch(
                         if ctx.requester_ep != 0 {
                             send_error(ctx.requester_ep, "not found", my_pid);
                         }
-                        ipc::channel_close(ctx.ctl_ep);
-                        ctx.state = FsLaunchState::Done;
+                        ctx.state = FsLaunchState::Done; // Drop handles ctl_ep cleanup
                         return true;
                     }
                 }
@@ -1014,43 +1026,46 @@ fn poll_fs_launch(
                 if ctx.requester_ep != 0 {
                     send_error(ctx.requester_ep, "fs error", my_pid);
                 }
-                ipc::channel_close(ctx.ctl_ep);
-                ctx.state = FsLaunchState::Done;
+                ctx.state = FsLaunchState::Done; // Drop handles ctl_ep cleanup
                 return true;
             }
         }
         FsLaunchState::WaitOpen => {
             let (resp, send_wake) = ipc::channel_recv(ctx.ctl_ep);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
-            if let Some(resp) = resp {
+            if let Some(mut resp) = resp {
+                // Extract raw cap values from the RAII Cap array for from_bytes_with_caps.
+                let mut raw_caps = [0usize; ipc::MAX_CAPS];
+                for (i, raw_cap) in raw_caps.iter_mut().enumerate().take(resp.cap_count) {
+                    if let Cap::Channel(ref ep) = resp.caps[i] {
+                        *raw_cap = ep.raw();
+                    }
+                }
                 let parsed = rvos_wire::from_bytes_with_caps::<FsResponse>(
                     &resp.data[..resp.len],
-                    &resp.caps[..resp.cap_count],
+                    &raw_caps[..resp.cap_count],
                 );
-                let file_cap = match parsed {
-                    Ok(FsResponse::Opened { file, .. }) => file.raw(),
-                    _ => {
-                        crate::println!("[init] fs: open {} failed", ctx.name());
-                        if ctx.requester_ep != 0 {
-                            send_error(ctx.requester_ep, "open failed", my_pid);
-                        }
-                        ipc::channel_close(ctx.ctl_ep);
-                        ctx.state = FsLaunchState::Done;
-                        return true;
+                if !matches!(parsed, Ok(FsResponse::Opened { .. })) {
+                    crate::println!("[init] fs: open {} failed", ctx.name());
+                    if ctx.requester_ep != 0 {
+                        send_error(ctx.requester_ep, "open failed", my_pid);
                     }
-                };
-                // Decode the file channel endpoint from the cap
-                match ipc::decode_cap_channel(file_cap) {
-                    Some(ep) => ctx.file_ep = ep,
-                    None => {
-                        crate::println!("[init] fs: open {} bad cap", ctx.name());
-                        if ctx.requester_ep != 0 {
-                            send_error(ctx.requester_ep, "bad cap", my_pid);
-                        }
-                        ipc::channel_close(ctx.ctl_ep);
-                        ctx.state = FsLaunchState::Done;
-                        return true;
+                    ctx.state = FsLaunchState::Done; // Drop handles ctl_ep cleanup
+                    return true;
+                }
+                // Extract the file channel endpoint from the received message cap
+                if resp.cap_count > 0 {
+                    if let Cap::Channel(ep) = resp.caps[0].take() {
+                        ctx.file_ep = ep.into_raw();
                     }
+                }
+                if ctx.file_ep == 0 {
+                    crate::println!("[init] fs: open {} bad cap", ctx.name());
+                    if ctx.requester_ep != 0 {
+                        send_error(ctx.requester_ep, "bad cap", my_pid);
+                    }
+                    ctx.state = FsLaunchState::Done; // Drop handles ctl_ep cleanup
+                    return true;
                 }
 
                 // Send Read request for the whole file
@@ -1071,8 +1086,7 @@ fn poll_fs_launch(
                 if ctx.requester_ep != 0 {
                     send_error(ctx.requester_ep, "fs error", my_pid);
                 }
-                ipc::channel_close(ctx.ctl_ep);
-                ctx.state = FsLaunchState::Done;
+                ctx.state = FsLaunchState::Done; // Drop handles ctl_ep cleanup
                 return true;
             }
         }
@@ -1099,9 +1113,7 @@ fn poll_fs_launch(
                                 if ctx.requester_ep != 0 {
                                     send_error(ctx.requester_ep, "read error", my_pid);
                                 }
-                                ipc::channel_close(ctx.file_ep);
-                                ipc::channel_close(ctx.ctl_ep);
-                                ctx.state = FsLaunchState::Done;
+                                ctx.state = FsLaunchState::Done; // Drop handles cleanup
                                 return true;
                             }
                             _ => {
@@ -1118,9 +1130,7 @@ fn poll_fs_launch(
                             if ctx.requester_ep != 0 {
                                 send_error(ctx.requester_ep, "read error", my_pid);
                             }
-                            ipc::channel_close(ctx.file_ep);
-                            ipc::channel_close(ctx.ctl_ep);
-                            ctx.state = FsLaunchState::Done;
+                            ctx.state = FsLaunchState::Done; // Drop handles cleanup
                             return true;
                         }
                         break;
@@ -1140,8 +1150,12 @@ fn finish_fs_launch(
     my_pid: usize,
     dyn_spawns: &mut [Option<DynSpawn>; MAX_DYN_SPAWNS],
 ) {
-    ipc::channel_close(ctx.file_ep);
-    ipc::channel_close(ctx.ctl_ep);
+    // Close fs channels early to free channel slots for spawn channels.
+    // Zero the fields so the Drop impl won't double-close.
+    let ctl = core::mem::replace(&mut ctx.ctl_ep, 0);
+    let file = core::mem::replace(&mut ctx.file_ep, 0);
+    if ctl != 0 { drop(unsafe { ipc::OwnedEndpoint::from_raw(ctl) }); }
+    if file != 0 { drop(unsafe { ipc::OwnedEndpoint::from_raw(file) }); }
 
     if ctx.data.is_empty() {
         crate::println!("[init] fs: {} empty, skipping", ctx.name());
@@ -1180,7 +1194,7 @@ fn finish_fs_launch(
                 return;
             }
         };
-        register_service(svc_name, init_svc_ep);
+        register_service(svc_name, init_svc_ep.into_raw());
         crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, svc_ctl_ep)
     } else if let Some(console_type) = ctx.provides_console {
         // This program provides a console: give it a control channel as handle 1
@@ -1192,10 +1206,12 @@ fn finish_fs_launch(
                 return;
             }
         };
-        register_console(console_type, init_ep);
+        register_console(console_type, init_ep.into_raw());
         crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, ctl_ep)
     } else if ctx.extra_cap != 0 {
-        crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, ctx.extra_cap)
+        // SAFETY: clone_from_raw was called when storing extra_cap, so we own this reference.
+        let extra_ep = unsafe { ipc::OwnedEndpoint::from_raw(core::mem::replace(&mut ctx.extra_cap, 0)) };
+        crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, extra_ep)
     } else {
         crate::task::spawn_user_elf_with_boot_channel(&ctx.data, ctx.name(), boot_a)
     };
@@ -1224,28 +1240,36 @@ fn finish_fs_launch(
                 return;
             }
         };
-        crate::task::set_exit_notify_ep(pid, kernel_ep);
+        let kernel_ep_raw = kernel_ep.into_raw();
+        crate::task::set_exit_notify_ep(pid, kernel_ep_raw);
 
         // Watcher channel: init forwards exit code to the requester
         let (client_handle_ep, init_watcher_ep) = match ipc::channel_create_pair() {
             Some(pair) => pair,
             None => {
                 crate::println!("[init] no channels for watcher");
-                ipc::channel_close(init_notify_ep);
-                ipc::channel_close(kernel_ep);
+                drop(init_notify_ep); // close our end
+                // Reclaim kernel_ep from the process and close it
+                crate::task::set_exit_notify_ep(pid, 0);
+                drop(unsafe { ipc::OwnedEndpoint::from_raw(kernel_ep_raw) });
                 send_error(ctx.requester_ep, "no channels", my_pid);
                 ctx.state = FsLaunchState::Done;
                 return;
             }
         };
 
+        // Convert to raw for storage; cleanup on error via from_raw.
+        let init_notify_raw = init_notify_ep.into_raw();
+        let init_watcher_raw = init_watcher_ep.into_raw();
+        let client_handle_raw = client_handle_ep.raw();
+
         // Register in dyn_spawns table
         let mut registered = false;
         for slot in dyn_spawns.iter_mut() {
             if slot.is_none() {
                 *slot = Some(DynSpawn {
-                    notify_ep: init_notify_ep,
-                    watcher_ep: init_watcher_ep,
+                    notify_ep: init_notify_raw,
+                    watcher_ep: init_watcher_raw,
                 });
                 registered = true;
                 break;
@@ -1253,18 +1277,20 @@ fn finish_fs_launch(
         }
         if !registered {
             crate::println!("[init] dyn_spawns full, cannot track process exit");
-            ipc::channel_close(init_notify_ep);
-            ipc::channel_close(kernel_ep);
-            ipc::channel_close(client_handle_ep);
-            ipc::channel_close(init_watcher_ep);
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(init_notify_raw) });
+            // Reclaim kernel_ep from process and close it
+            crate::task::set_exit_notify_ep(pid, 0);
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(kernel_ep_raw) });
+            drop(client_handle_ep);
+            drop(unsafe { ipc::OwnedEndpoint::from_raw(init_watcher_raw) });
             send_error(ctx.requester_ep, "busy", my_pid);
             ctx.state = FsLaunchState::Done;
             return;
         }
 
         // Send Ok response with process handle capability
-        send_ok_with_cap(ctx.requester_ep, client_handle_ep, my_pid);
-        ipc::channel_close(client_handle_ep);
+        send_ok_with_cap(ctx.requester_ep, client_handle_raw, my_pid);
+        drop(client_handle_ep); // close our reference
     }
 
     ctx.state = FsLaunchState::Done;

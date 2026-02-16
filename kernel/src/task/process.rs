@@ -18,10 +18,29 @@ pub const MAX_MMAP_REGIONS: usize = 256;
 pub const MAX_BREAKPOINTS: usize = 8;
 const NAME_LEN: usize = 16;
 
-#[derive(Clone, Copy, Debug)]
+/// Non-Copy handle object holding RAII resource wrappers.
+/// Drop on HandleObject auto-decrements the underlying resource's ref count.
+#[derive(Debug)]
 pub enum HandleObject {
-    Channel(usize),              // global endpoint ID
-    Shm { id: usize, rw: bool }, // global SHM ID + permission flag
+    Channel(crate::ipc::OwnedEndpoint),
+    Shm { owned: crate::ipc::OwnedShm, rw: bool },
+}
+
+/// Lightweight, Copy descriptor returned by handle lookups.
+/// Contains only raw IDs — no ownership, no ref counting.
+#[derive(Clone, Copy, Debug)]
+pub enum HandleInfo {
+    Channel(usize),              // raw global endpoint ID
+    Shm { id: usize, rw: bool }, // raw global SHM ID + permission flag
+}
+
+impl HandleObject {
+    pub fn info(&self) -> HandleInfo {
+        match self {
+            HandleObject::Channel(ep) => HandleInfo::Channel(ep.raw()),
+            HandleObject::Shm { owned, rw } => HandleInfo::Shm { id: owned.raw(), rw: *rw },
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -163,7 +182,7 @@ impl Process {
             user_satp: 0,
             user_entry: 0,
             user_stack_top: 0,
-            handles: [None; MAX_HANDLES],
+            handles: [const { None }; MAX_HANDLES],
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -242,7 +261,7 @@ impl Process {
             user_satp: satp,
             user_entry: code_phys,
             user_stack_top: stack_phys_top,
-            handles: [None; MAX_HANDLES],
+            handles: [const { None }; MAX_HANDLES],
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -309,7 +328,7 @@ impl Process {
             user_satp: satp,
             user_entry: loaded.entry_va,
             user_stack_top: stack_phys_top,
-            handles: [None; MAX_HANDLES],
+            handles: [const { None }; MAX_HANDLES],
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -343,7 +362,7 @@ impl Process {
             user_satp: 0,
             user_entry: 0,
             user_stack_top: 0,
-            handles: [None; MAX_HANDLES],
+            handles: [const { None }; MAX_HANDLES],
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -390,19 +409,27 @@ impl Process {
         None
     }
 
-    /// Look up a local handle to get the HandleObject.
-    pub fn lookup_handle(&self, handle: usize) -> Option<HandleObject> {
+    /// Look up a local handle to get lightweight info (no ownership transfer).
+    pub fn lookup_handle(&self, handle: usize) -> Option<HandleInfo> {
         if handle < MAX_HANDLES {
-            self.handles[handle]
+            self.handles[handle].as_ref().map(|obj| obj.info())
         } else {
             None
         }
     }
 
-    /// Free a local handle.
-    pub fn free_handle(&mut self, handle: usize) {
+    /// Take a handle out of the table, returning the HandleObject.
+    /// The caller owns the returned object. Dropping it auto-closes the resource.
+    ///
+    /// IMPORTANT: Do NOT call this while holding the SCHEDULER lock, then drop
+    /// the result while still holding it. OwnedEndpoint::drop → channel_close
+    /// → wake_process → SCHEDULER lock = deadlock. Use .take() under lock,
+    /// drop outside.
+    pub fn take_handle(&mut self, handle: usize) -> Option<HandleObject> {
         if handle < MAX_HANDLES {
-            self.handles[handle] = None;
+            self.handles[handle].take()
+        } else {
+            None
         }
     }
 

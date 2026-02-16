@@ -15,7 +15,7 @@ const MAX_SHM_REGIONS: usize = 32;
 /// Maximum number of messages queued per endpoint before backpressure kicks in
 pub const MAX_QUEUE_DEPTH: usize = 64;
 
-/// Sentinel value meaning "no capability attached"
+/// Sentinel value meaning "no capability attached" (user-space ABI)
 pub const NO_CAP: usize = usize::MAX;
 
 /// Errors returned by channel send operations.
@@ -27,77 +27,167 @@ pub enum SendError {
     QueueFull,
 }
 
-// Internal capability encoding in message queue (bits 63..62)
-// 00 = no capability (NO_CAP)
-// 01 = channel endpoint
-// 10 = shared memory (RW)
-// 11 = shared memory (RO)
-const CAP_TAG_CHANNEL: usize = 0b01 << 62;
-const CAP_TAG_SHM_RW: usize = 0b10 << 62;
-const CAP_TAG_SHM_RO: usize = 0b11 << 62;
-const CAP_TAG_MASK: usize = 0b11 << 62;
-const CAP_ID_MASK: usize = !(0b11 << 62);
+// ============================================================
+// RAII Types
+// ============================================================
 
-/// Encode a channel endpoint capability for the message queue.
-pub fn encode_cap_channel(global_ep: usize) -> usize {
-    CAP_TAG_CHANNEL | (global_ep & CAP_ID_MASK)
+/// RAII wrapper for a channel endpoint. Clone = inc_ref, Drop = close.
+pub struct OwnedEndpoint(usize);
+
+impl core::fmt::Debug for OwnedEndpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("OwnedEndpoint").field(&self.0).finish()
+    }
 }
 
-/// Encode a SHM capability for the message queue.
-pub fn encode_cap_shm(global_shm_id: usize, rw: bool) -> usize {
-    let tag = if rw { CAP_TAG_SHM_RW } else { CAP_TAG_SHM_RO };
-    tag | (global_shm_id & CAP_ID_MASK)
+impl OwnedEndpoint {
+    /// Wrap a raw endpoint ID. Caller must already own one reference.
+    ///
+    /// # Safety
+    /// The caller must hold exactly one un-managed reference count for this
+    /// endpoint (e.g. from `channel_create_pair`). Constructing two
+    /// `OwnedEndpoint`s from the same raw ID without an intervening inc_ref
+    /// is a double-free bug.
+    pub unsafe fn from_raw(raw_ep: usize) -> Self {
+        OwnedEndpoint(raw_ep)
+    }
+
+    /// Consume without calling Drop. For permanent endpoints stored in
+    /// AtomicUsize (service control channels).
+    pub fn into_raw(self) -> usize {
+        let raw = self.0;
+        core::mem::forget(self);
+        raw
+    }
+
+    /// Borrow the raw endpoint ID for operations (send, recv, is_active).
+    pub fn raw(&self) -> usize {
+        self.0
+    }
+
+    /// Create a new owned reference from a raw endpoint ID by incrementing
+    /// the ref count. The raw ID must refer to an active endpoint.
+    pub fn clone_from_raw(raw_ep: usize) -> Self {
+        channel_inc_ref(raw_ep);
+        OwnedEndpoint(raw_ep)
+    }
 }
 
-/// Decoded capability from message queue.
-pub enum DecodedCap {
+impl Clone for OwnedEndpoint {
+    fn clone(&self) -> Self {
+        channel_inc_ref(self.0);
+        OwnedEndpoint(self.0)
+    }
+}
+
+impl Drop for OwnedEndpoint {
+    fn drop(&mut self) {
+        channel_close(self.0);
+    }
+}
+
+/// RAII wrapper for a shared memory region. Clone = inc_ref, Drop = dec_ref.
+pub struct OwnedShm(usize);
+
+impl core::fmt::Debug for OwnedShm {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("OwnedShm").field(&self.0).finish()
+    }
+}
+
+impl OwnedShm {
+    /// Wrap a raw SHM ID. Caller must already own one reference.
+    ///
+    /// # Safety
+    /// Same contract as `OwnedEndpoint::from_raw`.
+    pub unsafe fn from_raw(id: usize) -> Self {
+        OwnedShm(id)
+    }
+
+    /// Consume without calling Drop.
+    #[allow(dead_code)]
+    pub fn into_raw(self) -> usize {
+        let id = self.0;
+        core::mem::forget(self);
+        id
+    }
+
+    /// Borrow the raw SHM ID.
+    pub fn raw(&self) -> usize {
+        self.0
+    }
+
+    /// Create a new owned reference from a raw SHM ID by incrementing
+    /// the ref count.
+    pub fn clone_from_raw(id: usize) -> Self {
+        shm_inc_ref(id);
+        OwnedShm(id)
+    }
+}
+
+impl Clone for OwnedShm {
+    fn clone(&self) -> Self {
+        shm_inc_ref(self.0);
+        OwnedShm(self.0)
+    }
+}
+
+impl Drop for OwnedShm {
+    fn drop(&mut self) {
+        shm_dec_ref(self.0);
+    }
+}
+
+/// A capability slot in a kernel Message.
+pub enum Cap {
     None,
-    Channel(usize),           // global endpoint ID
-    Shm { id: usize, rw: bool }, // global SHM ID + permission
+    Channel(OwnedEndpoint),
+    Shm { owned: OwnedShm, rw: bool },
 }
 
-/// Decode a capability from the message queue.
-pub fn decode_cap(encoded: usize) -> DecodedCap {
-    if encoded == NO_CAP {
-        return DecodedCap::None;
+impl Cap {
+    #[allow(dead_code)]
+    pub fn is_none(&self) -> bool {
+        matches!(self, Cap::None)
     }
-    let tag = encoded & CAP_TAG_MASK;
-    let id = encoded & CAP_ID_MASK;
-    match tag {
-        CAP_TAG_CHANNEL => DecodedCap::Channel(id),
-        CAP_TAG_SHM_RW => DecodedCap::Shm { id, rw: true },
-        CAP_TAG_SHM_RO => DecodedCap::Shm { id, rw: false },
-        _ => DecodedCap::None, // tag 00 with non-MAX value, treat as none
+
+    /// Take the cap out, replacing with None.
+    pub fn take(&mut self) -> Cap {
+        core::mem::replace(self, Cap::None)
     }
 }
 
-/// Convenience: decode an encoded cap as a channel endpoint ID.
-/// Used by kernel-internal services that receive caps through message queues.
-pub fn decode_cap_channel(encoded: usize) -> Option<usize> {
-    match decode_cap(encoded) {
-        DecodedCap::Channel(ep) => Some(ep),
-        _ => None,
+impl Clone for Cap {
+    fn clone(&self) -> Self {
+        match self {
+            Cap::None => Cap::None,
+            Cap::Channel(ep) => Cap::Channel(ep.clone()),
+            Cap::Shm { owned, rw } => Cap::Shm { owned: owned.clone(), rw: *rw },
+        }
     }
 }
+
+// ============================================================
+// Message
+// ============================================================
 
 /// Maximum number of capabilities per message.
 pub const MAX_CAPS: usize = 4;
 
-/// A fixed-size message with optional capabilities
-#[derive(Clone)]
-#[repr(C)]
+/// A fixed-size message with optional RAII capabilities.
+///
+/// Not Copy or Clone — caps hold RAII types. The `VecDeque<Message>` queue
+/// uses move semantics (push_back moves in, pop_front moves out).
 pub struct Message {
     pub data: [u8; MAX_MSG_SIZE],
     pub len: usize,
     pub sender_pid: usize,
-    pub caps: [usize; MAX_CAPS],
+    pub caps: [Cap; MAX_CAPS],
     pub cap_count: usize,
 }
 
-// Compile-time assertions: MAX_MSG_SIZE and Message layout must match all
-// other definitions (lib/rvos, vendor/rust std, rvos-wire).
+// Compile-time assertion: MAX_MSG_SIZE must match all other definitions.
 const _: () = assert!(MAX_MSG_SIZE == 1024);
-const _: () = assert!(core::mem::size_of::<Message>() == 1080);
 
 impl Message {
     pub fn new() -> Self {
@@ -105,7 +195,7 @@ impl Message {
             data: [0u8; MAX_MSG_SIZE],
             len: 0,
             sender_pid: 0,
-            caps: [NO_CAP; MAX_CAPS],
+            caps: [const { Cap::None }; MAX_CAPS],
             cap_count: 0,
         }
     }
@@ -126,6 +216,10 @@ impl Message {
         core::str::from_utf8(&self.data[..self.len]).unwrap_or("???")
     }
 }
+
+// ============================================================
+// Channel internals
+// ============================================================
 
 /// Bidirectional channel with two queues.
 ///
@@ -195,84 +289,62 @@ fn ep_to_channel(endpoint: usize) -> (usize, bool) {
 }
 
 /// Create a bidirectional channel pair.
-/// Returns Some((ep_a, ep_b)) — two global endpoint IDs, or None if all
+/// Returns Some((ep_a, ep_b)) as RAII OwnedEndpoints, or None if all
 /// channel slots are exhausted.
-pub fn channel_create_pair() -> Option<(usize, usize)> {
+pub fn channel_create_pair() -> Option<(OwnedEndpoint, OwnedEndpoint)> {
     let mut mgr = CHANNELS.lock();
     for (i, slot) in mgr.channels.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(Channel::new());
-            return Some((i * 2, i * 2 + 1));
+            // SAFETY: Channel::new() sets ref_count_a=1, ref_count_b=1,
+            // so we own exactly one reference to each endpoint.
+            unsafe {
+                return Some((
+                    OwnedEndpoint::from_raw(i * 2),
+                    OwnedEndpoint::from_raw(i * 2 + 1),
+                ));
+            }
         }
     }
     crate::println!("[ipc] channel_create_pair: all {} slots exhausted", MAX_CHANNELS);
     None
 }
 
-/// Send a message on an endpoint.
+/// Send a message on an endpoint (by move).
 /// send(ep_a) delivers to queue_b, send(ep_b) delivers to queue_a.
-/// Returns Ok(wake_pid) where wake_pid is the PID of a blocked receiver to wake (0 = none).
 ///
-/// The blocked field is NOT cleared here — it persists until the receiver
-/// re-registers via poll_add or the channel is closed.  This ensures that
-/// rapid-fire sends (e.g., client sends request, server is still in its
-/// event loop and hasn't re-registered yet) still trigger a wake.  Redundant
-/// wakes are harmless: wake_process on a Ready/Running process just sets
-/// wakeup_pending.
-pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, SendError> {
+/// On success: returns Ok(wake_pid) where wake_pid is the PID of a blocked
+/// receiver to wake (0 = none). The message (with its RAII caps) is now
+/// owned by the queue.
+///
+/// On failure: returns Err((error, msg)) — the message is returned to the
+/// caller intact with all caps still owned. Dropping it auto-closes caps.
+#[allow(clippy::result_large_err)]
+pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, Message)> {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
         if !channel.active {
-            return Err(SendError::ChannelClosed);
+            return Err((SendError::ChannelClosed, msg));
         }
         if is_b {
             // Sending from B side -> push to queue_a (for A to recv)
             if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
-                return Err(SendError::QueueFull);
+                return Err((SendError::QueueFull, msg));
             }
             channel.queue_a.push_back(msg);
             Ok(channel.blocked_a)
         } else {
             // Sending from A side -> push to queue_b (for B to recv)
             if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
-                return Err(SendError::QueueFull);
+                return Err((SendError::QueueFull, msg));
             }
             channel.queue_b.push_back(msg);
             Ok(channel.blocked_b)
         }
     } else {
-        Err(SendError::ChannelClosed)
+        Err((SendError::ChannelClosed, msg))
     }
-}
-
-/// Send by reference (for syscall path). Returns Ok(wake_pid) or Err(SendError).
-/// See channel_send for why blocked is not cleared here.
-pub fn channel_send_ref(endpoint: usize, msg: &Message) -> Result<usize, SendError> {
-    let (ch_idx, is_b) = ep_to_channel(endpoint);
-    let mut mgr = CHANNELS.lock();
-    let result = if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
-        if !channel.active {
-            Err(SendError::ChannelClosed)
-        } else if is_b {
-            if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
-                Err(SendError::QueueFull)
-            } else {
-                channel.queue_a.push_back(msg.clone());
-                Ok(channel.blocked_a)
-            }
-        } else {
-            if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
-                Err(SendError::QueueFull)
-            } else {
-                channel.queue_b.push_back(msg.clone());
-                Ok(channel.blocked_b)
-            }
-        }
-    } else {
-        Err(SendError::ChannelClosed)
-    };
-    result
 }
 
 /// Try to receive a message (non-blocking).
@@ -340,27 +412,34 @@ pub fn channel_set_send_blocked(endpoint: usize, pid: usize) {
     }
 }
 
-/// Blocking send for kernel tasks. Blocks the calling kernel task until the
-/// message is sent or the channel is closed. Returns Ok(()) on success, or
-/// Err(SendError::ChannelClosed) if the channel closed before sending.
-pub fn channel_send_blocking(endpoint: usize, msg: &Message, pid: usize) -> Result<(), SendError> {
+/// Blocking send for kernel tasks. Takes the message by move.
+/// Blocks the calling kernel task until the message is sent or the channel
+/// is closed. On QueueFull, the message is returned from channel_send and
+/// retried after blocking. On ChannelClosed, the message drops (auto-closing
+/// all RAII caps).
+pub fn channel_send_blocking(endpoint: usize, mut msg: Message, pid: usize) -> Result<(), SendError> {
     loop {
-        match channel_send_ref(endpoint, msg) {
+        match channel_send(endpoint, msg) {
             Ok(wake) => {
                 if wake != 0 {
                     crate::task::wake_process(wake);
                 }
                 return Ok(());
             }
-            Err(SendError::QueueFull) => {
+            Err((SendError::QueueFull, returned)) => {
+                msg = returned;
                 if !channel_is_active(endpoint) {
+                    // msg drops here → caps auto-close
                     return Err(SendError::ChannelClosed);
                 }
                 channel_set_send_blocked(endpoint, pid);
                 crate::task::block_process(pid);
                 crate::task::schedule();
             }
-            Err(e) => return Err(e),
+            Err((SendError::ChannelClosed, _dropped)) => {
+                // _dropped goes out of scope → caps auto-close
+                return Err(SendError::ChannelClosed);
+            }
         }
     }
 }
@@ -388,8 +467,8 @@ pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
 /// Result of accepting a client connection from a service control channel.
 #[allow(dead_code)]
 pub struct AcceptedClient {
-    /// The server-side endpoint for the new client channel.
-    pub endpoint: usize,
+    /// The server-side endpoint for the new client channel (RAII).
+    pub endpoint: OwnedEndpoint,
     /// The PID of the connecting client (from the NewConnection message).
     pub client_pid: u32,
     /// Channel role: 0 = generic, 1 = stdin, 2 = stdout.
@@ -402,12 +481,11 @@ pub struct AcceptedClient {
 pub fn accept_client(control_ep: usize, pid: usize) -> AcceptedClient {
     loop {
         match channel_recv_blocking(control_ep, pid) {
-            Some(msg) => {
+            Some(mut msg) => {
                 if msg.cap_count > 0 {
-                    if let Some(ep) = decode_cap_channel(msg.caps[0]) {
+                    if let Cap::Channel(ep) = msg.caps[0].take() {
                         // Parse client_pid from NewConnection message
                         let client_pid = if msg.len >= 5 {
-                            // NewConnection wire format: u32(client_pid) + u8(channel_role)
                             u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]])
                         } else {
                             0
@@ -431,26 +509,6 @@ pub fn accept_client(control_ep: usize, pid: usize) -> AcceptedClient {
     }
 }
 
-/// RAII wrapper around a channel endpoint. Calls `channel_close` on drop.
-/// Prevents the leak bug class where services forget to close client endpoints.
-pub struct OwnedEndpoint(usize);
-
-impl OwnedEndpoint {
-    pub fn new(ep: usize) -> Self {
-        OwnedEndpoint(ep)
-    }
-
-    pub fn raw(&self) -> usize {
-        self.0
-    }
-}
-
-impl Drop for OwnedEndpoint {
-    fn drop(&mut self) {
-        channel_close(self.0);
-    }
-}
-
 /// Check if a channel endpoint is still active.
 #[must_use]
 pub fn channel_is_active(endpoint: usize) -> bool {
@@ -466,7 +524,10 @@ pub fn channel_is_active(endpoint: usize) -> bool {
 /// Increment the ref count for a channel endpoint.
 /// Panics if the endpoint refers to an inactive or invalid channel — this
 /// indicates a kernel bug (the caller should only inc_ref endpoints it owns).
-pub fn channel_inc_ref(endpoint: usize) {
+///
+/// Private to the ipc module — external code uses OwnedEndpoint::clone()
+/// or OwnedEndpoint::clone_from_raw() instead.
+fn channel_inc_ref(endpoint: usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     let ch = mgr.channels.get_mut(ch_idx)
@@ -484,11 +545,19 @@ pub fn channel_inc_ref(endpoint: usize) {
 /// the channel when the ref count reaches 0. Wakes any blocked peer (recv or
 /// send) so it can detect the close. Frees the channel slot when both ref
 /// counts are 0.
-pub fn channel_close(endpoint: usize) {
+///
+/// When freeing the channel, the Channel is taken out of the slot before
+/// releasing the CHANNELS lock, then dropped outside the lock. This prevents
+/// deadlock: dropping queued Messages drops their RAII Caps, which may call
+/// channel_close recursively.
+///
+/// Private to the ipc module — external code drops OwnedEndpoint instead.
+fn channel_close(endpoint: usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     let wake_recv;
     let wake_send;
+    let dropped_channel;
     if let Some(Some(ref mut ch)) = mgr.channels.get_mut(ch_idx) {
         // Decrement the appropriate ref count
         let rc = if is_b { &mut ch.ref_count_b } else { &mut ch.ref_count_a };
@@ -515,10 +584,14 @@ pub fn channel_close(endpoint: usize) {
             if is_b { ch.send_blocked_a = 0; } else { ch.send_blocked_b = 0; }
         }
 
-        // Free the channel slot if both sides have zero refs
-        if ch.ref_count_a == 0 && ch.ref_count_b == 0 {
-            mgr.channels[ch_idx] = None;
-        }
+        // Take the channel out for deferred drop if both sides have zero refs.
+        // Dropping inside the lock would deadlock if queued messages hold RAII
+        // caps to other channels (Drop → channel_close → lock CHANNELS again).
+        dropped_channel = if ch.ref_count_a == 0 && ch.ref_count_b == 0 {
+            mgr.channels[ch_idx].take()
+        } else {
+            None
+        };
     } else {
         return;
     }
@@ -529,6 +602,9 @@ pub fn channel_close(endpoint: usize) {
     if wake_send != 0 && wake_send != wake_recv {
         crate::task::wake_process(wake_send);
     }
+    // Drop the channel (and its queued messages) outside the lock.
+    // Message caps with OwnedEndpoints/OwnedShms will be cleaned up here.
+    drop(dropped_channel);
 }
 
 // ============================================================
@@ -570,8 +646,8 @@ fn shm_init() {
 
 /// Create a new SHM region with the given number of contiguous physical pages.
 /// The pages must already be allocated and zeroed.
-/// Returns the global SHM ID, or None if the table is full.
-pub fn shm_create(base_ppn: PhysPageNum, page_count: usize) -> Option<usize> {
+/// Returns an OwnedShm, or None if the table is full.
+pub fn shm_create(base_ppn: PhysPageNum, page_count: usize) -> Option<OwnedShm> {
     let mut mgr = SHM_REGIONS.lock();
     for (i, slot) in mgr.regions.iter_mut().enumerate() {
         if slot.is_none() {
@@ -581,7 +657,8 @@ pub fn shm_create(base_ppn: PhysPageNum, page_count: usize) -> Option<usize> {
                 ref_count: 1,
                 active: true,
             });
-            return Some(i);
+            // SAFETY: ref_count starts at 1, so we own exactly one reference.
+            return Some(unsafe { OwnedShm::from_raw(i) });
         }
     }
     None
@@ -589,7 +666,9 @@ pub fn shm_create(base_ppn: PhysPageNum, page_count: usize) -> Option<usize> {
 
 /// Increment the ref_count of a SHM region.
 /// Panics if the SHM ID is invalid or inactive — this indicates a kernel bug.
-pub fn shm_inc_ref(shm_id: usize) {
+///
+/// Private to the ipc module — external code uses OwnedShm::clone() instead.
+fn shm_inc_ref(shm_id: usize) {
     let mut mgr = SHM_REGIONS.lock();
     let region = mgr.regions.get_mut(shm_id)
         .and_then(|slot| slot.as_mut())
@@ -601,7 +680,9 @@ pub fn shm_inc_ref(shm_id: usize) {
 /// Decrement the ref_count of a SHM region. If it reaches 0, free the physical
 /// frames and mark the region as inactive.
 /// Panics if the SHM ID is invalid or inactive — this indicates a kernel bug.
-pub fn shm_dec_ref(shm_id: usize) {
+///
+/// Private to the ipc module — external code drops OwnedShm instead.
+fn shm_dec_ref(shm_id: usize) {
     let mut mgr = SHM_REGIONS.lock();
     let region = mgr.regions.get_mut(shm_id)
         .and_then(|slot| slot.as_mut())

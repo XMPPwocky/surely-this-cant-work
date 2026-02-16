@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::SpinLock;
 use crate::arch::trap::TrapFrame;
 use crate::task::context::TaskContext;
-use crate::task::process::{Process, ProcessState, HandleObject, MAX_PROCS};
+use crate::task::process::{Process, ProcessState, HandleObject, HandleInfo, MAX_PROCS};
 use crate::mm::heap::{SchdAlloc, SCHD_ALLOC};
 
 extern "C" {
@@ -217,7 +217,7 @@ pub fn spawn_user(user_code: &[u8], name: &str) -> Option<usize> {
 
 /// Spawn a user-mode process with handle 0 pre-set to boot_ep (boot channel).
 #[allow(dead_code)]
-pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize) -> Option<usize> {
+pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: crate::ipc::OwnedEndpoint) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched)?;
     let mut proc = match Process::new_user(user_code) {
@@ -228,13 +228,14 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: usize
         }
     };
     proc.set_name(name);
+    let ep_raw = boot_ep.raw();
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
-    crate::println!("  Spawned user [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
+    crate::println!("  Spawned user [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, ep_raw);
     Some(pid)
 }
 
@@ -261,7 +262,7 @@ pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> Option<usize> {
 }
 
 /// Spawn a user ELF process with handle 0 pre-set to boot_ep (boot channel).
-pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: usize) -> Option<usize> {
+pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: crate::ipc::OwnedEndpoint) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched)?;
     let mut proc = match Process::new_user_elf(elf_data) {
@@ -272,18 +273,19 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: us
         }
     };
     proc.set_name(name);
+    let ep_raw = boot_ep.raw();
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
-    crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, boot_ep);
+    crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, ep_raw);
     Some(pid)
 }
 
 /// Spawn a user ELF process with handle 0 = boot_ep and handle 1 = extra_ep.
-pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, extra_ep: usize) -> Option<usize> {
+pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: crate::ipc::OwnedEndpoint, extra_ep: crate::ipc::OwnedEndpoint) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
     let pid = find_free_slot(&mut sched)?;
     let mut proc = match Process::new_user_elf(elf_data) {
@@ -294,6 +296,8 @@ pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, 
         }
     };
     proc.set_name(name);
+    let boot_raw = boot_ep.raw();
+    let extra_raw = extra_ep.raw();
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
     proc.handles[1] = Some(HandleObject::Channel(extra_ep));
 
@@ -301,12 +305,13 @@ pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: usize, 
     fixup_trap_ctx_ptr(&mut sched, pid);
     sched.ready_queue.push_back(pid);
 
-    crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={}, extra_ep={})", pid, name, pid, boot_ep, extra_ep);
+    crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={}, extra_ep={})", pid, name, pid, boot_raw, extra_raw);
     Some(pid)
 }
 
 /// Look up a handle in the current process's handle table.
-pub fn current_process_handle(handle: usize) -> Option<HandleObject> {
+/// Returns lightweight HandleInfo (Copy, no ownership) for reading.
+pub fn current_process_handle(handle: usize) -> Option<HandleInfo> {
     let sched = SCHEDULER.lock();
     let pid = sched.current;
     match sched.processes[pid].as_ref() {
@@ -317,18 +322,25 @@ pub fn current_process_handle(handle: usize) -> Option<HandleObject> {
 
 /// Allocate a new handle in the current process for the given HandleObject.
 /// Returns the local handle index, or None if the table is full.
+/// On failure, the HandleObject is dropped (auto-closing the resource).
 pub fn current_process_alloc_handle(obj: HandleObject) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
     let pid = sched.current;
     sched.processes[pid].as_mut().expect("no current process").alloc_handle(obj)
 }
 
-/// Free a handle in the current process.
-pub fn current_process_free_handle(handle: usize) {
+/// Take a handle from the current process, returning the HandleObject.
+/// The caller owns the returned object. Dropping it auto-closes the resource.
+///
+/// IMPORTANT: The SCHEDULER lock is released before this function returns,
+/// so the caller can safely drop the returned HandleObject (which may call
+/// channel_close → wake_process → SCHEDULER lock).
+pub fn current_process_take_handle(handle: usize) -> Option<HandleObject> {
     let mut sched = SCHEDULER.lock();
     let pid = sched.current;
-    if let Some(ref mut proc) = sched.processes[pid] {
-        proc.free_handle(handle);
+    match sched.processes[pid].as_mut() {
+        Some(proc) => proc.take_handle(handle),
+        None => None,
     }
 }
 
@@ -621,13 +633,13 @@ pub fn terminate_current_process() {
     use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
     use crate::mm::heap::PGTB_ALLOC;
 
-    // Collect handles and cleanup info while holding the lock,
-    // then release the lock BEFORE calling channel_close (which may call
-    // wake_process, requiring the SCHEDULER lock — would deadlock otherwise).
-    let mut channel_eps: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
-    let mut shm_ids: [usize; crate::task::process::MAX_HANDLES] = [usize::MAX; crate::task::process::MAX_HANDLES];
-    let mut notify_ep = 0usize;
-    let mut debug_event_ep = 0usize;
+    // Take handles and cleanup info while holding the lock,
+    // then release the lock BEFORE dropping handles (which may call
+    // channel_close → wake_process, requiring the SCHEDULER lock).
+    let mut taken_handles: [Option<HandleObject>; crate::task::process::MAX_HANDLES] =
+        [const { None }; crate::task::process::MAX_HANDLES];
+    let mut notify_ep_raw = 0usize;
+    let mut debug_event_ep_raw = 0usize;
 
     // Frame cleanup info
     let mut pt_frames: alloc::vec::Vec<PhysPageNum, crate::mm::heap::PgtbAlloc> = alloc::vec::Vec::new_in(PGTB_ALLOC);
@@ -640,20 +652,11 @@ pub fn terminate_current_process() {
         let pid = sched.current;
         if let Some(ref mut proc) = sched.processes[pid] {
             // Snapshot exit_notify_ep before cleanup
-            notify_ep = proc.exit_notify_ep;
+            notify_ep_raw = proc.exit_notify_ep;
             proc.exit_notify_ep = 0;
-            // Snapshot handles and clear them from the process
-            for i in 0..crate::task::process::MAX_HANDLES {
-                if let Some(handle_obj) = proc.handles[i].take() {
-                    match handle_obj {
-                        HandleObject::Channel(ep) => {
-                            channel_eps[i] = ep;
-                        }
-                        HandleObject::Shm { id, .. } => {
-                            shm_ids[i] = id;
-                        }
-                    }
-                }
+            // Take handles from the process (RAII ownership transfer)
+            for (i, slot) in taken_handles.iter_mut().enumerate().take(crate::task::process::MAX_HANDLES) {
+                *slot = proc.take_handle(i);
             }
             // Clean up mmap regions (unmap and free anonymous frames)
             if proc.user_satp != 0 {
@@ -689,7 +692,7 @@ pub fn terminate_current_process() {
 
             // Snapshot debug state for cleanup after lock release
             if proc.debug_attached {
-                debug_event_ep = proc.debug_event_ep;
+                debug_event_ep_raw = proc.debug_event_ep;
                 proc.debug_attached = false;
                 proc.debug_event_ep = 0;
                 proc.debug_suspend_pending = false;
@@ -700,42 +703,42 @@ pub fn terminate_current_process() {
             proc.state = ProcessState::Dead;
         }
     }
-    // SCHEDULER lock released — now safe to call channel_close (which may wake_process)
+    // SCHEDULER lock released — now safe to drop handles (channel_close may wake_process)
 
     // Send ProcessExited debug event and close the event channel
-    if debug_event_ep != 0 {
+    if debug_event_ep_raw != 0 {
+        // SAFETY: debug_event_ep was set via set_process_debug_state which stores
+        // one unmanaged reference. We wrap it in OwnedEndpoint for RAII cleanup.
+        let debug_ep = unsafe { crate::ipc::OwnedEndpoint::from_raw(debug_event_ep_raw) };
         let mut msg = crate::ipc::Message::new();
         let event = rvos_proto::debug::DebugEvent::ProcessExited { exit_code: 0 };
         msg.len = rvos_wire::to_bytes(&event, &mut msg.data).unwrap_or(0);
-        if let Ok(wake) = crate::ipc::channel_send(debug_event_ep, msg) {
+        if let Ok(wake) = crate::ipc::channel_send(debug_ep.raw(), msg) {
             if wake != 0 {
                 crate::task::wake_process(wake);
             }
         }
-        crate::ipc::channel_close(debug_event_ep);
+        drop(debug_ep); // → channel_close
     }
 
     // Send exit notification before closing handles (so the receiver wakes up)
-    if notify_ep != 0 {
+    if notify_ep_raw != 0 {
+        // SAFETY: exit_notify_ep was set via set_exit_notify_ep which stores
+        // one unmanaged reference. We wrap it for RAII cleanup.
+        let notify_ep = unsafe { crate::ipc::OwnedEndpoint::from_raw(notify_ep_raw) };
         let mut msg = crate::ipc::Message::new();
         let notif = rvos_proto::process::ExitNotification { exit_code: 0 };
         msg.len = rvos_wire::to_bytes(&notif, &mut msg.data).unwrap_or(0);
-        if let Ok(wake) = crate::ipc::channel_send(notify_ep, msg) {
+        if let Ok(wake) = crate::ipc::channel_send(notify_ep.raw(), msg) {
             if wake != 0 {
                 crate::task::wake_process(wake);
             }
         }
-        crate::ipc::channel_close(notify_ep);
+        drop(notify_ep); // → channel_close
     }
 
-    for i in 0..crate::task::process::MAX_HANDLES {
-        if channel_eps[i] != usize::MAX {
-            crate::ipc::channel_close(channel_eps[i]);
-        }
-        if shm_ids[i] != usize::MAX {
-            crate::ipc::shm_dec_ref(shm_ids[i]);
-        }
-    }
+    // Drop all taken handles — RAII auto-closes channels and dec_refs SHMs
+    drop(taken_handles);
 
     // Free physical frames (code, user stack, page table nodes).
     // NOTE: Do NOT free kernel stack here — we're still executing on it!

@@ -11,7 +11,6 @@ mod misc;
 
 use crate::arch::sbi;
 use crate::arch::trap::TrapFrame;
-use crate::task::HandleObject;
 
 // Syscall numbers
 pub const SYS_EXIT: usize = 93;
@@ -191,68 +190,21 @@ pub(super) fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
     Some(pa)
 }
 
-/// Translate a user-space cap handle into an encoded capability for the message queue.
-/// Increments ref count on success. Returns None on invalid handle.
-pub(super) fn translate_cap_for_send(local_handle: usize) -> Option<usize> {
-    if local_handle == crate::ipc::NO_CAP {
-        return Some(crate::ipc::NO_CAP);
-    }
-    match crate::task::current_process_handle(local_handle) {
-        Some(HandleObject::Channel(global_ep)) => {
-            crate::ipc::channel_inc_ref(global_ep);
-            Some(crate::ipc::encode_cap_channel(global_ep))
-        }
-        Some(HandleObject::Shm { id, rw }) => {
-            crate::ipc::shm_inc_ref(id);
-            Some(crate::ipc::encode_cap_shm(id, rw))
-        }
-        None => None,
-    }
+/// User-space ABI message layout for ptr::read/write at the syscall boundary.
+/// Must match the user-space `Message` in `lib/rvos/src/message.rs`.
+/// The kernel `Message` now uses RAII `Cap` types, so this raw struct is
+/// needed to translate between user-space ABI and kernel representations.
+#[repr(C)]
+pub(super) struct UserMessage {
+    pub data: [u8; crate::ipc::MAX_MSG_SIZE],
+    pub len: usize,
+    pub sender_pid: usize,
+    pub caps: [usize; crate::ipc::MAX_CAPS],
+    pub cap_count: usize,
 }
 
-/// Rollback an encoded cap by decrementing its ref count.
-pub(super) fn rollback_encoded_cap(encoded: usize) {
-    match crate::ipc::decode_cap(encoded) {
-        crate::ipc::DecodedCap::Channel(ep) => { crate::ipc::channel_close(ep); }
-        crate::ipc::DecodedCap::Shm { id, .. } => { crate::ipc::shm_dec_ref(id); }
-        crate::ipc::DecodedCap::None => {}
-    }
-}
-
-/// Install a received capability into the current process's handle table.
-/// Returns the local handle index, or NO_CAP on failure.
-pub(super) fn install_received_cap(encoded_cap: usize) -> usize {
-    match crate::ipc::decode_cap(encoded_cap) {
-        crate::ipc::DecodedCap::None => crate::ipc::NO_CAP,
-        crate::ipc::DecodedCap::Channel(global_ep) => {
-            match crate::task::current_process_alloc_handle(HandleObject::Channel(global_ep)) {
-                Some(h) => h,
-                None => {
-                    crate::ipc::channel_close(global_ep);
-                    crate::ipc::NO_CAP
-                }
-            }
-        }
-        crate::ipc::DecodedCap::Shm { id, rw } => {
-            match crate::task::current_process_alloc_handle(HandleObject::Shm { id, rw }) {
-                Some(h) => h,
-                None => {
-                    crate::ipc::shm_dec_ref(id);
-                    crate::ipc::NO_CAP
-                }
-            }
-        }
-    }
-}
-
-/// Install all received caps in a message into the current process's handle table.
-pub(super) fn install_received_caps(msg: &mut crate::ipc::Message) {
-    for i in 0..msg.cap_count {
-        if msg.caps[i] != crate::ipc::NO_CAP {
-            msg.caps[i] = install_received_cap(msg.caps[i]);
-        }
-    }
-}
+// Compile-time check: UserMessage must match user-space ABI (1080 bytes).
+const _: () = assert!(core::mem::size_of::<UserMessage>() == 1080);
 
 // ============================================================
 // Syscall tracing helpers

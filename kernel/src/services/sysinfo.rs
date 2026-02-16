@@ -20,7 +20,7 @@ pub fn sysinfo_service() {
 
     loop {
         let accepted = ipc::accept_client(control_ep, my_pid);
-        let client = ipc::OwnedEndpoint::new(accepted.endpoint);
+        let client = accepted.endpoint;
 
         // Wait for one request from this client
         let msg = match ipc::channel_recv_blocking(client.raw(), my_pid) {
@@ -114,5 +114,5 @@ fn format_memstat() -> String {
 /// Send a message, blocking if the queue is full.
 fn send_with_backpressure(ep: usize, msg: Message) {
     let my_pid = crate::task::current_pid();
-    let _ = ipc::channel_send_blocking(ep, &msg, my_pid);
+    let _ = ipc::channel_send_blocking(ep, msg, my_pid);
 }

@@ -99,7 +99,7 @@ fn send_file_data(ep: usize, data: &[u8], pid: usize) {
         let mut msg = Message::new();
         msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk }, &mut msg.data).unwrap_or(0);
         msg.sender_pid = pid;
-        let _ = ipc::channel_send_blocking(ep, &msg, pid);
+        let _ = ipc::channel_send_blocking(ep, msg, pid);
     }
 }
 
@@ -108,7 +108,7 @@ fn send_file_sentinel(ep: usize, pid: usize) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FileResponse::Data { chunk: &[] }, &mut msg.data).unwrap_or(0);
     msg.sender_pid = pid;
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
 
 /// Send FileResponse::WriteOk { written }.
@@ -116,7 +116,7 @@ fn send_write_ok(ep: usize, written: u32, pid: usize) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FileResponse::WriteOk { written }, &mut msg.data).unwrap_or(0);
     msg.sender_pid = pid;
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
 
 /// Send FileResponse::IoctlOk { result }.
@@ -124,7 +124,7 @@ fn send_ioctl_ok(ep: usize, result: u32, pid: usize) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&FileResponse::IoctlOk { result }, &mut msg.data).unwrap_or(0);
     msg.sender_pid = pid;
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
 
 // --- Per-client state ---
@@ -189,12 +189,15 @@ fn cleanup_dead_clients(
         let stdout_dead = client.stdout_ep != usize::MAX && !ipc::channel_is_active(client.stdout_ep);
 
         if stdin_dead || stdout_dead {
-            // Close both endpoints
+            // Close both endpoints via RAII
             if client.stdin_ep != usize::MAX {
-                ipc::channel_close(client.stdin_ep);
+                // SAFETY: we own this endpoint (stored raw from into_raw at registration)
+                drop(unsafe { ipc::OwnedEndpoint::from_raw(client.stdin_ep) });
+                client.stdin_ep = usize::MAX;
             }
             if client.stdout_ep != usize::MAX {
-                ipc::channel_close(client.stdout_ep);
+                drop(unsafe { ipc::OwnedEndpoint::from_raw(client.stdout_ep) });
+                client.stdout_ep = usize::MAX;
             }
             client.active = false;
 
@@ -242,10 +245,11 @@ pub fn serial_console_server() {
             let (msg, send_wake) = ipc::channel_recv(control_ep);
             if send_wake != 0 { crate::task::wake_process(send_wake); }
             match msg {
-                Some(msg) => {
+                Some(mut msg) => {
                     handled = true;
                     if msg.cap_count > 0 {
-                        if let Some(ep) = ipc::decode_cap_channel(msg.caps[0]) {
+                        if let ipc::Cap::Channel(ep) = msg.caps[0].take() {
+                            let ep_raw = ep.raw();
                             // Parse NewConnection { client_pid, channel_role }
                             let (client_pid, channel_role) = match rvos_wire::from_bytes::<NewConnection>(&msg.data[..msg.len]) {
                                 Ok(nc) => (nc.client_pid, nc.channel_role),
@@ -254,11 +258,11 @@ pub fn serial_console_server() {
 
                             if let Some(idx) = find_or_create_client(&mut clients, client_pid) {
                                 match channel_role {
-                                    1 => clients[idx].stdin_ep = ep,  // stdin
-                                    2 => clients[idx].stdout_ep = ep, // stdout
+                                    1 => clients[idx].stdin_ep = ep.into_raw(),  // stdin
+                                    2 => clients[idx].stdout_ep = ep.into_raw(), // stdout
                                     _ => {
                                         // Legacy generic: treat as stdout (shouldn't happen)
-                                        clients[idx].stdout_ep = ep;
+                                        clients[idx].stdout_ep = ep.into_raw();
                                     }
                                 }
 
@@ -268,8 +272,9 @@ pub fn serial_console_server() {
                                 // that only need stdout (e.g. window-srv, fbcon) from
                                 // stealing serial input from the actual shell.
                             } else {
-                                ipc::channel_close(ep);
+                                drop(ep); // auto-close
                             }
+                            let _ = ep_raw; // suppress unused warning
                         }
                     }
                 }
@@ -357,7 +362,7 @@ pub fn serial_console_server() {
                                             &mut emsg.data,
                                         ).unwrap_or(0);
                                         emsg.sender_pid = my_pid;
-                                        let _ = ipc::channel_send_blocking(client.stdin_ep, &emsg, my_pid);
+                                        let _ = ipc::channel_send_blocking(client.stdin_ep, emsg, my_pid);
                                     }
                                 }
                             }

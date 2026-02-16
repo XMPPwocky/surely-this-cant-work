@@ -32,7 +32,7 @@ pub fn math_service() {
 
     loop {
         let accepted = ipc::accept_client(control_ep, my_pid);
-        let client = ipc::OwnedEndpoint::new(accepted.endpoint);
+        let client = accepted.endpoint;
         let mut transport = KernelTransport::new(client.raw(), my_pid);
 
         // On bad request, math_dispatch returns Err and we let the

@@ -26,7 +26,7 @@ pub fn kbd_server() {
 
     // Wait for a client endpoint from init (via control channel)
     let accepted = ipc::accept_client(control_ep, my_pid);
-    let client = ipc::OwnedEndpoint::new(accepted.endpoint);
+    let client = accepted.endpoint;
     let client_ep = client.raw();
 
     crate::println!("[kbd-server] client connected");
@@ -50,7 +50,7 @@ pub fn kbd_server() {
                     let mut msg = Message::new();
                     msg.sender_pid = my_pid;
                     msg.len = rvos_wire::to_bytes(&kbd_event, &mut msg.data).unwrap_or(0);
-                    match ipc::channel_send_blocking(client_ep, &msg, my_pid) {
+                    match ipc::channel_send_blocking(client_ep, msg, my_pid) {
                         Ok(()) => {
                             sent_any = true;
                         }

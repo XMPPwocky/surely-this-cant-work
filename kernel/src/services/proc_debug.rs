@@ -4,7 +4,7 @@
 //! breakpoint management, and backtrace for user processes.
 
 use crate::ipc;
-use crate::ipc::OwnedEndpoint;
+use crate::ipc::{OwnedEndpoint, Cap};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::debug::*;
 
@@ -68,7 +68,7 @@ pub fn proc_debug_service() {
     loop {
         // Accept a client connection on the control channel
         let accepted = ipc::accept_client(control_ep, my_pid);
-        let client_ep = OwnedEndpoint::new(accepted.endpoint);
+        let client_ep = accepted.endpoint;
 
         // Receive DebugAttachRequest
         let msg = match ipc::channel_recv_blocking(client_ep.raw(), my_pid) {
@@ -93,7 +93,7 @@ pub fn proc_debug_service() {
             continue;
         }
 
-        // Create session + event channel pairs
+        // Create session + event channel pairs (RAII — all four are OwnedEndpoint)
         let (session_a, session_b) = match ipc::channel_create_pair() {
             Some(pair) => pair,
             None => {
@@ -104,84 +104,53 @@ pub fn proc_debug_service() {
         let (event_a, event_b) = match ipc::channel_create_pair() {
             Some(pair) => pair,
             None => {
-                ipc::channel_close(session_a);
-                ipc::channel_close(session_b);
+                // session_a, session_b drop here → auto-close
+                drop(session_a);
+                drop(session_b);
                 send_attach_error(client_ep.raw(), my_pid, DebugError::NoResources {});
                 continue;
             }
         };
 
-        // Mark the target as debugged (event_a is the service's endpoint)
-        crate::task::set_process_debug_state(target_pid, true, event_a);
+        // Mark the target as debugged. Transfer event_a ownership to the process
+        // (the process stores it as raw usize, reclaimed on exit or detach).
+        let event_a_raw = event_a.into_raw();
+        crate::task::set_process_debug_state(target_pid, true, event_a_raw);
 
-        // Send DebugAttachResponse::Ok with session_b + event_b to client
-        let resp = DebugAttachResponse::Ok {
-            session: rvos_wire::RawChannelCap::new(session_b),
-            events: rvos_wire::RawChannelCap::new(event_b),
-        };
+        // Build response message with session_b and event_b as cap transfers.
+        // Clone creates a reference for the message; the originals will be dropped
+        // after the send succeeds, closing the service's references.
         let mut resp_msg = ipc::Message::new();
-        let (data_len, cap_count) = rvos_wire::to_bytes_with_caps(
-            &resp,
-            &mut resp_msg.data,
-            &mut resp_msg.caps,
-        )
-        .unwrap_or((0, 0));
-        resp_msg.len = data_len;
-        resp_msg.cap_count = cap_count;
-        // Inc ref for each cap we're sending
-        if cap_count > 0 {
-            for i in 0..cap_count {
-                if resp_msg.caps[i] != ipc::NO_CAP {
-                    let ep = match ipc::decode_cap(resp_msg.caps[i]) {
-                        ipc::DecodedCap::Channel(ep) => ep,
-                        _ => continue,
-                    };
-                    ipc::channel_inc_ref(ep);
-                }
-            }
-        }
-        // Actually the caps from to_bytes_with_caps are raw handles, need to encode them
-        // Let me use KernelTransport instead for correct cap handling
-        // Actually, looking at the wire format more closely, to_bytes_with_caps writes
-        // the RawChannelCap handle values into the caps array. For kernel-side sending,
-        // we need to encode them as channel caps and inc_ref.
-        // Reset and do it properly:
-        resp_msg = ipc::Message::new();
         resp_msg.len = rvos_wire::to_bytes(&DebugAttachResponse::Ok {
             session: rvos_wire::RawChannelCap::new(0), // placeholder
             events: rvos_wire::RawChannelCap::new(0),  // placeholder
         }, &mut resp_msg.data).unwrap_or(0);
-        // Put the actual caps in the sideband
-        resp_msg.caps[0] = ipc::encode_cap_channel(session_b);
-        resp_msg.caps[1] = ipc::encode_cap_channel(event_b);
+        resp_msg.caps[0] = Cap::Channel(session_b.clone());
+        resp_msg.caps[1] = Cap::Channel(event_b.clone());
         resp_msg.cap_count = 2;
-        ipc::channel_inc_ref(session_b);
-        ipc::channel_inc_ref(event_b);
 
-        if ipc::channel_send_blocking(client_ep.raw(), &resp_msg, my_pid).is_err() {
-            // Client disconnected before receiving response
-            ipc::channel_close(session_a);
-            ipc::channel_close(session_b);
-            ipc::channel_close(event_a);
-            ipc::channel_close(event_b);
+        if ipc::channel_send_blocking(client_ep.raw(), resp_msg, my_pid).is_err() {
+            // Client disconnected. The message (with cloned caps) is dropped → auto-close.
+            // session_a, session_b, event_b drop here → auto-close.
+            // Reclaim event_a from the process.
+            // SAFETY: event_a_raw was stored via into_raw and we own the reference.
+            drop(unsafe { OwnedEndpoint::from_raw(event_a_raw) });
             crate::task::set_process_debug_state(target_pid, false, 0);
             continue;
         }
 
         // Drop the service's original references to the B endpoints.
-        // The inc_ref calls above created a second reference for the client;
-        // the service only uses the A endpoints from here on.
-        ipc::channel_close(session_b);
-        ipc::channel_close(event_b);
+        // The clones in the message have the receiver's references.
+        drop(session_b);
+        drop(event_b);
 
-        // Enter session loop
-        let session_ep = OwnedEndpoint::new(session_a);
-        handle_debug_session(session_ep.raw(), target_pid, event_a, my_pid);
+        // Enter session loop (session_a is the service's endpoint)
+        handle_debug_session(session_a.raw(), target_pid, event_a_raw, my_pid);
 
         // Session ended — detach
-        detach_process(target_pid, event_a);
-        // session_ep drops here, closing session_a
-        // event_a is closed in detach_process
+        detach_process(target_pid, event_a_raw);
+        // session_a drops here → closes session_a
+        // client_ep drops here → closes client channel
     }
 }
 
@@ -189,7 +158,7 @@ fn send_attach_error(client_ep: usize, pid: usize, code: DebugError) {
     let resp = DebugAttachResponse::Error { code };
     let mut msg = ipc::Message::new();
     msg.len = rvos_wire::to_bytes(&resp, &mut msg.data).unwrap_or(0);
-    let _ = ipc::channel_send_blocking(client_ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(client_ep, msg, pid);
 }
 
 fn handle_debug_session(session_ep: usize, target_pid: usize, _event_ep: usize, my_pid: usize) {
@@ -217,10 +186,6 @@ fn handle_debug_session(session_ep: usize, target_pid: usize, _event_ep: usize, 
 
             SessionRequest::Resume {} => {
                 // Restore breakpoint original bytes if we hit one
-                // (The sepc still points at the c.ebreak instruction.
-                // The service must restore original bytes before resuming.)
-                // Actually per the design, "resuming from a breakpoint clears it"
-                // so we restore original bytes for any bp at sepc, then resume.
                 if let Some(tf) = crate::task::read_debug_trap_frame(target_pid) {
                     let sepc = tf.sepc;
                     let (bps, count) = crate::task::process_debug_breakpoints(target_pid);
@@ -503,7 +468,7 @@ fn handle_debug_session(session_ep: usize, target_pid: usize, _event_ep: usize, 
     }
 }
 
-fn detach_process(target_pid: usize, event_ep: usize) {
+fn detach_process(target_pid: usize, event_ep_raw: usize) {
     // Restore all breakpoints
     let (bps, count) = crate::task::process_debug_breakpoints(target_pid);
     for bp in bps.iter().take(count) {
@@ -526,8 +491,9 @@ fn detach_process(target_pid: usize, event_ep: usize) {
         crate::task::wake_process(target_pid);
     }
 
-    // Close event channel
-    ipc::channel_close(event_ep);
+    // Close event channel via RAII
+    // SAFETY: event_ep_raw was stored via into_raw; we own this reference.
+    drop(unsafe { OwnedEndpoint::from_raw(event_ep_raw) });
 }
 
 // ---- Response helpers ----
@@ -536,33 +502,33 @@ fn send_session_ok(ep: usize, pid: usize) {
     let resp = SessionResponse::Ok {};
     let mut msg = ipc::Message::new();
     msg.len = rvos_wire::to_bytes(&resp, &mut msg.data).unwrap_or(0);
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
 
 fn send_session_error(ep: usize, pid: usize, message: &str) {
     let resp = SessionResponse::Error { message };
     let mut msg = ipc::Message::new();
     msg.len = rvos_wire::to_bytes(&resp, &mut msg.data).unwrap_or(0);
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
 
 fn send_session_registers(ep: usize, pid: usize, data: &[u8]) {
     let resp = SessionResponse::Registers { data };
     let mut msg = ipc::Message::new();
     msg.len = rvos_wire::to_bytes(&resp, &mut msg.data).unwrap_or(0);
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
 
 fn send_session_memory(ep: usize, pid: usize, data: &[u8]) {
     let resp = SessionResponse::Memory { data };
     let mut msg = ipc::Message::new();
     msg.len = rvos_wire::to_bytes(&resp, &mut msg.data).unwrap_or(0);
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
 
 fn send_session_backtrace(ep: usize, pid: usize, frames: &[u8]) {
     let resp = SessionResponse::Backtrace { frames };
     let mut msg = ipc::Message::new();
     msg.len = rvos_wire::to_bytes(&resp, &mut msg.data).unwrap_or(0);
-    let _ = ipc::channel_send_blocking(ep, &msg, pid);
+    let _ = ipc::channel_send_blocking(ep, msg, pid);
 }
