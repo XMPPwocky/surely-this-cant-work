@@ -703,6 +703,10 @@ static KTEST_ELF: &[u8] = include_bytes!(
     "../../target/riscv64gc-unknown-rvos/release/ktest"
 );
 
+static KTEST_HELPER_ELF: &[u8] = include_bytes!(
+    "../../target/riscv64gc-unknown-rvos/release/ktest-helper"
+);
+
 static DBG_ELF: &[u8] = include_bytes!(
     "../../target/riscv64gc-unknown-rvos/release/dbg"
 );
@@ -740,6 +744,7 @@ fn main() {
     fs().add_static_file(b"/bin/triangle", TRIANGLE_ELF);
     fs().add_static_file(b"/bin/gui-bench", GUI_BENCH_ELF);
     fs().add_static_file(b"/bin/ktest", KTEST_ELF);
+    fs().add_static_file(b"/bin/ktest-helper", KTEST_HELPER_ELF);
     fs().add_static_file(b"/bin/dbg", DBG_ELF);
 
     // The fs server has:

@@ -521,10 +521,16 @@ fn parse_ns_overrides(blob: &[u8], orig_msg: &Message) -> [Option<NsOverride>; M
             });
             out_idx += 1;
         } else {
-            // Redirect entry: decode the capability from the message's cap array
+            // Redirect entry: decode the capability from the message's cap array.
+            // Inc_ref the endpoint so the BootRegistration holds its own reference.
+            // The IPC transfer's inc_ref covers the extra_cap (handle 1) usage;
+            // this additional inc_ref covers the override stored in BootRegistration.
+            // Without this, cleanup of both extra_cap and the override would
+            // double-close a single reference, deactivating the endpoint prematurely.
             if cap_index < orig_msg.cap_count {
                 let encoded = orig_msg.caps[cap_index];
                 if let Some(ep) = ipc::decode_cap_channel(encoded) {
+                    ipc::channel_inc_ref(ep);
                     result[out_idx] = Some(NsOverride {
                         name,
                         name_len: nlen,

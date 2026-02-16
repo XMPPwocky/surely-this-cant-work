@@ -8,6 +8,7 @@ members = [
     "hello",
     "ipc-torture",
     "ktest",
+    "ktest-helper",
     "rvos-rt",
     "shell",
     "triangle",

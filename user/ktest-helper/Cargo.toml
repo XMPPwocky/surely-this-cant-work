@@ -1,0 +1,8 @@
+[package]
+name = "ktest-helper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rvos-rt.workspace = true
+rvos.workspace = true

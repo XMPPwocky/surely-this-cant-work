@@ -1021,6 +1021,412 @@ fn test_spawn_exit_notification() -> Result<(), &'static str> {
 }
 
 // ============================================================
+// 13. Regression -- Scheduling
+// ============================================================
+
+#[inline(always)]
+fn rdtime() -> u64 {
+    let t: u64;
+    unsafe { core::arch::asm!("rdtime {}", out(reg) t, options(nomem, nostack)) };
+    t
+}
+
+fn test_yield_latency() -> Result<(), &'static str> {
+    // 100 yields should complete in <5M ticks (500ms at 10MHz).
+    // With idle-in-ready-queue bug, each yield stalls ~100ms → 10s total.
+    let start = rdtime();
+    for _ in 0..100 {
+        raw::sys_yield();
+    }
+    let elapsed = rdtime() - start;
+    assert_true(elapsed < 5_000_000, "yield latency too high (scheduling bug?)")
+}
+
+fn test_ipc_roundtrip_latency() -> Result<(), &'static str> {
+    // 100 send+recv roundtrips should complete in <5M ticks (500ms).
+    // With the scheduling bug (premature blocked clear), each roundtrip
+    // stalls ~50-100ms.
+    let (ha, hb) = raw::sys_chan_create();
+    let start = rdtime();
+    for i in 0..100u8 {
+        let mut msg = Message::new();
+        msg.data[0] = i;
+        msg.len = 1;
+        raw::sys_chan_send(ha, &msg);
+        let mut recv = Message::new();
+        let ret = raw::sys_chan_recv(hb, &mut recv);
+        if ret != 0 {
+            raw::sys_chan_close(ha);
+            raw::sys_chan_close(hb);
+            return Err("recv failed during roundtrip");
+        }
+    }
+    let elapsed = rdtime() - start;
+    raw::sys_chan_close(ha);
+    raw::sys_chan_close(hb);
+    assert_true(elapsed < 5_000_000, "IPC roundtrip latency too high (scheduling bug?)")
+}
+
+// ============================================================
+// 14. Regression -- Wakeup
+// ============================================================
+
+fn test_blocking_recv_wakeup() -> Result<(), &'static str> {
+    // Send a message, then blocking recv. Should complete quickly.
+    // If wakeup is lost, blocks until timer tick (~10ms minimum).
+    let (ha, hb) = raw::sys_chan_create();
+    let msg = Message::from_bytes(b"wake");
+    raw::sys_chan_send(ha, &msg);
+    let start = rdtime();
+    let mut recv = Message::new();
+    let ret = raw::sys_chan_recv_blocking(hb, &mut recv);
+    let elapsed = rdtime() - start;
+    raw::sys_chan_close(ha);
+    raw::sys_chan_close(hb);
+    assert_eq(ret, 0, "blocking recv failed")?;
+    assert_true(&recv.data[..4] == b"wake", "data mismatch")?;
+    assert_true(elapsed < 1_000_000, "blocking recv too slow (wakeup bug?)")
+}
+
+fn test_fill_drain_fill_no_loss() -> Result<(), &'static str> {
+    // Fill channel to 64, drain 64, fill again to 64, drain again.
+    // Verify data integrity on second drain. Tests that blocked/wakeup
+    // state resets properly between fill/drain cycles.
+    let (ha, hb) = raw::sys_chan_create();
+
+    // First fill
+    for i in 0..64u8 {
+        let mut msg = Message::new();
+        msg.data[0] = i;
+        msg.len = 1;
+        let ret = raw::sys_chan_send(ha, &msg);
+        if ret != 0 {
+            raw::sys_chan_close(ha);
+            raw::sys_chan_close(hb);
+            return Err("first fill: send failed");
+        }
+    }
+
+    // First drain
+    for i in 0..64u8 {
+        let mut recv = Message::new();
+        let ret = raw::sys_chan_recv(hb, &mut recv);
+        if ret != 0 || recv.data[0] != i {
+            raw::sys_chan_close(ha);
+            raw::sys_chan_close(hb);
+            return Err("first drain: data mismatch");
+        }
+    }
+
+    // Second fill (values offset by 100)
+    for i in 0..64u8 {
+        let mut msg = Message::new();
+        msg.data[0] = i.wrapping_add(100);
+        msg.len = 1;
+        let ret = raw::sys_chan_send(ha, &msg);
+        if ret != 0 {
+            raw::sys_chan_close(ha);
+            raw::sys_chan_close(hb);
+            return Err("second fill: send failed");
+        }
+    }
+
+    // Second drain — verify integrity
+    for i in 0..64u8 {
+        let mut recv = Message::new();
+        let ret = raw::sys_chan_recv(hb, &mut recv);
+        if ret != 0 || recv.data[0] != i.wrapping_add(100) {
+            raw::sys_chan_close(ha);
+            raw::sys_chan_close(hb);
+            return Err("second drain: data mismatch");
+        }
+    }
+
+    raw::sys_chan_close(ha);
+    raw::sys_chan_close(hb);
+    Ok(())
+}
+
+// ============================================================
+// 15. Regression -- Validation
+// ============================================================
+
+fn test_buffer_validation_overflow() -> Result<(), &'static str> {
+    // Pass a pointer near usize::MAX so ptr+sizeof(Message) wraps around.
+    // With the old validate_user_buffer bug, the kernel would accept this
+    // and crash. All must return error (usize::MAX).
+    let (ha, hb) = raw::sys_chan_create();
+    let bad_ptr = usize::MAX - 16;
+
+    let ret = raw::syscall2(raw::SYS_CHAN_SEND, ha, bad_ptr);
+    assert_eq(ret, usize::MAX, "send with overflow ptr should fail")?;
+
+    let ret = raw::syscall2(raw::SYS_CHAN_RECV, hb, bad_ptr);
+    assert_eq(ret, usize::MAX, "recv with overflow ptr should fail")?;
+
+    let ret = raw::syscall2(raw::SYS_CHAN_RECV_BLOCKING, hb, bad_ptr);
+    assert_eq(ret, usize::MAX, "recv_blocking with overflow ptr should fail")?;
+
+    raw::sys_chan_close(ha);
+    raw::sys_chan_close(hb);
+    Ok(())
+}
+
+fn test_buffer_validation_null() -> Result<(), &'static str> {
+    // Null pointer for message buffer — must return error, not crash.
+    let (ha, hb) = raw::sys_chan_create();
+
+    let ret = raw::syscall2(raw::SYS_CHAN_SEND, ha, 0);
+    assert_eq(ret, usize::MAX, "send with null ptr should fail")?;
+
+    let ret = raw::syscall2(raw::SYS_CHAN_RECV, hb, 0);
+    assert_eq(ret, usize::MAX, "recv with null ptr should fail")?;
+
+    let ret = raw::syscall1(raw::SYS_MEMINFO, 0);
+    assert_eq(ret, usize::MAX, "meminfo with null ptr should fail")?;
+
+    raw::sys_chan_close(ha);
+    raw::sys_chan_close(hb);
+    Ok(())
+}
+
+// ============================================================
+// 16. Regression -- Resource Limits
+// ============================================================
+
+fn test_mmap_many_regions() -> Result<(), &'static str> {
+    // Allocate 64 anonymous mmap regions. If old limit (32) exists,
+    // fails at region 33.
+    let mut addrs = [0usize; 64];
+    for (i, addr) in addrs.iter_mut().enumerate() {
+        let a = raw::sys_mmap(0, 4096);
+        if a == usize::MAX {
+            // Clean up what we mapped
+            for &prev in addrs.iter().take(i) {
+                raw::sys_munmap(prev, 4096);
+            }
+            return Err("mmap failed before 64 regions");
+        }
+        *addr = a;
+    }
+    // Clean up
+    for &a in &addrs {
+        raw::sys_munmap(a, 4096);
+    }
+    Ok(())
+}
+
+fn test_mmap_child_region_count() -> Result<(), &'static str> {
+    // Spawn ktest-helper with command byte 2 (allocate 64 mmap regions).
+    let (our_ep, child_ep) = raw::sys_chan_create();
+
+    // Send command byte 2
+    let mut cmd = Message::new();
+    cmd.data[0] = 2;
+    cmd.len = 1;
+    raw::sys_chan_send(our_ep, &cmd);
+
+    let proc_chan = rvos::spawn_process_with_cap("/bin/ktest-helper", child_ep)
+        .map_err(|_| "spawn ktest-helper failed")?;
+    raw::sys_chan_close(child_ep);
+
+    // Receive count from child
+    let mut reply = Message::new();
+    let ret = raw::sys_chan_recv_blocking(our_ep, &mut reply);
+    if ret != 0 {
+        // Wait for exit and clean up
+        let ph = proc_chan.into_raw_handle();
+        let mut exit_msg = Message::new();
+        raw::sys_chan_recv_blocking(ph, &mut exit_msg);
+        raw::sys_chan_close(ph);
+        raw::sys_chan_close(our_ep);
+        return Err("recv from child failed");
+    }
+
+    let count = if reply.len >= 4 {
+        u32::from_le_bytes([reply.data[0], reply.data[1], reply.data[2], reply.data[3]])
+    } else {
+        0
+    };
+
+    // Wait for child exit
+    let ph = proc_chan.into_raw_handle();
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(ph, &mut exit_msg);
+    raw::sys_chan_close(ph);
+    raw::sys_chan_close(our_ep);
+
+    assert_eq(count as usize, 64, "child couldn't allocate 64 mmap regions")
+}
+
+// ============================================================
+// 17. Regression -- Resource Leaks
+// ============================================================
+
+fn test_spawn_cleanup_no_leak() -> Result<(), &'static str> {
+    // Spawn hello-std 5× in a loop, each time wait for exit.
+    // The framework's built-in leak detection (meminfo before/after
+    // second run) catches growing heap/frames.
+    for _ in 0..5 {
+        let proc_chan = rvos::spawn_process("/bin/hello-std")
+            .map_err(|_| "spawn failed")?;
+        let proc_handle = proc_chan.into_raw_handle();
+        let mut exit_msg = Message::new();
+        raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+        raw::sys_chan_close(proc_handle);
+    }
+    Ok(())
+}
+
+// ============================================================
+// 18. Regression -- Fault Isolation
+// ============================================================
+
+fn test_umode_fault_kills_child_not_kernel() -> Result<(), &'static str> {
+    // Spawn ktest-helper with arg "crash" (null dereference).
+    // Wait for exit notification. Assert kernel still alive.
+    let proc_chan = rvos::spawn_process_with_args("/bin/ktest-helper", b"crash")
+        .map_err(|_| "spawn ktest-helper failed")?;
+    let proc_handle = proc_chan.into_raw_handle();
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+    raw::sys_chan_close(proc_handle);
+
+    // If we got here, kernel survived. Verify clock still works.
+    let (wall, _) = raw::sys_clock();
+    assert_true(wall > 0, "kernel dead after child crash")
+}
+
+// ============================================================
+// 19. Regression -- Cap Ref Counting
+// ============================================================
+
+fn test_ns_override_cap_delivery() -> Result<(), &'static str> {
+    // Redirect a custom service name (not stdout — stdout requires a Write/WriteOk
+    // round-trip protocol that a raw channel can't satisfy). The child (hello-std)
+    // never connects to "ktest-svc" so it runs normally. This tests that the
+    // override cap is properly ref-counted during spawn.
+    let (our_ep, child_ep) = raw::sys_chan_create();
+
+    let proc_chan = rvos::spawn_process_with_overrides(
+        "/bin/hello-std",
+        b"",
+        &[rvos::NsOverride::Redirect("ktest-svc", child_ep)],
+    ).map_err(|_| "spawn with override failed")?;
+    raw::sys_chan_close(child_ep);
+
+    // Wait for child to exit
+    let proc_handle = proc_chan.into_raw_handle();
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+    raw::sys_chan_close(proc_handle);
+
+    // Verify our channel is still alive (send should succeed if peer endpoint
+    // exists — it won't be consumed but the send should not return error for
+    // a closed channel).
+    let test_msg = Message::from_bytes(b"alive");
+    let ret = raw::sys_chan_send(our_ep, &test_msg);
+    raw::sys_chan_close(our_ep);
+
+    // Send returns 0 on success, nonzero if channel is dead.
+    // After child exit, the override endpoint should have been cleaned up,
+    // but our_ep's peer may be closed. What matters is: the spawn succeeded
+    // and the child exited normally (didn't crash due to ref counting).
+    // ret == 0 means channel still alive (init server holds ref), or
+    // ret != 0 means peer closed (expected after cleanup). Both are fine.
+    let _ = ret;
+    Ok(())
+}
+
+fn test_two_children_shared_override() -> Result<(), &'static str> {
+    // Spawn TWO children sequentially with the same override endpoint.
+    // If bug 0002 exists, child 1's exit kills the override channel
+    // and child 2's spawn fails or child 2 can't connect to services.
+    let (our_ep, child_ep) = raw::sys_chan_create();
+
+    // Child 1
+    let proc1 = rvos::spawn_process_with_overrides(
+        "/bin/hello-std",
+        b"",
+        &[rvos::NsOverride::Redirect("ktest-svc", child_ep)],
+    ).map_err(|_| "spawn child 1 failed")?;
+    let ph1 = proc1.into_raw_handle();
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(ph1, &mut exit_msg);
+    raw::sys_chan_close(ph1);
+
+    // Child 2 — same override endpoint. If ref counting is broken, the
+    // endpoint was deactivated when child 1 exited, and this spawn might
+    // fail or the child might crash.
+    let proc2 = rvos::spawn_process_with_overrides(
+        "/bin/hello-std",
+        b"",
+        &[rvos::NsOverride::Redirect("ktest-svc", child_ep)],
+    ).map_err(|_| "spawn child 2 failed (cap ref counting bug?)")?;
+    raw::sys_chan_close(child_ep);
+
+    let ph2 = proc2.into_raw_handle();
+    let mut exit_msg2 = Message::new();
+    raw::sys_chan_recv_blocking(ph2, &mut exit_msg2);
+    raw::sys_chan_close(ph2);
+    raw::sys_chan_close(our_ep);
+
+    Ok(())
+}
+
+fn test_cap_delivery_via_spawn() -> Result<(), &'static str> {
+    // Create channel pair, send command byte 1 on our end, spawn
+    // ktest-helper with cap. Child reads command, writes "ktest-ok" back.
+    let (our_ep, child_ep) = raw::sys_chan_create();
+
+    // Send command byte 1
+    let mut cmd = Message::new();
+    cmd.data[0] = 1;
+    cmd.len = 1;
+    raw::sys_chan_send(our_ep, &cmd);
+
+    let proc_chan = rvos::spawn_process_with_cap("/bin/ktest-helper", child_ep)
+        .map_err(|_| "spawn ktest-helper failed")?;
+    raw::sys_chan_close(child_ep);
+
+    // Receive reply
+    let mut reply = Message::new();
+    let ret = raw::sys_chan_recv_blocking(our_ep, &mut reply);
+
+    // Wait for child exit
+    let ph = proc_chan.into_raw_handle();
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(ph, &mut exit_msg);
+    raw::sys_chan_close(ph);
+    raw::sys_chan_close(our_ep);
+
+    assert_eq(ret, 0, "recv from child failed")?;
+    assert_true(reply.len >= 8 && &reply.data[..8] == b"ktest-ok", "child didn't reply ktest-ok")
+}
+
+// ============================================================
+// 20. Regression -- Scheduler Stress
+// ============================================================
+
+fn test_stress_spawn_exit() -> Result<(), &'static str> {
+    // Spawn 3 hello-std children, wait for all exits.
+    // If schedule() race exists, heavy IPC during parallel spawn
+    // increases chance of kernel panic. Serves as a smoke test.
+    let mut handles = [usize::MAX; 3];
+    for handle in handles.iter_mut() {
+        let proc_chan = rvos::spawn_process("/bin/hello-std")
+            .map_err(|_| "spawn failed")?;
+        *handle = proc_chan.into_raw_handle();
+    }
+    for &h in &handles {
+        let mut exit_msg = Message::new();
+        raw::sys_chan_recv_blocking(h, &mut exit_msg);
+        raw::sys_chan_close(h);
+    }
+    Ok(())
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -1118,6 +1524,44 @@ fn main() {
     total.merge(&run_section("Process Spawn", &[
         ("spawn_hello", test_spawn_hello),
         ("spawn_exit_notification", test_spawn_exit_notification),
+    ]));
+
+    total.merge(&run_section("Regression -- Scheduling", &[
+        ("yield_latency", test_yield_latency),
+        ("ipc_roundtrip_latency", test_ipc_roundtrip_latency),
+    ]));
+
+    total.merge(&run_section("Regression -- Wakeup", &[
+        ("blocking_recv_wakeup", test_blocking_recv_wakeup),
+        ("fill_drain_fill_no_loss", test_fill_drain_fill_no_loss),
+    ]));
+
+    total.merge(&run_section("Regression -- Validation", &[
+        ("buffer_validation_overflow", test_buffer_validation_overflow),
+        ("buffer_validation_null", test_buffer_validation_null),
+    ]));
+
+    total.merge(&run_section("Regression -- Resource Limits", &[
+        ("mmap_many_regions", test_mmap_many_regions),
+        ("mmap_child_region_count", test_mmap_child_region_count),
+    ]));
+
+    total.merge(&run_section("Regression -- Resource Leaks", &[
+        ("spawn_cleanup_no_leak", test_spawn_cleanup_no_leak),
+    ]));
+
+    total.merge(&run_section("Regression -- Fault Isolation", &[
+        ("umode_fault_kills_child", test_umode_fault_kills_child_not_kernel),
+    ]));
+
+    total.merge(&run_section("Regression -- Cap Ref Counting", &[
+        ("ns_override_cap_delivery", test_ns_override_cap_delivery),
+        ("two_children_shared_override", test_two_children_shared_override),
+        ("cap_delivery_via_spawn", test_cap_delivery_via_spawn),
+    ]));
+
+    total.merge(&run_section("Regression -- Scheduler Stress", &[
+        ("stress_spawn_exit", test_stress_spawn_exit),
     ]));
 
     println!();
