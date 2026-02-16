@@ -790,6 +790,19 @@ pub fn block_process(pid: usize) {
     }
 }
 
+/// Unconditionally set a process to Blocked state, ignoring `wakeup_pending`.
+/// Used by the debugger's suspend/breakpoint paths where the block is
+/// unconditional — any pending IPC wakeup is irrelevant because the process
+/// must stop for inspection. The IPC message remains in the channel queue
+/// and will be picked up when the debugger resumes the process.
+pub fn force_block_process(pid: usize) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.wakeup_pending = false;
+        proc.state = ProcessState::Blocked;
+    }
+}
+
 /// Wake a blocked process (set to Ready and add to FRONT of ready queue).
 /// Pushing to front gives woken receivers priority, enabling fast IPC round-trips.
 /// If the process is Running or Ready, set wakeup_pending so a subsequent
