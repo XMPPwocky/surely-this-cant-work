@@ -711,6 +711,14 @@ static DBG_ELF: &[u8] = include_bytes!(
     "../../target/riscv64gc-unknown-rvos/release/dbg"
 );
 
+static NET_STACK_ELF: &[u8] = include_bytes!(
+    "../../target/riscv64gc-unknown-rvos/release/net-stack"
+);
+
+static UDP_ECHO_ELF: &[u8] = include_bytes!(
+    "../../target/riscv64gc-unknown-rvos/release/udp-echo"
+);
+
 // --- Multiplexed client state ---
 
 const MAX_CLIENTS: usize = 8;
@@ -746,6 +754,8 @@ fn main() {
     fs().add_static_file(b"/bin/ktest", KTEST_ELF);
     fs().add_static_file(b"/bin/ktest-helper", KTEST_HELPER_ELF);
     fs().add_static_file(b"/bin/dbg", DBG_ELF);
+    fs().add_static_file(b"/bin/net-stack", NET_STACK_ELF);
+    fs().add_static_file(b"/bin/udp-echo", UDP_ECHO_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)

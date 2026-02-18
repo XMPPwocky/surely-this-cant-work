@@ -1,0 +1,71 @@
+#!/usr/bin/expect -f
+# Boot rvOS, run udp-echo, send a UDP test packet, dump pcap.
+# Requires: sudo scripts/net-setup.sh (TAP/bridge) + tcpdump
+# Usage: expect scripts/net-test.exp
+
+set timeout 30
+log_user 1
+
+cd [file dirname [file dirname [file normalize [info script]]]]
+
+# Start tcpdump on bridge in background
+exec sudo rm -f /tmp/rvos.pcap
+exec sudo tcpdump -i rvos-br0 -w /tmp/rvos.pcap -U &
+
+after 1000
+
+# Start QEMU via make run (which uses TAP)
+spawn make run
+
+# Wait for net-stack to be fully ready
+# The shell prompt appears before this, so by the time this matches
+# the shell is already accepting input.
+expect {
+    "entering main loop" {}
+    timeout { puts "\nTIMEOUT waiting for net-stack"; exit 1 }
+}
+
+after 1000
+
+# Run udp-echo in background (shell is ready, prompt already shown)
+send "run /bin/udp-echo &\r"
+expect {
+    "listening on port 7777" {}
+    timeout { puts "\nTIMEOUT waiting for udp-echo bind"; exit 1 }
+}
+
+# Give the system a moment to settle
+after 2000
+
+# Send a UDP packet from the host via the bridge
+exec bash -c "echo -n 'hello-rvos' | nc -u -w1 10.0.2.15 7777" &
+
+# Wait to see if the echo appears in the rvOS console
+after 5000
+
+# Shutdown
+send "shutdown\r"
+expect {
+    "Power off" {}
+    eof {}
+    timeout { puts "\nTIMEOUT waiting for shutdown" }
+}
+
+# Wait for QEMU to exit
+catch {wait}
+
+# Stop tcpdump
+after 1000
+catch {exec sudo pkill -f "tcpdump -i rvos-br0"}
+after 1000
+
+# Dump the pcap
+puts "\n=== PCAP DUMP ==="
+if {[catch {exec tcpdump -r /tmp/rvos.pcap -nn -e 2>@1} result]} {
+    puts $result
+} else {
+    puts $result
+}
+puts "=== END PCAP ==="
+
+exit 0

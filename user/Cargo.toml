@@ -9,9 +9,11 @@ members = [
     "ipc-torture",
     "ktest",
     "ktest-helper",
+    "net-stack",
     "rvos-rt",
     "shell",
     "triangle",
+    "udp-echo",
     "winclient",
     "window-server",
 ]

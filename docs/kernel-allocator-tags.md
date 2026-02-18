@@ -25,6 +25,7 @@ Untagged allocations (via `GlobalAlloc`) are tracked under tag `????`.
 | `PGTB` | `kernel/src/mm/`         | Page table frame tracking                    |
 | `INIT` | `kernel/src/services/`   | ELF loading data buffers                     |
 | `TRAC` | `kernel/src/trace.rs`    | Trace snapshot (transient)                   |
+| `NETS` | `kernel/src/services/`   | Network server data buffers                  |
 | `????` | (global allocator)       | All untagged allocations                     |
 
 ## Viewing Memory Stats

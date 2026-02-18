@@ -12,6 +12,9 @@ USER_CARGO = . $$HOME/.cargo/env && cargo +rvos
 USER_TARGET = --target riscv64gc-unknown-rvos
 USER_MANIFEST = --manifest-path user/Cargo.toml
 
+# VirtIO net device via TAP (requires: sudo scripts/net-setup.sh)
+QEMU_NET = -device virtio-net-device,netdev=net0 -netdev tap,id=net0,ifname=rvos-tap0,script=no,downscript=no
+
 .PHONY: build build-user build-fs build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench test bench-save bench-check clippy clippy-kernel clippy-user
 
 # Build all user crates except fs (which embeds the others via include_bytes!)
@@ -55,6 +58,7 @@ run: build
 	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
+		$(QEMU_NET) \
 		-kernel $(KERNEL_BIN)
 
 run-gui: build
@@ -63,6 +67,7 @@ run-gui: build
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
 		-device virtio-tablet-device \
+		$(QEMU_NET) \
 		-display gtk \
 		-kernel $(KERNEL_BIN)
 
@@ -73,6 +78,7 @@ run-vnc: build
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
 		-device virtio-tablet-device \
+		$(QEMU_NET) \
 		-display vnc=:0 \
 		-kernel $(KERNEL_BIN)
 
@@ -87,6 +93,7 @@ run-gpu-screenshot: build
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
 		-device virtio-tablet-device \
+		$(QEMU_NET) \
 		-display vnc=:0 \
 		-kernel $(KERNEL_BIN) \
 		-monitor unix:/tmp/qemu-monitor.sock,server,nowait &
@@ -101,6 +108,7 @@ debug: build
 	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
+		$(QEMU_NET) \
 		-kernel $(KERNEL_BIN) \
 		-s -S &
 	gdb-multiarch -ex "target remote :1234" -ex "file $(KERNEL_ELF)"

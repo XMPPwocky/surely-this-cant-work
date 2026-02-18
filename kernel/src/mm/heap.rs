@@ -380,6 +380,8 @@ pub type InitAlloc = TaggedAlloc<{tag(b"INIT")}>;
 pub type TracAlloc = TaggedAlloc<{tag(b"TRAC")}>;
 #[allow(dead_code)]
 pub type DbugAlloc = TaggedAlloc<{tag(b"DBUG")}>;
+#[allow(dead_code)]
+pub type NetsAlloc = TaggedAlloc<{tag(b"NETS")}>;
 
 /// Const instances for use with `Vec::new_in()` / `VecDeque::new_in()`.
 pub const IPC_ALLOC:  IpcAlloc  = TaggedAlloc;
@@ -389,3 +391,5 @@ pub const INIT_ALLOC: InitAlloc = TaggedAlloc;
 pub const TRAC_ALLOC: TracAlloc = TaggedAlloc;
 #[allow(dead_code)]
 pub const DBUG_ALLOC: DbugAlloc = TaggedAlloc;
+#[allow(dead_code)]
+pub const NETS_ALLOC: NetsAlloc = TaggedAlloc;

@@ -81,6 +81,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-stack"
+version = "0.1.0"
+dependencies = [
+ "rvos",
+ "rvos-proto",
+ "rvos-rt",
+]
+
+[[package]]
 name = "rvos"
 version = "0.1.0"
 dependencies = [
@@ -122,6 +131,15 @@ version = "0.1.0"
 dependencies = [
  "rvos",
  "rvos-gfx",
+ "rvos-proto",
+ "rvos-rt",
+]
+
+[[package]]
+name = "udp-echo"
+version = "0.1.0"
+dependencies = [
+ "rvos",
  "rvos-proto",
  "rvos-rt",
 ]

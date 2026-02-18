@@ -47,7 +47,7 @@ const MAX_BOOT_REGS: usize = 16;
 const MAX_CONSOLE_SERVICES: usize = 4;
 
 /// Maximum number of named services (sysinfo, math, fs, compositor, etc.)
-const MAX_NAMED_SERVICES: usize = 8;
+const MAX_NAMED_SERVICES: usize = 12;
 const SERVICE_NAME_LEN: usize = 16;
 
 /// A named service with an atomic control endpoint.
@@ -896,6 +896,7 @@ struct FsProgram {
 const FS_PROGRAMS: &[FsProgram] = &[
     FsProgram { path: b"/bin/window-server", name: "window-srv", console_type: ConsoleType::Serial, service_name: Some("window"), requires_gpu: true, provides_console: None },
     FsProgram { path: b"/bin/fbcon", name: "fbcon", console_type: ConsoleType::Serial, service_name: None, requires_gpu: true, provides_console: None },
+    FsProgram { path: b"/bin/net-stack", name: "net-stack", console_type: ConsoleType::Serial, service_name: Some("net"), requires_gpu: false, provides_console: None },
 ];
 
 /// Initialize fs launch state machines. For each program, create a client

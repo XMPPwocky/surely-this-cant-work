@@ -109,6 +109,15 @@ pub extern "C" fn kmain() -> ! {
         println!("[boot] VirtIO tablet initialized");
     }
 
+    // ---- Phase 3d: VirtIO network ----
+    let net_present = drivers::virtio::net::init();
+    if net_present {
+        if let Some(mac) = drivers::virtio::net::mac_address() {
+            println!("[boot] VirtIO net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
+    }
+
     // ---- Phase 4: Scheduler and IPC ----
     task::init();
     ipc::init();
@@ -164,6 +173,13 @@ pub extern "C" fn kmain() -> ! {
     services::proc_debug::set_control_ep(debug_ctl_ep.into_raw());
     services::init::register_service("process-debug", init_debug_ep.into_raw());
 
+    // Net server kernel task (only if VirtIO net device is present)
+    if net_present {
+        let (init_net_ep, net_ctl_ep) = ipc::channel_create_pair().expect("boot: net channel");
+        services::net_server::set_control_ep(net_ctl_ep.into_raw());
+        services::init::register_service("net-raw", init_net_ep.into_raw());
+    }
+
     // Filesystem service: control channel goes to a user-space fs server
     let (init_fs_ep, fs_ctl_ep) = ipc::channel_create_pair().expect("boot: fs channel");
     services::init::set_fs_control_ep(init_fs_ep.into_raw());
@@ -194,6 +210,9 @@ pub extern "C" fn kmain() -> ! {
     task::spawn_named(services::sysinfo::sysinfo_service, "sysinfo").expect("boot: sysinfo");
     task::spawn_named(services::math::math_service, "math").expect("boot: math");
     task::spawn_named(services::proc_debug::proc_debug_service, "proc-debug").expect("boot: proc-debug");
+    if net_present {
+        task::spawn_named(services::net_server::net_server, "net-server").expect("boot: net-server");
+    }
 
     // Spawn fs server as a user process with boot channel + control channel
     let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair().expect("boot: fs-boot channel");
