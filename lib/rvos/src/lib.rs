@@ -14,6 +14,7 @@ pub mod service;
 pub mod transport;
 pub mod tty;
 pub mod fs;
+pub mod socket;
 
 pub use error::{RecvError, SysError, SysResult};
 pub use message::Message;
