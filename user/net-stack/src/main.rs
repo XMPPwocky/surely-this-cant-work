@@ -362,6 +362,38 @@ struct UdpHdr {
     len: u16,
 }
 
+/// Verify the UDP checksum over the pseudo-header + UDP segment.
+/// Returns true if the checksum is correct or zero (not computed, valid in IPv4).
+fn udp_checksum_ok(src_ip: &[u8; 4], dst_ip: &[u8; 4], udp_segment: &[u8]) -> bool {
+    let cksum_field = u16::from_be_bytes([udp_segment[6], udp_segment[7]]);
+    if cksum_field == 0 {
+        return true; // RFC 768: zero means no checksum computed
+    }
+    // Build pseudo-header and sum it together with the UDP segment.
+    let udp_len = udp_segment.len() as u16;
+    let mut sum: u32 = 0;
+    // Pseudo-header: src IP (4), dst IP (4), zero (1), protocol (1), UDP length (2)
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+    sum += PROTO_UDP as u32; // 0x00 || protocol
+    sum += udp_len as u32;
+    // Sum UDP segment (header + data)
+    let mut i = 0;
+    while i + 1 < udp_segment.len() {
+        sum += u16::from_be_bytes([udp_segment[i], udp_segment[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < udp_segment.len() {
+        sum += (udp_segment[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    sum == 0xFFFF
+}
+
 fn parse_udp(packet: &[u8]) -> Option<(UdpHdr, &[u8])> {
     if packet.len() < UDP_HDR_SIZE {
         return None;
@@ -376,7 +408,11 @@ fn parse_udp(packet: &[u8]) -> Option<(UdpHdr, &[u8])> {
     Some((UdpHdr { src_port, dst_port, len }, data))
 }
 
-fn build_udp(src_port: u16, dst_port: u16, payload: &[u8], buf: &mut [u8]) -> usize {
+fn build_udp(
+    src_ip: &[u8; 4], dst_ip: &[u8; 4],
+    src_port: u16, dst_port: u16,
+    payload: &[u8], buf: &mut [u8],
+) -> usize {
     let total_len = UDP_HDR_SIZE + payload.len();
     if total_len > buf.len() || total_len > 0xFFFF {
         return 0;
@@ -390,10 +426,36 @@ fn build_udp(src_port: u16, dst_port: u16, payload: &[u8], buf: &mut [u8]) -> us
     let l = (total_len as u16).to_be_bytes();
     buf[4] = l[0];
     buf[5] = l[1];
-    // Checksum = 0 (optional in IPv4)
+    // Checksum field = 0 during computation
     buf[6] = 0;
     buf[7] = 0;
     buf[UDP_HDR_SIZE..total_len].copy_from_slice(payload);
+    // Compute UDP checksum over pseudo-header + segment
+    let udp_len = total_len as u16;
+    let mut sum: u32 = 0;
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+    sum += PROTO_UDP as u32;
+    sum += udp_len as u32;
+    let mut i = 0;
+    while i + 1 < total_len {
+        sum += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < total_len {
+        sum += (buf[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    // RFC 768: if computed checksum is 0, transmit as 0xFFFF
+    let cksum = if cksum == 0 { 0xFFFF } else { cksum };
+    let cb = cksum.to_be_bytes();
+    buf[6] = cb[0];
+    buf[7] = cb[1];
     total_len
 }
 
@@ -616,6 +678,11 @@ fn process_frame(
                     Some(u) => u,
                     None => return,
                 };
+                if !udp_checksum_ok(&ip.src, &ip.dst, ip_payload) {
+                    println!("net-stack: dropped UDP packet from {}.{}.{}.{}:{} (bad checksum)",
+                        ip.src[0], ip.src[1], ip.src[2], ip.src[3], udp.src_port);
+                    return;
+                }
                 // Find socket bound to this destination port
                 for sock in sockets.iter_mut() {
                     if sock.active && sock.port == udp.dst_port {
@@ -703,7 +770,7 @@ fn handle_client_message(
 
             // Build UDP payload
             let mut udp_buf = [0u8; 1480];
-            let udp_len = build_udp(src_port, dst_port, data, &mut udp_buf);
+            let udp_len = build_udp(&OUR_IP, &dst_ip, src_port, dst_port, data, &mut udp_buf);
             if udp_len == 0 {
                 let mut resp_msg = Message::new();
                 resp_msg.len = rvos_wire::to_bytes(

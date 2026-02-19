@@ -239,7 +239,8 @@ pub fn poll_rx() -> Option<(usize, usize, u16)> {
     let frame_len = match (total_len as usize).checked_sub(VIRTIO_NET_HDR_SIZE) {
         Some(len) if len > 0 => len,
         _ => {
-            // Frame too short (shorter than VirtIO net header) — requeue and skip
+            crate::println!("[net] dropping short RX frame ({} bytes, need > {})",
+                total_len, VIRTIO_NET_HDR_SIZE);
             requeue_rx(desc_idx);
             return None;
         }
