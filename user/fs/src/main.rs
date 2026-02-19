@@ -715,6 +715,10 @@ static NET_STACK_ELF: &[u8] = include_bytes!(
     "../../target/riscv64gc-unknown-rvos/release/net-stack"
 );
 
+static TCP_ECHO_ELF: &[u8] = include_bytes!(
+    "../../target/riscv64gc-unknown-rvos/release/tcp-echo"
+);
+
 static UDP_ECHO_ELF: &[u8] = include_bytes!(
     "../../target/riscv64gc-unknown-rvos/release/udp-echo"
 );
@@ -755,6 +759,7 @@ fn main() {
     fs().add_static_file(b"/bin/ktest-helper", KTEST_HELPER_ELF);
     fs().add_static_file(b"/bin/dbg", DBG_ELF);
     fs().add_static_file(b"/bin/net-stack", NET_STACK_ELF);
+    fs().add_static_file(b"/bin/tcp-echo", TCP_ECHO_ELF);
     fs().add_static_file(b"/bin/udp-echo", UDP_ECHO_ELF);
 
     // The fs server has:

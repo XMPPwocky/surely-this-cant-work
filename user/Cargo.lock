@@ -126,6 +126,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tcp-echo"
+version = "0.1.0"
+dependencies = [
+ "rvos",
+ "rvos-proto",
+ "rvos-rt",
+]
+
+[[package]]
 name = "triangle"
 version = "0.1.0"
 dependencies = [

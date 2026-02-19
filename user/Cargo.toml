@@ -13,6 +13,7 @@ members = [
     "rvos-rt",
     "shell",
     "triangle",
+    "tcp-echo",
     "udp-echo",
     "winclient",
     "window-server",
