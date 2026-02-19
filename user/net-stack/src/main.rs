@@ -1368,6 +1368,23 @@ fn tcp_input_conn(
                 conn.state = TcpState::Established;
                 conn.retx_deadline = 0;
                 conn.retx_count = 0;
+                // RFC 793: the handshake ACK may carry data — buffer it
+                if !data.is_empty() && tcp.seq == conn.rcv_nxt {
+                    let space = conn.recv_buf.len() - conn.recv_len;
+                    let copy_len = data.len().min(space);
+                    if copy_len > 0 {
+                        conn.recv_buf[conn.recv_len..conn.recv_len + copy_len]
+                            .copy_from_slice(&data[..copy_len]);
+                        conn.recv_len += copy_len;
+                        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(copy_len as u32);
+                    }
+                    tcp_send_segment(
+                        conn.local_port, &conn.remote_addr, conn.remote_port,
+                        conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+                        shm_base, raw_handle, our_mac, arp_table, pending, now,
+                        tx,
+                    );
+                }
                 // Add to listener's accept queue
                 let li = conn.listener_sock_idx;
                 if li != usize::MAX && li < MAX_SOCKETS && sockets[li].active
