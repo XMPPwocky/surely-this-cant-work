@@ -723,6 +723,10 @@ static UDP_ECHO_ELF: &[u8] = include_bytes!(
     "../../target/riscv64gc-unknown-rvos/release/udp-echo"
 );
 
+static NC_ELF: &[u8] = include_bytes!(
+    "../../target/riscv64gc-unknown-rvos/release/nc"
+);
+
 // --- Multiplexed client state ---
 
 const MAX_CLIENTS: usize = 8;
@@ -761,6 +765,7 @@ fn main() {
     fs().add_static_file(b"/bin/net-stack", NET_STACK_ELF);
     fs().add_static_file(b"/bin/tcp-echo", TCP_ECHO_ELF);
     fs().add_static_file(b"/bin/udp-echo", UDP_ECHO_ELF);
+    fs().add_static_file(b"/bin/nc", NC_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)

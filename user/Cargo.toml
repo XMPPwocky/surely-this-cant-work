@@ -9,6 +9,7 @@ members = [
     "ipc-torture",
     "ktest",
     "ktest-helper",
+    "nc",
     "net-stack",
     "rvos-rt",
     "shell",
