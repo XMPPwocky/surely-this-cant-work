@@ -3,6 +3,7 @@ extern crate rvos_rt;
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
 use rvos::rvos_wire;
@@ -60,6 +61,23 @@ const TCP_ACK: u8 = 0x10;
 const MAX_SOCKETS: usize = 16;
 const MAX_PENDING: usize = 4;
 const MAX_PENDING_CLIENTS: usize = 4;
+
+/// Heap-allocated scratch buffers for packet TX, avoiding large stack frames.
+struct TxScratch {
+    frame_buf: [u8; 1534],
+    ip_buf: [u8; 1534],
+    tcp_buf: [u8; 1500],
+    /// Reusable Message buffer for building responses (avoids 1080-byte stack allocs).
+    msg: Message,
+}
+
+/// Heap-allocated buffers for receiving in the main event loop.
+struct RxScratch {
+    rx_buf: [u8; 1534],
+    doorbell: Message,
+    ctrl_msg: Message,
+    client_msg: Message,
+}
 
 // ---------------------------------------------------------------------------
 // Volatile SHM access
@@ -828,19 +846,17 @@ impl PendingClient {
 
 struct PendingPacket {
     dst_ip: [u8; 4],
-    data: [u8; 1500],
-    len: usize,
+    data: Vec<u8>,
     active: bool,
     timestamp: u64,
     last_arp: u64,
 }
 
 impl PendingPacket {
-    const fn new() -> Self {
+    fn new() -> Self {
         PendingPacket {
             dst_ip: [0; 4],
-            data: [0; 1500],
-            len: 0,
+            data: Vec::new(),
             active: false,
             timestamp: 0,
             last_arp: 0,
@@ -852,7 +868,7 @@ impl PendingPacket {
 // TX via SHM ring buffer
 // ---------------------------------------------------------------------------
 
-fn tx_frame(shm_base: usize, raw_handle: usize, frame: &[u8]) {
+fn tx_frame(shm_base: usize, raw_handle: usize, frame: &[u8], msg: &mut Message) {
     let tx_head = shm_read_u32(shm_base, CTRL_TX_HEAD);
     let tx_tail = shm_read_u32(shm_base, CTRL_TX_TAIL);
     if tx_head.wrapping_sub(tx_tail) >= TX_SLOTS as u32 {
@@ -873,9 +889,9 @@ fn tx_frame(shm_base: usize, raw_handle: usize, frame: &[u8]) {
     shm_write_u32(shm_base, CTRL_TX_HEAD, tx_head.wrapping_add(1));
 
     // Send TxReady doorbell (fire-and-forget: kernel polls regardless)
-    let mut msg = Message::new();
+    *msg = Message::new();
     msg.len = rvos_wire::to_bytes(&NetRawRequest::TxReady {}, &mut msg.data).unwrap_or(0);
-    let _ = raw::sys_chan_send(raw_handle, &msg); // fire-and-forget doorbell
+    let _ = raw::sys_chan_send(raw_handle, msg); // fire-and-forget doorbell
 }
 
 // ---------------------------------------------------------------------------
@@ -892,24 +908,23 @@ fn send_ip_packet(
     ip_packet: &[u8],
     dst_ip: &[u8; 4],
     now: u64,
+    frame_buf: &mut [u8; 1534],
+    msg: &mut Message,
 ) {
     let next_hop = resolve_next_hop(dst_ip);
 
     if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
         // Have MAC -- send immediately
-        let mut frame_buf = [0u8; 1534];
-        let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, ip_packet, &mut frame_buf);
+        let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, ip_packet, frame_buf);
         if frame_len > 0 {
-            tx_frame(shm_base, raw_handle, &frame_buf[..frame_len]);
+            tx_frame(shm_base, raw_handle, &frame_buf[..frame_len], msg);
         }
     } else {
         // Queue packet and send ARP request
         let mut queued = false;
         for p in pending.iter_mut() {
             if !p.active {
-                let copy_len = ip_packet.len().min(p.data.len());
-                p.data[..copy_len].copy_from_slice(&ip_packet[..copy_len]);
-                p.len = copy_len;
+                p.data = ip_packet.to_vec();
                 p.dst_ip = *dst_ip;
                 p.active = true;
                 p.timestamp = now;
@@ -925,7 +940,7 @@ fn send_ip_packet(
         let mut arp_buf = [0u8; 64];
         let arp_len = send_arp_request(our_mac, &OUR_IP, &next_hop, &mut arp_buf);
         if arp_len > 0 {
-            tx_frame(shm_base, raw_handle, &arp_buf[..arp_len]);
+            tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], msg);
         }
     }
 }
@@ -934,6 +949,7 @@ fn send_ip_packet(
 // Drain pending ARP queue: try to send queued packets whose MAC is now known
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn drain_pending(
     shm_base: usize,
     raw_handle: usize,
@@ -941,6 +957,8 @@ fn drain_pending(
     arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
+    frame_buf: &mut [u8; 1534],
+    msg: &mut Message,
 ) {
     for p in pending.iter_mut() {
         if !p.active {
@@ -955,11 +973,9 @@ fn drain_pending(
         }
         let next_hop = resolve_next_hop(&p.dst_ip);
         if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
-            let mut frame_buf = [0u8; 1534];
-            let data_len = p.len;
-            let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, &p.data[..data_len], &mut frame_buf);
+            let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, &p.data, frame_buf);
             if frame_len > 0 {
-                tx_frame(shm_base, raw_handle, &frame_buf[..frame_len]);
+                tx_frame(shm_base, raw_handle, &frame_buf[..frame_len], msg);
             }
             p.active = false;
         }
@@ -982,6 +998,7 @@ fn process_frame(
     pending_accept: &mut Option<PendingAcceptInfo>,
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
+    tx: &mut TxScratch,
 ) {
     let (eth, payload) = match parse_eth(frame) {
         Some(e) => e,
@@ -992,10 +1009,10 @@ fn process_frame(
         ETHERTYPE_ARP => {
             let mut reply_buf = [0u8; 64];
             if let Some(reply_len) = handle_arp(arp_table, our_mac, &OUR_IP, payload, &mut reply_buf, now) {
-                tx_frame(shm_base, raw_handle, &reply_buf[..reply_len]);
+                tx_frame(shm_base, raw_handle, &reply_buf[..reply_len], &mut tx.msg);
             }
             // After learning new MACs, try to drain pending queue
-            drain_pending(shm_base, raw_handle, our_mac, arp_table, pending, now);
+            drain_pending(shm_base, raw_handle, our_mac, arp_table, pending, now, &mut tx.frame_buf, &mut tx.msg);
         }
         ETHERTYPE_IPV4 => {
             let (ip, ip_payload) = match parse_ipv4(payload) {
@@ -1024,21 +1041,21 @@ fn process_frame(
                     if sock.active && sock.port == udp.dst_port {
                         if sock.recv_pending {
                             // Send SocketData::Datagram to client
-                            let mut msg = Message::new();
+                            tx.msg = Message::new();
                             let truncated_len = udp_data.len().min(900);
                             let addr = SocketAddr::Inet4 {
                                 a: ip.src[0], b: ip.src[1],
                                 c: ip.src[2], d: ip.src[3],
                                 port: udp.src_port,
                             };
-                            msg.len = rvos_wire::to_bytes(
+                            tx.msg.len = rvos_wire::to_bytes(
                                 &SocketData::Datagram {
                                     addr,
                                     data: &udp_data[..truncated_len],
                                 },
-                                &mut msg.data,
+                                &mut tx.msg.data,
                             ).unwrap_or(0);
-                            let ret = raw::sys_chan_send(sock.handle, &msg);
+                            let ret = raw::sys_chan_send(sock.handle, &tx.msg);
                             sock.recv_pending = false;
                             if ret == 2 {
                                 // Client channel closed — clean up socket
@@ -1062,6 +1079,7 @@ fn process_frame(
                     &tcp, tcp_data,
                     sockets, tcp_conns, pending_accept,
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
             }
         }
@@ -1082,17 +1100,16 @@ fn tcp_send_segment(
     shm_base: usize, raw_handle: usize,
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    tx: &mut TxScratch,
 ) {
-    let mut tcp_buf = [0u8; 1500];
     let tcp_len = build_tcp(
         &OUR_IP, dst_addr, src_port, dst_port,
-        seq, ack, flags, window, payload, &mut tcp_buf,
+        seq, ack, flags, window, payload, &mut tx.tcp_buf,
     );
     if tcp_len == 0 { return; }
-    let mut ip_buf = [0u8; 1534];
-    let ip_len = build_ipv4(&OUR_IP, dst_addr, PROTO_TCP, &tcp_buf[..tcp_len], &mut ip_buf);
+    let ip_len = build_ipv4(&OUR_IP, dst_addr, PROTO_TCP, &tx.tcp_buf[..tcp_len], &mut tx.ip_buf);
     if ip_len == 0 { return; }
-    send_ip_packet(shm_base, raw_handle, our_mac, arp_table, pending, &ip_buf[..ip_len], dst_addr, now);
+    send_ip_packet(shm_base, raw_handle, our_mac, arp_table, pending, &tx.ip_buf[..ip_len], dst_addr, now, &mut tx.frame_buf, &mut tx.msg);
 }
 
 /// Send a RST in response to an unexpected segment.
@@ -1102,6 +1119,7 @@ fn tcp_send_rst(
     shm_base: usize, raw_handle: usize,
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    tx: &mut TxScratch,
 ) {
     let (seq, ack, flags) = if tcp.flags & TCP_ACK != 0 {
         (tcp.ack, 0, TCP_RST)
@@ -1112,11 +1130,12 @@ fn tcp_send_rst(
         tcp.dst_port, src_ip, tcp.src_port,
         seq, ack, flags, 0, &[],
         shm_base, raw_handle, our_mac, arp_table, pending, now,
+        tx,
     );
 }
 
 /// Deliver buffered data to a client waiting on Recv.
-fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns) {
+fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns, msg: &mut Message) {
     if !sock.recv_pending || sock.tcp_conn_idx == usize::MAX {
         return;
     }
@@ -1127,12 +1146,12 @@ fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns) {
         if conn.state == TcpState::CloseWait || conn.state == TcpState::LastAck
             || conn.state == TcpState::Closed
         {
-            let mut msg = Message::new();
+            *msg = Message::new();
             msg.len = rvos_wire::to_bytes(
                 &SocketData::Data { data: &[] },
                 &mut msg.data,
             ).unwrap_or(0);
-            let ret = raw::sys_chan_send(sock.handle, &msg);
+            let ret = raw::sys_chan_send(sock.handle, msg);
             sock.recv_pending = false;
             if ret == 2 {
                 sock.deactivate(tcp_conns);
@@ -1141,12 +1160,12 @@ fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns) {
         return;
     }
     let deliver_len = (conn.recv_len).min(sock.recv_max_len as usize);
-    let mut msg = Message::new();
+    *msg = Message::new();
     msg.len = rvos_wire::to_bytes(
         &SocketData::Data { data: &conn.recv_buf[..deliver_len] },
         &mut msg.data,
     ).unwrap_or(0);
-    let ret = raw::sys_chan_send(sock.handle, &msg);
+    let ret = raw::sys_chan_send(sock.handle, msg);
     sock.recv_pending = false;
     if ret == 2 {
         sock.deactivate(tcp_conns);
@@ -1167,6 +1186,7 @@ fn tcp_try_send_data(
     shm_base: usize, raw_handle: usize,
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    tx: &mut TxScratch,
 ) {
     let conn = &mut tcp_conns[conn_idx];
     if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
@@ -1188,6 +1208,7 @@ fn tcp_try_send_data(
         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
         payload,
         shm_base, raw_handle, our_mac, arp_table, pending, now,
+        tx,
     );
     conn.snd_nxt = conn.snd_nxt.wrapping_add(send_len as u32);
     // Set retransmit timer
@@ -1209,12 +1230,14 @@ fn tcp_input(
     shm_base: usize, raw_handle: usize,
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    tx: &mut TxScratch,
 ) {
     // 1. Try to find an existing connection
     if let Some(ci) = tcp_find_conn(tcp_conns, tcp.dst_port, src_ip, tcp.src_port) {
         tcp_input_conn(
             ci, src_ip, tcp, data,
             sockets, tcp_conns, pending_accept, shm_base, raw_handle, our_mac, arp_table, pending, now,
+            tx,
         );
         return;
     }
@@ -1226,7 +1249,7 @@ fn tcp_input(
     if let Some(li) = listener_idx {
         // Only SYN should arrive for a listening socket
         if tcp.flags & TCP_SYN == 0 || tcp.flags & TCP_ACK != 0 {
-            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now);
+            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
             return;
         }
         // Check accept backlog
@@ -1255,13 +1278,14 @@ fn tcp_input(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
             shm_base, raw_handle, our_mac, arp_table, pending, now,
+            tx,
         );
         return;
     }
 
     // 3. No match — send RST
     if tcp.flags & TCP_RST == 0 {
-        tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now);
+        tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
     }
 }
 
@@ -1277,6 +1301,7 @@ fn tcp_input_conn(
     shm_base: usize, raw_handle: usize,
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    tx: &mut TxScratch,
 ) {
     // Handle RST
     if tcp.flags & TCP_RST != 0 {
@@ -1285,12 +1310,12 @@ fn tcp_input_conn(
         conn.reset();
         if si != usize::MAX && si < MAX_SOCKETS && sockets[si].active {
             // Notify client of reset
-            let mut msg = Message::new();
-            msg.len = rvos_wire::to_bytes(
+            tx.msg = Message::new();
+            tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Error { code: SocketError::ConnReset {} },
-                &mut msg.data,
+                &mut tx.msg.data,
             ).unwrap_or(0);
-            let _ = raw::sys_chan_send(sockets[si].handle, &msg);
+            let _ = raw::sys_chan_send(sockets[si].handle, &tx.msg);
         }
         return;
     }
@@ -1303,7 +1328,7 @@ fn tcp_input_conn(
             // We sent SYN (client connect), expecting SYN-ACK
             if tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK != 0 {
                 if tcp.ack != conn.snd_nxt {
-                    tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now);
+                    tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
                     return;
                 }
                 conn.snd_una = tcp.ack;
@@ -1317,16 +1342,17 @@ fn tcp_input_conn(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
                 // Notify waiting Connect call
                 if conn.socket_idx != usize::MAX && conn.socket_idx < MAX_SOCKETS {
                     let sock = &mut sockets[conn.socket_idx];
-                    let mut msg = Message::new();
-                    msg.len = rvos_wire::to_bytes(
+                    tx.msg = Message::new();
+                    tx.msg.len = rvos_wire::to_bytes(
                         &SocketResponse::Ok {},
-                        &mut msg.data,
+                        &mut tx.msg.data,
                     ).unwrap_or(0);
-                    let _ = raw::sys_chan_send(sock.handle, &msg);
+                    let _ = raw::sys_chan_send(sock.handle, &tx.msg);
                 }
             }
         }
@@ -1355,6 +1381,7 @@ fn tcp_input_conn(
                         tcp_deliver_accept(
                             &mut sockets[li], tcp_conns, pending_accept, 0,
                             shm_base, raw_handle, our_mac, arp_table, pending, now,
+                            tx,
                         );
                         // Process pending accept assignment
                         if let Some(info) = pending_accept.take() {
@@ -1365,7 +1392,7 @@ fn tcp_input_conn(
             }
         }
         TcpState::Established => {
-            tcp_input_established(ci, tcp, data, sockets, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now);
+            tcp_input_established(ci, tcp, data, sockets, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
         }
         TcpState::FinWait1 => {
             let conn = &mut tcp_conns[ci];
@@ -1382,6 +1409,7 @@ fn tcp_input_conn(
                         conn.local_port, &conn.remote_addr, conn.remote_port,
                         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
                         shm_base, raw_handle, our_mac, arp_table, pending, now,
+                        tx,
                     );
                 } else {
                     conn.state = TcpState::FinWait2;
@@ -1394,6 +1422,7 @@ fn tcp_input_conn(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
             }
         }
@@ -1408,6 +1437,7 @@ fn tcp_input_conn(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
             }
         }
@@ -1442,6 +1472,7 @@ fn tcp_input_conn(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
             }
         }
@@ -1459,6 +1490,7 @@ fn tcp_input_established(
     shm_base: usize, raw_handle: usize,
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    tx: &mut TxScratch,
 ) {
     // Process ACK
     if tcp.flags & TCP_ACK != 0 {
@@ -1482,11 +1514,12 @@ fn tcp_input_established(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
             shm_base, raw_handle, our_mac, arp_table, pending, now,
+            tx,
         );
         // Try to deliver data to waiting client
         let si = conn.socket_idx;
         if si != usize::MAX && si < MAX_SOCKETS {
-            tcp_try_deliver_recv(&mut sockets[si], tcp_conns);
+            tcp_try_deliver_recv(&mut sockets[si], tcp_conns, &mut tx.msg);
         }
     } else if !data.is_empty() {
         // Out-of-order: send duplicate ACK (will cause retransmit on sender side)
@@ -1494,6 +1527,7 @@ fn tcp_input_established(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
             shm_base, raw_handle, our_mac, arp_table, pending, now,
+            tx,
         );
     }
 
@@ -1507,17 +1541,18 @@ fn tcp_input_established(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
             shm_base, raw_handle, our_mac, arp_table, pending, now,
+            tx,
         );
         // If client is waiting on Recv, deliver EOF
         let si = conn.socket_idx;
         if si != usize::MAX && si < MAX_SOCKETS {
-            tcp_try_deliver_recv(&mut sockets[si], tcp_conns);
+            tcp_try_deliver_recv(&mut sockets[si], tcp_conns, &mut tx.msg);
         }
     }
 
     // Try to send more data if window opened up
     if tcp_conns[ci].send_len > 0 {
-        tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now);
+        tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
     }
 }
 
@@ -1557,6 +1592,7 @@ fn tcp_deliver_accept(
     shm_base: usize, raw_handle: usize,
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], _now: u64,
+    tx: &mut TxScratch,
 ) {
     if !sock.accept_pending || sock.accept_count == 0 {
         return;
@@ -1580,18 +1616,18 @@ fn tcp_deliver_accept(
     let (sock_a, sock_b) = raw::sys_chan_create();
 
     // Send Accepted response with the new channel cap
-    let mut resp = Message::new();
+    tx.msg = Message::new();
     let (len, cap_count) = rvos_wire::to_bytes_with_caps(
         &SocketResponse::Accepted {
             peer_addr,
             socket: rvos_wire::RawChannelCap::new(sock_b),
         },
-        &mut resp.data,
-        &mut resp.caps,
+        &mut tx.msg.data,
+        &mut tx.msg.caps,
     ).unwrap_or((0, 0));
-    resp.len = len;
-    resp.cap_count = cap_count;
-    let ret = raw::sys_chan_send(sock.handle, &resp);
+    tx.msg.len = len;
+    tx.msg.cap_count = cap_count;
+    let ret = raw::sys_chan_send(sock.handle, &tx.msg);
     raw::sys_chan_close(sock_b);
     sock.accept_pending = false;
 
@@ -1605,7 +1641,7 @@ fn tcp_deliver_accept(
     // We can't assign the socket here because sock is already a mutable
     // reference to one element of the sockets array. Store the info for
     // the caller to assign after this function returns.
-    let _ = (shm_base, raw_handle, our_mac, arp_table, pending);
+    let _ = (shm_base, raw_handle, our_mac, arp_table, pending, tx);
     conn.socket_idx = sock_a; // abuse: store handle temporarily
     *pending_accept = Some(PendingAcceptInfo {
         handle: sock_a,
@@ -1626,6 +1662,7 @@ fn tcp_check_retransmits(
     our_mac: &[u8; 6], arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     sockets: &mut [Socket; MAX_SOCKETS],
+    tx: &mut TxScratch,
 ) {
     for conn in tcp_conns.iter_mut() {
         if !conn.active || conn.retx_deadline == 0 || now < conn.retx_deadline {
@@ -1637,12 +1674,12 @@ fn tcp_check_retransmits(
             let si = conn.socket_idx;
             conn.reset();
             if si != usize::MAX && si < MAX_SOCKETS && sockets[si].active {
-                let mut msg = Message::new();
-                msg.len = rvos_wire::to_bytes(
+                tx.msg = Message::new();
+                tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::TimedOut {} },
-                    &mut msg.data,
+                    &mut tx.msg.data,
                 ).unwrap_or(0);
-                let _ = raw::sys_chan_send(sockets[si].handle, &msg);
+                let _ = raw::sys_chan_send(sockets[si].handle, &tx.msg);
             }
             continue;
         }
@@ -1657,6 +1694,7 @@ fn tcp_check_retransmits(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
             }
             TcpState::SynReceived => {
@@ -1665,6 +1703,7 @@ fn tcp_check_retransmits(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
             }
             TcpState::Established | TcpState::CloseWait => {
@@ -1677,6 +1716,7 @@ fn tcp_check_retransmits(
                         conn.snd_una, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
                         &conn.send_buf[..send_len],
                         shm_base, raw_handle, our_mac, arp_table, pending, now,
+                        tx,
                     );
                 }
             }
@@ -1687,6 +1727,7 @@ fn tcp_check_retransmits(
                     conn.snd_nxt.wrapping_sub(1), conn.rcv_nxt,
                     TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
             }
             _ => {
@@ -1712,17 +1753,17 @@ fn tcp_check_timewait(tcp_conns: &mut TcpConns, now: u64) {
 // ---------------------------------------------------------------------------
 
 /// Send a SocketResponse::Ok on a handle.
-fn send_sock_ok(handle: usize) {
-    let mut msg = Message::new();
+fn send_sock_ok(handle: usize, msg: &mut Message) {
+    *msg = Message::new();
     msg.len = rvos_wire::to_bytes(&SocketResponse::Ok {}, &mut msg.data).unwrap_or(0);
-    let _ = raw::sys_chan_send(handle, &msg);
+    let _ = raw::sys_chan_send(handle, msg);
 }
 
 /// Send a SocketResponse::Error on a handle.
-fn send_sock_error(handle: usize, code: SocketError) {
-    let mut msg = Message::new();
+fn send_sock_error(handle: usize, code: SocketError, msg: &mut Message) {
+    *msg = Message::new();
     msg.len = rvos_wire::to_bytes(&SocketResponse::Error { code }, &mut msg.data).unwrap_or(0);
-    let _ = raw::sys_chan_send(handle, &msg);
+    let _ = raw::sys_chan_send(handle, msg);
 }
 
 /// Allocate an ephemeral port (49152..65535) that isn't in use.
@@ -1770,6 +1811,7 @@ fn handle_client_message(
     arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
+    tx: &mut TxScratch,
 ) {
     let req = match rvos_wire::from_bytes::<SocketRequest<'_>>(&msg.data[..msg.len]) {
         Ok(r) => r,
@@ -1783,20 +1825,20 @@ fn handle_client_message(
             let SocketAddr::Inet4 { port, .. } = addr;
             // Check if port is already bound
             let already_bound = sockets.iter().any(|s| s.active && s.port == port);
-            let mut resp_msg = Message::new();
+            tx.msg = Message::new();
             if already_bound {
-                resp_msg.len = rvos_wire::to_bytes(
+                tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::AddrInUse {} },
-                    &mut resp_msg.data,
+                    &mut tx.msg.data,
                 ).unwrap_or(0);
             } else {
                 sockets[sock_idx].port = port;
-                resp_msg.len = rvos_wire::to_bytes(
+                tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Ok {},
-                    &mut resp_msg.data,
+                    &mut tx.msg.data,
                 ).unwrap_or(0);
             }
-            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == 2 {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -1809,27 +1851,26 @@ fn handle_client_message(
             let mut udp_buf = [0u8; 1480];
             let udp_len = build_udp(&OUR_IP, &dst_ip, src_port, dst_port, data, &mut udp_buf);
             if udp_len == 0 {
-                let mut resp_msg = Message::new();
-                resp_msg.len = rvos_wire::to_bytes(
+                tx.msg = Message::new();
+                tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::InvalidArg {} },
-                    &mut resp_msg.data,
+                    &mut tx.msg.data,
                 ).unwrap_or(0);
-                if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                if raw::sys_chan_send(handle, &tx.msg) == 2 {
                     sockets[sock_idx].deactivate(tcp_conns);
                 }
                 return;
             }
 
             // Build IPv4 packet
-            let mut ip_buf = [0u8; 1500];
-            let ip_len = build_ipv4(&OUR_IP, &dst_ip, PROTO_UDP, &udp_buf[..udp_len], &mut ip_buf);
+            let ip_len = build_ipv4(&OUR_IP, &dst_ip, PROTO_UDP, &udp_buf[..udp_len], &mut tx.ip_buf);
             if ip_len == 0 {
-                let mut resp_msg = Message::new();
-                resp_msg.len = rvos_wire::to_bytes(
+                tx.msg = Message::new();
+                tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::NoResources {} },
-                    &mut resp_msg.data,
+                    &mut tx.msg.data,
                 ).unwrap_or(0);
-                if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                if raw::sys_chan_send(handle, &tx.msg) == 2 {
                     sockets[sock_idx].deactivate(tcp_conns);
                 }
                 return;
@@ -1837,15 +1878,16 @@ fn handle_client_message(
 
             send_ip_packet(
                 shm_base, raw_handle, our_mac, arp_table, pending,
-                &ip_buf[..ip_len], &dst_ip, now,
+                &tx.ip_buf[..ip_len], &dst_ip, now,
+                &mut tx.frame_buf, &mut tx.msg,
             );
 
-            let mut resp_msg = Message::new();
-            resp_msg.len = rvos_wire::to_bytes(
+            tx.msg = Message::new();
+            tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Sent { bytes: data.len() as u32 },
-                &mut resp_msg.data,
+                &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == 2 {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -1854,8 +1896,8 @@ fn handle_client_message(
         }
         SocketRequest::GetSockName {} => {
             let port = sockets[sock_idx].port;
-            let mut resp_msg = Message::new();
-            resp_msg.len = rvos_wire::to_bytes(
+            tx.msg = Message::new();
+            tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Addr {
                     addr: SocketAddr::Inet4 {
                         a: OUR_IP[0], b: OUR_IP[1],
@@ -1863,27 +1905,27 @@ fn handle_client_message(
                         port,
                     },
                 },
-                &mut resp_msg.data,
+                &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == 2 {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
         SocketRequest::Listen { backlog: _ } => {
             if !sockets[sock_idx].is_stream {
-                send_sock_error(handle, SocketError::NotSupported {});
+                send_sock_error(handle, SocketError::NotSupported {}, &mut tx.msg);
                 return;
             }
             if sockets[sock_idx].port == 0 {
-                send_sock_error(handle, SocketError::InvalidArg {});
+                send_sock_error(handle, SocketError::InvalidArg {}, &mut tx.msg);
                 return;
             }
             sockets[sock_idx].tcp_listening = true;
-            send_sock_ok(handle);
+            send_sock_ok(handle, &mut tx.msg);
         }
         SocketRequest::Accept {} => {
             if !sockets[sock_idx].tcp_listening {
-                send_sock_error(handle, SocketError::InvalidArg {});
+                send_sock_error(handle, SocketError::InvalidArg {}, &mut tx.msg);
                 return;
             }
             if sockets[sock_idx].accept_count > 0 {
@@ -1891,6 +1933,7 @@ fn handle_client_message(
                 tcp_deliver_accept(
                     &mut sockets[sock_idx], tcp_conns, pending_accept, 0,
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
                 // Process pending accept assignment
                 if let Some(info) = pending_accept.take() {
@@ -1903,7 +1946,7 @@ fn handle_client_message(
         }
         SocketRequest::Connect { addr } => {
             if !sockets[sock_idx].is_stream {
-                send_sock_error(handle, SocketError::NotSupported {});
+                send_sock_error(handle, SocketError::NotSupported {}, &mut tx.msg);
                 return;
             }
             let SocketAddr::Inet4 { a, b, c, d, port } = addr;
@@ -1919,7 +1962,7 @@ fn handle_client_message(
             };
             // Allocate a TCP connection
             let Some(ci) = tcp_alloc_conn(tcp_conns) else {
-                send_sock_error(handle, SocketError::NoResources {});
+                send_sock_error(handle, SocketError::NoResources {}, &mut tx.msg);
                 return;
             };
             let conn = &mut tcp_conns[ci];
@@ -1941,56 +1984,57 @@ fn handle_client_message(
                 src_port, &dst_ip, port,
                 conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
                 shm_base, raw_handle, our_mac, arp_table, pending, now,
+                tx,
             );
             // Response is deferred until SYN-ACK arrives
         }
         SocketRequest::Send { data } => {
             let ci = sockets[sock_idx].tcp_conn_idx;
             if ci == usize::MAX {
-                send_sock_error(handle, SocketError::NotConnected {});
+                send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
             }
             let conn = &mut tcp_conns[ci];
             if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
-                send_sock_error(handle, SocketError::NotConnected {});
+                send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
             }
             let space = conn.send_buf.len() - conn.send_len;
             let copy_len = data.len().min(space);
             if copy_len == 0 {
-                send_sock_error(handle, SocketError::NoResources {});
+                send_sock_error(handle, SocketError::NoResources {}, &mut tx.msg);
                 return;
             }
             conn.send_buf[conn.send_len..conn.send_len + copy_len]
                 .copy_from_slice(&data[..copy_len]);
             conn.send_len += copy_len;
             // Try to send immediately
-            tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now);
+            tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
             // Respond with bytes accepted
-            let mut resp_msg = Message::new();
-            resp_msg.len = rvos_wire::to_bytes(
+            tx.msg = Message::new();
+            tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Sent { bytes: copy_len as u32 },
-                &mut resp_msg.data,
+                &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == 2 {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
         SocketRequest::Recv { max_len } => {
             let ci = sockets[sock_idx].tcp_conn_idx;
             if ci == usize::MAX {
-                send_sock_error(handle, SocketError::NotConnected {});
+                send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
             }
             sockets[sock_idx].recv_max_len = max_len;
             sockets[sock_idx].recv_pending = true;
             // Try to deliver immediately if data is available
-            tcp_try_deliver_recv(&mut sockets[sock_idx], tcp_conns);
+            tcp_try_deliver_recv(&mut sockets[sock_idx], tcp_conns, &mut tx.msg);
         }
         SocketRequest::Shutdown { how } => {
             let ci = sockets[sock_idx].tcp_conn_idx;
             if ci == usize::MAX {
-                send_sock_error(handle, SocketError::NotConnected {});
+                send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
             }
             let conn = &mut tcp_conns[ci];
@@ -2007,21 +2051,22 @@ fn handle_client_message(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
                     shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    tx,
                 );
                 conn.snd_nxt = conn.snd_nxt.wrapping_add(1);
                 conn.retx_deadline = now + conn.rto_ticks;
             }
-            send_sock_ok(handle);
+            send_sock_ok(handle, &mut tx.msg);
         }
         SocketRequest::GetPeerName {} => {
             let ci = sockets[sock_idx].tcp_conn_idx;
             if ci == usize::MAX {
-                send_sock_error(handle, SocketError::NotConnected {});
+                send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
             }
             let conn = &tcp_conns[ci];
-            let mut resp_msg = Message::new();
-            resp_msg.len = rvos_wire::to_bytes(
+            tx.msg = Message::new();
+            tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Addr {
                     addr: SocketAddr::Inet4 {
                         a: conn.remote_addr[0], b: conn.remote_addr[1],
@@ -2029,9 +2074,9 @@ fn handle_client_message(
                         port: conn.remote_port,
                     },
                 },
-                &mut resp_msg.data,
+                &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == 2 {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -2044,6 +2089,7 @@ fn handle_socket_request(
     client_handle: usize,
     sockets: &mut [Socket; MAX_SOCKETS],
     msg: &Message,
+    tx: &mut TxScratch,
 ) {
     let req = match rvos_wire::from_bytes::<SocketsRequest>(&msg.data[..msg.len]) {
         Ok(r) => r,
@@ -2060,15 +2106,15 @@ fn handle_socket_request(
     let free_idx = sockets.iter().position(|s| !s.active);
     let Some(idx) = free_idx else {
         // No free slots — send error
-        let mut resp = Message::new();
+        tx.msg = Message::new();
         let (len, cap_count) = rvos_wire::to_bytes_with_caps(
             &SocketsResponse::Error { code: SocketError::NoResources {} },
-            &mut resp.data,
-            &mut resp.caps,
+            &mut tx.msg.data,
+            &mut tx.msg.caps,
         ).unwrap_or((0, 0));
-        resp.len = len;
-        resp.cap_count = cap_count;
-        let _ = raw::sys_chan_send(client_handle, &resp);
+        tx.msg.len = len;
+        tx.msg.cap_count = cap_count;
+        let _ = raw::sys_chan_send(client_handle, &tx.msg);
         raw::sys_chan_close(client_handle);
         return;
     };
@@ -2077,15 +2123,15 @@ fn handle_socket_request(
     let (sock_a, sock_b) = raw::sys_chan_create();
 
     // Send Created response with sock_b as the client's end
-    let mut resp = Message::new();
+    tx.msg = Message::new();
     let (len, cap_count) = rvos_wire::to_bytes_with_caps(
         &SocketsResponse::Created { socket: rvos_wire::RawChannelCap::new(sock_b) },
-        &mut resp.data,
-        &mut resp.caps,
+        &mut tx.msg.data,
+        &mut tx.msg.caps,
     ).unwrap_or((0, 0));
-    resp.len = len;
-    resp.cap_count = cap_count;
-    let ret = raw::sys_chan_send(client_handle, &resp);
+    tx.msg.len = len;
+    tx.msg.cap_count = cap_count;
+    let ret = raw::sys_chan_send(client_handle, &tx.msg);
 
     // Close our reference to sock_b (the send transferred a ref to the client)
     raw::sys_chan_close(sock_b);
@@ -2123,23 +2169,37 @@ fn main() {
     };
     let raw_handle = raw_ch.into_raw_handle();
 
+    // Allocate scratch buffers on the heap early so we can reuse tx.msg for init
+    let mut tx: Box<TxScratch> = {
+        let layout = alloc::alloc::Layout::new::<TxScratch>();
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut TxScratch };
+        assert!(!ptr.is_null(), "failed to allocate TxScratch");
+        unsafe { Box::from_raw(ptr) }
+    };
+    let mut rx: Box<RxScratch> = {
+        let layout = alloc::alloc::Layout::new::<RxScratch>();
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut RxScratch };
+        assert!(!ptr.is_null(), "failed to allocate RxScratch");
+        unsafe { Box::from_raw(ptr) }
+    };
+
     // 2. Send GetDeviceInfo request
-    let mut msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&NetRawRequest::GetDeviceInfo {}, &mut msg.data).unwrap_or(0);
-    if raw::sys_chan_send_blocking(raw_handle, &msg) != 0 {
+    tx.msg = Message::new();
+    tx.msg.len = rvos_wire::to_bytes(&NetRawRequest::GetDeviceInfo {}, &mut tx.msg.data).unwrap_or(0);
+    if raw::sys_chan_send_blocking(raw_handle, &tx.msg) != 0 {
         println!("[net-stack] failed to send GetDeviceInfo");
         return;
     }
 
     // 3. Receive DeviceInfo response (with SHM cap)
-    let mut resp = Message::new();
-    if raw::sys_chan_recv_blocking(raw_handle, &mut resp) != 0 {
+    rx.client_msg = Message::new();
+    if raw::sys_chan_recv_blocking(raw_handle, &mut rx.client_msg) != 0 {
         println!("[net-stack] failed to recv DeviceInfo");
         return;
     }
 
     let our_mac;
-    match rvos_wire::from_bytes::<NetRawResponse>(&resp.data[..resp.len]) {
+    match rvos_wire::from_bytes::<NetRawResponse>(&rx.client_msg.data[..rx.client_msg.len]) {
         Ok(NetRawResponse::DeviceInfo { mac0, mac1, mac2, mac3, mac4, mac5, mtu: _ }) => {
             our_mac = [mac0, mac1, mac2, mac3, mac4, mac5];
             println!(
@@ -2154,7 +2214,7 @@ fn main() {
     }
 
     // 4. Map SHM from cap
-    let shm_cap = if resp.cap_count > 0 { resp.caps[0] } else { NO_CAP };
+    let shm_cap = if rx.client_msg.cap_count > 0 { rx.client_msg.caps[0] } else { NO_CAP };
     if shm_cap == NO_CAP {
         println!("[net-stack] no SHM cap received from net-raw");
         return;
@@ -2182,7 +2242,7 @@ fn main() {
         b
     };
     let mut pending_accept: Option<PendingAcceptInfo> = None;
-    let mut pending = [const { PendingPacket::new() }; MAX_PENDING];
+    let mut pending = core::array::from_fn(|_| PendingPacket::new());
     let mut pending_clients = [const { PendingClient::new() }; MAX_PENDING_CLIENTS];
 
     // Pre-populate ARP entry for gateway (QEMU user-net responds to ARP)
@@ -2192,7 +2252,7 @@ fn main() {
         let mut arp_buf = [0u8; 64];
         let arp_len = send_arp_request(&our_mac, &OUR_IP, &GATEWAY_IP, &mut arp_buf);
         if arp_len > 0 {
-            tx_frame(shm_base, raw_handle, &arp_buf[..arp_len]);
+            tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], &mut tx.msg);
         }
     }
 
@@ -2219,19 +2279,18 @@ fn main() {
             let slot_offset = RX_RING_OFFSET + slot_idx * RX_SLOT_SIZE;
             let frame_len = shm_read_u16(shm_base, slot_offset) as usize;
 
-            let mut frame_buf = [0u8; 1534];
             let copy_len = frame_len.min(1534);
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (shm_base + slot_offset + 2) as *const u8,
-                    frame_buf.as_mut_ptr(),
+                    rx.rx_buf.as_mut_ptr(),
                     copy_len,
                 );
             }
             shm_write_u32(shm_base, CTRL_RX_TAIL, rx_tail.wrapping_add(1));
 
             process_frame(
-                &frame_buf[..copy_len],
+                &rx.rx_buf[..copy_len],
                 shm_base,
                 raw_handle,
                 &our_mac,
@@ -2241,13 +2300,14 @@ fn main() {
                 &mut pending_accept,
                 &mut pending,
                 now,
+                &mut tx,
             );
         }
 
         // b. Poll raw channel for RxReady/TxConsumed doorbells
         loop {
-            let mut doorbell = Message::new();
-            let ret = raw::sys_chan_recv(raw_handle, &mut doorbell);
+            rx.doorbell = Message::new();
+            let ret = raw::sys_chan_recv(raw_handle, &mut rx.doorbell);
             if ret != 0 {
                 break;
             }
@@ -2259,14 +2319,14 @@ fn main() {
 
         // c. Poll control channel (handle 1) for new client connections
         loop {
-            let mut ctrl_msg = Message::new();
-            let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut ctrl_msg);
+            rx.ctrl_msg = Message::new();
+            let ret = raw::sys_chan_recv(CONTROL_HANDLE, &mut rx.ctrl_msg);
             if ret != 0 {
                 break;
             }
             handled = true;
 
-            let cap = if ctrl_msg.cap_count > 0 { ctrl_msg.caps[0] } else { NO_CAP };
+            let cap = if rx.ctrl_msg.cap_count > 0 { rx.ctrl_msg.caps[0] } else { NO_CAP };
             if cap == NO_CAP {
                 continue;
             }
@@ -2292,8 +2352,8 @@ fn main() {
             if !pc.active {
                 continue;
             }
-            let mut client_msg = Message::new();
-            let ret = raw::sys_chan_recv(pc.handle, &mut client_msg);
+            rx.client_msg = Message::new();
+            let ret = raw::sys_chan_recv(pc.handle, &mut rx.client_msg);
             if ret == 2 {
                 // Client closed control channel before sending request
                 handled = true;
@@ -2307,7 +2367,7 @@ fn main() {
             handled = true;
             let h = pc.handle;
             pc.active = false;
-            handle_socket_request(h, &mut sockets, &client_msg);
+            handle_socket_request(h, &mut sockets, &rx.client_msg, &mut tx);
         }
 
         // d. Poll all active socket channels for SocketRequest messages
@@ -2317,8 +2377,8 @@ fn main() {
                 continue;
             }
             loop {
-                let mut client_msg = Message::new();
-                let ret = raw::sys_chan_recv(sockets[i].handle, &mut client_msg);
+                rx.client_msg = Message::new();
+                let ret = raw::sys_chan_recv(sockets[i].handle, &mut rx.client_msg);
                 if ret == 2 {
                     // Channel closed by client — clean up socket
                     handled = true;
@@ -2334,13 +2394,14 @@ fn main() {
                     &mut sockets,
                     &mut tcp_conns,
                     &mut pending_accept,
-                    &client_msg,
+                    &rx.client_msg,
                     shm_base,
                     raw_handle,
                     &our_mac,
                     &arp_table,
                     &mut pending,
                     now,
+                    &mut tx,
                 );
             }
         }
@@ -2357,13 +2418,13 @@ fn main() {
                     let mut arp_buf = [0u8; 64];
                     let arp_len = send_arp_request(&our_mac, &OUR_IP, &next_hop, &mut arp_buf);
                     if arp_len > 0 {
-                        tx_frame(shm_base, raw_handle, &arp_buf[..arp_len]);
+                        tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], &mut tx.msg);
                     }
                 }
             }
         }
         // Try to drain any newly resolved entries (also expires timed-out packets)
-        drain_pending(shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now);
+        drain_pending(shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now, &mut tx.frame_buf, &mut tx.msg);
 
         // f. Process pending accept assignments
         if let Some(info) = pending_accept.take() {
@@ -2372,7 +2433,7 @@ fn main() {
         }
 
         // g. TCP retransmit timers
-        tcp_check_retransmits(&mut tcp_conns, shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now, &mut sockets);
+        tcp_check_retransmits(&mut tcp_conns, shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now, &mut sockets, &mut tx);
 
         // h. TCP TimeWait cleanup
         tcp_check_timewait(&mut tcp_conns, now);
