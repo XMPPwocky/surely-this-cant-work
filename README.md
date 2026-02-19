@@ -19,7 +19,7 @@ A from-scratch RISC-V 64-bit microkernel operating system written in Rust. Targe
 - **UART serial console** — 16550A driver with `print!`/`println!` macros via `core::fmt::Write`
 - **VirtIO GPU driver** — MMIO transport, split virtqueue, framebuffer console with 8x16 bitmap font
 - **VirtIO keyboard/mouse** — input device drivers with raw event delivery to user-space window server
-- **VirtIO network** — Ethernet driver with shared-memory ring buffer; user-space IP/UDP/ARP stack
+- **VirtIO network** — Ethernet driver with shared-memory ring buffer; user-space TCP/IP stack with `std::net` support
 - **Filesystem** — in-memory tmpfs with directory hierarchy, served over IPC; init loads binaries from `/bin`
 - **Process debugger** — attach/detach, single-step, breakpoints, register/memory inspection via debug service
 - **Tracing** — `SYS_TRACE` syscall records timestamped events into a kernel ring buffer; viewable from shell
@@ -90,10 +90,11 @@ Serial-only boot (no GPU):
 | 3 | sysinfo | kernel | Process/memory info service |
 | 4 | math | kernel | Computation service |
 | 5 | proc-debug | kernel | Process debugger service |
-| 6 | net-server | kernel | VirtIO network driver service |
-| 7 | fs | user | Filesystem server (tmpfs) |
-| 8 | shell-serial | user | Interactive shell (serial) |
-| 9 | net-stack | user | IP/UDP/ARP network stack |
+| 6 | timer | kernel | Timed wakeup service |
+| 7 | net-server | kernel | VirtIO network driver service |
+| 8 | fs | user | Filesystem server (tmpfs) |
+| 9 | shell-serial | user | Interactive shell (serial) |
+| 10 | net-stack | user | TCP/IP network stack |
 
 With GPU, additional kernel tasks are spawned: gpu-server, kbd-server,
 mouse-server, fb-con; and user processes: fbcon, window-server, shell-fb.
@@ -190,7 +191,8 @@ rvos/
 ├── user/
 │   ├── shell/                   # Interactive shell (line editing, history, tab completion)
 │   ├── fs/                      # Filesystem server (tmpfs, directory hierarchy)
-│   ├── net-stack/               # User-space IP/UDP/ARP network stack
+│   ├── net-stack/               # User-space TCP/IP network stack
+│   ├── tcp-echo/                # TCP echo server demo
 │   ├── udp-echo/                # UDP echo server demo
 │   ├── window-server/           # Compositing window server (GPU + kbd/mouse)
 │   ├── fbcon/                   # Framebuffer console (text terminal on GPU)
@@ -198,6 +200,7 @@ rvos/
 │   ├── triangle/                # GPU triangle rendering demo
 │   ├── dbg/                     # Interactive process debugger client
 │   ├── bench/                   # Benchmark suite
+│   ├── ktest/                   # Kernel test suite
 │   ├── hello/                   # Hello world with Rust std
 │   └── rvos-rt/                 # Runtime crate for std programs
 ├── lib/
@@ -247,7 +250,7 @@ rvos/
 - **Channel-based I/O** — all user I/O goes through IPC channels (no direct read/write syscalls)
 - **Capability passing** — channel endpoints transferred between processes via messages
 - **Shared memory for bulk data** — SHM regions for zero-copy transfer (network ring buffers, GPU framebuffers)
-- **User-space network stack** — kernel provides raw Ethernet via SHM ring buffer; IP/UDP/ARP runs in user space
+- **User-space network stack** — kernel provides raw Ethernet via SHM ring buffer; TCP/IP/UDP/ARP runs in user space
 - **Buddy allocator** — efficient O(log n) allocation with contiguous frame support for DMA
 - **Round-robin scheduling** — timer-driven preemption at ~100ms intervals; cooperative yield also available
 - **Custom Rust target** — `riscv64gc-unknown-rvos` enables user programs with full Rust `std` support via a forked Rust toolchain (`vendor/rust/`). The std PAL (`std/src/sys/pal/rvos/`) uses `rvos-wire` and `rvos-proto` (symlinked from `lib/`) for IPC-based I/O. Run `make build-std-lib` after modifying any of these crates
