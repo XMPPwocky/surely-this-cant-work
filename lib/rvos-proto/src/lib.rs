@@ -16,5 +16,7 @@ pub mod gpu;
 pub mod kbd;
 pub mod mouse;
 pub mod net;
+pub mod socket;
+pub mod timer;
 pub mod window;
 pub mod service_control;
