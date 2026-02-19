@@ -3,7 +3,9 @@ extern crate rvos_rt;
 
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
-use rvos_proto::net::*;
+use rvos::rvos_wire;
+use rvos_proto::net::{NetRawRequest, NetRawResponse};
+use rvos_proto::socket::*;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -39,8 +41,9 @@ const PROTO_UDP: u8 = 17;
 
 const UDP_HDR_SIZE: usize = 8;
 
-const MAX_SOCKETS: usize = 8;
+const MAX_SOCKETS: usize = 16;
 const MAX_PENDING: usize = 4;
+const MAX_PENDING_CLIENTS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Volatile SHM access
@@ -510,32 +513,48 @@ fn resolve_next_hop(dst_ip: &[u8; 4]) -> [u8; 4] {
 // Socket table
 // ---------------------------------------------------------------------------
 
-struct UdpSocket {
+struct Socket {
     port: u16,
-    client_handle: usize,
+    handle: usize,
     recv_pending: bool,
     active: bool,
+    is_stream: bool,
 }
 
-impl UdpSocket {
+impl Socket {
     const fn new() -> Self {
-        UdpSocket {
+        Socket {
             port: 0,
-            client_handle: 0,
+            handle: 0,
             recv_pending: false,
             active: false,
+            is_stream: false,
         }
     }
 
     /// Clean up a socket whose client channel is dead.
     fn deactivate(&mut self) {
         if self.active {
-            raw::sys_chan_close(self.client_handle);
+            raw::sys_chan_close(self.handle);
             self.active = false;
-            self.client_handle = 0;
+            self.handle = 0;
             self.port = 0;
             self.recv_pending = false;
+            self.is_stream = false;
         }
+    }
+}
+
+/// A pending client that has connected to the sockets control channel
+/// but hasn't yet sent a SocketsRequest::Socket message.
+struct PendingClient {
+    handle: usize,
+    active: bool,
+}
+
+impl PendingClient {
+    const fn new() -> Self {
+        PendingClient { handle: 0, active: false }
     }
 }
 
@@ -694,7 +713,7 @@ fn process_frame(
     raw_handle: usize,
     our_mac: &[u8; 6],
     arp_table: &mut ArpTable,
-    sockets: &mut [UdpSocket; MAX_SOCKETS],
+    sockets: &mut [Socket; MAX_SOCKETS],
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
 ) {
@@ -738,21 +757,22 @@ fn process_frame(
                 for sock in sockets.iter_mut() {
                     if sock.active && sock.port == udp.dst_port {
                         if sock.recv_pending {
-                            // Send Datagram response to client
+                            // Send SocketData::Datagram to client
                             let mut msg = Message::new();
                             let truncated_len = udp_data.len().min(900);
+                            let addr = SocketAddr::Inet4 {
+                                a: ip.src[0], b: ip.src[1],
+                                c: ip.src[2], d: ip.src[3],
+                                port: udp.src_port,
+                            };
                             msg.len = rvos_wire::to_bytes(
-                                &NetResponse::Datagram {
-                                    src_ip0: ip.src[0],
-                                    src_ip1: ip.src[1],
-                                    src_ip2: ip.src[2],
-                                    src_ip3: ip.src[3],
-                                    src_port: udp.src_port,
+                                &SocketData::Datagram {
+                                    addr,
                                     data: &udp_data[..truncated_len],
                                 },
                                 &mut msg.data,
                             ).unwrap_or(0);
-                            let ret = raw::sys_chan_send(sock.client_handle, &msg);
+                            let ret = raw::sys_chan_send(sock.handle, &msg);
                             sock.recv_pending = false;
                             if ret == 2 {
                                 // Client channel closed — clean up socket
@@ -776,7 +796,7 @@ fn process_frame(
 #[allow(clippy::too_many_arguments)] // inherent complexity of passing service state
 fn handle_client_message(
     sock_idx: usize,
-    sockets: &mut [UdpSocket; MAX_SOCKETS],
+    sockets: &mut [Socket; MAX_SOCKETS],
     msg: &Message,
     shm_base: usize,
     raw_handle: usize,
@@ -785,27 +805,28 @@ fn handle_client_message(
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
 ) {
-    let req = match rvos_wire::from_bytes::<NetRequest<'_>>(&msg.data[..msg.len]) {
+    let req = match rvos_wire::from_bytes::<SocketRequest<'_>>(&msg.data[..msg.len]) {
         Ok(r) => r,
         Err(_) => return,
     };
 
-    let handle = sockets[sock_idx].client_handle;
+    let handle = sockets[sock_idx].handle;
 
     match req {
-        NetRequest::Bind { port } => {
+        SocketRequest::Bind { addr } => {
+            let SocketAddr::Inet4 { port, .. } = addr;
             // Check if port is already bound
             let already_bound = sockets.iter().any(|s| s.active && s.port == port);
             let mut resp_msg = Message::new();
             if already_bound {
                 resp_msg.len = rvos_wire::to_bytes(
-                    &NetResponse::Error { message: "port already bound" },
+                    &SocketResponse::Error { code: SocketError::AddrInUse {} },
                     &mut resp_msg.data,
                 ).unwrap_or(0);
             } else {
                 sockets[sock_idx].port = port;
                 resp_msg.len = rvos_wire::to_bytes(
-                    &NetResponse::Ok {},
+                    &SocketResponse::Ok {},
                     &mut resp_msg.data,
                 ).unwrap_or(0);
             }
@@ -813,11 +834,9 @@ fn handle_client_message(
                 sockets[sock_idx].deactivate();
             }
         }
-        NetRequest::SendTo {
-            dst_ip0, dst_ip1, dst_ip2, dst_ip3,
-            dst_port, data,
-        } => {
-            let dst_ip = [dst_ip0, dst_ip1, dst_ip2, dst_ip3];
+        SocketRequest::SendTo { addr, data } => {
+            let SocketAddr::Inet4 { a, b, c, d, port: dst_port } = addr;
+            let dst_ip = [a, b, c, d];
             let src_port = sockets[sock_idx].port;
 
             // Build UDP payload
@@ -826,7 +845,7 @@ fn handle_client_message(
             if udp_len == 0 {
                 let mut resp_msg = Message::new();
                 resp_msg.len = rvos_wire::to_bytes(
-                    &NetResponse::Error { message: "payload too large" },
+                    &SocketResponse::Error { code: SocketError::InvalidArg {} },
                     &mut resp_msg.data,
                 ).unwrap_or(0);
                 if raw::sys_chan_send(handle, &resp_msg) == 2 {
@@ -841,7 +860,7 @@ fn handle_client_message(
             if ip_len == 0 {
                 let mut resp_msg = Message::new();
                 resp_msg.len = rvos_wire::to_bytes(
-                    &NetResponse::Error { message: "ip build failed" },
+                    &SocketResponse::Error { code: SocketError::NoResources {} },
                     &mut resp_msg.data,
                 ).unwrap_or(0);
                 if raw::sys_chan_send(handle, &resp_msg) == 2 {
@@ -857,27 +876,124 @@ fn handle_client_message(
 
             let mut resp_msg = Message::new();
             resp_msg.len = rvos_wire::to_bytes(
-                &NetResponse::SendOk {},
+                &SocketResponse::Sent { bytes: data.len() as u32 },
                 &mut resp_msg.data,
             ).unwrap_or(0);
             if raw::sys_chan_send(handle, &resp_msg) == 2 {
                 sockets[sock_idx].deactivate();
             }
         }
-        NetRequest::RecvFrom {} => {
+        SocketRequest::RecvFrom {} => {
             sockets[sock_idx].recv_pending = true;
         }
-        NetRequest::Close {} => {
-            sockets[sock_idx].deactivate();
+        SocketRequest::GetSockName {} => {
+            let port = sockets[sock_idx].port;
+            let mut resp_msg = Message::new();
+            resp_msg.len = rvos_wire::to_bytes(
+                &SocketResponse::Addr {
+                    addr: SocketAddr::Inet4 {
+                        a: OUR_IP[0], b: OUR_IP[1],
+                        c: OUR_IP[2], d: OUR_IP[3],
+                        port,
+                    },
+                },
+                &mut resp_msg.data,
+            ).unwrap_or(0);
+            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                sockets[sock_idx].deactivate();
+            }
+        }
+        // TCP operations — not yet implemented
+        SocketRequest::Listen { .. }
+        | SocketRequest::Accept {}
+        | SocketRequest::Connect { .. }
+        | SocketRequest::Send { .. }
+        | SocketRequest::Recv { .. }
+        | SocketRequest::Shutdown { .. }
+        | SocketRequest::GetPeerName {} => {
+            let mut resp_msg = Message::new();
+            resp_msg.len = rvos_wire::to_bytes(
+                &SocketResponse::Error { code: SocketError::NotSupported {} },
+                &mut resp_msg.data,
+            ).unwrap_or(0);
+            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                sockets[sock_idx].deactivate();
+            }
         }
     }
+}
+
+/// Handle a SocketsRequest from a pending client: create per-socket channel,
+/// send back Created response with the cap.
+fn handle_socket_request(
+    client_handle: usize,
+    sockets: &mut [Socket; MAX_SOCKETS],
+    msg: &Message,
+) {
+    let req = match rvos_wire::from_bytes::<SocketsRequest>(&msg.data[..msg.len]) {
+        Ok(r) => r,
+        Err(_) => {
+            raw::sys_chan_close(client_handle);
+            return;
+        }
+    };
+
+    let SocketsRequest::Socket { sock_type } = req;
+    let is_stream = matches!(sock_type, SocketType::Stream {});
+
+    // Find a free socket slot
+    let free_idx = sockets.iter().position(|s| !s.active);
+    let Some(idx) = free_idx else {
+        // No free slots — send error
+        let mut resp = Message::new();
+        let (len, cap_count) = rvos_wire::to_bytes_with_caps(
+            &SocketsResponse::Error { code: SocketError::NoResources {} },
+            &mut resp.data,
+            &mut resp.caps,
+        ).unwrap_or((0, 0));
+        resp.len = len;
+        resp.cap_count = cap_count;
+        let _ = raw::sys_chan_send(client_handle, &resp);
+        raw::sys_chan_close(client_handle);
+        return;
+    };
+
+    // Create per-socket channel pair
+    let (sock_a, sock_b) = raw::sys_chan_create();
+
+    // Send Created response with sock_b as the client's end
+    let mut resp = Message::new();
+    let (len, cap_count) = rvos_wire::to_bytes_with_caps(
+        &SocketsResponse::Created { socket: rvos_wire::RawChannelCap::new(sock_b) },
+        &mut resp.data,
+        &mut resp.caps,
+    ).unwrap_or((0, 0));
+    resp.len = len;
+    resp.cap_count = cap_count;
+    let ret = raw::sys_chan_send(client_handle, &resp);
+
+    // Close our reference to sock_b (the send transferred a ref to the client)
+    raw::sys_chan_close(sock_b);
+    // Close the control channel — client will drop their end too
+    raw::sys_chan_close(client_handle);
+
+    if ret == 2 {
+        // Client already gone — clean up sock_a
+        raw::sys_chan_close(sock_a);
+        return;
+    }
+
+    // Register the per-socket channel in the socket table
+    sockets[idx].active = true;
+    sockets[idx].handle = sock_a;
+    sockets[idx].port = 0;
+    sockets[idx].recv_pending = false;
+    sockets[idx].is_stream = is_stream;
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-
-use rvos::rvos_wire;
 
 fn main() {
     println!("[net-stack] starting...");
@@ -937,8 +1053,9 @@ fn main() {
 
     // 5. Initialize state
     let mut arp_table = ArpTable::new();
-    let mut sockets = [const { UdpSocket::new() }; MAX_SOCKETS];
+    let mut sockets = [const { Socket::new() }; MAX_SOCKETS];
     let mut pending = [const { PendingPacket::new() }; MAX_PENDING];
+    let mut pending_clients = [const { PendingClient::new() }; MAX_PENDING_CLIENTS];
 
     // Pre-populate ARP entry for gateway (QEMU user-net responds to ARP)
     // We'll learn it dynamically from the first ARP reply, but send a
@@ -1024,32 +1141,46 @@ fn main() {
                 continue;
             }
 
-            // Parse NewConnection to get client_pid (for logging)
-            if let Ok(nc) = rvos_wire::from_bytes::<rvos_proto::service_control::NewConnection>(
-                &ctrl_msg.data[..ctrl_msg.len],
-            ) {
-                println!("[net-stack] new client pid={}", nc.client_pid);
-            }
-
-            // Find free socket slot and assign this client
+            // Store as pending client — will handle SocketsRequest on next poll
             let mut assigned = false;
-            for sock in sockets.iter_mut() {
-                if !sock.active {
-                    sock.active = true;
-                    sock.client_handle = cap;
-                    sock.port = 0;
-                    sock.recv_pending = false;
+            for pc in pending_clients.iter_mut() {
+                if !pc.active {
+                    pc.active = true;
+                    pc.handle = cap;
                     assigned = true;
                     break;
                 }
             }
             if !assigned {
-                println!("[net-stack] no free socket slots, closing client");
+                println!("[net-stack] no free pending client slots, closing");
                 raw::sys_chan_close(cap);
             }
         }
 
-        // d. Poll all active client channels for Bind/SendTo/RecvFrom/Close
+        // c2. Poll pending clients for SocketsRequest::Socket messages
+        for pc in pending_clients.iter_mut() {
+            if !pc.active {
+                continue;
+            }
+            let mut client_msg = Message::new();
+            let ret = raw::sys_chan_recv(pc.handle, &mut client_msg);
+            if ret == 2 {
+                // Client closed control channel before sending request
+                handled = true;
+                raw::sys_chan_close(pc.handle);
+                pc.active = false;
+                continue;
+            }
+            if ret != 0 {
+                continue; // No message yet
+            }
+            handled = true;
+            let h = pc.handle;
+            pc.active = false;
+            handle_socket_request(h, &mut sockets, &client_msg);
+        }
+
+        // d. Poll all active socket channels for SocketRequest messages
         #[allow(clippy::needless_range_loop)]
         for i in 0..MAX_SOCKETS {
             if !sockets[i].active {
@@ -1057,15 +1188,11 @@ fn main() {
             }
             loop {
                 let mut client_msg = Message::new();
-                let ret = raw::sys_chan_recv(sockets[i].client_handle, &mut client_msg);
+                let ret = raw::sys_chan_recv(sockets[i].handle, &mut client_msg);
                 if ret == 2 {
-                    // Channel closed by client
+                    // Channel closed by client — clean up socket
                     handled = true;
-                    sockets[i].active = false;
-                    raw::sys_chan_close(sockets[i].client_handle);
-                    sockets[i].client_handle = 0;
-                    sockets[i].port = 0;
-                    sockets[i].recv_pending = false;
+                    sockets[i].deactivate();
                     break;
                 }
                 if ret != 0 {
@@ -1110,9 +1237,14 @@ fn main() {
             // Register all channels for poll-based wakeup
             raw::sys_chan_poll_add(raw_handle);
             raw::sys_chan_poll_add(CONTROL_HANDLE);
+            for pc in pending_clients.iter() {
+                if pc.active {
+                    raw::sys_chan_poll_add(pc.handle);
+                }
+            }
             for sock in sockets.iter() {
                 if sock.active {
-                    raw::sys_chan_poll_add(sock.client_handle);
+                    raw::sys_chan_poll_add(sock.handle);
                 }
             }
             raw::sys_block();
