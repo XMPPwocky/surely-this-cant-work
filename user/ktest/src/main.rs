@@ -1537,7 +1537,74 @@ fn test_debugger_second_attach() -> Result<(), &'static str> {
 }
 
 // ============================================================
-// 21. Regression -- Scheduler Stress
+// 21. Timer Service
+// ============================================================
+
+fn test_timer_basic() -> Result<(), &'static str> {
+    // Connect to the timer service, request a 50ms timer, verify it fires.
+    use rvos::rvos_wire;
+    use rvos_proto::timer::{TimerRequest, TimerResponse};
+
+    let svc = rvos::connect_to_service("timer")
+        .map_err(|_| "connect to timer failed")?;
+    let handle = svc.into_raw_handle();
+
+    let req = TimerRequest::After { duration_us: 50_000 }; // 50ms
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+
+    let start = rdtime();
+    raw::sys_chan_send_blocking(handle, &msg);
+
+    let mut resp_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(handle, &mut resp_msg);
+    let elapsed = rdtime() - start;
+    raw::sys_chan_close(handle);
+
+    if ret != 0 {
+        return Err("recv timer response failed");
+    }
+
+    let resp: TimerResponse = rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
+        .map_err(|_| "decode timer response failed")?;
+
+    match resp {
+        TimerResponse::Expired {} => {}
+    }
+
+    // At 10MHz, 50ms = 500_000 ticks. Allow 10ms–500ms window.
+    assert_true(elapsed >= 100_000, "timer fired too early")?;
+    assert_true(elapsed < 5_000_000, "timer fired too late")
+}
+
+fn test_timer_short() -> Result<(), &'static str> {
+    // Verify a very short timer (1ms) fires and doesn't hang.
+    use rvos::rvos_wire;
+    use rvos_proto::timer::{TimerRequest, TimerResponse};
+
+    let svc = rvos::connect_to_service("timer")
+        .map_err(|_| "connect to timer failed")?;
+    let handle = svc.into_raw_handle();
+
+    let req = TimerRequest::After { duration_us: 1_000 }; // 1ms
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(handle, &msg);
+
+    let mut resp_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(handle, &mut resp_msg);
+    raw::sys_chan_close(handle);
+
+    if ret != 0 {
+        return Err("recv timer response failed");
+    }
+    let _: TimerResponse = rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
+        .map_err(|_| "decode timer response failed")?;
+    Ok(())
+}
+
+// ============================================================
+// 22. Regression -- Scheduler Stress
 // ============================================================
 
 fn test_stress_spawn_exit() -> Result<(), &'static str> {
@@ -1694,6 +1761,11 @@ fn main() {
 
     total.merge(&run_section("Regression -- Debugger", &[
         ("debugger_second_attach", test_debugger_second_attach),
+    ]));
+
+    total.merge(&run_section("Timer Service", &[
+        ("timer_basic", test_timer_basic),
+        ("timer_short", test_timer_short),
     ]));
 
     total.merge(&run_section("Regression -- Scheduler Stress", &[
