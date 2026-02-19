@@ -23,6 +23,9 @@ pub const SYS_MEMINFO: usize = 233;
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
 
+/// Syscall return codes (matches kernel SyscallError ABI).
+pub const CHAN_CLOSED: usize = 2;
+
 #[inline(always)]
 pub fn syscall0(num: usize) -> (usize, usize) {
     let ret0: usize;

@@ -1057,7 +1057,7 @@ fn process_frame(
                             ).unwrap_or(0);
                             let ret = raw::sys_chan_send(sock.handle, &tx.msg);
                             sock.recv_pending = false;
-                            if ret == 2 {
+                            if ret == raw::CHAN_CLOSED {
                                 // Client channel closed — clean up socket
                                 sock.deactivate(tcp_conns);
                             }
@@ -1153,7 +1153,7 @@ fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns, msg: &mut M
             ).unwrap_or(0);
             let ret = raw::sys_chan_send(sock.handle, msg);
             sock.recv_pending = false;
-            if ret == 2 {
+            if ret == raw::CHAN_CLOSED {
                 sock.deactivate(tcp_conns);
             }
         }
@@ -1167,7 +1167,7 @@ fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns, msg: &mut M
     ).unwrap_or(0);
     let ret = raw::sys_chan_send(sock.handle, msg);
     sock.recv_pending = false;
-    if ret == 2 {
+    if ret == raw::CHAN_CLOSED {
         sock.deactivate(tcp_conns);
         return;
     }
@@ -1631,7 +1631,7 @@ fn tcp_deliver_accept(
     raw::sys_chan_close(sock_b);
     sock.accept_pending = false;
 
-    if ret == 2 {
+    if ret == raw::CHAN_CLOSED {
         // Listener client gone
         raw::sys_chan_close(sock_a);
         conn.reset();
@@ -1838,7 +1838,7 @@ fn handle_client_message(
                     &mut tx.msg.data,
                 ).unwrap_or(0);
             }
-            if raw::sys_chan_send(handle, &tx.msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -1856,7 +1856,7 @@ fn handle_client_message(
                     &SocketResponse::Error { code: SocketError::InvalidArg {} },
                     &mut tx.msg.data,
                 ).unwrap_or(0);
-                if raw::sys_chan_send(handle, &tx.msg) == 2 {
+                if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                     sockets[sock_idx].deactivate(tcp_conns);
                 }
                 return;
@@ -1870,7 +1870,7 @@ fn handle_client_message(
                     &SocketResponse::Error { code: SocketError::NoResources {} },
                     &mut tx.msg.data,
                 ).unwrap_or(0);
-                if raw::sys_chan_send(handle, &tx.msg) == 2 {
+                if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                     sockets[sock_idx].deactivate(tcp_conns);
                 }
                 return;
@@ -1887,7 +1887,7 @@ fn handle_client_message(
                 &SocketResponse::Sent { bytes: data.len() as u32 },
                 &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &tx.msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -1907,7 +1907,7 @@ fn handle_client_message(
                 },
                 &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &tx.msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -2016,7 +2016,7 @@ fn handle_client_message(
                 &SocketResponse::Sent { bytes: copy_len as u32 },
                 &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &tx.msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -2076,7 +2076,7 @@ fn handle_client_message(
                 },
                 &mut tx.msg.data,
             ).unwrap_or(0);
-            if raw::sys_chan_send(handle, &tx.msg) == 2 {
+            if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
         }
@@ -2138,7 +2138,7 @@ fn handle_socket_request(
     // Close the control channel — client will drop their end too
     raw::sys_chan_close(client_handle);
 
-    if ret == 2 {
+    if ret == raw::CHAN_CLOSED {
         // Client already gone — clean up sock_a
         raw::sys_chan_close(sock_a);
         return;
@@ -2354,7 +2354,7 @@ fn main() {
             }
             rx.client_msg = Message::new();
             let ret = raw::sys_chan_recv(pc.handle, &mut rx.client_msg);
-            if ret == 2 {
+            if ret == raw::CHAN_CLOSED {
                 // Client closed control channel before sending request
                 handled = true;
                 raw::sys_chan_close(pc.handle);
@@ -2379,7 +2379,7 @@ fn main() {
             loop {
                 rx.client_msg = Message::new();
                 let ret = raw::sys_chan_recv(sockets[i].handle, &mut rx.client_msg);
-                if ret == 2 {
+                if ret == raw::CHAN_CLOSED {
                     // Channel closed by client — clean up socket
                     handled = true;
                     sockets[i].deactivate(&mut tcp_conns);
