@@ -1,101 +1,35 @@
 // Pull in the rvos-rt crate so _start gets linked
 extern crate rvos_rt;
 
-use rvos::channel::Channel;
-use rvos_proto::net::{NetRequest, NetRequestMsg, NetResponse, NetResponseMsg};
+use rvos::socket::{UdpSocket, SocketAddr};
 
 fn main() {
     println!("UDP echo server starting...");
 
-    // Connect to "net" service via boot channel (handle 0)
-    let net_ch = match rvos::service::connect_to_service("net") {
-        Ok(ch) => ch,
+    let addr = SocketAddr::Inet4 { a: 0, b: 0, c: 0, d: 0, port: 7777 };
+    let mut sock = match UdpSocket::bind(addr) {
+        Ok(s) => s,
         Err(e) => {
-            println!("Failed to connect to net service: {:?}", e);
+            println!("Bind failed: {:?}", e);
             return;
         }
     };
+    println!("UDP echo server listening on port 7777");
 
-    let mut ch: Channel<NetRequestMsg, NetResponseMsg> =
-        Channel::from_raw_handle(net_ch.into_raw_handle());
-
-    // Bind to port 7777
-    if let Err(e) = ch.send(&NetRequest::Bind { port: 7777 }) {
-        println!("Failed to send Bind: {:?}", e);
-        return;
-    }
-
-    // Wait for Bind response
-    let resp = ch.recv_blocking();
-    match resp {
-        Ok(NetResponse::Ok {}) => {
-            println!("UDP echo server listening on port 7777");
-        }
-        Ok(NetResponse::Error { message }) => {
-            println!("Bind failed: {}", message);
-            return;
-        }
-        _ => {
-            println!("Unexpected bind response");
-            return;
-        }
-    }
-
-    // Echo loop
+    let mut buf = [0u8; 1024];
     loop {
-        // Send RecvFrom request
-        if let Err(e) = ch.send(&NetRequest::RecvFrom {}) {
-            println!("Failed to send RecvFrom: {:?}", e);
-            return;
-        }
-
-        // Wait for datagram
-        let resp = ch.recv_blocking();
-        match resp {
-            Ok(NetResponse::Datagram {
-                src_ip0, src_ip1, src_ip2, src_ip3,
-                src_port, data,
-            }) => {
-                println!(
-                    "Received {} bytes from {}.{}.{}.{}:{}",
-                    data.len(), src_ip0, src_ip1, src_ip2, src_ip3, src_port
-                );
-
-                // Copy data to stack buffer before sending (borrow release)
-                let mut buf = [0u8; 1024];
-                let len = data.len().min(buf.len());
-                buf[..len].copy_from_slice(&data[..len]);
-
-                // Echo back
-                if let Err(e) = ch.send(&NetRequest::SendTo {
-                    dst_ip0: src_ip0,
-                    dst_ip1: src_ip1,
-                    dst_ip2: src_ip2,
-                    dst_ip3: src_ip3,
-                    dst_port: src_port,
-                    data: &buf[..len],
-                }) {
-                    println!("Failed to send echo: {:?}", e);
-                    return;
-                }
-
-                // Wait for send confirmation
-                let send_resp = ch.recv_blocking();
-                match send_resp {
-                    Ok(NetResponse::SendOk {}) => {}
-                    Ok(NetResponse::Error { message }) => {
-                        println!("Send failed: {}", message);
-                    }
-                    _ => {}
-                }
-            }
-            Ok(NetResponse::Error { message }) => {
-                println!("RecvFrom error: {}", message);
-            }
-            _ => {
-                println!("Unexpected response, exiting");
+        let (len, peer) = match sock.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("recv_from error: {:?}", e);
                 return;
             }
+        };
+        let SocketAddr::Inet4 { a, b, c, d, port } = peer;
+        println!("Received {} bytes from {}.{}.{}.{}:{}", len, a, b, c, d, port);
+
+        if let Err(e) = sock.send_to(&buf[..len], peer) {
+            println!("send_to error: {:?}", e);
         }
     }
 }
