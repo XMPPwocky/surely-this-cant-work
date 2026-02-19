@@ -1,41 +1,47 @@
 // Pull in the rvos-rt crate so _start gets linked
 extern crate rvos_rt;
 
-use rvos::socket::{TcpListener, TcpStream, SocketAddr, ShutdownHow};
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 
-fn handle_client(mut stream: TcpStream, peer: SocketAddr) {
-    let SocketAddr::Inet4 { a, b, c, d, port } = peer;
-    println!("Connection from {}.{}.{}.{}:{}", a, b, c, d, port);
+fn handle_client(mut stream: TcpStream) {
+    let peer = match stream.peer_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!("peer_addr error: {:?}", e);
+            return;
+        }
+    };
+    println!("Connection from {}", peer);
 
     let mut buf = [0u8; 1024];
     loop {
-        let n = match stream.recv(&mut buf) {
+        let n = match stream.read(&mut buf) {
             Ok(0) => {
                 println!("Client disconnected");
                 break;
             }
             Ok(n) => n,
             Err(e) => {
-                println!("recv error: {:?}", e);
+                println!("read error: {:?}", e);
                 break;
             }
         };
         println!("Received {} bytes", n);
 
-        if let Err(e) = stream.send(&buf[..n]) {
-            println!("send error: {:?}", e);
+        if let Err(e) = stream.write_all(&buf[..n]) {
+            println!("write error: {:?}", e);
             break;
         }
     }
 
-    let _ = stream.shutdown(ShutdownHow::Both {});
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
 fn main() {
     println!("TCP echo server starting...");
 
-    let addr = SocketAddr::Inet4 { a: 0, b: 0, c: 0, d: 0, port: 7778 };
-    let mut listener = match TcpListener::bind(addr) {
+    let listener = match TcpListener::bind("0.0.0.0:7778") {
         Ok(l) => l,
         Err(e) => {
             println!("Bind failed: {:?}", e);
@@ -45,13 +51,13 @@ fn main() {
     println!("TCP echo server listening on port 7778");
 
     loop {
-        let (stream, peer) = match listener.accept() {
+        let (stream, _peer) = match listener.accept() {
             Ok(r) => r,
             Err(e) => {
                 println!("accept error: {:?}", e);
                 continue;
             }
         };
-        handle_client(stream, peer);
+        handle_client(stream);
     }
 }
