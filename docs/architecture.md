@@ -66,7 +66,7 @@ The kernel creates channels and spawns all services and user processes:
 
 ```
 kmain
- ├── creates control channels for: serial-con, sysinfo, math, process-debug
+ ├── creates control channels for: serial-con, sysinfo, math, process-debug, timer
  ├── creates boot channels for: shell-serial
  ├── (with GPU) creates control channels for: gpu, kbd, mouse
  ├── (with net) creates control channels for: net-raw
@@ -76,6 +76,7 @@ kmain
  │   ├── sysinfo      (process/memory info service)
  │   ├── math         (computation service)
  │   ├── proc-debug   (process debugger attach/step/breakpoint)
+ │   ├── timer        (timed wakeups via IPC)
  │   ├── gpu-server   (VirtIO GPU wrapper, if GPU)
  │   ├── kbd-server   (VirtIO keyboard wrapper, if GPU)
  │   ├── mouse-server (VirtIO tablet wrapper, if GPU)
@@ -88,8 +89,8 @@ kmain
 
 Additional user processes spawned by init on demand:
 
-- **net-stack** — user-space network stack, connects to `net-raw`, registers
-  as `"net"` service, provides UDP socket API
+- **net-stack** — user-space TCP/IP stack, connects to `net-raw`, registers
+  as `"net"` service, provides TCP and UDP socket API
 - **window-server** — compositing window manager (GPU mode)
 - **fbcon** — framebuffer console multiplexer (GPU mode)
 
@@ -331,21 +332,22 @@ through the init server's service discovery protocol.
 ### Service Topology
 
 ```
-                         ┌──────────┐
-                         │   init   │ ← service directory + process loader
-                         └────┬─────┘
-        ┌──────────┬──────────┼──────────┬────────────┬─────────────┐
-        ↓          ↓          ↓          ↓            ↓             ↓
-  ┌──────────┐ ┌────────┐ ┌────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-  │serial-con│ │sysinfo │ │  math  │ │proc-debug│ │net-server│ │gpu-server│
-  └────┬─────┘ └────────┘ └────────┘ └──────────┘ └────┬─────┘ └──────────┘
-       ↓                                                ↓
-  [shell-serial]                                   [net-stack] ← "net" service
-  [shell-fb]                                            ↓
-                                                   [udp-echo]
+                              ┌──────────┐
+                              │   init   │ ← service directory + process loader
+                              └────┬─────┘
+        ┌──────────┬──────────┬────┼────┬────────────┬─────────────┐
+        ↓          ↓          ↓    ↓    ↓            ↓             ↓
+  ┌──────────┐ ┌────────┐ ┌────┐ ┌───┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │serial-con│ │sysinfo │ │math│ │tmr│ │proc-debug│ │net-server│ │gpu-server│
+  └────┬─────┘ └────────┘ └────┘ └───┘ └──────────┘ └────┬─────┘ └──────────┘
+       ↓                                                   ↓
+  [shell-serial]                                      [net-stack] ← "net" service
+  [shell-fb]                                               ↓
+                                                      [tcp-echo]
+                                                      [udp-echo]
 ```
 
-Kernel tasks (in-process): init, serial-con, sysinfo, math, proc-debug,
+Kernel tasks (in-process): init, serial-con, sysinfo, math, timer, proc-debug,
 gpu-server, kbd-server, mouse-server, net-server.
 
 User processes (ELF): fs, shell, net-stack, udp-echo, window-server, fbcon,

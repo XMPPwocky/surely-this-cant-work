@@ -101,9 +101,9 @@ TX_RING_OFFSET  = 0x3040
 A compile-time assertion in the kernel verifies that the layout fits
 within the allocated pages.
 
-## UDP Socket Protocol
+## Socket Protocol
 
-Above net-raw sits the **net-stack** user-space process, which provides a
-UDP socket API to applications via the `"net"` named service. See
-`lib/rvos-proto/src/net.rs` for the `NetRequest`/`NetResponse` message
-definitions (Bind, SendTo, RecvFrom, Close).
+Above net-raw sits the **net-stack** user-space process, which provides TCP
+and UDP socket APIs to applications via the `"net"` named service. See
+`docs/protocols/socket.md` and `lib/rvos-proto/src/socket.rs` for the
+full socket protocol definition.

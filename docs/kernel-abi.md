@@ -645,7 +645,8 @@ User Process                          Init Server
 | `"sysinfo"`       | System information. Returns a channel connected to the sysinfo service. Send `"PS"` to get a process list (multi-message response terminated by a zero-length sentinel). |
 | `"math"`          | Math computation service. Returns a channel connected to the math service. Send serialized `MathOp` messages; receive `MathResponse` messages (uses the `rvos_wire` serialization format). |
 | `"fs"`            | Filesystem service. Returns a control channel to the tmpfs server. Send Open/Delete/Stat/Readdir requests; Open returns a file channel capability for Read/Write operations. |
-| `"net"`           | UDP network service (user-space `net-stack`). Bind to a port, send/receive UDP datagrams. See `lib/rvos-proto/src/net.rs` for the `NetRequest`/`NetResponse` protocol. |
+| `"net"`           | TCP/IP socket service (user-space `net-stack`). Two-layer protocol: `SocketsRequest`/`SocketsResponse` to create per-socket channels, then `SocketRequest`/`SocketResponse`/`SocketData` for socket operations (bind, connect, send, recv, accept, etc.). See `docs/protocols/socket.md`. |
+| `"timer"`         | Timed wakeup service (kernel task). Send `After { duration_us }`, receive `Expired` when the duration elapses. See `docs/protocols/timer.md`. |
 | `"process-debug"` | Process debugger. Attach to a running process, set breakpoints, single-step, read/write registers and memory. See `docs/protocols/` for details. |
 | `"gpu"`           | VirtIO GPU access (GPU mode only). Allocate framebuffers, set scanout, transfer/flush display regions. |
 | `"kbd"`           | VirtIO keyboard input (GPU mode only). Receive keyboard events. |
