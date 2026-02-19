@@ -137,7 +137,7 @@ pub fn timer_service() {
                         match rvos_wire::from_bytes::<TimerRequest>(&msg.data[..msg.len]) {
                             Ok(TimerRequest::After { duration_us }) => {
                                 let now = crate::task::process::rdtime();
-                                c.deadline = now + duration_us * TICKS_PER_US;
+                                c.deadline = now.saturating_add(duration_us.saturating_mul(TICKS_PER_US));
                             }
                             Err(_) => {}
                         }
