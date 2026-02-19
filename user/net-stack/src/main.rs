@@ -1254,10 +1254,14 @@ fn tcp_input(
         }
         // Check accept backlog
         if sockets[li].accept_count >= TCP_ACCEPT_BACKLOG {
-            return; // silently drop — backlog full
+            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+            return;
         }
         // Allocate a connection
-        let Some(ci) = tcp_alloc_conn(tcp_conns) else { return };
+        let Some(ci) = tcp_alloc_conn(tcp_conns) else {
+            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+            return;
+        };
         let conn = &mut tcp_conns[ci];
         conn.active = true;
         conn.local_port = tcp.dst_port;
