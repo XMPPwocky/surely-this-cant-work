@@ -28,11 +28,19 @@ rvOS uses the standard RISC-V `ecall` instruction to transition from U-mode
 4. On return to user mode, the caller reads results from `a0` (and `a1` where
    applicable).
 
-**Error convention:** Most syscalls return `0` on success. A return value of
-`usize::MAX` (`0xFFFF_FFFF_FFFF_FFFF` on RV64) indicates an error (invalid
-handle, bad pointer, allocation failure, etc.). The non-blocking receive
-(`SYS_CHAN_RECV`) returns `1` when no message is available, distinguishing
-"empty" from "error".
+**Error convention:** Most syscalls return `0` on success. Error codes:
+
+| Code         | Meaning                                                  |
+|--------------|----------------------------------------------------------|
+| `0`          | Success                                                  |
+| `1`          | Empty (non-blocking recv: no message available)          |
+| `2`          | Channel closed (peer endpoint has been deactivated)      |
+| `5`          | Queue full (non-blocking send: destination queue at capacity) |
+| `usize::MAX` | Generic error (invalid handle, bad pointer, allocation failure, etc.) |
+
+Value-returning syscalls (`SYS_CHAN_CREATE`, `SYS_SHM_CREATE`, `SYS_SHM_DUP_RO`,
+`SYS_MMAP`) return the allocated handle/address on success or `usize::MAX` on
+error.
 
 ### User-Side Wrapper Patterns
 
@@ -66,6 +74,8 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 202    | `SYS_CHAN_RECV`        | `a0` = handle, `a1` = msg_ptr | `a0` = 0, 1, 2, or `usize::MAX` | Non-blocking receive. 0=success, 1=empty, 2=channel closed, MAX=error. |
 | 203    | `SYS_CHAN_CLOSE`       | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Closes a channel handle. Decrements the endpoint's ref count; deactivates only when the last handle is closed. |
 | 204    | `SYS_CHAN_RECV_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking receive. Suspends the process until a message arrives. |
+| 205    | `SYS_SHM_CREATE`      | `a0` = size (bytes)           | `a0` = handle or `usize::MAX` | Creates a shared memory region. Returns a handle to the SHM object. |
+| 206    | `SYS_SHM_DUP_RO`      | `a0` = shm_handle             | `a0` = handle or `usize::MAX` | Duplicates a SHM handle as read-only. Returns a new handle. |
 | 207    | `SYS_CHAN_SEND_BLOCKING` | `a0` = handle, `a1` = msg_ptr | `a0` = 0 or `usize::MAX` | Blocking send. Suspends the process if the queue is full until space is available. |
 | 208    | `SYS_CHAN_POLL_ADD`    | `a0` = handle                 | `a0` = 0 or `usize::MAX`  | Registers the calling process as waiting on this channel. Use with `SYS_BLOCK` for multiplexed I/O. |
 | 209    | `SYS_BLOCK`           | (none)                        | `a0` = 0                  | Blocks the calling process until woken by a channel event. |
@@ -195,6 +205,34 @@ eventually closes that handle via `SYS_CHAN_CLOSE`, the ref count is
 decremented back.
 
 Returns 0 on success, `usize::MAX` if the handle is invalid.
+
+#### SYS_SHM_CREATE (205)
+
+Creates a shared memory (SHM) region backed by contiguous physical pages.
+
+- `a0` = size in bytes (rounded up to page granularity).
+
+The kernel allocates contiguous physical frames, zeroes them, creates an
+internal SHM object, and installs a read-write SHM handle in the caller's
+handle table. The SHM handle can be sent to another process via capability
+transfer; the receiver gets a handle to the same physical pages. To map the
+SHM into the process's address space, use `SYS_MMAP` with the SHM handle.
+
+Returns the handle index on success, `usize::MAX` on failure (zero size,
+allocation failure, handle table full).
+
+#### SYS_SHM_DUP_RO (206)
+
+Duplicates an existing SHM handle as read-only.
+
+- `a0` = existing SHM handle.
+
+Creates a new SHM handle that references the same physical pages but with
+read-only permissions. The new handle can be passed to another process via
+capability transfer for read-only shared memory access.
+
+Returns the new handle index on success, `usize::MAX` on failure (invalid
+handle, not a SHM handle, handle table full).
 
 #### SYS_CHAN_POLL_ADD (208)
 
@@ -601,12 +639,17 @@ User Process                          Init Server
 
 ### Available Services
 
-| Service Name | Description                                                        |
-|--------------|--------------------------------------------------------------------|
-| `"stdio"`    | Console I/O. Returns a channel connected to the appropriate console server (serial or framebuffer, depending on how the process was spawned). |
-| `"sysinfo"`  | System information. Returns a channel connected to the sysinfo service. Send `"PS"` to get a process list (multi-message response terminated by a zero-length sentinel). |
-| `"math"`     | Math computation service. Returns a channel connected to the math service. Send serialized `MathOp` messages; receive `MathResponse` messages (uses the `rvos_wire` serialization format). |
-| `"fs"`       | Filesystem service. Returns a control channel to the tmpfs server. Send Open/Delete/Stat/Readdir requests; Open returns a file channel capability for Read/Write operations. |
+| Service Name      | Description                                                        |
+|-------------------|--------------------------------------------------------------------|
+| `"stdio"`         | Console I/O. Returns a channel connected to the appropriate console server (serial or framebuffer, depending on how the process was spawned). |
+| `"sysinfo"`       | System information. Returns a channel connected to the sysinfo service. Send `"PS"` to get a process list (multi-message response terminated by a zero-length sentinel). |
+| `"math"`          | Math computation service. Returns a channel connected to the math service. Send serialized `MathOp` messages; receive `MathResponse` messages (uses the `rvos_wire` serialization format). |
+| `"fs"`            | Filesystem service. Returns a control channel to the tmpfs server. Send Open/Delete/Stat/Readdir requests; Open returns a file channel capability for Read/Write operations. |
+| `"net"`           | UDP network service (user-space `net-stack`). Bind to a port, send/receive UDP datagrams. See `lib/rvos-proto/src/net.rs` for the `NetRequest`/`NetResponse` protocol. |
+| `"process-debug"` | Process debugger. Attach to a running process, set breakpoints, single-step, read/write registers and memory. See `docs/protocols/` for details. |
+| `"gpu"`           | VirtIO GPU access (GPU mode only). Allocate framebuffers, set scanout, transfer/flush display regions. |
+| `"kbd"`           | VirtIO keyboard input (GPU mode only). Receive keyboard events. |
+| `"mouse"`         | VirtIO tablet/mouse input (GPU mode only). Receive pointer events. |
 
 ### Service Channel Lifecycle
 
