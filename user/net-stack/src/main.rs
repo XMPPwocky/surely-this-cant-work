@@ -1,6 +1,8 @@
 // Pull in the rvos-rt crate so _start gets linked
 extern crate rvos_rt;
+extern crate alloc;
 
+use alloc::boxed::Box;
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
 use rvos::rvos_wire;
@@ -38,8 +40,22 @@ const ARP_HLEN: usize = 28;
 
 const IPV4_HDR_SIZE: usize = 20;
 const PROTO_UDP: u8 = 17;
+const PROTO_TCP: u8 = 6;
 
 const UDP_HDR_SIZE: usize = 8;
+const TCP_HDR_SIZE: usize = 20;
+const TCP_MSS: u16 = 1460;
+const TCP_WINDOW: u16 = 4096;
+const MAX_TCP_CONNS: usize = 16;
+const TCP_INITIAL_RTO: u64 = TICK_HZ; // 1 second
+const TCP_MAX_RETX: u8 = 8;
+const TCP_ACCEPT_BACKLOG: usize = 4;
+
+// TCP flags
+const TCP_FIN: u8 = 0x01;
+const TCP_SYN: u8 = 0x02;
+const TCP_RST: u8 = 0x04;
+const TCP_ACK: u8 = 0x10;
 
 const MAX_SOCKETS: usize = 16;
 const MAX_PENDING: usize = 4;
@@ -497,6 +513,234 @@ fn build_udp(
 }
 
 // ---------------------------------------------------------------------------
+// TCP
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)] // all states are part of the TCP FSM even if not all are constructed yet
+enum TcpState {
+    Closed,
+    Listen,
+    SynSent,
+    SynReceived,
+    Established,
+    FinWait1,
+    FinWait2,
+    CloseWait,
+    Closing,
+    LastAck,
+    TimeWait,
+}
+
+struct TcpHdr {
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+}
+
+fn parse_tcp(packet: &[u8]) -> Option<(TcpHdr, &[u8])> {
+    if packet.len() < TCP_HDR_SIZE {
+        return None;
+    }
+    let src_port = u16::from_be_bytes([packet[0], packet[1]]);
+    let dst_port = u16::from_be_bytes([packet[2], packet[3]]);
+    let seq = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+    let ack = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+    let data_offset = (packet[12] >> 4) as usize;
+    let hdr_len = data_offset * 4;
+    if hdr_len < TCP_HDR_SIZE || hdr_len > packet.len() {
+        return None;
+    }
+    let flags = packet[13];
+    let window = u16::from_be_bytes([packet[14], packet[15]]);
+    let data = &packet[hdr_len..];
+    Some((TcpHdr { src_port, dst_port, seq, ack, flags, window }, data))
+}
+
+/// Compute TCP checksum over pseudo-header + TCP segment.
+fn tcp_checksum(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_segment: &[u8]) -> u16 {
+    let tcp_len = tcp_segment.len() as u16;
+    let mut sum: u32 = 0;
+    // Pseudo-header
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+    sum += PROTO_TCP as u32;
+    sum += tcp_len as u32;
+    // Sum TCP segment
+    let mut i = 0;
+    while i + 1 < tcp_segment.len() {
+        sum += u16::from_be_bytes([tcp_segment[i], tcp_segment[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < tcp_segment.len() {
+        sum += (tcp_segment[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let cksum = !(sum as u16);
+    if cksum == 0 { 0xFFFF } else { cksum }
+}
+
+/// Verify TCP checksum. Returns true if valid.
+fn tcp_checksum_ok(src_ip: &[u8; 4], dst_ip: &[u8; 4], tcp_segment: &[u8]) -> bool {
+    let tcp_len = tcp_segment.len() as u16;
+    let mut sum: u32 = 0;
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
+    sum += PROTO_TCP as u32;
+    sum += tcp_len as u32;
+    let mut i = 0;
+    while i + 1 < tcp_segment.len() {
+        sum += u16::from_be_bytes([tcp_segment[i], tcp_segment[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < tcp_segment.len() {
+        sum += (tcp_segment[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    sum == 0xFFFF
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tcp(
+    src_ip: &[u8; 4], dst_ip: &[u8; 4],
+    src_port: u16, dst_port: u16,
+    seq: u32, ack: u32, flags: u8, window: u16,
+    payload: &[u8], buf: &mut [u8],
+) -> usize {
+    let total_len = TCP_HDR_SIZE + payload.len();
+    if total_len > buf.len() || total_len > 0xFFFF {
+        return 0;
+    }
+    // Source port
+    let sp = src_port.to_be_bytes();
+    buf[0] = sp[0]; buf[1] = sp[1];
+    // Dest port
+    let dp = dst_port.to_be_bytes();
+    buf[2] = dp[0]; buf[3] = dp[1];
+    // Sequence number
+    let sq = seq.to_be_bytes();
+    buf[4] = sq[0]; buf[5] = sq[1]; buf[6] = sq[2]; buf[7] = sq[3];
+    // Ack number
+    let ak = ack.to_be_bytes();
+    buf[8] = ak[0]; buf[9] = ak[1]; buf[10] = ak[2]; buf[11] = ak[3];
+    // Data offset (5 words = 20 bytes) + reserved
+    buf[12] = 0x50;
+    // Flags
+    buf[13] = flags;
+    // Window
+    let wn = window.to_be_bytes();
+    buf[14] = wn[0]; buf[15] = wn[1];
+    // Checksum placeholder
+    buf[16] = 0; buf[17] = 0;
+    // Urgent pointer
+    buf[18] = 0; buf[19] = 0;
+    // Payload
+    if !payload.is_empty() {
+        buf[TCP_HDR_SIZE..total_len].copy_from_slice(payload);
+    }
+    // Compute checksum
+    let cksum = tcp_checksum(src_ip, dst_ip, &buf[..total_len]);
+    let cb = cksum.to_be_bytes();
+    buf[16] = cb[0]; buf[17] = cb[1];
+    total_len
+}
+
+struct TcpConn {
+    local_port: u16,
+    remote_addr: [u8; 4],
+    remote_port: u16,
+    state: TcpState,
+    // Send state
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_wnd: u16,
+    // Receive state
+    rcv_nxt: u32,
+    // Buffers
+    recv_buf: [u8; 4096],
+    recv_len: usize,
+    send_buf: [u8; 4096],
+    send_len: usize,
+    // Retransmission
+    rto_ticks: u64,
+    retx_count: u8,
+    retx_deadline: u64, // 0 = no pending retransmit
+    // Owning socket index
+    socket_idx: usize,
+    // For listening: index of the listener socket that spawned this conn
+    listener_sock_idx: usize,
+    active: bool,
+    // TimeWait deadline
+    time_wait_deadline: u64,
+}
+
+impl TcpConn {
+    const fn new() -> Self {
+        TcpConn {
+            local_port: 0,
+            remote_addr: [0; 4],
+            remote_port: 0,
+            state: TcpState::Closed,
+            snd_una: 0,
+            snd_nxt: 0,
+            snd_wnd: 0,
+            rcv_nxt: 0,
+            recv_buf: [0; 4096],
+            recv_len: 0,
+            send_buf: [0; 4096],
+            send_len: 0,
+            rto_ticks: 0,
+            retx_count: 0,
+            retx_deadline: 0,
+            socket_idx: usize::MAX,
+            listener_sock_idx: usize::MAX,
+            active: false,
+            time_wait_deadline: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// Initial sequence number from clock.
+fn tcp_initial_seq() -> u32 {
+    (now_ticks() & 0xFFFF_FFFF) as u32
+}
+
+type TcpConns = [TcpConn; MAX_TCP_CONNS];
+
+/// Find a TCP connection matching a 4-tuple.
+fn tcp_find_conn(conns: &TcpConns, local_port: u16, remote_addr: &[u8; 4], remote_port: u16) -> Option<usize> {
+    for (i, c) in conns.iter().enumerate() {
+        if c.active && c.local_port == local_port
+            && c.remote_addr == *remote_addr
+            && c.remote_port == remote_port
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Allocate a free TCP connection slot.
+fn tcp_alloc_conn(conns: &TcpConns) -> Option<usize> {
+    conns.iter().position(|c| !c.active)
+}
+
+// ---------------------------------------------------------------------------
 // Routing
 // ---------------------------------------------------------------------------
 
@@ -519,6 +763,13 @@ struct Socket {
     recv_pending: bool,
     active: bool,
     is_stream: bool,
+    // TCP-specific
+    tcp_conn_idx: usize,        // index into tcp_conns (usize::MAX = none)
+    tcp_listening: bool,
+    accept_queue: [usize; TCP_ACCEPT_BACKLOG], // conn indices waiting to be accepted
+    accept_count: usize,
+    accept_pending: bool,       // client has called Accept, waiting for connection
+    recv_max_len: u32,          // for TCP Recv: max bytes to return
 }
 
 impl Socket {
@@ -529,18 +780,31 @@ impl Socket {
             recv_pending: false,
             active: false,
             is_stream: false,
+            tcp_conn_idx: usize::MAX,
+            tcp_listening: false,
+            accept_queue: [usize::MAX; TCP_ACCEPT_BACKLOG],
+            accept_count: 0,
+            accept_pending: false,
+            recv_max_len: 0,
         }
     }
 
     /// Clean up a socket whose client channel is dead.
-    fn deactivate(&mut self) {
+    fn deactivate(&mut self, tcp_conns: &mut TcpConns) {
         if self.active {
             raw::sys_chan_close(self.handle);
-            self.active = false;
-            self.handle = 0;
-            self.port = 0;
-            self.recv_pending = false;
-            self.is_stream = false;
+            // Clean up associated TCP connection
+            if self.tcp_conn_idx != usize::MAX {
+                tcp_conns[self.tcp_conn_idx].reset();
+            }
+            // Clean up accept queue connections
+            for i in 0..self.accept_count {
+                let ci = self.accept_queue[i];
+                if ci != usize::MAX {
+                    tcp_conns[ci].reset();
+                }
+            }
+            *self = Self::new();
         }
     }
 }
@@ -714,6 +978,8 @@ fn process_frame(
     our_mac: &[u8; 6],
     arp_table: &mut ArpTable,
     sockets: &mut [Socket; MAX_SOCKETS],
+    tcp_conns: &mut TcpConns,
+    pending_accept: &mut Option<PendingAcceptInfo>,
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
 ) {
@@ -776,13 +1042,27 @@ fn process_frame(
                             sock.recv_pending = false;
                             if ret == 2 {
                                 // Client channel closed — clean up socket
-                                sock.deactivate();
+                                sock.deactivate(tcp_conns);
                             }
                         }
                         // Only deliver to the first matching socket
                         break;
                     }
                 }
+            } else if ip.proto == PROTO_TCP {
+                if !tcp_checksum_ok(&ip.src, &ip.dst, ip_payload) {
+                    return;
+                }
+                let (tcp, tcp_data) = match parse_tcp(ip_payload) {
+                    Some(t) => t,
+                    None => return,
+                };
+                tcp_input(
+                    &ip.src, &ip.dst,
+                    &tcp, tcp_data,
+                    sockets, tcp_conns, pending_accept,
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
             }
         }
         _ => {} // Ignore other ethertypes
@@ -790,13 +1070,699 @@ fn process_frame(
 }
 
 // ---------------------------------------------------------------------------
+// TCP input processing
+// ---------------------------------------------------------------------------
+
+/// Send a TCP segment (helper wrapping build_tcp + build_ipv4 + send_ip_packet).
+#[allow(clippy::too_many_arguments)]
+fn tcp_send_segment(
+    src_port: u16, dst_addr: &[u8; 4], dst_port: u16,
+    seq: u32, ack: u32, flags: u8, window: u16,
+    payload: &[u8],
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+) {
+    let mut tcp_buf = [0u8; 1500];
+    let tcp_len = build_tcp(
+        &OUR_IP, dst_addr, src_port, dst_port,
+        seq, ack, flags, window, payload, &mut tcp_buf,
+    );
+    if tcp_len == 0 { return; }
+    let mut ip_buf = [0u8; 1534];
+    let ip_len = build_ipv4(&OUR_IP, dst_addr, PROTO_TCP, &tcp_buf[..tcp_len], &mut ip_buf);
+    if ip_len == 0 { return; }
+    send_ip_packet(shm_base, raw_handle, our_mac, arp_table, pending, &ip_buf[..ip_len], dst_addr, now);
+}
+
+/// Send a RST in response to an unexpected segment.
+#[allow(clippy::too_many_arguments)]
+fn tcp_send_rst(
+    src_ip: &[u8; 4], tcp: &TcpHdr,
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+) {
+    let (seq, ack, flags) = if tcp.flags & TCP_ACK != 0 {
+        (tcp.ack, 0, TCP_RST)
+    } else {
+        (0, tcp.seq.wrapping_add(1), TCP_RST | TCP_ACK)
+    };
+    tcp_send_segment(
+        tcp.dst_port, src_ip, tcp.src_port,
+        seq, ack, flags, 0, &[],
+        shm_base, raw_handle, our_mac, arp_table, pending, now,
+    );
+}
+
+/// Deliver buffered data to a client waiting on Recv.
+fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns) {
+    if !sock.recv_pending || sock.tcp_conn_idx == usize::MAX {
+        return;
+    }
+    let conn = &mut tcp_conns[sock.tcp_conn_idx];
+    if conn.recv_len == 0 {
+        // If connection is in CloseWait/LastAck (remote sent FIN) and buffer is empty,
+        // deliver zero-length read to signal EOF
+        if conn.state == TcpState::CloseWait || conn.state == TcpState::LastAck
+            || conn.state == TcpState::Closed
+        {
+            let mut msg = Message::new();
+            msg.len = rvos_wire::to_bytes(
+                &SocketData::Data { data: &[] },
+                &mut msg.data,
+            ).unwrap_or(0);
+            let ret = raw::sys_chan_send(sock.handle, &msg);
+            sock.recv_pending = false;
+            if ret == 2 {
+                sock.deactivate(tcp_conns);
+            }
+        }
+        return;
+    }
+    let deliver_len = (conn.recv_len).min(sock.recv_max_len as usize);
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(
+        &SocketData::Data { data: &conn.recv_buf[..deliver_len] },
+        &mut msg.data,
+    ).unwrap_or(0);
+    let ret = raw::sys_chan_send(sock.handle, &msg);
+    sock.recv_pending = false;
+    if ret == 2 {
+        sock.deactivate(tcp_conns);
+        return;
+    }
+    // Remove delivered data from buffer
+    if deliver_len < conn.recv_len {
+        conn.recv_buf.copy_within(deliver_len..conn.recv_len, 0);
+    }
+    conn.recv_len -= deliver_len;
+}
+
+/// Try to send data from the send buffer.
+#[allow(clippy::too_many_arguments)]
+fn tcp_try_send_data(
+    conn_idx: usize,
+    tcp_conns: &mut TcpConns,
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+) {
+    let conn = &mut tcp_conns[conn_idx];
+    if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
+        return;
+    }
+    // How much data can we send?
+    let in_flight = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+    let window = conn.snd_wnd as usize;
+    let can_send = window.saturating_sub(in_flight);
+    let unsent = conn.send_len - (conn.snd_nxt.wrapping_sub(conn.snd_una) as usize);
+    let send_len = unsent.min(can_send).min(TCP_MSS as usize);
+    if send_len == 0 {
+        return;
+    }
+    let offset = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+    let payload = &conn.send_buf[offset..offset + send_len];
+    tcp_send_segment(
+        conn.local_port, &conn.remote_addr, conn.remote_port,
+        conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
+        payload,
+        shm_base, raw_handle, our_mac, arp_table, pending, now,
+    );
+    conn.snd_nxt = conn.snd_nxt.wrapping_add(send_len as u32);
+    // Set retransmit timer
+    if conn.retx_deadline == 0 {
+        conn.rto_ticks = TCP_INITIAL_RTO;
+        conn.retx_count = 0;
+        conn.retx_deadline = now + conn.rto_ticks;
+    }
+}
+
+/// Process an incoming TCP segment.
+#[allow(clippy::too_many_arguments)]
+fn tcp_input(
+    src_ip: &[u8; 4], _dst_ip: &[u8; 4],
+    tcp: &TcpHdr, data: &[u8],
+    sockets: &mut [Socket; MAX_SOCKETS],
+    tcp_conns: &mut TcpConns,
+    pending_accept: &mut Option<PendingAcceptInfo>,
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+) {
+    // 1. Try to find an existing connection
+    if let Some(ci) = tcp_find_conn(tcp_conns, tcp.dst_port, src_ip, tcp.src_port) {
+        tcp_input_conn(
+            ci, src_ip, tcp, data,
+            sockets, tcp_conns, pending_accept, shm_base, raw_handle, our_mac, arp_table, pending, now,
+        );
+        return;
+    }
+
+    // 2. Check for a listening socket
+    let listener_idx = sockets.iter().position(|s| {
+        s.active && s.tcp_listening && s.port == tcp.dst_port
+    });
+    if let Some(li) = listener_idx {
+        // Only SYN should arrive for a listening socket
+        if tcp.flags & TCP_SYN == 0 || tcp.flags & TCP_ACK != 0 {
+            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now);
+            return;
+        }
+        // Check accept backlog
+        if sockets[li].accept_count >= TCP_ACCEPT_BACKLOG {
+            return; // silently drop — backlog full
+        }
+        // Allocate a connection
+        let Some(ci) = tcp_alloc_conn(tcp_conns) else { return };
+        let conn = &mut tcp_conns[ci];
+        conn.active = true;
+        conn.local_port = tcp.dst_port;
+        conn.remote_addr = *src_ip;
+        conn.remote_port = tcp.src_port;
+        conn.state = TcpState::SynReceived;
+        conn.rcv_nxt = tcp.seq.wrapping_add(1);
+        conn.snd_una = tcp_initial_seq();
+        conn.snd_nxt = conn.snd_una.wrapping_add(1); // SYN consumes one seq
+        conn.snd_wnd = tcp.window;
+        conn.socket_idx = usize::MAX; // not yet associated with a socket
+        conn.listener_sock_idx = li;
+        conn.rto_ticks = TCP_INITIAL_RTO;
+        conn.retx_count = 0;
+        conn.retx_deadline = now + conn.rto_ticks;
+        // Send SYN-ACK
+        tcp_send_segment(
+            conn.local_port, &conn.remote_addr, conn.remote_port,
+            conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
+            shm_base, raw_handle, our_mac, arp_table, pending, now,
+        );
+        return;
+    }
+
+    // 3. No match — send RST
+    if tcp.flags & TCP_RST == 0 {
+        tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now);
+    }
+}
+
+/// Process TCP input for an existing connection.
+#[allow(clippy::too_many_arguments)]
+fn tcp_input_conn(
+    ci: usize,
+    src_ip: &[u8; 4],
+    tcp: &TcpHdr, data: &[u8],
+    sockets: &mut [Socket; MAX_SOCKETS],
+    tcp_conns: &mut TcpConns,
+    pending_accept: &mut Option<PendingAcceptInfo>,
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+) {
+    // Handle RST
+    if tcp.flags & TCP_RST != 0 {
+        let conn = &mut tcp_conns[ci];
+        let si = conn.socket_idx;
+        conn.reset();
+        if si != usize::MAX && si < MAX_SOCKETS && sockets[si].active {
+            // Notify client of reset
+            let mut msg = Message::new();
+            msg.len = rvos_wire::to_bytes(
+                &SocketResponse::Error { code: SocketError::ConnReset {} },
+                &mut msg.data,
+            ).unwrap_or(0);
+            let _ = raw::sys_chan_send(sockets[si].handle, &msg);
+        }
+        return;
+    }
+
+    // Read state before the match so we can reborrow tcp_conns within each arm
+    let state = tcp_conns[ci].state;
+    match state {
+        TcpState::SynSent => {
+            let conn = &mut tcp_conns[ci];
+            // We sent SYN (client connect), expecting SYN-ACK
+            if tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK != 0 {
+                if tcp.ack != conn.snd_nxt {
+                    tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now);
+                    return;
+                }
+                conn.snd_una = tcp.ack;
+                conn.rcv_nxt = tcp.seq.wrapping_add(1);
+                conn.snd_wnd = tcp.window;
+                conn.state = TcpState::Established;
+                conn.retx_deadline = 0;
+                conn.retx_count = 0;
+                // Send ACK
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+                // Notify waiting Connect call
+                if conn.socket_idx != usize::MAX && conn.socket_idx < MAX_SOCKETS {
+                    let sock = &mut sockets[conn.socket_idx];
+                    let mut msg = Message::new();
+                    msg.len = rvos_wire::to_bytes(
+                        &SocketResponse::Ok {},
+                        &mut msg.data,
+                    ).unwrap_or(0);
+                    let _ = raw::sys_chan_send(sock.handle, &msg);
+                }
+            }
+        }
+        TcpState::SynReceived => {
+            // We sent SYN-ACK (server side), expecting ACK
+            if tcp.flags & TCP_ACK != 0 {
+                let conn = &mut tcp_conns[ci];
+                if tcp.ack != conn.snd_nxt {
+                    return;
+                }
+                conn.snd_una = tcp.ack;
+                conn.snd_wnd = tcp.window;
+                conn.state = TcpState::Established;
+                conn.retx_deadline = 0;
+                conn.retx_count = 0;
+                // Add to listener's accept queue
+                let li = conn.listener_sock_idx;
+                if li != usize::MAX && li < MAX_SOCKETS && sockets[li].active
+                    && sockets[li].accept_count < TCP_ACCEPT_BACKLOG
+                {
+                    let cnt = sockets[li].accept_count;
+                    sockets[li].accept_queue[cnt] = ci;
+                    sockets[li].accept_count += 1;
+                    // If Accept is pending, deliver now
+                    if sockets[li].accept_pending {
+                        tcp_deliver_accept(
+                            &mut sockets[li], tcp_conns, pending_accept, 0,
+                            shm_base, raw_handle, our_mac, arp_table, pending, now,
+                        );
+                        // Process pending accept assignment
+                        if let Some(info) = pending_accept.take() {
+                            assign_accepted_socket(sockets, tcp_conns, info.handle, info.conn_idx);
+                        }
+                    }
+                }
+            }
+        }
+        TcpState::Established => {
+            tcp_input_established(ci, tcp, data, sockets, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now);
+        }
+        TcpState::FinWait1 => {
+            let conn = &mut tcp_conns[ci];
+            // We sent FIN, waiting for ACK
+            if tcp.flags & TCP_ACK != 0 && tcp.ack == conn.snd_nxt {
+                conn.snd_una = tcp.ack;
+                conn.retx_deadline = 0;
+                if tcp.flags & TCP_FIN != 0 {
+                    // Simultaneous close: FIN+ACK
+                    conn.rcv_nxt = tcp.seq.wrapping_add(1);
+                    conn.state = TcpState::TimeWait;
+                    conn.time_wait_deadline = now + 2 * TICK_HZ;
+                    tcp_send_segment(
+                        conn.local_port, &conn.remote_addr, conn.remote_port,
+                        conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+                        shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    );
+                } else {
+                    conn.state = TcpState::FinWait2;
+                }
+            } else if tcp.flags & TCP_FIN != 0 {
+                // Simultaneous close without ACK
+                conn.rcv_nxt = tcp.seq.wrapping_add(1);
+                conn.state = TcpState::Closing;
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+            }
+        }
+        TcpState::FinWait2 => {
+            let conn = &mut tcp_conns[ci];
+            // Waiting for remote FIN
+            if tcp.flags & TCP_FIN != 0 {
+                conn.rcv_nxt = tcp.seq.wrapping_add(1);
+                conn.state = TcpState::TimeWait;
+                conn.time_wait_deadline = now + 2 * TICK_HZ;
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+            }
+        }
+        TcpState::Closing => {
+            let conn = &mut tcp_conns[ci];
+            if tcp.flags & TCP_ACK != 0 && tcp.ack == conn.snd_nxt {
+                conn.state = TcpState::TimeWait;
+                conn.time_wait_deadline = now + 2 * TICK_HZ;
+            }
+        }
+        TcpState::LastAck => {
+            let conn = &mut tcp_conns[ci];
+            if tcp.flags & TCP_ACK != 0 && tcp.ack == conn.snd_nxt {
+                let si = conn.socket_idx;
+                conn.reset();
+                if si != usize::MAX && si < MAX_SOCKETS {
+                    // Don't deactivate — let client close the channel
+                }
+            }
+        }
+        TcpState::CloseWait => {
+            // Process ACKs for sent data
+            if tcp.flags & TCP_ACK != 0 {
+                tcp_process_ack(ci, tcp_conns, tcp.ack);
+            }
+        }
+        TcpState::TimeWait => {
+            let conn = &mut tcp_conns[ci];
+            // Re-ACK any FIN retransmissions
+            if tcp.flags & TCP_FIN != 0 {
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Process TCP data in Established state.
+#[allow(clippy::too_many_arguments)]
+fn tcp_input_established(
+    ci: usize,
+    tcp: &TcpHdr, data: &[u8],
+    sockets: &mut [Socket; MAX_SOCKETS],
+    tcp_conns: &mut TcpConns,
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+) {
+    // Process ACK
+    if tcp.flags & TCP_ACK != 0 {
+        tcp_process_ack(ci, tcp_conns, tcp.ack);
+    }
+    let conn = &mut tcp_conns[ci];
+    conn.snd_wnd = tcp.window;
+
+    // Accept in-order data only
+    if !data.is_empty() && tcp.seq == conn.rcv_nxt {
+        let space = conn.recv_buf.len() - conn.recv_len;
+        let copy_len = data.len().min(space);
+        if copy_len > 0 {
+            conn.recv_buf[conn.recv_len..conn.recv_len + copy_len]
+                .copy_from_slice(&data[..copy_len]);
+            conn.recv_len += copy_len;
+            conn.rcv_nxt = conn.rcv_nxt.wrapping_add(copy_len as u32);
+        }
+        // Send ACK
+        tcp_send_segment(
+            conn.local_port, &conn.remote_addr, conn.remote_port,
+            conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+            shm_base, raw_handle, our_mac, arp_table, pending, now,
+        );
+        // Try to deliver data to waiting client
+        let si = conn.socket_idx;
+        if si != usize::MAX && si < MAX_SOCKETS {
+            tcp_try_deliver_recv(&mut sockets[si], tcp_conns);
+        }
+    } else if !data.is_empty() {
+        // Out-of-order: send duplicate ACK (will cause retransmit on sender side)
+        tcp_send_segment(
+            conn.local_port, &conn.remote_addr, conn.remote_port,
+            conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+            shm_base, raw_handle, our_mac, arp_table, pending, now,
+        );
+    }
+
+    // Handle FIN
+    let conn = &mut tcp_conns[ci];
+    if tcp.flags & TCP_FIN != 0 && tcp.seq == conn.rcv_nxt {
+        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+        conn.state = TcpState::CloseWait;
+        // ACK the FIN
+        tcp_send_segment(
+            conn.local_port, &conn.remote_addr, conn.remote_port,
+            conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
+            shm_base, raw_handle, our_mac, arp_table, pending, now,
+        );
+        // If client is waiting on Recv, deliver EOF
+        let si = conn.socket_idx;
+        if si != usize::MAX && si < MAX_SOCKETS {
+            tcp_try_deliver_recv(&mut sockets[si], tcp_conns);
+        }
+    }
+
+    // Try to send more data if window opened up
+    if tcp_conns[ci].send_len > 0 {
+        tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now);
+    }
+}
+
+/// Process an ACK: advance snd_una, remove acked data from send buffer.
+fn tcp_process_ack(ci: usize, tcp_conns: &mut TcpConns, ack_num: u32) {
+    let conn = &mut tcp_conns[ci];
+    let acked = ack_num.wrapping_sub(conn.snd_una);
+    if acked == 0 || acked > (conn.send_len as u32) {
+        return;
+    }
+    let acked = acked as usize;
+    // Remove acked data from send_buf
+    if acked < conn.send_len {
+        conn.send_buf.copy_within(acked..conn.send_len, 0);
+    }
+    conn.send_len -= acked;
+    conn.snd_una = ack_num;
+    // If all data is acked, clear retransmit timer
+    if conn.snd_una == conn.snd_nxt {
+        conn.retx_deadline = 0;
+        conn.retx_count = 0;
+    } else {
+        // Reset retransmit timer for remaining data
+        conn.rto_ticks = TCP_INITIAL_RTO;
+        conn.retx_count = 0;
+        conn.retx_deadline = now_ticks() + conn.rto_ticks;
+    }
+}
+
+/// Deliver a connection from the accept queue to a waiting Accept call.
+#[allow(clippy::too_many_arguments)]
+fn tcp_deliver_accept(
+    sock: &mut Socket,
+    tcp_conns: &mut TcpConns,
+    pending_accept: &mut Option<PendingAcceptInfo>,
+    _sockets_base: usize,
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], _now: u64,
+) {
+    if !sock.accept_pending || sock.accept_count == 0 {
+        return;
+    }
+    // Pop the first connection from the accept queue
+    let ci = sock.accept_queue[0];
+    for j in 1..sock.accept_count {
+        sock.accept_queue[j - 1] = sock.accept_queue[j];
+    }
+    sock.accept_count -= 1;
+    sock.accept_queue[sock.accept_count] = usize::MAX;
+
+    let conn = &mut tcp_conns[ci];
+    let peer_addr = SocketAddr::Inet4 {
+        a: conn.remote_addr[0], b: conn.remote_addr[1],
+        c: conn.remote_addr[2], d: conn.remote_addr[3],
+        port: conn.remote_port,
+    };
+
+    // Create a new channel pair for the accepted socket
+    let (sock_a, sock_b) = raw::sys_chan_create();
+
+    // Send Accepted response with the new channel cap
+    let mut resp = Message::new();
+    let (len, cap_count) = rvos_wire::to_bytes_with_caps(
+        &SocketResponse::Accepted {
+            peer_addr,
+            socket: rvos_wire::RawChannelCap::new(sock_b),
+        },
+        &mut resp.data,
+        &mut resp.caps,
+    ).unwrap_or((0, 0));
+    resp.len = len;
+    resp.cap_count = cap_count;
+    let ret = raw::sys_chan_send(sock.handle, &resp);
+    raw::sys_chan_close(sock_b);
+    sock.accept_pending = false;
+
+    if ret == 2 {
+        // Listener client gone
+        raw::sys_chan_close(sock_a);
+        conn.reset();
+        return;
+    }
+
+    // We can't assign the socket here because sock is already a mutable
+    // reference to one element of the sockets array. Store the info for
+    // the caller to assign after this function returns.
+    let _ = (shm_base, raw_handle, our_mac, arp_table, pending);
+    conn.socket_idx = sock_a; // abuse: store handle temporarily
+    *pending_accept = Some(PendingAcceptInfo {
+        handle: sock_a,
+        conn_idx: ci,
+    });
+}
+
+struct PendingAcceptInfo {
+    handle: usize,
+    conn_idx: usize,
+}
+
+/// Check retransmit timers for all active TCP connections.
+#[allow(clippy::too_many_arguments)]
+fn tcp_check_retransmits(
+    tcp_conns: &mut TcpConns,
+    shm_base: usize, raw_handle: usize,
+    our_mac: &[u8; 6], arp_table: &ArpTable,
+    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    sockets: &mut [Socket; MAX_SOCKETS],
+) {
+    for conn in tcp_conns.iter_mut() {
+        if !conn.active || conn.retx_deadline == 0 || now < conn.retx_deadline {
+            continue;
+        }
+        conn.retx_count += 1;
+        if conn.retx_count > TCP_MAX_RETX {
+            // Too many retransmits — abort connection
+            let si = conn.socket_idx;
+            conn.reset();
+            if si != usize::MAX && si < MAX_SOCKETS && sockets[si].active {
+                let mut msg = Message::new();
+                msg.len = rvos_wire::to_bytes(
+                    &SocketResponse::Error { code: SocketError::TimedOut {} },
+                    &mut msg.data,
+                ).unwrap_or(0);
+                let _ = raw::sys_chan_send(sockets[si].handle, &msg);
+            }
+            continue;
+        }
+        // Exponential backoff
+        conn.rto_ticks = conn.rto_ticks.saturating_mul(2).min(60 * TICK_HZ);
+        conn.retx_deadline = now + conn.rto_ticks;
+
+        match conn.state {
+            TcpState::SynSent => {
+                // Retransmit SYN
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+            }
+            TcpState::SynReceived => {
+                // Retransmit SYN-ACK
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+            }
+            TcpState::Established | TcpState::CloseWait => {
+                // Retransmit unacked data
+                let unacked_len = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+                if unacked_len > 0 && unacked_len <= conn.send_len {
+                    let send_len = unacked_len.min(TCP_MSS as usize);
+                    tcp_send_segment(
+                        conn.local_port, &conn.remote_addr, conn.remote_port,
+                        conn.snd_una, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
+                        &conn.send_buf[..send_len],
+                        shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    );
+                }
+            }
+            TcpState::FinWait1 | TcpState::LastAck => {
+                // Retransmit FIN
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_nxt.wrapping_sub(1), conn.rcv_nxt,
+                    TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+            }
+            _ => {
+                conn.retx_deadline = 0;
+            }
+        }
+    }
+}
+
+/// Clean up TimeWait connections that have expired.
+fn tcp_check_timewait(tcp_conns: &mut TcpConns, now: u64) {
+    for conn in tcp_conns.iter_mut() {
+        if conn.active && conn.state == TcpState::TimeWait
+            && conn.time_wait_deadline != 0 && now >= conn.time_wait_deadline
+        {
+            conn.reset();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handle client requests
 // ---------------------------------------------------------------------------
+
+/// Send a SocketResponse::Ok on a handle.
+fn send_sock_ok(handle: usize) {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&SocketResponse::Ok {}, &mut msg.data).unwrap_or(0);
+    let _ = raw::sys_chan_send(handle, &msg);
+}
+
+/// Send a SocketResponse::Error on a handle.
+fn send_sock_error(handle: usize, code: SocketError) {
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&SocketResponse::Error { code }, &mut msg.data).unwrap_or(0);
+    let _ = raw::sys_chan_send(handle, &msg);
+}
+
+/// Allocate an ephemeral port (49152..65535) that isn't in use.
+fn alloc_ephemeral_port(sockets: &[Socket; MAX_SOCKETS]) -> u16 {
+    static mut NEXT_EPHEMERAL: u16 = 49152;
+    for _ in 0..1000 {
+        let port = unsafe {
+            let p = NEXT_EPHEMERAL;
+            NEXT_EPHEMERAL = if p >= 65534 { 49152 } else { p + 1 };
+            p
+        };
+        if !sockets.iter().any(|s| s.active && s.port == port) {
+            return port;
+        }
+    }
+    0 // shouldn't happen with 16K range and 16 sockets
+}
+
+/// Assign a newly accepted socket to a free slot.
+fn assign_accepted_socket(sockets: &mut [Socket; MAX_SOCKETS], tcp_conns: &mut TcpConns, handle: usize, conn_idx: usize) {
+    let free = sockets.iter().position(|s| !s.active);
+    let Some(idx) = free else {
+        raw::sys_chan_close(handle);
+        tcp_conns[conn_idx].reset();
+        return;
+    };
+    sockets[idx].active = true;
+    sockets[idx].handle = handle;
+    sockets[idx].is_stream = true;
+    sockets[idx].tcp_conn_idx = conn_idx;
+    tcp_conns[conn_idx].socket_idx = idx;
+    sockets[idx].port = tcp_conns[conn_idx].local_port;
+}
 
 #[allow(clippy::too_many_arguments)] // inherent complexity of passing service state
 fn handle_client_message(
     sock_idx: usize,
     sockets: &mut [Socket; MAX_SOCKETS],
+    tcp_conns: &mut TcpConns,
+    pending_accept: &mut Option<PendingAcceptInfo>,
     msg: &Message,
     shm_base: usize,
     raw_handle: usize,
@@ -831,7 +1797,7 @@ fn handle_client_message(
                 ).unwrap_or(0);
             }
             if raw::sys_chan_send(handle, &resp_msg) == 2 {
-                sockets[sock_idx].deactivate();
+                sockets[sock_idx].deactivate(tcp_conns);
             }
         }
         SocketRequest::SendTo { addr, data } => {
@@ -849,7 +1815,7 @@ fn handle_client_message(
                     &mut resp_msg.data,
                 ).unwrap_or(0);
                 if raw::sys_chan_send(handle, &resp_msg) == 2 {
-                    sockets[sock_idx].deactivate();
+                    sockets[sock_idx].deactivate(tcp_conns);
                 }
                 return;
             }
@@ -864,7 +1830,7 @@ fn handle_client_message(
                     &mut resp_msg.data,
                 ).unwrap_or(0);
                 if raw::sys_chan_send(handle, &resp_msg) == 2 {
-                    sockets[sock_idx].deactivate();
+                    sockets[sock_idx].deactivate(tcp_conns);
                 }
                 return;
             }
@@ -880,7 +1846,7 @@ fn handle_client_message(
                 &mut resp_msg.data,
             ).unwrap_or(0);
             if raw::sys_chan_send(handle, &resp_msg) == 2 {
-                sockets[sock_idx].deactivate();
+                sockets[sock_idx].deactivate(tcp_conns);
             }
         }
         SocketRequest::RecvFrom {} => {
@@ -900,24 +1866,173 @@ fn handle_client_message(
                 &mut resp_msg.data,
             ).unwrap_or(0);
             if raw::sys_chan_send(handle, &resp_msg) == 2 {
-                sockets[sock_idx].deactivate();
+                sockets[sock_idx].deactivate(tcp_conns);
             }
         }
-        // TCP operations — not yet implemented
-        SocketRequest::Listen { .. }
-        | SocketRequest::Accept {}
-        | SocketRequest::Connect { .. }
-        | SocketRequest::Send { .. }
-        | SocketRequest::Recv { .. }
-        | SocketRequest::Shutdown { .. }
-        | SocketRequest::GetPeerName {} => {
+        SocketRequest::Listen { backlog: _ } => {
+            if !sockets[sock_idx].is_stream {
+                send_sock_error(handle, SocketError::NotSupported {});
+                return;
+            }
+            if sockets[sock_idx].port == 0 {
+                send_sock_error(handle, SocketError::InvalidArg {});
+                return;
+            }
+            sockets[sock_idx].tcp_listening = true;
+            send_sock_ok(handle);
+        }
+        SocketRequest::Accept {} => {
+            if !sockets[sock_idx].tcp_listening {
+                send_sock_error(handle, SocketError::InvalidArg {});
+                return;
+            }
+            if sockets[sock_idx].accept_count > 0 {
+                // Connection already waiting — deliver immediately
+                tcp_deliver_accept(
+                    &mut sockets[sock_idx], tcp_conns, pending_accept, 0,
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+                // Process pending accept assignment
+                if let Some(info) = pending_accept.take() {
+                    assign_accepted_socket(sockets, tcp_conns, info.handle, info.conn_idx);
+                }
+            } else {
+                // No connections waiting — mark as pending
+                sockets[sock_idx].accept_pending = true;
+            }
+        }
+        SocketRequest::Connect { addr } => {
+            if !sockets[sock_idx].is_stream {
+                send_sock_error(handle, SocketError::NotSupported {});
+                return;
+            }
+            let SocketAddr::Inet4 { a, b, c, d, port } = addr;
+            let dst_ip = [a, b, c, d];
+            let src_port = sockets[sock_idx].port;
+            // Auto-assign ephemeral port if not bound
+            let src_port = if src_port == 0 {
+                let p = alloc_ephemeral_port(sockets);
+                sockets[sock_idx].port = p;
+                p
+            } else {
+                src_port
+            };
+            // Allocate a TCP connection
+            let Some(ci) = tcp_alloc_conn(tcp_conns) else {
+                send_sock_error(handle, SocketError::NoResources {});
+                return;
+            };
+            let conn = &mut tcp_conns[ci];
+            conn.active = true;
+            conn.local_port = src_port;
+            conn.remote_addr = dst_ip;
+            conn.remote_port = port;
+            conn.state = TcpState::SynSent;
+            conn.snd_una = tcp_initial_seq();
+            conn.snd_nxt = conn.snd_una.wrapping_add(1);
+            conn.snd_wnd = TCP_WINDOW;
+            conn.socket_idx = sock_idx;
+            conn.rto_ticks = TCP_INITIAL_RTO;
+            conn.retx_count = 0;
+            conn.retx_deadline = now + conn.rto_ticks;
+            sockets[sock_idx].tcp_conn_idx = ci;
+            // Send SYN
+            tcp_send_segment(
+                src_port, &dst_ip, port,
+                conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
+                shm_base, raw_handle, our_mac, arp_table, pending, now,
+            );
+            // Response is deferred until SYN-ACK arrives
+        }
+        SocketRequest::Send { data } => {
+            let ci = sockets[sock_idx].tcp_conn_idx;
+            if ci == usize::MAX {
+                send_sock_error(handle, SocketError::NotConnected {});
+                return;
+            }
+            let conn = &mut tcp_conns[ci];
+            if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
+                send_sock_error(handle, SocketError::NotConnected {});
+                return;
+            }
+            let space = conn.send_buf.len() - conn.send_len;
+            let copy_len = data.len().min(space);
+            if copy_len == 0 {
+                send_sock_error(handle, SocketError::NoResources {});
+                return;
+            }
+            conn.send_buf[conn.send_len..conn.send_len + copy_len]
+                .copy_from_slice(&data[..copy_len]);
+            conn.send_len += copy_len;
+            // Try to send immediately
+            tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now);
+            // Respond with bytes accepted
             let mut resp_msg = Message::new();
             resp_msg.len = rvos_wire::to_bytes(
-                &SocketResponse::Error { code: SocketError::NotSupported {} },
+                &SocketResponse::Sent { bytes: copy_len as u32 },
                 &mut resp_msg.data,
             ).unwrap_or(0);
             if raw::sys_chan_send(handle, &resp_msg) == 2 {
-                sockets[sock_idx].deactivate();
+                sockets[sock_idx].deactivate(tcp_conns);
+            }
+        }
+        SocketRequest::Recv { max_len } => {
+            let ci = sockets[sock_idx].tcp_conn_idx;
+            if ci == usize::MAX {
+                send_sock_error(handle, SocketError::NotConnected {});
+                return;
+            }
+            sockets[sock_idx].recv_max_len = max_len;
+            sockets[sock_idx].recv_pending = true;
+            // Try to deliver immediately if data is available
+            tcp_try_deliver_recv(&mut sockets[sock_idx], tcp_conns);
+        }
+        SocketRequest::Shutdown { how } => {
+            let ci = sockets[sock_idx].tcp_conn_idx;
+            if ci == usize::MAX {
+                send_sock_error(handle, SocketError::NotConnected {});
+                return;
+            }
+            let conn = &mut tcp_conns[ci];
+            let send_fin = matches!(how, ShutdownHow::Write {} | ShutdownHow::Both {});
+            if send_fin && (conn.state == TcpState::Established || conn.state == TcpState::CloseWait) {
+                // Send FIN
+                let new_state = if conn.state == TcpState::Established {
+                    TcpState::FinWait1
+                } else {
+                    TcpState::LastAck
+                };
+                conn.state = new_state;
+                tcp_send_segment(
+                    conn.local_port, &conn.remote_addr, conn.remote_port,
+                    conn.snd_nxt, conn.rcv_nxt, TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
+                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                );
+                conn.snd_nxt = conn.snd_nxt.wrapping_add(1);
+                conn.retx_deadline = now + conn.rto_ticks;
+            }
+            send_sock_ok(handle);
+        }
+        SocketRequest::GetPeerName {} => {
+            let ci = sockets[sock_idx].tcp_conn_idx;
+            if ci == usize::MAX {
+                send_sock_error(handle, SocketError::NotConnected {});
+                return;
+            }
+            let conn = &tcp_conns[ci];
+            let mut resp_msg = Message::new();
+            resp_msg.len = rvos_wire::to_bytes(
+                &SocketResponse::Addr {
+                    addr: SocketAddr::Inet4 {
+                        a: conn.remote_addr[0], b: conn.remote_addr[1],
+                        c: conn.remote_addr[2], d: conn.remote_addr[3],
+                        port: conn.remote_port,
+                    },
+                },
+                &mut resp_msg.data,
+            ).unwrap_or(0);
+            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                sockets[sock_idx].deactivate(tcp_conns);
             }
         }
     }
@@ -1054,6 +2169,19 @@ fn main() {
     // 5. Initialize state
     let mut arp_table = ArpTable::new();
     let mut sockets = [const { Socket::new() }; MAX_SOCKETS];
+    let mut tcp_conns: Box<TcpConns> = {
+        let layout = alloc::alloc::Layout::new::<TcpConns>();
+        let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut TcpConns };
+        assert!(!ptr.is_null(), "failed to allocate TcpConns");
+        let mut b = unsafe { Box::from_raw(ptr) };
+        // Fix up non-zero default fields
+        for conn in b.iter_mut() {
+            conn.socket_idx = usize::MAX;
+            conn.listener_sock_idx = usize::MAX;
+        }
+        b
+    };
+    let mut pending_accept: Option<PendingAcceptInfo> = None;
     let mut pending = [const { PendingPacket::new() }; MAX_PENDING];
     let mut pending_clients = [const { PendingClient::new() }; MAX_PENDING_CLIENTS];
 
@@ -1109,6 +2237,8 @@ fn main() {
                 &our_mac,
                 &mut arp_table,
                 &mut sockets,
+                &mut tcp_conns,
+                &mut pending_accept,
                 &mut pending,
                 now,
             );
@@ -1192,7 +2322,7 @@ fn main() {
                 if ret == 2 {
                     // Channel closed by client — clean up socket
                     handled = true;
-                    sockets[i].deactivate();
+                    sockets[i].deactivate(&mut tcp_conns);
                     break;
                 }
                 if ret != 0 {
@@ -1202,6 +2332,8 @@ fn main() {
                 handle_client_message(
                     i,
                     &mut sockets,
+                    &mut tcp_conns,
+                    &mut pending_accept,
                     &client_msg,
                     shm_base,
                     raw_handle,
@@ -1232,6 +2364,26 @@ fn main() {
         }
         // Try to drain any newly resolved entries (also expires timed-out packets)
         drain_pending(shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now);
+
+        // f. Process pending accept assignments
+        if let Some(info) = pending_accept.take() {
+            assign_accepted_socket(&mut sockets, &mut tcp_conns, info.handle, info.conn_idx);
+            handled = true;
+        }
+
+        // g. TCP retransmit timers
+        tcp_check_retransmits(&mut tcp_conns, shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now, &mut sockets);
+
+        // h. TCP TimeWait cleanup
+        tcp_check_timewait(&mut tcp_conns, now);
+
+        // i. Check if any TCP connections have pending retransmits (keep polling)
+        for conn in tcp_conns.iter() {
+            if conn.active && conn.retx_deadline != 0 {
+                handled = true;
+                break;
+            }
+        }
 
         if !handled {
             // Register all channels for poll-based wakeup
