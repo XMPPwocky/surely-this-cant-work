@@ -102,10 +102,20 @@ fn build_eth(dst: &[u8; 6], src: &[u8; 6], ethertype: u16, payload: &[u8], buf: 
 // ARP
 // ---------------------------------------------------------------------------
 
+const TICK_HZ: u64 = 10_000_000; // QEMU virt aclint-mtimer @ 10MHz
+const ARP_ENTRY_TTL: u64 = 60 * TICK_HZ; // 60 seconds
+const PENDING_TIMEOUT: u64 = 3 * TICK_HZ; // 3 seconds
+const ARP_RETRY_INTERVAL: u64 = TICK_HZ; // 1 second between retries
+
+fn now_ticks() -> u64 {
+    raw::sys_clock().0
+}
+
 struct ArpEntry {
     ip: [u8; 4],
     mac: [u8; 6],
     valid: bool,
+    timestamp: u64,
 }
 
 struct ArpTable {
@@ -120,25 +130,27 @@ impl ArpTable {
                     ip: [0; 4],
                     mac: [0; 6],
                     valid: false,
+                    timestamp: 0,
                 }
             }; 8],
         }
     }
 
-    fn lookup(&self, ip: &[u8; 4]) -> Option<[u8; 6]> {
+    fn lookup(&self, ip: &[u8; 4], now: u64) -> Option<[u8; 6]> {
         for e in &self.entries {
-            if e.valid && e.ip == *ip {
+            if e.valid && e.ip == *ip && now.wrapping_sub(e.timestamp) < ARP_ENTRY_TTL {
                 return Some(e.mac);
             }
         }
         None
     }
 
-    fn insert(&mut self, ip: [u8; 4], mac: [u8; 6]) {
+    fn insert(&mut self, ip: [u8; 4], mac: [u8; 6], now: u64) {
         // Update existing entry
         for e in &mut self.entries {
             if e.valid && e.ip == ip {
                 e.mac = mac;
+                e.timestamp = now;
                 return;
             }
         }
@@ -148,13 +160,33 @@ impl ArpTable {
                 e.ip = ip;
                 e.mac = mac;
                 e.valid = true;
+                e.timestamp = now;
                 return;
             }
         }
-        // Evict slot 0
-        self.entries[0].ip = ip;
-        self.entries[0].mac = mac;
-        self.entries[0].valid = true;
+        // Evict oldest entry
+        let mut oldest_idx = 0;
+        let mut oldest_age = 0u64;
+        for (i, e) in self.entries.iter().enumerate() {
+            let age = now.wrapping_sub(e.timestamp);
+            if age > oldest_age {
+                oldest_age = age;
+                oldest_idx = i;
+            }
+        }
+        self.entries[oldest_idx].ip = ip;
+        self.entries[oldest_idx].mac = mac;
+        self.entries[oldest_idx].valid = true;
+        self.entries[oldest_idx].timestamp = now;
+    }
+
+    /// Remove entries older than ARP_ENTRY_TTL.
+    fn expire(&mut self, now: u64) {
+        for e in &mut self.entries {
+            if e.valid && now.wrapping_sub(e.timestamp) >= ARP_ENTRY_TTL {
+                e.valid = false;
+            }
+        }
     }
 }
 
@@ -166,6 +198,7 @@ fn handle_arp(
     our_ip: &[u8; 4],
     payload: &[u8],
     reply_buf: &mut [u8],
+    now: u64,
 ) -> Option<usize> {
     if payload.len() < ARP_HLEN {
         return None;
@@ -191,7 +224,7 @@ fn handle_arp(
     target_ip.copy_from_slice(&payload[24..28]);
 
     // Always learn the sender
-    arp_table.insert(sender_ip, sender_mac);
+    arp_table.insert(sender_ip, sender_mac, now);
 
     // If this is a request targeting our IP, send a reply
     if operation == 1 && target_ip == *our_ip {
@@ -514,6 +547,8 @@ struct PendingPacket {
     data: [u8; 1500],
     len: usize,
     active: bool,
+    timestamp: u64,
+    last_arp: u64,
 }
 
 impl PendingPacket {
@@ -523,6 +558,8 @@ impl PendingPacket {
             data: [0; 1500],
             len: 0,
             active: false,
+            timestamp: 0,
+            last_arp: 0,
         }
     }
 }
@@ -561,6 +598,7 @@ fn tx_frame(shm_base: usize, raw_handle: usize, frame: &[u8]) {
 // Send a fully built IP packet: resolve MAC, wrap in Ethernet, TX
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn send_ip_packet(
     shm_base: usize,
     raw_handle: usize,
@@ -569,10 +607,11 @@ fn send_ip_packet(
     pending: &mut [PendingPacket; MAX_PENDING],
     ip_packet: &[u8],
     dst_ip: &[u8; 4],
+    now: u64,
 ) {
     let next_hop = resolve_next_hop(dst_ip);
 
-    if let Some(dst_mac) = arp_table.lookup(&next_hop) {
+    if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
         // Have MAC -- send immediately
         let mut frame_buf = [0u8; 1534];
         let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, ip_packet, &mut frame_buf);
@@ -589,12 +628,13 @@ fn send_ip_packet(
                 p.len = copy_len;
                 p.dst_ip = *dst_ip;
                 p.active = true;
+                p.timestamp = now;
+                p.last_arp = 0; // trigger immediate ARP in main loop
                 queued = true;
                 break;
             }
         }
         if !queued {
-            // Queue full, drop the packet
             println!("[net-stack] pending ARP queue full, dropping packet");
         }
 
@@ -616,13 +656,21 @@ fn drain_pending(
     our_mac: &[u8; 6],
     arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING],
+    now: u64,
 ) {
     for p in pending.iter_mut() {
         if !p.active {
             continue;
         }
+        // Expire timed-out entries
+        if now.wrapping_sub(p.timestamp) >= PENDING_TIMEOUT {
+            println!("[net-stack] ARP timeout for {}.{}.{}.{}, dropping packet",
+                p.dst_ip[0], p.dst_ip[1], p.dst_ip[2], p.dst_ip[3]);
+            p.active = false;
+            continue;
+        }
         let next_hop = resolve_next_hop(&p.dst_ip);
-        if let Some(dst_mac) = arp_table.lookup(&next_hop) {
+        if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
             let mut frame_buf = [0u8; 1534];
             let data_len = p.len;
             let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, &p.data[..data_len], &mut frame_buf);
@@ -638,6 +686,7 @@ fn drain_pending(
 // Process a received Ethernet frame
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn process_frame(
     frame: &[u8],
     shm_base: usize,
@@ -646,6 +695,7 @@ fn process_frame(
     arp_table: &mut ArpTable,
     sockets: &mut [UdpSocket; MAX_SOCKETS],
     pending: &mut [PendingPacket; MAX_PENDING],
+    now: u64,
 ) {
     let (eth, payload) = match parse_eth(frame) {
         Some(e) => e,
@@ -655,11 +705,11 @@ fn process_frame(
     match eth.ethertype {
         ETHERTYPE_ARP => {
             let mut reply_buf = [0u8; 64];
-            if let Some(reply_len) = handle_arp(arp_table, our_mac, &OUR_IP, payload, &mut reply_buf) {
+            if let Some(reply_len) = handle_arp(arp_table, our_mac, &OUR_IP, payload, &mut reply_buf, now) {
                 tx_frame(shm_base, raw_handle, &reply_buf[..reply_len]);
             }
             // After learning new MACs, try to drain pending queue
-            drain_pending(shm_base, raw_handle, our_mac, arp_table, pending);
+            drain_pending(shm_base, raw_handle, our_mac, arp_table, pending, now);
         }
         ETHERTYPE_IPV4 => {
             let (ip, ip_payload) = match parse_ipv4(payload) {
@@ -671,7 +721,7 @@ fn process_frame(
                 return;
             }
             // Learn sender MAC for future replies
-            arp_table.insert(ip.src, eth.src);
+            arp_table.insert(ip.src, eth.src, now);
 
             if ip.proto == PROTO_UDP {
                 let (udp, udp_data) = match parse_udp(ip_payload) {
@@ -732,6 +782,7 @@ fn handle_client_message(
     our_mac: &[u8; 6],
     arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING],
+    now: u64,
 ) {
     let req = match rvos_wire::from_bytes::<NetRequest<'_>>(&msg.data[..msg.len]) {
         Ok(r) => r,
@@ -800,7 +851,7 @@ fn handle_client_message(
 
             send_ip_packet(
                 shm_base, raw_handle, our_mac, arp_table, pending,
-                &ip_buf[..ip_len], &dst_ip,
+                &ip_buf[..ip_len], &dst_ip, now,
             );
 
             let mut resp_msg = Message::new();
@@ -904,6 +955,10 @@ fn main() {
     // 6. Main event loop
     loop {
         let mut handled = false;
+        let now = now_ticks();
+
+        // Expire stale ARP entries
+        arp_table.expire(now);
 
         // a. Drain SHM RX ring
         loop {
@@ -937,6 +992,7 @@ fn main() {
                 &mut arp_table,
                 &mut sockets,
                 &mut pending,
+                now,
             );
         }
 
@@ -1024,16 +1080,20 @@ fn main() {
                     &our_mac,
                     &arp_table,
                     &mut pending,
+                    now,
                 );
             }
         }
 
-        // e. Check pending ARP queue (retry sending ARP requests for still-pending entries)
-        for p in pending.iter() {
+        // e. Check pending ARP queue (retry with backoff, expire timed-out entries)
+        for p in pending.iter_mut() {
             if p.active {
                 handled = true; // Keep looping while we have pending work
                 let next_hop = resolve_next_hop(&p.dst_ip);
-                if arp_table.lookup(&next_hop).is_none() {
+                if arp_table.lookup(&next_hop, now).is_none()
+                    && now.wrapping_sub(p.last_arp) >= ARP_RETRY_INTERVAL
+                {
+                    p.last_arp = now;
                     let mut arp_buf = [0u8; 64];
                     let arp_len = send_arp_request(&our_mac, &OUR_IP, &next_hop, &mut arp_buf);
                     if arp_len > 0 {
@@ -1042,8 +1102,8 @@ fn main() {
                 }
             }
         }
-        // Try to drain any newly resolved entries
-        drain_pending(shm_base, raw_handle, &our_mac, &arp_table, &mut pending);
+        // Try to drain any newly resolved entries (also expires timed-out packets)
+        drain_pending(shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now);
 
         if !handled {
             // Register all channels for poll-based wakeup
