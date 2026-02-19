@@ -19,12 +19,12 @@ const TX_RING_OFFSET: usize = 0x3040;
 const RX_SLOT_SIZE: usize = 1536;
 const TX_SLOT_SIZE: usize = 1536;
 const RX_SLOTS: usize = 8;
-const TX_SLOTS: usize = 2;
+const TX_SLOTS: usize = 4;
 const CTRL_RX_HEAD: usize = CTRL_OFFSET;
 const CTRL_RX_TAIL: usize = CTRL_OFFSET + 0x04;
 const CTRL_TX_HEAD: usize = CTRL_OFFSET + 0x08;
 const CTRL_TX_TAIL: usize = CTRL_OFFSET + 0x0C;
-const SHM_PAGE_COUNT: usize = 4;
+const SHM_PAGE_COUNT: usize = 5;
 
 // Compile-time check: SHM ring layout must fit within allocated pages
 const _: () = assert!(

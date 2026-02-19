@@ -20,7 +20,8 @@ const TX_RING_OFFSET: usize = 0x3040;
 const RX_SLOT_SIZE: usize = 1536;
 const TX_SLOT_SIZE: usize = 1536;
 const RX_SLOTS: usize = 8;
-const TX_SLOTS: usize = 2;
+const TX_SLOTS: usize = 4;
+const SHM_PAGE_COUNT: usize = 5;
 
 const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
@@ -927,7 +928,7 @@ fn main() {
         println!("[net-stack] no SHM cap received from net-raw");
         return;
     }
-    let shm_base = raw::sys_mmap(shm_cap, 4 * 4096);
+    let shm_base = raw::sys_mmap(shm_cap, SHM_PAGE_COUNT * 4096);
     if shm_base == usize::MAX {
         println!("[net-stack] mmap failed for SHM");
         return;
