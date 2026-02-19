@@ -1405,7 +1405,139 @@ fn test_cap_delivery_via_spawn() -> Result<(), &'static str> {
 }
 
 // ============================================================
-// 20. Regression -- Scheduler Stress
+// 20. Regression -- Debugger Second Attach (Bug 0007)
+// ============================================================
+
+fn test_debugger_second_attach() -> Result<(), &'static str> {
+    // Regression test for Bug 0007: debugger service hangs on second attach
+    // because it didn't close transferred B endpoints after send.
+    //
+    // 1. Spawn a long-lived child (command byte 3 = wait mode)
+    // 2. Attach to it via process-debug service
+    // 3. Detach (close session/event channels)
+    // 4. Attach again — should succeed, not hang
+    // 5. Detach and clean up
+    use rvos::rvos_wire;
+    use rvos_proto::debug::*;
+
+    let (our_ep, child_ep) = raw::sys_chan_create();
+
+    // Send command byte 3 (wait mode)
+    let mut cmd = Message::new();
+    cmd.data[0] = 3;
+    cmd.len = 1;
+    raw::sys_chan_send(our_ep, &cmd);
+
+    let proc_chan = rvos::spawn_process_with_cap("/bin/ktest-helper", child_ep)
+        .map_err(|_| "spawn ktest-helper failed")?;
+    raw::sys_chan_close(child_ep);
+
+    // Receive ack to get child PID
+    let mut ack_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(our_ep, &mut ack_msg);
+    if ret != 0 {
+        // Clean up and fail
+        let ph = proc_chan.into_raw_handle();
+        let mut exit_msg = Message::new();
+        raw::sys_chan_recv_blocking(ph, &mut exit_msg);
+        raw::sys_chan_close(ph);
+        raw::sys_chan_close(our_ep);
+        return Err("recv ack from child failed");
+    }
+    let child_pid = ack_msg.sender_pid as u32;
+
+    // Helper: attach to the debug service and return session + event handles
+    let do_attach = |pid: u32| -> Result<(usize, usize), &'static str> {
+        let svc = rvos::connect_to_service("process-debug")
+            .map_err(|_| "connect to process-debug failed")?;
+        let svc_handle = svc.into_raw_handle();
+
+        let req = DebugAttachRequest { pid };
+        let mut msg = Message::new();
+        msg.len = rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+        let ret = raw::sys_chan_send_blocking(svc_handle, &msg);
+        if ret != 0 {
+            raw::sys_chan_close(svc_handle);
+            return Err("send attach request failed");
+        }
+
+        let mut resp_msg = Message::new();
+        let ret = raw::sys_chan_recv_blocking(svc_handle, &mut resp_msg);
+        raw::sys_chan_close(svc_handle);
+        if ret != 0 {
+            return Err("recv attach response failed");
+        }
+
+        let resp: DebugAttachResponse = rvos_wire::from_bytes_with_caps(
+            &resp_msg.data[..resp_msg.len],
+            &resp_msg.caps[..resp_msg.cap_count],
+        ).map_err(|_| "decode attach response failed")?;
+
+        match resp {
+            DebugAttachResponse::Ok { session, events } => {
+                Ok((session.raw(), events.raw()))
+            }
+            DebugAttachResponse::Error { .. } => {
+                Err("attach returned error")
+            }
+        }
+    };
+
+    // First attach
+    let (session1, event1) = match do_attach(child_pid) {
+        Ok(handles) => handles,
+        Err(e) => {
+            // Release child and clean up
+            raw::sys_chan_send(our_ep, &Message::from_bytes(b"done"));
+            let ph = proc_chan.into_raw_handle();
+            let mut exit_msg = Message::new();
+            raw::sys_chan_recv_blocking(ph, &mut exit_msg);
+            raw::sys_chan_close(ph);
+            raw::sys_chan_close(our_ep);
+            return Err(e);
+        }
+    };
+
+    // Detach (close session and event channels)
+    raw::sys_chan_close(session1);
+    raw::sys_chan_close(event1);
+
+    // Small yield to let the service process the detach
+    for _ in 0..10 {
+        raw::sys_yield();
+    }
+
+    // Second attach — this is where Bug 0007 would hang
+    let (session2, event2) = match do_attach(child_pid) {
+        Ok(handles) => handles,
+        Err(e) => {
+            raw::sys_chan_send(our_ep, &Message::from_bytes(b"done"));
+            let ph = proc_chan.into_raw_handle();
+            let mut exit_msg = Message::new();
+            raw::sys_chan_recv_blocking(ph, &mut exit_msg);
+            raw::sys_chan_close(ph);
+            raw::sys_chan_close(our_ep);
+            return Err(e);
+        }
+    };
+
+    // Success! Clean up second session
+    raw::sys_chan_close(session2);
+    raw::sys_chan_close(event2);
+
+    // Release child
+    raw::sys_chan_send(our_ep, &Message::from_bytes(b"done"));
+    let ph = proc_chan.into_raw_handle();
+    let mut exit_msg = Message::new();
+    raw::sys_chan_recv_blocking(ph, &mut exit_msg);
+    raw::sys_chan_close(ph);
+    raw::sys_chan_close(our_ep);
+
+    Ok(())
+}
+
+// ============================================================
+// 21. Regression -- Scheduler Stress
 // ============================================================
 
 fn test_stress_spawn_exit() -> Result<(), &'static str> {
@@ -1558,6 +1690,10 @@ fn main() {
         ("ns_override_cap_delivery", test_ns_override_cap_delivery),
         ("two_children_shared_override", test_two_children_shared_override),
         ("cap_delivery_via_spawn", test_cap_delivery_via_spawn),
+    ]));
+
+    total.merge(&run_section("Regression -- Debugger", &[
+        ("debugger_second_attach", test_debugger_second_attach),
     ]));
 
     total.merge(&run_section("Regression -- Scheduler Stress", &[

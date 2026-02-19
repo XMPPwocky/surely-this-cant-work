@@ -11,6 +11,7 @@ use rvos::Message;
 ///   (none)  → check handle 1 for a command-byte protocol:
 ///     Byte 1 → send "ktest-ok" back on handle 1
 ///     Byte 2 → allocate 64 mmap regions, report count on handle 1
+///     Byte 3 → send ack (with sender_pid), then block until second message
 ///
 /// Handle layout when spawned with cap:
 ///   h0=boot, h1=extra_cap, h2=stdin, h3=stdout
@@ -66,6 +67,15 @@ fn main() {
                 reply.data[..4].copy_from_slice(&bytes);
                 reply.len = 4;
                 raw::sys_chan_send(cap_handle, &reply);
+            }
+            3 => {
+                // Command 3: send ack (parent reads sender_pid), then block
+                // until parent sends a second message (used for debugger tests)
+                let ack = Message::from_bytes(b"ack");
+                raw::sys_chan_send(cap_handle, &ack);
+                // Block until parent sends a release message
+                let mut release = Message::new();
+                raw::sys_chan_recv_blocking(cap_handle, &mut release);
             }
             _ => {
                 let reply = Message::from_bytes(b"ktest-ok");
