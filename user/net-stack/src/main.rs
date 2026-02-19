@@ -1309,13 +1309,15 @@ fn tcp_input_conn(
         let si = conn.socket_idx;
         conn.reset();
         if si != usize::MAX && si < MAX_SOCKETS && sockets[si].active {
-            // Notify client of reset
+            // Notify client of reset; deactivate if channel already closed
             tx.msg = Message::new();
             tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Error { code: SocketError::ConnReset {} },
                 &mut tx.msg.data,
             ).expect("serialize");
-            let _ = raw::sys_chan_send(sockets[si].handle, &tx.msg);
+            if raw::sys_chan_send(sockets[si].handle, &tx.msg) == raw::CHAN_CLOSED {
+                sockets[si].deactivate(tcp_conns);
+            }
         }
         return;
     }
@@ -1352,7 +1354,9 @@ fn tcp_input_conn(
                         &SocketResponse::Ok {},
                         &mut tx.msg.data,
                     ).expect("serialize");
-                    let _ = raw::sys_chan_send(sock.handle, &tx.msg);
+                    if raw::sys_chan_send(sock.handle, &tx.msg) == raw::CHAN_CLOSED {
+                        sock.deactivate(tcp_conns);
+                    }
                 }
             }
         }
@@ -1696,7 +1700,12 @@ fn tcp_check_retransmits(
                     &SocketResponse::Error { code: SocketError::TimedOut {} },
                     &mut tx.msg.data,
                 ).expect("serialize");
-                let _ = raw::sys_chan_send(sockets[si].handle, &tx.msg);
+                if raw::sys_chan_send(sockets[si].handle, &tx.msg) == raw::CHAN_CLOSED {
+                    // Can't call deactivate() here (tcp_conns borrowed by iter).
+                    // Close handle; main loop will clean up the socket on next poll.
+                    raw::sys_chan_close(sockets[si].handle);
+                    sockets[si].active = false;
+                }
             }
             continue;
         }
@@ -1769,18 +1778,18 @@ fn tcp_check_timewait(tcp_conns: &mut TcpConns, now: u64) {
 // Handle client requests
 // ---------------------------------------------------------------------------
 
-/// Send a SocketResponse::Ok on a handle.
-fn send_sock_ok(handle: usize, msg: &mut Message) {
+/// Send a SocketResponse::Ok on a handle. Returns false if channel closed.
+fn send_sock_ok(handle: usize, msg: &mut Message) -> bool {
     *msg = Message::new();
     msg.len = rvos_wire::to_bytes(&SocketResponse::Ok {}, &mut msg.data).expect("serialize");
-    let _ = raw::sys_chan_send(handle, msg);
+    raw::sys_chan_send(handle, msg) != raw::CHAN_CLOSED
 }
 
-/// Send a SocketResponse::Error on a handle.
-fn send_sock_error(handle: usize, code: SocketError, msg: &mut Message) {
+/// Send a SocketResponse::Error on a handle. Returns false if channel closed.
+fn send_sock_error(handle: usize, code: SocketError, msg: &mut Message) -> bool {
     *msg = Message::new();
     msg.len = rvos_wire::to_bytes(&SocketResponse::Error { code }, &mut msg.data).expect("serialize");
-    let _ = raw::sys_chan_send(handle, msg);
+    raw::sys_chan_send(handle, msg) != raw::CHAN_CLOSED
 }
 
 /// Allocate an ephemeral port (49152..65535) that isn't in use.
