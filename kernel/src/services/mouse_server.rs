@@ -27,7 +27,6 @@ pub fn mouse_server() {
     // Wait for a client endpoint from init (via control channel)
     let accepted = ipc::accept_client(control_ep, my_pid);
     let client = accepted.endpoint;
-    let client_ep = client.raw();
 
     crate::println!("[mouse-server] client connected");
 
@@ -54,7 +53,7 @@ pub fn mouse_server() {
                     let mut msg = Message::new();
                     msg.sender_pid = my_pid;
                     msg.len = rvos_wire::to_bytes(&mouse_event, &mut msg.data).unwrap_or(0);
-                    match ipc::channel_send_blocking(client_ep, msg, my_pid) {
+                    match client.send_blocking(msg, my_pid) {
                         Ok(()) => {
                             sent_any = true;
                         }
@@ -69,7 +68,7 @@ pub fn mouse_server() {
         }
 
         if !sent_any {
-            if !ipc::channel_is_active(client_ep) {
+            if !client.is_active() {
                 crate::println!("[mouse-server] client disconnected");
                 return;
             }

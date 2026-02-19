@@ -4,7 +4,7 @@
 //! connects and receives the display framebuffer as a SHM capability,
 //! then sends Flush commands to update rectangular regions.
 
-use crate::ipc::{self, Message, Cap};
+use crate::ipc::{self, Message, Cap, OwnedEndpoint};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::gpu::{GpuRequest, GpuResponse};
 
@@ -36,13 +36,12 @@ pub fn gpu_server() {
     // Wait for a client endpoint from init (via control channel)
     let accepted = ipc::accept_client(control_ep, my_pid);
     let client = accepted.endpoint;
-    let client_ep = client.raw();
 
     crate::println!("[gpu-server] client connected");
 
     // Main loop: serve requests from the single client
     loop {
-        let msg = match ipc::channel_recv_blocking(client_ep, my_pid) {
+        let msg = match client.recv_blocking(my_pid) {
             Some(msg) => msg,
             None => {
                 crate::println!("[gpu-server] client disconnected");
@@ -68,7 +67,7 @@ pub fn gpu_server() {
                 // Attach SHM capability (RW) — clone creates a new reference for the receiver
                 resp.caps[0] = Cap::Shm { owned: shm.clone(), rw: true };
                 resp.cap_count = 1;
-                send_msg(client_ep, resp);
+                send_reply(&client, resp, my_pid);
             }
             GpuRequest::Flush { x, y, w, h } => {
                 let in_bounds = x.checked_add(w).is_some_and(|xw| xw <= width)
@@ -83,13 +82,12 @@ pub fn gpu_server() {
                 let mut resp = Message::new();
                 resp.len = rvos_wire::to_bytes(&resp_data, &mut resp.data).unwrap_or(0);
                 resp.sender_pid = my_pid;
-                send_msg(client_ep, resp);
+                send_reply(&client, resp, my_pid);
             }
         }
     }
 }
 
-fn send_msg(ep: usize, msg: Message) {
-    let my_pid = crate::task::current_pid();
-    let _ = ipc::channel_send_blocking(ep, msg, my_pid);
+fn send_reply(ep: &OwnedEndpoint, msg: Message, pid: usize) {
+    let _ = ep.send_blocking(msg, pid);
 }

@@ -71,6 +71,28 @@ impl OwnedEndpoint {
         channel_inc_ref(raw_ep);
         OwnedEndpoint(raw_ep)
     }
+
+    /// Non-blocking send. Returns the woken PID (or 0) on success.
+    #[allow(dead_code, clippy::result_large_err)] // mirrors channel_send; will be used as more services convert
+    pub fn send(&self, msg: Message) -> Result<usize, (SendError, Message)> {
+        channel_send(self.0, msg)
+    }
+
+    /// Blocking send. Suspends `pid` if the queue is full.
+    pub fn send_blocking(&self, msg: Message, pid: usize) -> Result<(), SendError> {
+        channel_send_blocking(self.0, msg, pid)
+    }
+
+    /// Blocking receive. Suspends `pid` until a message arrives.
+    /// Returns `None` if the channel is closed.
+    pub fn recv_blocking(&self, pid: usize) -> Option<Message> {
+        channel_recv_blocking(self.0, pid)
+    }
+
+    /// Check whether this endpoint's channel is still active.
+    pub fn is_active(&self) -> bool {
+        channel_is_active(self.0)
+    }
 }
 
 impl Clone for OwnedEndpoint {
