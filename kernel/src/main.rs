@@ -180,6 +180,11 @@ pub extern "C" fn kmain() -> ! {
         services::init::register_service("net-raw", init_net_ep.into_raw());
     }
 
+    // Timer service kernel task
+    let (init_timer_ep, timer_ctl_ep) = ipc::channel_create_pair().expect("boot: timer channel");
+    services::timer::set_control_ep(timer_ctl_ep.into_raw());
+    services::init::register_service("timer", init_timer_ep.into_raw());
+
     // Filesystem service: control channel goes to a user-space fs server
     let (init_fs_ep, fs_ctl_ep) = ipc::channel_create_pair().expect("boot: fs channel");
     services::init::set_fs_control_ep(init_fs_ep.into_raw());
@@ -213,6 +218,7 @@ pub extern "C" fn kmain() -> ! {
     if net_present {
         task::spawn_named(services::net_server::net_server, "net-server").expect("boot: net-server");
     }
+    task::spawn_named(services::timer::timer_service, "timer").expect("boot: timer");
 
     // Spawn fs server as a user process with boot channel + control channel
     let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair().expect("boot: fs-boot channel");

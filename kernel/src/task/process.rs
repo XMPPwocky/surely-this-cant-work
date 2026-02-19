@@ -92,6 +92,9 @@ pub struct Process {
     // Wakeup pending flag: set when wake_process is called on a Running/Ready process.
     // Checked by block_process to avoid the "check-then-block" race.
     pub wakeup_pending: bool,
+    // Timer deadline: if nonzero and the process is Blocked, the scheduler
+    // will wake it when rdtime() >= wake_deadline. Used by timer service.
+    pub wake_deadline: u64,
     // Exit notification endpoint: if nonzero, kernel sends exit code on this
     // endpoint when the process exits, then closes it. NOT in the handle table.
     pub exit_notify_ep: usize,
@@ -191,6 +194,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: KERNEL_STACK_ALLOC_PAGES as u32,
             wakeup_pending: false,
+            wake_deadline: 0,
             exit_notify_ep: 0,
             pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
             code_ppn: 0,
@@ -270,6 +274,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: (KERNEL_STACK_ALLOC_PAGES + n_code_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
+            wake_deadline: 0,
             exit_notify_ep: 0,
             pt_frames,
             code_ppn: code_ppn.0,
@@ -337,6 +342,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: (KERNEL_STACK_ALLOC_PAGES + loaded.total_pages + USER_STACK_PAGES) as u32,
             wakeup_pending: false,
+            wake_deadline: 0,
             exit_notify_ep: 0,
             pt_frames,
             code_ppn: loaded.code_ppn.0,
@@ -371,6 +377,7 @@ impl Process {
             last_switched_away: rdtime(),
             mem_pages: 0, // idle task doesn't own any pages
             wakeup_pending: false,
+            wake_deadline: 0,
             exit_notify_ep: 0,
             pt_frames: alloc::vec::Vec::new_in(PGTB_ALLOC),
             code_ppn: 0,

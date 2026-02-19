@@ -7,3 +7,4 @@ pub mod mouse_server;
 pub mod net_server;
 pub mod proc_debug;
 pub mod sysinfo;
+pub mod timer;

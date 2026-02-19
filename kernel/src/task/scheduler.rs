@@ -779,6 +779,54 @@ pub fn set_exit_notify_ep(pid: usize, ep: usize) {
     }
 }
 
+/// Check all blocked processes for expired timer deadlines.
+/// Called from timer_tick() — runs with interrupts disabled (inside trap handler).
+pub fn check_deadlines(now: u64) {
+    let mut sched = SCHEDULER.lock();
+    for pid in 1..sched.processes.len() {
+        let should_wake = if let Some(ref proc) = sched.processes[pid] {
+            proc.state == ProcessState::Blocked
+                && proc.wake_deadline != 0
+                && now >= proc.wake_deadline
+        } else {
+            false
+        };
+        if should_wake {
+            if let Some(ref mut proc) = sched.processes[pid] {
+                proc.wake_deadline = 0;
+                proc.state = ProcessState::Ready;
+            }
+            sched.ready_queue.push_back(pid);
+        }
+    }
+}
+
+/// Block a process until a deadline (rdtime tick value).
+/// If the deadline has already passed, the process is not blocked.
+/// If the deadline is sooner than the next regular timer tick,
+/// re-arms the SBI timer for a precise wakeup.
+pub fn block_with_deadline(pid: usize, deadline_tick: u64) {
+    let mut sched = SCHEDULER.lock();
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        if proc.wakeup_pending {
+            proc.wakeup_pending = false;
+            return;
+        }
+        let now = crate::task::process::rdtime();
+        if now >= deadline_tick {
+            // Deadline already passed — don't block
+            return;
+        }
+        proc.state = ProcessState::Blocked;
+        proc.wake_deadline = deadline_tick;
+        drop(sched);
+        // Re-arm SBI timer to fire early if deadline < next regular tick
+        if deadline_tick < now + TIMER_INTERVAL {
+            crate::arch::sbi::sbi_set_timer(deadline_tick);
+        }
+    }
+}
+
 /// Set a process to Blocked state
 pub fn block_process(pid: usize) {
     let mut sched = SCHEDULER.lock();

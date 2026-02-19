@@ -227,6 +227,9 @@ fn timer_tick() {
     }
     sbi::sbi_set_timer(time + TIMER_INTERVAL);
 
+    // Check for expired timer deadlines and wake blocked processes
+    crate::task::check_deadlines(time);
+
     NEED_RESCHED.store(true, Ordering::Relaxed);
 }
 
