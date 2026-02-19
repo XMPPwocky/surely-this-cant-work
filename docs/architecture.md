@@ -66,21 +66,32 @@ The kernel creates channels and spawns all services and user processes:
 
 ```
 kmain
- ├── creates control channels for: serial-con, sysinfo, math
+ ├── creates control channels for: serial-con, sysinfo, math, process-debug
  ├── creates boot channels for: shell-serial
  ├── (with GPU) creates control channels for: gpu, kbd, mouse
+ ├── (with net) creates control channels for: net-raw
  ├── spawns kernel tasks:
  │   ├── init         (service directory + process loader)
  │   ├── serial-con   (serial console server)
  │   ├── sysinfo      (process/memory info service)
  │   ├── math         (computation service)
+ │   ├── proc-debug   (process debugger attach/step/breakpoint)
  │   ├── gpu-server   (VirtIO GPU wrapper, if GPU)
  │   ├── kbd-server   (VirtIO keyboard wrapper, if GPU)
- │   └── mouse-server (VirtIO tablet wrapper, if GPU)
+ │   ├── mouse-server (VirtIO tablet wrapper, if GPU)
+ │   └── net-server   (VirtIO net wrapper, if net device present)
  └── spawns user processes (ELF):
      ├── fs           (filesystem server, tmpfs)
-     └── shell-serial (interactive shell on serial)
+     ├── shell-serial (interactive shell on serial)
+     └── (with GPU) shell-fb (interactive shell on framebuffer)
 ```
+
+Additional user processes spawned by init on demand:
+
+- **net-stack** — user-space network stack, connects to `net-raw`, registers
+  as `"net"` service, provides UDP socket API
+- **window-server** — compositing window manager (GPU mode)
+- **fbcon** — framebuffer console multiplexer (GPU mode)
 
 ### Phase 6: Preemptive Scheduling
 
@@ -320,17 +331,25 @@ through the init server's service discovery protocol.
 ### Service Topology
 
 ```
-                    ┌──────────┐
-                    │   init   │ ← service directory
-                    └────┬─────┘
-           ┌─────────────┼─────────────┬──────────────┐
-           ↓             ↓             ↓              ↓
-     ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
-     │serial-con│  │  fb-con  │  │ sysinfo  │  │   math   │
-     └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘
-          ↓             ↓             ↓              ↓
-     [shell-serial] [shell-fb]    (on demand)    (on demand)
+                         ┌──────────┐
+                         │   init   │ ← service directory + process loader
+                         └────┬─────┘
+        ┌──────────┬──────────┼──────────┬────────────┬─────────────┐
+        ↓          ↓          ↓          ↓            ↓             ↓
+  ┌──────────┐ ┌────────┐ ┌────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+  │serial-con│ │sysinfo │ │  math  │ │proc-debug│ │net-server│ │gpu-server│
+  └────┬─────┘ └────────┘ └────────┘ └──────────┘ └────┬─────┘ └──────────┘
+       ↓                                                ↓
+  [shell-serial]                                   [net-stack] ← "net" service
+  [shell-fb]                                            ↓
+                                                   [udp-echo]
 ```
+
+Kernel tasks (in-process): init, serial-con, sysinfo, math, proc-debug,
+gpu-server, kbd-server, mouse-server, net-server.
+
+User processes (ELF): fs, shell, net-stack, udp-echo, window-server, fbcon,
+dbg, bench, winclient, triangle, gui-bench, ktest.
 
 ### Service Discovery Flow
 
