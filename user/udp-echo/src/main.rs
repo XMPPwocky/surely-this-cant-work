@@ -1,13 +1,12 @@
 // Pull in the rvos-rt crate so _start gets linked
 extern crate rvos_rt;
 
-use rvos::socket::{UdpSocket, SocketAddr};
+use std::net::UdpSocket;
 
 fn main() {
     println!("UDP echo server starting...");
 
-    let addr = SocketAddr::Inet4 { a: 0, b: 0, c: 0, d: 0, port: 7777 };
-    let mut sock = match UdpSocket::bind(addr) {
+    let sock = match UdpSocket::bind("0.0.0.0:7777") {
         Ok(s) => s,
         Err(e) => {
             println!("Bind failed: {:?}", e);
@@ -25,8 +24,7 @@ fn main() {
                 return;
             }
         };
-        let SocketAddr::Inet4 { a, b, c, d, port } = peer;
-        println!("Received {} bytes from {}.{}.{}.{}:{}", len, a, b, c, d, port);
+        println!("Received {} bytes from {}", len, peer);
 
         if let Err(e) = sock.send_to(&buf[..len], peer) {
             println!("send_to error: {:?}", e);
