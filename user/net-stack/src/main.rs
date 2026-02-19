@@ -430,6 +430,17 @@ impl UdpSocket {
             active: false,
         }
     }
+
+    /// Clean up a socket whose client channel is dead.
+    fn deactivate(&mut self) {
+        if self.active {
+            raw::sys_chan_close(self.client_handle);
+            self.active = false;
+            self.client_handle = 0;
+            self.port = 0;
+            self.recv_pending = false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,10 +489,10 @@ fn tx_frame(shm_base: usize, raw_handle: usize, frame: &[u8]) {
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
     shm_write_u32(shm_base, CTRL_TX_HEAD, tx_head.wrapping_add(1));
 
-    // Send TxReady doorbell
+    // Send TxReady doorbell (fire-and-forget: kernel polls regardless)
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&NetRawRequest::TxReady {}, &mut msg.data).unwrap_or(0);
-    let _ = raw::sys_chan_send(raw_handle, &msg);
+    let _ = raw::sys_chan_send(raw_handle, &msg); // fire-and-forget doorbell
 }
 
 // ---------------------------------------------------------------------------
@@ -623,8 +634,12 @@ fn process_frame(
                                 },
                                 &mut msg.data,
                             ).unwrap_or(0);
-                            let _ = raw::sys_chan_send(sock.client_handle, &msg);
+                            let ret = raw::sys_chan_send(sock.client_handle, &msg);
                             sock.recv_pending = false;
+                            if ret == 2 {
+                                // Client channel closed — clean up socket
+                                sock.deactivate();
+                            }
                         }
                         // Only deliver to the first matching socket
                         break;
@@ -675,7 +690,9 @@ fn handle_client_message(
                     &mut resp_msg.data,
                 ).unwrap_or(0);
             }
-            let _ = raw::sys_chan_send(handle, &resp_msg);
+            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                sockets[sock_idx].deactivate();
+            }
         }
         NetRequest::SendTo {
             dst_ip0, dst_ip1, dst_ip2, dst_ip3,
@@ -693,7 +710,9 @@ fn handle_client_message(
                     &NetResponse::Error { message: "payload too large" },
                     &mut resp_msg.data,
                 ).unwrap_or(0);
-                let _ = raw::sys_chan_send(handle, &resp_msg);
+                if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                    sockets[sock_idx].deactivate();
+                }
                 return;
             }
 
@@ -706,7 +725,9 @@ fn handle_client_message(
                     &NetResponse::Error { message: "ip build failed" },
                     &mut resp_msg.data,
                 ).unwrap_or(0);
-                let _ = raw::sys_chan_send(handle, &resp_msg);
+                if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                    sockets[sock_idx].deactivate();
+                }
                 return;
             }
 
@@ -720,17 +741,15 @@ fn handle_client_message(
                 &NetResponse::SendOk {},
                 &mut resp_msg.data,
             ).unwrap_or(0);
-            let _ = raw::sys_chan_send(handle, &resp_msg);
+            if raw::sys_chan_send(handle, &resp_msg) == 2 {
+                sockets[sock_idx].deactivate();
+            }
         }
         NetRequest::RecvFrom {} => {
             sockets[sock_idx].recv_pending = true;
         }
         NetRequest::Close {} => {
-            sockets[sock_idx].active = false;
-            raw::sys_chan_close(sockets[sock_idx].client_handle);
-            sockets[sock_idx].client_handle = 0;
-            sockets[sock_idx].port = 0;
-            sockets[sock_idx].recv_pending = false;
+            sockets[sock_idx].deactivate();
         }
     }
 }
@@ -757,11 +776,17 @@ fn main() {
     // 2. Send GetDeviceInfo request
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&NetRawRequest::GetDeviceInfo {}, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send_blocking(raw_handle, &msg);
+    if raw::sys_chan_send_blocking(raw_handle, &msg) != 0 {
+        println!("[net-stack] failed to send GetDeviceInfo");
+        return;
+    }
 
     // 3. Receive DeviceInfo response (with SHM cap)
     let mut resp = Message::new();
-    raw::sys_chan_recv_blocking(raw_handle, &mut resp);
+    if raw::sys_chan_recv_blocking(raw_handle, &mut resp) != 0 {
+        println!("[net-stack] failed to recv DeviceInfo");
+        return;
+    }
 
     let our_mac;
     match rvos_wire::from_bytes::<NetRawResponse>(&resp.data[..resp.len]) {

@@ -20,7 +20,10 @@ fn main() {
         Channel::from_raw_handle(net_ch.into_raw_handle());
 
     // Bind to port 7777
-    ch.send(&NetRequest::Bind { port: 7777 }).unwrap();
+    if let Err(e) = ch.send(&NetRequest::Bind { port: 7777 }) {
+        println!("Failed to send Bind: {:?}", e);
+        return;
+    }
 
     // Wait for Bind response
     let resp = ch.recv_blocking();
@@ -41,7 +44,10 @@ fn main() {
     // Echo loop
     loop {
         // Send RecvFrom request
-        ch.send(&NetRequest::RecvFrom {}).unwrap();
+        if let Err(e) = ch.send(&NetRequest::RecvFrom {}) {
+            println!("Failed to send RecvFrom: {:?}", e);
+            return;
+        }
 
         // Wait for datagram
         let resp = ch.recv_blocking();
@@ -61,14 +67,17 @@ fn main() {
                 buf[..len].copy_from_slice(&data[..len]);
 
                 // Echo back
-                ch.send(&NetRequest::SendTo {
+                if let Err(e) = ch.send(&NetRequest::SendTo {
                     dst_ip0: src_ip0,
                     dst_ip1: src_ip1,
                     dst_ip2: src_ip2,
                     dst_ip3: src_ip3,
                     dst_port: src_port,
                     data: &buf[..len],
-                }).unwrap();
+                }) {
+                    println!("Failed to send echo: {:?}", e);
+                    return;
+                }
 
                 // Wait for send confirmation
                 let send_resp = ch.recv_blocking();

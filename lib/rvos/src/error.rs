@@ -1,13 +1,20 @@
 //! Error types for rvOS syscalls.
 
 /// System call error codes.
+///
+/// Variants marked "(ABI)" can be returned by `from_code()`; other variants
+/// are only used for locally-constructed errors on the user side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SysError {
-    InvalidHandle,
+    /// The channel is closed / deactivated. (ABI code 2)
     ChannelClosed,
-    NoResources,
-    BadAddress,
+    /// Non-blocking send: queue is full. (ABI code 5)
     QueueFull,
+    /// Resource exhaustion (handle table full, no free channels, OOM).
+    NoResources,
+    /// A user pointer or serialization buffer was invalid.
+    BadAddress,
+    /// An unrecognised or generic kernel error code. (ABI code usize::MAX)
     Unknown(usize),
 }
 
@@ -28,17 +35,20 @@ pub enum RecvError {
     /// A message was received but failed to decode.  The channel should be
     /// considered broken — callers should log the error and close it.
     Decode(rvos_wire::WireError),
+    /// A syscall error other than Empty or Closed.
+    Syscall(SysError),
 }
 
 impl SysError {
-    /// Convert a raw syscall return code to a result.
+    /// Convert a raw syscall return code to a `SysResult`.
+    ///
+    /// The kernel ABI codes are: 0 = success, 2 = ChannelClosed,
+    /// 5 = QueueFull, usize::MAX = generic error. All other values
+    /// are mapped to `Unknown(code)`.
     pub fn from_code(code: usize) -> SysResult<()> {
         match code {
             0 => Ok(()),
-            1 => Err(SysError::InvalidHandle),
             2 => Err(SysError::ChannelClosed),
-            3 => Err(SysError::NoResources),
-            4 => Err(SysError::BadAddress),
             5 => Err(SysError::QueueFull),
             n => Err(SysError::Unknown(n)),
         }

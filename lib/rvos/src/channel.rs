@@ -258,15 +258,17 @@ impl<S, R: rvos_wire::MessageType> Channel<S, R> {
     pub fn try_recv<'a>(&'a mut self) -> Result<R::Msg<'a>, RecvError> {
         match raw::sys_chan_recv(self.inner.raw_handle(), &mut self.recv_buf) {
             0 => self.decode_recv_buf(),
+            1 => Err(RecvError::Empty),
             2 => Err(RecvError::Closed),
-            _ => Err(RecvError::Empty),
+            code => Err(RecvError::Syscall(SysError::Unknown(code))),
         }
     }
 
     /// Blocking receive.
     ///
     /// Blocks until a message arrives, then deserializes and returns it.
-    /// Returns `Err(RecvError::Closed)` if the peer closed the channel.
+    /// Returns `Err(RecvError::Closed)` if the peer closed the channel,
+    /// or `Err(RecvError::Syscall(..))` on other errors.
     ///
     /// The returned value may borrow from the channel's internal receive
     /// buffer.  See [`try_recv`](Self::try_recv) for details.
@@ -275,7 +277,7 @@ impl<S, R: rvos_wire::MessageType> Channel<S, R> {
         match ret {
             0 => self.decode_recv_buf(),
             2 => Err(RecvError::Closed),
-            _ => Err(RecvError::Closed),
+            code => Err(RecvError::Syscall(SysError::Unknown(code))),
         }
     }
 
