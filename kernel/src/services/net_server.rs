@@ -67,8 +67,10 @@ pub fn net_server() {
     crate::drivers::virtio::net::set_wake_pid(my_pid);
 
     // Allocate contiguous physical pages for the SHM ring buffer
-    let shm_ppn = frame::frame_alloc_contiguous(SHM_PAGE_COUNT)
-        .expect("net_server: failed to allocate contiguous pages for SHM ring");
+    let Some(shm_ppn) = frame::frame_alloc_contiguous(SHM_PAGE_COUNT) else {
+        crate::println!("[net-server] OOM: cannot allocate SHM pages, shutting down");
+        return;
+    };
 
     // Compute the kernel virtual address of the SHM region.
     // (In rvOS the kernel identity-maps physical memory, so PhysAddr == VirtAddr.)
@@ -80,12 +82,16 @@ pub fn net_server() {
     }
 
     // Create the SHM IPC region
-    let shm = ipc::shm_create(shm_ppn, SHM_PAGE_COUNT)
-        .expect("net_server: failed to create SHM region");
+    let Some(shm) = ipc::shm_create(shm_ppn, SHM_PAGE_COUNT) else {
+        crate::println!("[net-server] failed to create SHM region, shutting down");
+        return;
+    };
 
     // Read MAC address from the driver
-    let mac = crate::drivers::virtio::net::mac_address()
-        .expect("net_server: no net device");
+    let Some(mac) = crate::drivers::virtio::net::mac_address() else {
+        crate::println!("[net-server] no net device, shutting down");
+        return;
+    };
 
     crate::println!(
         "[net-server] ready (mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, shm_base={:#x}, shm={:?})",
