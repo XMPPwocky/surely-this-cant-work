@@ -2,8 +2,6 @@
 
 A from-scratch RISC-V 64-bit microkernel operating system written in Rust. Targets `qemu-system-riscv64` (virt machine). Zero external crates — only `core` and `alloc` in the kernel.
 
-~5,000 lines of Rust and RISC-V assembly across 40+ source files.
-
 ## Features
 
 - **Sv39 virtual memory** — 3-level page tables with identity-mapped kernel and per-process user address spaces
