@@ -890,7 +890,7 @@ fn tx_frame(shm_base: usize, raw_handle: usize, frame: &[u8], msg: &mut Message)
 
     // Send TxReady doorbell (fire-and-forget: kernel polls regardless)
     *msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&NetRawRequest::TxReady {}, &mut msg.data).unwrap_or(0);
+    msg.len = rvos_wire::to_bytes(&NetRawRequest::TxReady {}, &mut msg.data).expect("serialize");
     let _ = raw::sys_chan_send(raw_handle, msg); // fire-and-forget doorbell
 }
 
@@ -1054,7 +1054,7 @@ fn process_frame(
                                     data: &udp_data[..truncated_len],
                                 },
                                 &mut tx.msg.data,
-                            ).unwrap_or(0);
+                            ).expect("serialize");
                             let ret = raw::sys_chan_send(sock.handle, &tx.msg);
                             sock.recv_pending = false;
                             if ret == raw::CHAN_CLOSED {
@@ -1150,7 +1150,7 @@ fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns, msg: &mut M
             msg.len = rvos_wire::to_bytes(
                 &SocketData::Data { data: &[] },
                 &mut msg.data,
-            ).unwrap_or(0);
+            ).expect("serialize");
             let ret = raw::sys_chan_send(sock.handle, msg);
             sock.recv_pending = false;
             if ret == raw::CHAN_CLOSED {
@@ -1164,7 +1164,7 @@ fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns, msg: &mut M
     msg.len = rvos_wire::to_bytes(
         &SocketData::Data { data: &conn.recv_buf[..deliver_len] },
         &mut msg.data,
-    ).unwrap_or(0);
+    ).expect("serialize");
     let ret = raw::sys_chan_send(sock.handle, msg);
     sock.recv_pending = false;
     if ret == raw::CHAN_CLOSED {
@@ -1314,7 +1314,7 @@ fn tcp_input_conn(
             tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Error { code: SocketError::ConnReset {} },
                 &mut tx.msg.data,
-            ).unwrap_or(0);
+            ).expect("serialize");
             let _ = raw::sys_chan_send(sockets[si].handle, &tx.msg);
         }
         return;
@@ -1351,7 +1351,7 @@ fn tcp_input_conn(
                     tx.msg.len = rvos_wire::to_bytes(
                         &SocketResponse::Ok {},
                         &mut tx.msg.data,
-                    ).unwrap_or(0);
+                    ).expect("serialize");
                     let _ = raw::sys_chan_send(sock.handle, &tx.msg);
                 }
             }
@@ -1678,7 +1678,7 @@ fn tcp_check_retransmits(
                 tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::TimedOut {} },
                     &mut tx.msg.data,
-                ).unwrap_or(0);
+                ).expect("serialize");
                 let _ = raw::sys_chan_send(sockets[si].handle, &tx.msg);
             }
             continue;
@@ -1755,14 +1755,14 @@ fn tcp_check_timewait(tcp_conns: &mut TcpConns, now: u64) {
 /// Send a SocketResponse::Ok on a handle.
 fn send_sock_ok(handle: usize, msg: &mut Message) {
     *msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&SocketResponse::Ok {}, &mut msg.data).unwrap_or(0);
+    msg.len = rvos_wire::to_bytes(&SocketResponse::Ok {}, &mut msg.data).expect("serialize");
     let _ = raw::sys_chan_send(handle, msg);
 }
 
 /// Send a SocketResponse::Error on a handle.
 fn send_sock_error(handle: usize, code: SocketError, msg: &mut Message) {
     *msg = Message::new();
-    msg.len = rvos_wire::to_bytes(&SocketResponse::Error { code }, &mut msg.data).unwrap_or(0);
+    msg.len = rvos_wire::to_bytes(&SocketResponse::Error { code }, &mut msg.data).expect("serialize");
     let _ = raw::sys_chan_send(handle, msg);
 }
 
@@ -1830,13 +1830,13 @@ fn handle_client_message(
                 tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::AddrInUse {} },
                     &mut tx.msg.data,
-                ).unwrap_or(0);
+                ).expect("serialize");
             } else {
                 sockets[sock_idx].port = port;
                 tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Ok {},
                     &mut tx.msg.data,
-                ).unwrap_or(0);
+                ).expect("serialize");
             }
             if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
@@ -1855,7 +1855,7 @@ fn handle_client_message(
                 tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::InvalidArg {} },
                     &mut tx.msg.data,
-                ).unwrap_or(0);
+                ).expect("serialize");
                 if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                     sockets[sock_idx].deactivate(tcp_conns);
                 }
@@ -1869,7 +1869,7 @@ fn handle_client_message(
                 tx.msg.len = rvos_wire::to_bytes(
                     &SocketResponse::Error { code: SocketError::NoResources {} },
                     &mut tx.msg.data,
-                ).unwrap_or(0);
+                ).expect("serialize");
                 if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                     sockets[sock_idx].deactivate(tcp_conns);
                 }
@@ -1886,7 +1886,7 @@ fn handle_client_message(
             tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Sent { bytes: data.len() as u32 },
                 &mut tx.msg.data,
-            ).unwrap_or(0);
+            ).expect("serialize");
             if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
@@ -1906,7 +1906,7 @@ fn handle_client_message(
                     },
                 },
                 &mut tx.msg.data,
-            ).unwrap_or(0);
+            ).expect("serialize");
             if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
@@ -2015,7 +2015,7 @@ fn handle_client_message(
             tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Sent { bytes: copy_len as u32 },
                 &mut tx.msg.data,
-            ).unwrap_or(0);
+            ).expect("serialize");
             if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
@@ -2075,7 +2075,7 @@ fn handle_client_message(
                     },
                 },
                 &mut tx.msg.data,
-            ).unwrap_or(0);
+            ).expect("serialize");
             if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
             }
@@ -2185,7 +2185,7 @@ fn main() {
 
     // 2. Send GetDeviceInfo request
     tx.msg = Message::new();
-    tx.msg.len = rvos_wire::to_bytes(&NetRawRequest::GetDeviceInfo {}, &mut tx.msg.data).unwrap_or(0);
+    tx.msg.len = rvos_wire::to_bytes(&NetRawRequest::GetDeviceInfo {}, &mut tx.msg.data).expect("serialize");
     if raw::sys_chan_send_blocking(raw_handle, &tx.msg) != 0 {
         println!("[net-stack] failed to send GetDeviceInfo");
         return;
