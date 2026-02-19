@@ -24,6 +24,13 @@ const CTRL_RX_HEAD: usize = CTRL_OFFSET;
 const CTRL_RX_TAIL: usize = CTRL_OFFSET + 0x04;
 const CTRL_TX_HEAD: usize = CTRL_OFFSET + 0x08;
 const CTRL_TX_TAIL: usize = CTRL_OFFSET + 0x0C;
+const SHM_PAGE_COUNT: usize = 4;
+
+// Compile-time check: SHM ring layout must fit within allocated pages
+const _: () = assert!(
+    TX_RING_OFFSET + TX_SLOTS * TX_SLOT_SIZE <= SHM_PAGE_COUNT * 4096,
+    "SHM ring layout exceeds allocated size"
+);
 
 /// Control endpoint for net service (set by kmain before spawn)
 static NET_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -59,9 +66,9 @@ pub fn net_server() {
     // Register so network IRQs wake this task
     crate::drivers::virtio::net::set_wake_pid(my_pid);
 
-    // Allocate 4 contiguous physical pages for the SHM ring buffer
-    let shm_ppn = frame::frame_alloc_contiguous(4)
-        .expect("net_server: failed to allocate 4 contiguous pages for SHM ring");
+    // Allocate contiguous physical pages for the SHM ring buffer
+    let shm_ppn = frame::frame_alloc_contiguous(SHM_PAGE_COUNT)
+        .expect("net_server: failed to allocate contiguous pages for SHM ring");
 
     // Compute the kernel virtual address of the SHM region.
     // (In rvOS the kernel identity-maps physical memory, so PhysAddr == VirtAddr.)
@@ -69,11 +76,11 @@ pub fn net_server() {
 
     // Zero the entire SHM region so control block indices start at 0
     unsafe {
-        core::ptr::write_bytes(shm_base as *mut u8, 0, 4 * 4096);
+        core::ptr::write_bytes(shm_base as *mut u8, 0, SHM_PAGE_COUNT * 4096);
     }
 
     // Create the SHM IPC region
-    let shm = ipc::shm_create(shm_ppn, 4)
+    let shm = ipc::shm_create(shm_ppn, SHM_PAGE_COUNT)
         .expect("net_server: failed to create SHM region");
 
     // Read MAC address from the driver

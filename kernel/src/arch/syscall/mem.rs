@@ -1,20 +1,18 @@
 //! Memory mapping syscalls: mmap, munmap, shm_create, shm_dup_ro, meminfo.
 
 use crate::task::{HandleObject, HandleInfo};
-use super::validate_user_buffer;
+use super::{validate_user_buffer, SyscallError, SyscallResult};
 
 /// SYS_SHM_CREATE: create a shared memory region and return a RW handle.
-pub fn sys_shm_create(size: usize) -> usize {
+pub fn sys_shm_create(size: usize) -> SyscallResult {
     if size == 0 {
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     let page_count = size.div_ceil(crate::mm::address::PAGE_SIZE);
 
-    let ppn = match crate::mm::frame::frame_alloc_contiguous(page_count) {
-        Some(ppn) => ppn,
-        None => return usize::MAX,
-    };
+    let ppn = crate::mm::frame::frame_alloc_contiguous(page_count)
+        .ok_or(SyscallError::Error)?;
 
     let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
     crate::println!("[shm_create] PID {} pages={} range={:#x}..{:#x} (ppn {:#x}..{:#x})",
@@ -31,40 +29,36 @@ pub fn sys_shm_create(size: usize) -> usize {
             for i in 0..page_count {
                 crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
             }
-            return usize::MAX;
+            return Err(SyscallError::Error);
         }
     };
 
     // alloc_handle takes ownership. On None, shm drops → auto dec_ref.
-    match crate::task::current_process_alloc_handle(HandleObject::Shm { owned: shm, rw: true }) {
-        Some(local_handle) => local_handle,
-        None => usize::MAX,
-    }
+    crate::task::current_process_alloc_handle(HandleObject::Shm { owned: shm, rw: true })
+        .ok_or(SyscallError::Error)
 }
 
 /// SYS_SHM_DUP_RO: duplicate a SHM handle as read-only.
-pub fn sys_shm_dup_ro(handle: usize) -> usize {
+pub fn sys_shm_dup_ro(handle: usize) -> SyscallResult {
     let shm_id = match crate::task::current_process_handle(handle) {
         Some(HandleInfo::Shm { id, .. }) => id,
-        _ => return usize::MAX,
+        _ => return Err(SyscallError::Error),
     };
 
     // Create new owned reference (inc_ref via clone_from_raw)
     let owned = crate::ipc::OwnedShm::clone_from_raw(shm_id);
 
     // alloc_handle takes ownership. On None, owned drops → auto dec_ref.
-    match crate::task::current_process_alloc_handle(HandleObject::Shm { owned, rw: false }) {
-        Some(local_handle) => local_handle,
-        None => usize::MAX,
-    }
+    crate::task::current_process_alloc_handle(HandleObject::Shm { owned, rw: false })
+        .ok_or(SyscallError::Error)
 }
 
 /// SYS_MMAP: map pages into process address space.
 /// a0 == 0: anonymous mapping (allocate fresh pages)
 /// a0 != 0: SHM handle mapping (map shared region)
-pub fn sys_mmap(shm_handle: usize, length: usize) -> usize {
+pub fn sys_mmap(shm_handle: usize, length: usize) -> SyscallResult {
     if length == 0 {
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     if shm_handle == 0 {
@@ -74,13 +68,11 @@ pub fn sys_mmap(shm_handle: usize, length: usize) -> usize {
     }
 }
 
-fn sys_mmap_anonymous(length: usize) -> usize {
+fn sys_mmap_anonymous(length: usize) -> SyscallResult {
     let pages = length.div_ceil(crate::mm::address::PAGE_SIZE);
 
-    let ppn = match crate::mm::frame::frame_alloc_contiguous(pages) {
-        Some(ppn) => ppn,
-        None => return usize::MAX,
-    };
+    let ppn = crate::mm::frame::frame_alloc_contiguous(pages)
+        .ok_or(SyscallError::Error)?;
 
     let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
 
@@ -93,7 +85,7 @@ fn sys_mmap_anonymous(length: usize) -> usize {
         for i in 0..pages {
             crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
         }
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
@@ -115,7 +107,7 @@ fn sys_mmap_anonymous(length: usize) -> usize {
                 crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + k));
             }
             unsafe { core::arch::asm!("sfence.vma"); }
-            return usize::MAX;
+            return Err(SyscallError::Error);
         }
     }
 
@@ -126,36 +118,34 @@ fn sys_mmap_anonymous(length: usize) -> usize {
             crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
         }
         unsafe { core::arch::asm!("sfence.vma"); }
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     unsafe { core::arch::asm!("sfence.vma"); }
 
     crate::task::current_process_adjust_mem_pages(pages as i32);
 
-    base_pa
+    Ok(base_pa)
 }
 
-fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
+fn sys_mmap_shm(shm_handle: usize, length: usize) -> SyscallResult {
     let (shm_id, rw) = match crate::task::current_process_handle(shm_handle) {
         Some(HandleInfo::Shm { id, rw }) => (id, rw),
-        _ => return usize::MAX,
+        _ => return Err(SyscallError::Error),
     };
 
-    let (base_ppn, region_page_count) = match crate::ipc::shm_get_info(shm_id) {
-        Some(info) => info,
-        None => return usize::MAX,
-    };
+    let (base_ppn, region_page_count) = crate::ipc::shm_get_info(shm_id)
+        .ok_or(SyscallError::Error)?;
 
     let map_pages = length.div_ceil(crate::mm::address::PAGE_SIZE);
 
     if map_pages > region_page_count {
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     let user_satp = crate::task::current_process_user_satp();
     if user_satp == 0 {
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
@@ -181,7 +171,7 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
                 pt2.unmap(crate::mm::address::VirtPageNum(base_ppn.0 + j));
             }
             unsafe { core::arch::asm!("sfence.vma"); }
-            return usize::MAX;
+            return Err(SyscallError::Error);
         }
     }
 
@@ -191,32 +181,30 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> usize {
             pt2.unmap(crate::mm::address::VirtPageNum(base_ppn.0 + i));
         }
         unsafe { core::arch::asm!("sfence.vma"); }
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     unsafe { core::arch::asm!("sfence.vma"); }
 
     crate::task::current_process_adjust_mem_pages(map_pages as i32);
 
-    base_ppn.0 * crate::mm::address::PAGE_SIZE
+    Ok(base_ppn.0 * crate::mm::address::PAGE_SIZE)
 }
 
-pub fn sys_munmap(addr: usize, length: usize) -> usize {
+pub fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     if length == 0 || !addr.is_multiple_of(crate::mm::address::PAGE_SIZE) {
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     let pages = length.div_ceil(crate::mm::address::PAGE_SIZE);
     let base_ppn = addr / crate::mm::address::PAGE_SIZE;
 
-    let shm_id = match crate::task::current_process_remove_mmap(base_ppn, pages) {
-        Some(shm_id) => shm_id,
-        None => return usize::MAX,
-    };
+    let shm_id = crate::task::current_process_remove_mmap(base_ppn, pages)
+        .ok_or(SyscallError::Error)?;
 
     let user_satp = crate::task::current_process_user_satp();
     if user_satp == 0 {
-        return usize::MAX;
+        return Err(SyscallError::Error);
     }
 
     let root_ppn = crate::mm::address::PhysPageNum(user_satp & ((1usize << 44) - 1));
@@ -234,15 +222,12 @@ pub fn sys_munmap(addr: usize, length: usize) -> usize {
 
     unsafe { core::arch::asm!("sfence.vma"); }
 
-    0
+    Ok(0)
 }
 
 /// SYS_MEMINFO: fill a user-space MemInfo struct with kernel memory statistics.
-pub fn sys_meminfo(buf_ptr: usize) -> usize {
-    let pa = match validate_user_buffer(buf_ptr, 5 * core::mem::size_of::<usize>()) {
-        Some(pa) => pa,
-        None => return usize::MAX,
-    };
+pub fn sys_meminfo(buf_ptr: usize) -> SyscallResult {
+    let pa = validate_user_buffer(buf_ptr, 5 * core::mem::size_of::<usize>())?;
     let (_tags, _count, heap_used) = crate::mm::heap::heap_stats();
     let heap_total = crate::mm::heap::heap_total_size();
     let frames_used = crate::mm::frame::frames_allocated();
@@ -256,5 +241,5 @@ pub fn sys_meminfo(buf_ptr: usize) -> usize {
         out.add(3).write(frames_total);
         out.add(4).write(proc_mem_pages);
     }
-    0
+    Ok(0)
 }

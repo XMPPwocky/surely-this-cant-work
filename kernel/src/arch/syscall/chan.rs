@@ -1,19 +1,13 @@
 //! Channel IPC syscalls: create, send, recv, close, poll.
 
-use crate::arch::trap::TrapFrame;
 use crate::task::{HandleObject, HandleInfo};
-use super::{validate_user_buffer, UserMessage};
+use super::{validate_user_buffer, UserMessage, SyscallError, SyscallResult};
 
 /// SYS_CHAN_CREATE: create a bidirectional channel pair.
-/// Returns handle_a in a0, handle_b in a1.
-pub fn sys_chan_create(tf: &mut TrapFrame) {
-    let (ep_a, ep_b) = match crate::ipc::channel_create_pair() {
-        Some(pair) => pair,
-        None => {
-            tf.regs[10] = usize::MAX;
-            return;
-        }
-    };
+/// Returns (handle_a, handle_b) on success.
+pub fn sys_chan_create() -> Result<(usize, usize), SyscallError> {
+    let (ep_a, ep_b) = crate::ipc::channel_create_pair()
+        .ok_or(SyscallError::Error)?;
     // alloc_handle takes ownership. On failure, ep drops → auto-close.
     let handle_a = match crate::task::current_process_alloc_handle(HandleObject::Channel(ep_a)) {
         Some(h) => h,
@@ -21,8 +15,7 @@ pub fn sys_chan_create(tf: &mut TrapFrame) {
             // ep_a was moved into alloc_handle → dropped on None return (auto-close).
             // ep_b still owned here → drops when we return (auto-close).
             drop(ep_b);
-            tf.regs[10] = usize::MAX;
-            return;
+            return Err(SyscallError::Error);
         }
     };
     let handle_b = match crate::task::current_process_alloc_handle(HandleObject::Channel(ep_b)) {
@@ -31,19 +24,17 @@ pub fn sys_chan_create(tf: &mut TrapFrame) {
             // ep_b was moved into alloc_handle → dropped on None return (auto-close).
             // handle_a is in the handle table → take it back so it drops.
             drop(crate::task::current_process_take_handle(handle_a));
-            tf.regs[10] = usize::MAX;
-            return;
+            return Err(SyscallError::Error);
         }
     };
-    tf.regs[10] = handle_a;
-    tf.regs[11] = handle_b;
+    Ok((handle_a, handle_b))
 }
 
 /// Build a kernel Message with RAII caps from a user-space ABI message.
 /// On success returns the kernel Message ready to send.
 /// On failure (bad handle) returns None — the partially-built message drops,
 /// auto-closing any previously translated caps.
-fn build_kernel_message(user_msg: &UserMessage) -> Option<crate::ipc::Message> {
+fn build_kernel_message(user_msg: &UserMessage) -> Result<crate::ipc::Message, SyscallError> {
     let mut msg = crate::ipc::Message::new();
     let copy_len = user_msg.len.min(crate::ipc::MAX_MSG_SIZE);
     msg.data[..copy_len].copy_from_slice(&user_msg.data[..copy_len]);
@@ -70,11 +61,11 @@ fn build_kernel_message(user_msg: &UserMessage) -> Option<crate::ipc::Message> {
             }
             None => {
                 // Invalid handle — drop msg (auto-closes all previously translated caps)
-                return None;
+                return Err(SyscallError::Error);
             }
         }
     }
-    Some(msg)
+    Ok(msg)
 }
 
 /// Write a received kernel Message into user space, installing caps into the
@@ -115,43 +106,34 @@ fn write_recv_message(msg: &mut crate::ipc::Message, msg_pa: usize) {
 }
 
 /// SYS_CHAN_SEND: translate handle -> endpoint, copy message from user, send.
-pub fn sys_chan_send(handle: usize, msg_ptr: usize) -> usize {
-    let msg_pa = match validate_user_buffer(msg_ptr, core::mem::size_of::<UserMessage>()) {
-        Some(pa) => pa,
-        None => return usize::MAX,
-    };
+pub fn sys_chan_send(handle: usize, msg_ptr: usize) -> SyscallResult {
+    let msg_pa = validate_user_buffer(msg_ptr, core::mem::size_of::<UserMessage>())?;
 
     let endpoint = match crate::task::current_process_handle(handle) {
         Some(HandleInfo::Channel(ep)) => ep,
-        _ => return usize::MAX,
+        _ => return Err(SyscallError::Error),
     };
 
     let user_msg = unsafe { core::ptr::read(msg_pa as *const UserMessage) };
-    let msg = match build_kernel_message(&user_msg) {
-        Some(m) => m,
-        None => return usize::MAX,
-    };
+    let msg = build_kernel_message(&user_msg)?;
 
     match crate::ipc::channel_send(endpoint, msg) {
         Ok(wake) => {
             if wake != 0 { crate::task::wake_process(wake); }
-            0
+            Ok(0)
         }
-        Err((crate::ipc::SendError::QueueFull, _dropped)) => 5,
-        Err((_, _dropped)) => usize::MAX,
+        Err((crate::ipc::SendError::QueueFull, _dropped)) => Err(SyscallError::QueueFull),
+        Err((_, _dropped)) => Err(SyscallError::Error),
     }
 }
 
 /// SYS_CHAN_RECV (non-blocking): translate handle, try recv, install caps.
-pub fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
-    let msg_pa = match validate_user_buffer(msg_buf_ptr, core::mem::size_of::<UserMessage>()) {
-        Some(pa) => pa,
-        None => return usize::MAX,
-    };
+pub fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> SyscallResult {
+    let msg_pa = validate_user_buffer(msg_buf_ptr, core::mem::size_of::<UserMessage>())?;
 
     let endpoint = match crate::task::current_process_handle(handle) {
         Some(HandleInfo::Channel(ep)) => ep,
-        _ => return usize::MAX,
+        _ => return Err(SyscallError::Error),
     };
 
     let (msg, send_wake) = crate::ipc::channel_recv(endpoint);
@@ -161,36 +143,25 @@ pub fn sys_chan_recv(handle: usize, msg_buf_ptr: usize) -> usize {
     match msg {
         Some(mut msg) => {
             write_recv_message(&mut msg, msg_pa);
-            0
+            Ok(0)
         }
         None => {
             if !crate::ipc::channel_is_active(endpoint) {
-                2 // ChannelClosed
+                Err(SyscallError::ChannelClosed)
             } else {
-                1 // Nothing available
+                Err(SyscallError::Empty)
             }
         }
     }
 }
 
 /// SYS_CHAN_RECV_BLOCKING: like recv but blocks if empty.
-pub fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
-    let handle = tf.regs[10];
-    let msg_buf_ptr = tf.regs[11];
-    let msg_pa = match validate_user_buffer(msg_buf_ptr, core::mem::size_of::<UserMessage>()) {
-        Some(pa) => pa,
-        None => {
-            tf.regs[10] = usize::MAX;
-            return;
-        }
-    };
+pub fn sys_chan_recv_blocking(handle: usize, msg_buf_ptr: usize) -> SyscallResult {
+    let msg_pa = validate_user_buffer(msg_buf_ptr, core::mem::size_of::<UserMessage>())?;
 
     let endpoint = match crate::task::current_process_handle(handle) {
         Some(HandleInfo::Channel(ep)) => ep,
-        _ => {
-            tf.regs[10] = usize::MAX;
-            return;
-        }
+        _ => return Err(SyscallError::Error),
     };
 
     let cur_pid = crate::task::current_pid();
@@ -202,13 +173,11 @@ pub fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
         match msg {
             Some(mut msg) => {
                 write_recv_message(&mut msg, msg_pa);
-                tf.regs[10] = 0;
-                return;
+                return Ok(0);
             }
             None => {
                 if !crate::ipc::channel_is_active(endpoint) {
-                    tf.regs[10] = 2; // ChannelClosed
-                    return;
+                    return Err(SyscallError::ChannelClosed);
                 }
                 crate::ipc::channel_set_blocked(endpoint, cur_pid);
                 crate::task::block_process(cur_pid);
@@ -221,33 +190,16 @@ pub fn sys_chan_recv_blocking(tf: &mut TrapFrame) {
 /// SYS_CHAN_SEND_BLOCKING: like send but blocks if queue full.
 /// Uses return-on-failure pattern: channel_send returns the message on QueueFull
 /// so we can retry without re-translating caps.
-pub fn sys_chan_send_blocking(tf: &mut TrapFrame) {
-    let handle = tf.regs[10];
-    let msg_ptr = tf.regs[11];
-    let msg_pa = match validate_user_buffer(msg_ptr, core::mem::size_of::<UserMessage>()) {
-        Some(pa) => pa,
-        None => {
-            tf.regs[10] = usize::MAX;
-            return;
-        }
-    };
+pub fn sys_chan_send_blocking(handle: usize, msg_ptr: usize) -> SyscallResult {
+    let msg_pa = validate_user_buffer(msg_ptr, core::mem::size_of::<UserMessage>())?;
 
     let endpoint = match crate::task::current_process_handle(handle) {
         Some(HandleInfo::Channel(ep)) => ep,
-        _ => {
-            tf.regs[10] = usize::MAX;
-            return;
-        }
+        _ => return Err(SyscallError::Error),
     };
 
     let user_msg = unsafe { core::ptr::read(msg_pa as *const UserMessage) };
-    let mut msg = match build_kernel_message(&user_msg) {
-        Some(m) => m,
-        None => {
-            tf.regs[10] = usize::MAX;
-            return;
-        }
-    };
+    let mut msg = build_kernel_message(&user_msg)?;
 
     let cur_pid = crate::task::current_pid();
     loop {
@@ -256,15 +208,13 @@ pub fn sys_chan_send_blocking(tf: &mut TrapFrame) {
                 if wake != 0 {
                     crate::task::wake_process(wake);
                 }
-                tf.regs[10] = 0;
-                return;
+                return Ok(0);
             }
             Err((crate::ipc::SendError::QueueFull, returned)) => {
                 msg = returned; // got message back, retry after blocking
                 if !crate::ipc::channel_is_active(endpoint) {
                     // msg drops → caps auto-close
-                    tf.regs[10] = usize::MAX;
-                    return;
+                    return Err(SyscallError::Error);
                 }
                 crate::ipc::channel_set_send_blocked(endpoint, cur_pid);
                 crate::task::block_process(cur_pid);
@@ -272,8 +222,7 @@ pub fn sys_chan_send_blocking(tf: &mut TrapFrame) {
             }
             Err((_, _dropped)) => {
                 // msg dropped → caps auto-close
-                tf.regs[10] = usize::MAX;
-                return;
+                return Err(SyscallError::Error);
             }
         }
     }
@@ -281,21 +230,21 @@ pub fn sys_chan_send_blocking(tf: &mut TrapFrame) {
 
 /// SYS_CHAN_POLL_ADD: register the calling process as blocked-waiting on a
 /// channel handle so that any future send to that endpoint will wake us.
-pub fn sys_chan_poll_add(handle: usize) -> usize {
+pub fn sys_chan_poll_add(handle: usize) -> SyscallResult {
     let endpoint = match crate::task::current_process_handle(handle) {
         Some(HandleInfo::Channel(ep)) => ep,
-        _ => return usize::MAX,
+        _ => return Err(SyscallError::Error),
     };
     let pid = crate::task::current_pid();
     crate::ipc::channel_set_blocked(endpoint, pid);
-    0
+    Ok(0)
 }
 
 /// SYS_CHAN_CLOSE: close a handle (channel or SHM).
 /// Takes the handle from the table; the returned RAII object drops automatically.
-pub fn sys_chan_close(handle: usize) -> usize {
+pub fn sys_chan_close(handle: usize) -> SyscallResult {
     match crate::task::current_process_take_handle(handle) {
-        Some(_obj) => 0, // _obj drops → auto-close channel or dec_ref SHM
-        None => usize::MAX,
+        Some(_obj) => Ok(0), // _obj drops → auto-close channel or dec_ref SHM
+        None => Err(SyscallError::Error),
     }
 }

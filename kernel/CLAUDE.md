@@ -58,6 +58,17 @@ for kernel tasks calling `channel_send_blocking` directly. Prefer RAII
 wrappers per the root CLAUDE.md convention — these manual paths should be
 migrated to RAII over time.
 
+## Syscall Error Handling
+
+All syscall handlers must return `SyscallResult` (= `Result<usize, SyscallError>`).
+Never return raw sentinel values (`usize::MAX`, bare integer codes) — use the
+`SyscallError` enum. See `kernel/src/arch/CLAUDE.md` for the full error code table.
+
+The dispatch in `handle_syscall` converts Results to raw `usize` at the ABI
+boundary via `result_to_a0()` (status-only syscalls) or `value_result_to_a0()`
+(syscalls returning handles/addresses). Both include debug assertions to catch
+success-value / error-code collisions.
+
 ## Kernel-internal Panic Policy
 
 Functions taking kernel-internal IDs (endpoint IDs, SHM IDs) should

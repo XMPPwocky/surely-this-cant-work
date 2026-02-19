@@ -235,11 +235,17 @@ pub fn set_wake_pid(pid: usize) {
 pub fn poll_rx() -> Option<(usize, usize, u16)> {
     let net = unsafe { (*core::ptr::addr_of_mut!(NET)).as_mut()? };
 
-    net.receiveq.pop_used().map(|(desc_idx, total_len)| {
-        let frame_ptr = net.rx_bufs + (desc_idx as usize) * RX_BUF_SIZE + VIRTIO_NET_HDR_SIZE;
-        let frame_len = total_len as usize - VIRTIO_NET_HDR_SIZE;
-        (frame_ptr, frame_len, desc_idx)
-    })
+    let (desc_idx, total_len) = net.receiveq.pop_used()?;
+    let frame_len = match (total_len as usize).checked_sub(VIRTIO_NET_HDR_SIZE) {
+        Some(len) if len > 0 => len,
+        _ => {
+            // Frame too short (shorter than VirtIO net header) — requeue and skip
+            requeue_rx(desc_idx);
+            return None;
+        }
+    };
+    let frame_ptr = net.rx_bufs + (desc_idx as usize) * RX_BUF_SIZE + VIRTIO_NET_HDR_SIZE;
+    Some((frame_ptr, frame_len, desc_idx))
 }
 
 /// Re-queue an RX descriptor after the caller has finished processing the frame.

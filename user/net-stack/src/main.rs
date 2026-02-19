@@ -282,7 +282,7 @@ fn parse_ipv4(packet: &[u8]) -> Option<(IpHdr, &[u8])> {
         return None;
     }
     let total_len = u16::from_be_bytes([packet[2], packet[3]]);
-    if (total_len as usize) > packet.len() {
+    if (total_len as usize) > packet.len() || (total_len as usize) < hdr_len {
         return None;
     }
     let proto = packet[9];

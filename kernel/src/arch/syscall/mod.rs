@@ -33,6 +33,79 @@ pub const SYS_SHUTDOWN: usize = 231;
 pub const SYS_CLOCK: usize = 232;
 pub const SYS_MEMINFO: usize = 233;
 
+/// Syscall error type used by all handlers. Converted to a raw usize at the
+/// ABI boundary in `handle_syscall`. User-space code in `lib/rvos/src/raw.rs`
+/// must decode these same values.
+pub(super) enum SyscallError {
+    /// Generic error (invalid handle, bad address, resource exhaustion).
+    /// ABI value: `usize::MAX`
+    Error,
+    /// Non-blocking recv found no message.
+    /// ABI value: 1
+    Empty,
+    /// Channel is closed / deactivated.
+    /// ABI value: 2
+    ChannelClosed,
+    /// Non-blocking send: queue is full.
+    /// ABI value: 5
+    QueueFull,
+}
+
+impl SyscallError {
+    /// Encode as the raw usize returned to user space in a0.
+    fn into_raw(self) -> usize {
+        match self {
+            SyscallError::Error => usize::MAX,
+            SyscallError::Empty => 1,
+            SyscallError::ChannelClosed => 2,
+            SyscallError::QueueFull => 5,
+        }
+    }
+}
+
+/// Result type for syscall handlers. `Ok(value)` is written to a0;
+/// `Err(e)` is encoded via `SyscallError::into_raw()`.
+pub(super) type SyscallResult = Result<usize, SyscallError>;
+
+/// Convert a status-only SyscallResult (Ok value is always 0) to raw a0.
+///
+/// Debug-asserts that the success value doesn't collide with any error code.
+/// Use `value_result_to_a0` for syscalls that return handles or addresses.
+fn result_to_a0(r: SyscallResult) -> usize {
+    match r {
+        Ok(v) => {
+            debug_assert!(
+                !is_error_code(v),
+                "syscall Ok({v:#x}) overlaps with error code — \
+                 use value_result_to_a0 for value-returning syscalls"
+            );
+            v
+        }
+        Err(e) => e.into_raw(),
+    }
+}
+
+/// Convert a value-returning SyscallResult (Ok value is a handle or address)
+/// to raw a0. These syscalls only use `SyscallError::Error` (= usize::MAX),
+/// so any Ok value != usize::MAX is unambiguous.
+fn value_result_to_a0(r: SyscallResult) -> usize {
+    match r {
+        Ok(v) => {
+            debug_assert_ne!(
+                v, usize::MAX,
+                "syscall Ok(usize::MAX) is indistinguishable from Error"
+            );
+            v
+        }
+        Err(e) => e.into_raw(),
+    }
+}
+
+/// Returns true if `v` matches any SyscallError encoding.
+const fn is_error_code(v: usize) -> bool {
+    matches!(v, 1 | 2 | 5 | usize::MAX)
+}
+
 /// Set to true to log every syscall (except yield) to the trace ring buffer.
 const TRACE_SYSCALLS: bool = false;
 
@@ -59,25 +132,31 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
             tf.regs[10] = crate::task::current_pid();
         }
         SYS_CHAN_CREATE => {
-            chan::sys_chan_create(tf);
+            match chan::sys_chan_create() {
+                Ok((ha, hb)) => {
+                    tf.regs[10] = ha;
+                    tf.regs[11] = hb;
+                }
+                Err(e) => tf.regs[10] = e.into_raw(),
+            }
         }
         SYS_CHAN_SEND => {
-            tf.regs[10] = chan::sys_chan_send(a0, a1);
+            tf.regs[10] = result_to_a0(chan::sys_chan_send(a0, a1));
         }
         SYS_CHAN_RECV => {
-            tf.regs[10] = chan::sys_chan_recv(a0, a1);
+            tf.regs[10] = result_to_a0(chan::sys_chan_recv(a0, a1));
         }
         SYS_CHAN_CLOSE => {
-            tf.regs[10] = chan::sys_chan_close(a0);
+            tf.regs[10] = result_to_a0(chan::sys_chan_close(a0));
         }
         SYS_CHAN_RECV_BLOCKING => {
-            chan::sys_chan_recv_blocking(tf);
+            tf.regs[10] = result_to_a0(chan::sys_chan_recv_blocking(a0, a1));
         }
         SYS_CHAN_SEND_BLOCKING => {
-            chan::sys_chan_send_blocking(tf);
+            tf.regs[10] = result_to_a0(chan::sys_chan_send_blocking(a0, a1));
         }
         SYS_CHAN_POLL_ADD => {
-            tf.regs[10] = chan::sys_chan_poll_add(a0);
+            tf.regs[10] = result_to_a0(chan::sys_chan_poll_add(a0));
         }
         SYS_BLOCK => {
             let pid = crate::task::current_pid();
@@ -86,19 +165,19 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
             tf.regs[10] = 0;
         }
         SYS_SHM_CREATE => {
-            tf.regs[10] = mem::sys_shm_create(a0);
+            tf.regs[10] = value_result_to_a0(mem::sys_shm_create(a0));
         }
         SYS_SHM_DUP_RO => {
-            tf.regs[10] = mem::sys_shm_dup_ro(a0);
+            tf.regs[10] = value_result_to_a0(mem::sys_shm_dup_ro(a0));
         }
         SYS_MMAP => {
-            tf.regs[10] = mem::sys_mmap(a0, a1);
+            tf.regs[10] = value_result_to_a0(mem::sys_mmap(a0, a1));
         }
         SYS_MUNMAP => {
-            tf.regs[10] = mem::sys_munmap(a0, a1);
+            tf.regs[10] = result_to_a0(mem::sys_munmap(a0, a1));
         }
         SYS_TRACE => {
-            tf.regs[10] = misc::sys_trace(a0, a1);
+            tf.regs[10] = result_to_a0(misc::sys_trace(a0, a1));
         }
         SYS_SHUTDOWN => {
             crate::println!("System shutdown requested by PID {}", crate::task::current_pid());
@@ -110,11 +189,11 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
             tf.regs[11] = cpu as usize;
         }
         SYS_MEMINFO => {
-            tf.regs[10] = mem::sys_meminfo(a0);
+            tf.regs[10] = result_to_a0(mem::sys_meminfo(a0));
         }
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);
-            tf.regs[10] = usize::MAX;
+            tf.regs[10] = SyscallError::Error.into_raw();
         }
     }
 
@@ -146,9 +225,9 @@ pub(super) fn translate_user_va(va: usize) -> Option<usize> {
 
 /// Validate a user buffer and return its physical address.
 /// Walks the user page table to translate VA->PA. Logs an error on failure.
-pub(super) fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
+pub(super) fn validate_user_buffer(ptr: usize, len: usize) -> Result<usize, SyscallError> {
     if len == 0 {
-        return None;
+        return Err(SyscallError::Error);
     }
     let pa = match translate_user_va(ptr) {
         Some(pa) => pa,
@@ -157,7 +236,7 @@ pub(super) fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
                 "[syscall] PID {}: invalid user pointer {:#x} (len={}), page not mapped",
                 crate::task::current_pid(), ptr, len
             );
-            return None;
+            return Err(SyscallError::Error);
         }
     };
 
@@ -169,7 +248,7 @@ pub(super) fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
                 "[syscall] PID {}: user buffer {:#x}+{} overflows address space",
                 crate::task::current_pid(), ptr, len
             );
-            return None;
+            return Err(SyscallError::Error);
         }
     };
     let start_page = ptr / crate::mm::address::PAGE_SIZE;
@@ -183,11 +262,11 @@ pub(super) fn validate_user_buffer(ptr: usize, len: usize) -> Option<usize> {
                     "[syscall] PID {}: user buffer {:#x}+{} spans non-contiguous pages",
                     crate::task::current_pid(), ptr, len
                 );
-                return None;
+                return Err(SyscallError::Error);
             }
         }
     }
-    Some(pa)
+    Ok(pa)
 }
 
 /// User-space ABI message layout for ptr::read/write at the syscall boundary.
