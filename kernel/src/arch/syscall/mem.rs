@@ -15,9 +15,6 @@ pub fn sys_shm_create(size: usize) -> SyscallResult {
         .ok_or(SyscallError::Error)?;
 
     let base_pa = ppn.0 * crate::mm::address::PAGE_SIZE;
-    crate::println!("[shm_create] PID {} pages={} range={:#x}..{:#x} (ppn {:#x}..{:#x})",
-        crate::task::current_pid(), page_count, base_pa, base_pa + page_count * crate::mm::address::PAGE_SIZE,
-        ppn.0, ppn.0 + page_count);
 
     unsafe {
         core::ptr::write_bytes(base_pa as *mut u8, 0, page_count * crate::mm::address::PAGE_SIZE);
@@ -80,6 +77,16 @@ fn sys_mmap_anonymous(length: usize) -> SyscallResult {
         core::ptr::write_bytes(base_pa as *mut u8, 0, pages * crate::mm::address::PAGE_SIZE);
     }
 
+    // Allocate VA from the per-process mmap bump pointer
+    let base_va = crate::task::current_process_alloc_mmap_va(pages)
+        .ok_or_else(|| {
+            for i in 0..pages {
+                crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
+            }
+            SyscallError::Error
+        })?;
+    let base_vpn = base_va / crate::mm::address::PAGE_SIZE;
+
     let user_satp = crate::task::current_process_user_satp();
     if user_satp == 0 {
         for i in 0..pages {
@@ -92,7 +99,7 @@ fn sys_mmap_anonymous(length: usize) -> SyscallResult {
     let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
 
     for i in 0..pages {
-        let vpn = crate::mm::address::VirtPageNum(ppn.0 + i);
+        let vpn = crate::mm::address::VirtPageNum(base_vpn + i);
         let page_ppn = crate::mm::address::PhysPageNum(ppn.0 + i);
         if pt.map(vpn, page_ppn,
             crate::mm::page_table::PTE_R |
@@ -101,7 +108,7 @@ fn sys_mmap_anonymous(length: usize) -> SyscallResult {
         {
             let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
             for j in 0..i {
-                pt2.unmap(crate::mm::address::VirtPageNum(ppn.0 + j));
+                pt2.unmap(crate::mm::address::VirtPageNum(base_vpn + j));
             }
             for k in 0..pages {
                 crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + k));
@@ -111,10 +118,10 @@ fn sys_mmap_anonymous(length: usize) -> SyscallResult {
         }
     }
 
-    if !crate::task::current_process_add_mmap(ppn.0, pages, None) {
+    if !crate::task::current_process_add_mmap(base_vpn, ppn.0, pages, None) {
         let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
         for i in 0..pages {
-            pt2.unmap(crate::mm::address::VirtPageNum(ppn.0 + i));
+            pt2.unmap(crate::mm::address::VirtPageNum(base_vpn + i));
             crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(ppn.0 + i));
         }
         unsafe { core::arch::asm!("sfence.vma"); }
@@ -125,7 +132,7 @@ fn sys_mmap_anonymous(length: usize) -> SyscallResult {
 
     crate::task::current_process_adjust_mem_pages(pages as i32);
 
-    Ok(base_pa)
+    Ok(base_va)
 }
 
 fn sys_mmap_shm(shm_handle: usize, length: usize) -> SyscallResult {
@@ -143,6 +150,11 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> SyscallResult {
         return Err(SyscallError::Error);
     }
 
+    // Allocate VA from the per-process mmap bump pointer
+    let base_va = crate::task::current_process_alloc_mmap_va(map_pages)
+        .ok_or(SyscallError::Error)?;
+    let base_vpn = base_va / crate::mm::address::PAGE_SIZE;
+
     let user_satp = crate::task::current_process_user_satp();
     if user_satp == 0 {
         return Err(SyscallError::Error);
@@ -157,28 +169,23 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> SyscallResult {
         crate::mm::page_table::PTE_R | crate::mm::page_table::PTE_U
     };
 
-    crate::println!("[mmap_shm] PID {} shm={} pages={} range={:#x}..{:#x}",
-        crate::task::current_pid(), shm_id, map_pages,
-        base_ppn.0 * crate::mm::address::PAGE_SIZE,
-        (base_ppn.0 + map_pages) * crate::mm::address::PAGE_SIZE);
-
     for i in 0..map_pages {
-        let vpn = crate::mm::address::VirtPageNum(base_ppn.0 + i);
+        let vpn = crate::mm::address::VirtPageNum(base_vpn + i);
         let page_ppn = crate::mm::address::PhysPageNum(base_ppn.0 + i);
         if pt.map(vpn, page_ppn, flags).is_err() {
             let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
             for j in 0..i {
-                pt2.unmap(crate::mm::address::VirtPageNum(base_ppn.0 + j));
+                pt2.unmap(crate::mm::address::VirtPageNum(base_vpn + j));
             }
             unsafe { core::arch::asm!("sfence.vma"); }
             return Err(SyscallError::Error);
         }
     }
 
-    if !crate::task::current_process_add_mmap(base_ppn.0, map_pages, Some(shm_id)) {
+    if !crate::task::current_process_add_mmap(base_vpn, base_ppn.0, map_pages, Some(shm_id)) {
         let mut pt2 = crate::mm::page_table::PageTable::from_root(root_ppn);
         for i in 0..map_pages {
-            pt2.unmap(crate::mm::address::VirtPageNum(base_ppn.0 + i));
+            pt2.unmap(crate::mm::address::VirtPageNum(base_vpn + i));
         }
         unsafe { core::arch::asm!("sfence.vma"); }
         return Err(SyscallError::Error);
@@ -188,7 +195,7 @@ fn sys_mmap_shm(shm_handle: usize, length: usize) -> SyscallResult {
 
     crate::task::current_process_adjust_mem_pages(map_pages as i32);
 
-    Ok(base_ppn.0 * crate::mm::address::PAGE_SIZE)
+    Ok(base_va)
 }
 
 pub fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
@@ -197,9 +204,9 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     }
 
     let pages = length.div_ceil(crate::mm::address::PAGE_SIZE);
-    let base_ppn = addr / crate::mm::address::PAGE_SIZE;
+    let base_vpn = addr / crate::mm::address::PAGE_SIZE;
 
-    let shm_id = crate::task::current_process_remove_mmap(base_ppn, pages)
+    let (base_ppn, shm_id) = crate::task::current_process_remove_mmap(base_vpn, pages)
         .ok_or(SyscallError::Error)?;
 
     let user_satp = crate::task::current_process_user_satp();
@@ -211,7 +218,7 @@ pub fn sys_munmap(addr: usize, length: usize) -> SyscallResult {
     let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
 
     for i in 0..pages {
-        let vpn = crate::mm::address::VirtPageNum(base_ppn + i);
+        let vpn = crate::mm::address::VirtPageNum(base_vpn + i);
         pt.unmap(vpn);
         if shm_id.is_none() {
             crate::mm::frame::frame_dealloc(crate::mm::address::PhysPageNum(base_ppn + i));

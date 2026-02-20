@@ -706,7 +706,7 @@ pub fn terminate_current_process() {
                 for slot in proc.mmap_regions.iter_mut() {
                     if let Some(region) = slot.take() {
                         for j in 0..region.page_count {
-                            let vpn = VirtPageNum(region.base_ppn + j);
+                            let vpn = VirtPageNum(region.base_vpn + j);
                             pt.unmap(vpn);
                             if region.shm_id.is_none() {
                                 crate::mm::frame::frame_dealloc(
@@ -865,7 +865,7 @@ pub fn terminate_process(target_pid: usize, exit_code: i32) -> Result<(), &'stat
                 for slot in proc.mmap_regions.iter_mut() {
                     if let Some(region) = slot.take() {
                         for j in 0..region.page_count {
-                            let vpn = VirtPageNum(region.base_ppn + j);
+                            let vpn = VirtPageNum(region.base_vpn + j);
                             pt.unmap(vpn);
                             if region.shm_id.is_none() {
                                 crate::mm::frame::frame_dealloc(
@@ -1246,25 +1246,42 @@ pub fn current_process_user_satp() -> usize {
     }
 }
 
-/// Add an mmap region to the current process. Returns true on success.
-pub fn current_process_add_mmap(base_ppn: usize, page_count: usize, shm_id: Option<usize>) -> bool {
+/// Allocate VA space for mmap in the current process. Returns the base VA,
+/// or None if the process doesn't exist or the VA space is exhausted.
+pub fn current_process_alloc_mmap_va(page_count: usize) -> Option<usize> {
     let mut sched = SCHEDULER.lock();
     let pid = sched.current;
     if let Some(ref mut proc) = sched.processes[pid] {
-        proc.add_mmap_region(base_ppn, page_count, shm_id)
+        let va = proc.mmap_next_va;
+        let end = va + page_count * crate::mm::address::PAGE_SIZE;
+        if end > crate::task::process::MMAP_VA_LIMIT {
+            return None;
+        }
+        proc.mmap_next_va = end;
+        Some(va)
+    } else {
+        None
+    }
+}
+
+/// Add an mmap region to the current process. Returns true on success.
+pub fn current_process_add_mmap(base_vpn: usize, base_ppn: usize, page_count: usize, shm_id: Option<usize>) -> bool {
+    let mut sched = SCHEDULER.lock();
+    let pid = sched.current;
+    if let Some(ref mut proc) = sched.processes[pid] {
+        proc.add_mmap_region(base_vpn, base_ppn, page_count, shm_id)
     } else {
         false
     }
 }
 
 /// Remove an mmap region from the current process.
-/// Returns Some(shm_id) if found (None inside means anonymous, Some(id) means SHM).
-/// Returns None if not found.
-pub fn current_process_remove_mmap(base_ppn: usize, page_count: usize) -> Option<Option<usize>> {
+/// Returns Some((base_ppn, shm_id)) if found. Returns None if not found.
+pub fn current_process_remove_mmap(base_vpn: usize, page_count: usize) -> Option<(usize, Option<usize>)> {
     let mut sched = SCHEDULER.lock();
     let pid = sched.current;
     if let Some(ref mut proc) = sched.processes[pid] {
-        proc.remove_mmap_region(base_ppn, page_count)
+        proc.remove_mmap_region(base_vpn, page_count)
     } else {
         None
     }

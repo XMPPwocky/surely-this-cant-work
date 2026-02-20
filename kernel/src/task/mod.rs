@@ -13,7 +13,8 @@ pub use scheduler::{
     check_deadlines,
     process_list, process_mem_list,
     current_process_handle, current_process_alloc_handle, current_process_take_handle,
-    current_process_user_satp, current_process_add_mmap, current_process_remove_mmap,
+    current_process_user_satp, current_process_alloc_mmap_va,
+    current_process_add_mmap, current_process_remove_mmap,
     current_process_mem_pages, current_process_adjust_mem_pages,
     set_exit_notify_ep,
     // Debug accessors

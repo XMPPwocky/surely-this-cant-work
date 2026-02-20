@@ -44,9 +44,18 @@ impl HandleObject {
     }
 }
 
+/// Base virtual address for user mmap allocations (1 GiB).
+/// Well below physical RAM (0x8000_0000) to avoid identity-map collisions.
+pub const MMAP_VA_BASE: usize = 0x4000_0000;
+
+/// Upper limit for mmap VA allocation (2 GiB).
+/// Leaves a large gap before kernel RAM at 0x8000_0000.
+pub const MMAP_VA_LIMIT: usize = 0x8000_0000;
+
 #[derive(Clone, Copy)]
 pub struct MmapRegion {
-    pub base_ppn: usize,
+    pub base_vpn: usize,       // virtual page number (for PTE unmap)
+    pub base_ppn: usize,       // physical page number (for frame dealloc)
     pub page_count: usize,
     pub shm_id: Option<usize>, // None = anonymous, Some(id) = SHM-backed
 }
@@ -102,6 +111,8 @@ pub struct Process {
     pub handles: [Option<HandleObject>; MAX_HANDLES], // local handle -> HandleObject
     pub channel_handle_count: u16, // number of Channel handles in this process
     pub mmap_regions: [Option<MmapRegion>; MAX_MMAP_REGIONS],
+    /// Next VA for mmap allocations (bump pointer, grows upward from MMAP_VA_BASE)
+    pub mmap_next_va: usize,
     name: [u8; NAME_LEN],
     name_len: usize,
     // CPU accounting (EWMA, scaled by 10000 = 100%)
@@ -212,6 +223,7 @@ impl Process {
             handles: [const { None }; MAX_HANDLES],
             channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
+            mmap_next_va: MMAP_VA_BASE,
             name: [0u8; NAME_LEN],
             name_len: 0,
             ewma_1s: 0,
@@ -295,6 +307,7 @@ impl Process {
             handles: [const { None }; MAX_HANDLES],
             channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
+            mmap_next_va: MMAP_VA_BASE,
             name: [0u8; NAME_LEN],
             name_len: 0,
             ewma_1s: 0,
@@ -366,6 +379,7 @@ impl Process {
             handles: [const { None }; MAX_HANDLES],
             channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
+            mmap_next_va: MMAP_VA_BASE,
             name: [0u8; NAME_LEN],
             name_len: 0,
             ewma_1s: 0,
@@ -404,6 +418,7 @@ impl Process {
             handles: [const { None }; MAX_HANDLES],
             channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
+            mmap_next_va: MMAP_VA_BASE,
             name: [0u8; NAME_LEN],
             name_len: 0,
             ewma_1s: 0,
@@ -484,25 +499,26 @@ impl Process {
     }
 
     /// Record an mmap region in the first free slot. Returns true on success, false if full.
-    pub fn add_mmap_region(&mut self, base_ppn: usize, page_count: usize, shm_id: Option<usize>) -> bool {
+    pub fn add_mmap_region(&mut self, base_vpn: usize, base_ppn: usize, page_count: usize, shm_id: Option<usize>) -> bool {
         for slot in self.mmap_regions.iter_mut() {
             if slot.is_none() {
-                *slot = Some(MmapRegion { base_ppn, page_count, shm_id });
+                *slot = Some(MmapRegion { base_vpn, base_ppn, page_count, shm_id });
                 return true;
             }
         }
         false
     }
 
-    /// Remove an mmap region matching base_ppn and page_count.
-    /// Returns Some(shm_id) if found (shm_id is None for anonymous, Some(id) for SHM-backed).
-    pub fn remove_mmap_region(&mut self, base_ppn: usize, page_count: usize) -> Option<Option<usize>> {
+    /// Remove an mmap region matching base_vpn and page_count.
+    /// Returns Some((base_ppn, shm_id)) if found.
+    pub fn remove_mmap_region(&mut self, base_vpn: usize, page_count: usize) -> Option<(usize, Option<usize>)> {
         for slot in self.mmap_regions.iter_mut() {
             if let Some(ref region) = slot {
-                if region.base_ppn == base_ppn && region.page_count == page_count {
+                if region.base_vpn == base_vpn && region.page_count == page_count {
+                    let base_ppn = region.base_ppn;
                     let shm_id = region.shm_id;
                     *slot = None;
-                    return Some(shm_id);
+                    return Some((base_ppn, shm_id));
                 }
             }
         }
