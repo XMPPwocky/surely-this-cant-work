@@ -85,6 +85,7 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 231    | `SYS_SHUTDOWN`        | (none)                        | Does not return            | Shuts down the machine via SBI.                            |
 | 232    | `SYS_CLOCK`           | (none)                        | `a0` = wall_ticks, `a1` = cpu_ticks | Returns wall-clock and global CPU ticks.           |
 | 233    | `SYS_MEMINFO`         | `a0` = info_ptr               | `a0` = 0 or `usize::MAX` | Fills a MemInfo struct with kernel memory statistics. |
+| 234    | `SYS_KILL`            | `a0` = target_pid, `a1` = exit_code | `a0` = 0 or `usize::MAX` | Terminates another process by PID.               |
 
 ### Detailed Syscall Descriptions
 
@@ -350,6 +351,34 @@ pub struct MemInfo {
 ```
 
 Returns 0 on success, `usize::MAX` on error (invalid pointer).
+
+#### SYS_KILL (234)
+
+Terminates another process by PID. The target process is moved to `Dead` state
+and fully cleaned up (handles closed, memory freed, channels deactivated).
+
+- `a0` = target PID (must not be 0 or the calling process's own PID).
+- `a1` = exit code (passed to the target's `ExitNotification` watcher).
+
+The kernel:
+1. Validates the target PID (not idle, not self, not already dead).
+2. Extracts cleanup info (handles, notification endpoint, debug endpoint,
+   memory pages) under the scheduler lock.
+3. Marks the process as `Dead` and removes it from the ready queue.
+4. Clears any stale blocked/send-blocked registrations on all channels.
+5. Frees the kernel stack.
+6. Sends a debug `ProcessExited` event if a debugger is attached.
+7. Sends an `ExitNotification` with the given exit code on the process's
+   watcher channel.
+8. Drops all handles (closing channels, freeing SHM).
+9. Frees physical frames (code pages, user stack, page table nodes).
+
+This syscall is used by console servers to implement Ctrl+C: the shell sets
+a foreground PID via the `TCSETFG` ioctl, and the console calls `SYS_KILL`
+with exit code `-2` when it receives 0x03 (Ctrl+C).
+
+Returns 0 on success, `usize::MAX` on error (invalid PID, target is idle
+task, target is self, target already dead).
 
 ---
 
