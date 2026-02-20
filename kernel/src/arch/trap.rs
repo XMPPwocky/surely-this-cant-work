@@ -269,8 +269,22 @@ fn external_interrupt() {
             net_irq if Some(net_irq) == crate::drivers::virtio::net::irq_number() => {
                 crate::drivers::virtio::net::handle_irq();
             }
-            _ => {
-                crate::println!("Unknown external interrupt: irq={}", irq);
+            other_irq => {
+                // Try block device IRQs (each blk device has IRQ = 1 + slot)
+                let blk_count = crate::drivers::virtio::blk::device_count();
+                let mut handled = false;
+                for i in 0..blk_count {
+                    if Some(other_irq) == crate::drivers::virtio::blk::irq_number(i) {
+                        crate::drivers::virtio::blk::handle_irq(
+                            (other_irq - 1) as usize,
+                        );
+                        handled = true;
+                        break;
+                    }
+                }
+                if !handled {
+                    crate::println!("Unknown external interrupt: irq={}", irq);
+                }
             }
         }
         plic::plic_complete(irq);

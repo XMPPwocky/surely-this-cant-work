@@ -47,7 +47,7 @@ const MAX_BOOT_REGS: usize = 16;
 const MAX_CONSOLE_SERVICES: usize = 4;
 
 /// Maximum number of named services (sysinfo, math, fs, compositor, etc.)
-const MAX_NAMED_SERVICES: usize = 12;
+const MAX_NAMED_SERVICES: usize = 16;
 const SERVICE_NAME_LEN: usize = 16;
 
 /// A named service with an atomic control endpoint.

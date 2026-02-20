@@ -118,6 +118,12 @@ pub extern "C" fn kmain() -> ! {
         }
     }
 
+    // ---- Phase 3e: VirtIO block devices ----
+    let blk_count = drivers::virtio::blk::init();
+    if blk_count > 0 {
+        println!("[boot] {} block device(s) initialized", blk_count);
+    }
+
     // ---- Phase 4: Scheduler and IPC ----
     task::init();
     ipc::init();
@@ -180,6 +186,22 @@ pub extern "C" fn kmain() -> ! {
         services::init::register_service("net-raw", init_net_ep.into_raw());
     }
 
+    // Block device servers (one per detected block device)
+    for i in 0..blk_count {
+        let (init_blk_ep, blk_ctl_ep) = ipc::channel_create_pair().expect("boot: blk channel");
+        services::blk_server::set_control_ep(i, blk_ctl_ep.into_raw());
+        services::blk_server::set_device_index(i, i);
+        // Register as "blk0", "blk1", etc.
+        let name: &str = match i {
+            0 => "blk0",
+            1 => "blk1",
+            2 => "blk2",
+            3 => "blk3",
+            _ => "blk?",
+        };
+        services::init::register_service(name, init_blk_ep.into_raw());
+    }
+
     // Timer service kernel task
     let (init_timer_ep, timer_ctl_ep) = ipc::channel_create_pair().expect("boot: timer channel");
     services::timer::set_control_ep(timer_ctl_ep.into_raw());
@@ -217,6 +239,16 @@ pub extern "C" fn kmain() -> ! {
     task::spawn_named(services::proc_debug::proc_debug_service, "proc-debug").expect("boot: proc-debug");
     if net_present {
         task::spawn_named(services::net_server::net_server, "net-server").expect("boot: net-server");
+    }
+    for i in 0..blk_count {
+        let name: &str = match i {
+            0 => "blk-server0",
+            1 => "blk-server1",
+            2 => "blk-server2",
+            3 => "blk-server3",
+            _ => "blk-server?",
+        };
+        task::spawn_named(services::blk_server::BLK_SERVER_ENTRIES[i], name).expect("boot: blk-server");
     }
     task::spawn_named(services::timer::timer_service, "timer").expect("boot: timer");
 
