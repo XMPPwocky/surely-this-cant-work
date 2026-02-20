@@ -2,12 +2,11 @@ use std::io::{self, Read, Write};
 
 use rvos::raw;
 use rvos::Message;
-use rvos::Channel;
 use rvos::UserTransport;
-use rvos::rvos_wire::{self, Never};
+use rvos::rvos_wire;
 use rvos::rvos_proto;
 use rvos_proto::math::MathClient;
-use rvos_proto::process::ExitNotification;
+use rvos_proto::process::{ExitNotification, ProcessStarted};
 use rvos_proto::sysinfo::SysinfoCommand;
 
 /// Request a service from the init server via boot channel (handle 0).
@@ -233,15 +232,48 @@ fn rebuild_args(blob: &mut [u8; 512], argv0: &str, rest: &str) -> usize {
     len
 }
 
-/// Wait for a child process to exit via its process handle channel, print exit code.
+/// Wait for a child process to exit via its process handle channel.
+/// Reads ProcessStarted to learn the child PID, sets foreground via TCSETFG
+/// ioctl so Ctrl+C kills the child, then waits for ExitNotification.
 fn wait_for_exit(proc_handle: usize) {
-    let mut proc_ch = Channel::<Never, ExitNotification>::from_raw_handle(proc_handle);
-    let exit_code = match proc_ch.next_message() {
-        Some(notif) => notif.exit_code,
-        None => -1,
+    let mut msg = Message::new();
+
+    // Read ProcessStarted to learn child PID
+    let ret = raw::sys_chan_recv_blocking(proc_handle, &mut msg);
+    let child_pid = if ret == 0 {
+        rvos_wire::from_bytes::<ProcessStarted>(&msg.data[..msg.len])
+            .map(|ps| ps.pid)
+            .unwrap_or(0)
+    } else {
+        0
     };
-    println!("Process exited with code {}", exit_code);
-    // Channel dropped here → handle closed automatically
+
+    // Tell console our foreground child
+    let stdin_h = std::os::rvos::stdin_handle();
+    if child_pid != 0 && stdin_h != 0 {
+        let _ = rvos::tty::ioctl(stdin_h, rvos_proto::fs::TCSETFG, child_pid);
+    }
+
+    // Wait for ExitNotification
+    let ret = raw::sys_chan_recv_blocking(proc_handle, &mut msg);
+    let exit_code = if ret == 0 {
+        rvos_wire::from_bytes::<ExitNotification>(&msg.data[..msg.len])
+            .map(|en| en.exit_code)
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+
+    // Clear foreground PID
+    if stdin_h != 0 {
+        let _ = rvos::tty::ioctl(stdin_h, rvos_proto::fs::TCSETFG, 0);
+    }
+
+    raw::sys_chan_close(proc_handle);
+
+    if exit_code != -2 {
+        println!("Process exited with code {}", exit_code);
+    }
 }
 
 fn cmd_run(args: &str) -> bool {
