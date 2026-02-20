@@ -6,6 +6,7 @@
 
 #![no_std]
 
+pub mod blk;
 pub mod math;
 pub mod debug;
 pub mod fs;
