@@ -6,6 +6,10 @@ use super::{validate_user_buffer, UserMessage, SyscallError, SyscallResult};
 /// SYS_CHAN_CREATE: create a bidirectional channel pair.
 /// Returns (handle_a, handle_b) on success.
 pub fn sys_chan_create() -> Result<(usize, usize), SyscallError> {
+    // Per-process channel limit: creating a pair adds 2 handles
+    if crate::task::current_process_channel_count() + 2 > crate::task::process::MAX_CHANNELS_PER_PROCESS as u16 {
+        return Err(SyscallError::Error);
+    }
     let (ep_a, ep_b) = crate::ipc::channel_create_pair()
         .ok_or(SyscallError::Error)?;
     // alloc_handle takes ownership. On failure, ep drops → auto-close.

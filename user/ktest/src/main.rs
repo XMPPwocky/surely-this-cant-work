@@ -1625,6 +1625,14 @@ fn test_stress_spawn_exit() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Yield repeatedly to let spawned child processes finish exiting and release
+/// their channel slots before the next spawn-heavy test section.
+fn yield_drain() {
+    for _ in 0..50 {
+        raw::sys_yield();
+    }
+}
+
 // ============================================================
 // 23. Block Device
 // ============================================================
@@ -2023,11 +2031,13 @@ fn main() {
         ("umode_fault_kills_child", test_umode_fault_kills_child_not_kernel),
     ]));
 
+    yield_drain();
     total.merge(&run_section("Regression -- Cap Ref Counting", &[
         ("ns_override_cap_delivery", test_ns_override_cap_delivery),
         ("two_children_shared_override", test_two_children_shared_override),
         ("cap_delivery_via_spawn", test_cap_delivery_via_spawn),
     ]));
+    yield_drain();
 
     total.merge(&run_section("Regression -- Debugger", &[
         ("debugger_second_attach", test_debugger_second_attach),
