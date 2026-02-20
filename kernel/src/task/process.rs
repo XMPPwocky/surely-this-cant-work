@@ -14,6 +14,7 @@ const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
 
 pub const MAX_PROCS: usize = 64;
 pub const MAX_HANDLES: usize = 32;
+pub const MAX_CHANNELS_PER_PROCESS: usize = 32;
 pub const MAX_MMAP_REGIONS: usize = 256;
 pub const MAX_BREAKPOINTS: usize = 8;
 const NAME_LEN: usize = 16;
@@ -80,6 +81,7 @@ pub struct Process {
     pub user_entry: usize,     // virtual (= physical) address of user code
     pub user_stack_top: usize, // virtual (= physical) address of user stack top
     pub handles: [Option<HandleObject>; MAX_HANDLES], // local handle -> HandleObject
+    pub channel_handle_count: u16, // number of Channel handles in this process
     pub mmap_regions: [Option<MmapRegion>; MAX_MMAP_REGIONS],
     name: [u8; NAME_LEN],
     name_len: usize,
@@ -186,6 +188,7 @@ impl Process {
             user_entry: 0,
             user_stack_top: 0,
             handles: [const { None }; MAX_HANDLES],
+            channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -266,6 +269,7 @@ impl Process {
             user_entry: code_phys,
             user_stack_top: stack_phys_top,
             handles: [const { None }; MAX_HANDLES],
+            channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -334,6 +338,7 @@ impl Process {
             user_entry: loaded.entry_va,
             user_stack_top: stack_phys_top,
             handles: [const { None }; MAX_HANDLES],
+            channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -369,6 +374,7 @@ impl Process {
             user_entry: 0,
             user_stack_top: 0,
             handles: [const { None }; MAX_HANDLES],
+            channel_handle_count: 0,
             mmap_regions: [None; MAX_MMAP_REGIONS],
             name: [0u8; NAME_LEN],
             name_len: 0,
@@ -407,9 +413,13 @@ impl Process {
     /// Allocate a handle in this process's table for the given HandleObject.
     /// Returns the local handle index, or None if the table is full.
     pub fn alloc_handle(&mut self, obj: HandleObject) -> Option<usize> {
+        let is_channel = matches!(obj, HandleObject::Channel(_));
         for (i, slot) in self.handles.iter_mut().enumerate() {
             if slot.is_none() {
                 *slot = Some(obj);
+                if is_channel {
+                    self.channel_handle_count += 1;
+                }
                 return Some(i);
             }
         }
@@ -434,7 +444,11 @@ impl Process {
     /// drop outside.
     pub fn take_handle(&mut self, handle: usize) -> Option<HandleObject> {
         if handle < MAX_HANDLES {
-            self.handles[handle].take()
+            let obj = self.handles[handle].take();
+            if matches!(obj, Some(HandleObject::Channel(_))) {
+                self.channel_handle_count = self.channel_handle_count.saturating_sub(1);
+            }
+            obj
         } else {
             None
         }

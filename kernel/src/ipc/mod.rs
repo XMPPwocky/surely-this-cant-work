@@ -9,7 +9,7 @@ use crate::mm::heap::{IpcAlloc, IPC_ALLOC};
 /// Maximum message payload size in bytes
 pub const MAX_MSG_SIZE: usize = 1024;
 /// Maximum number of bidirectional channels
-const MAX_CHANNELS: usize = 64;
+const MAX_CHANNELS: usize = 1024;
 /// Maximum number of shared memory regions
 const MAX_SHM_REGIONS: usize = 32;
 /// Maximum number of messages queued per endpoint before backpressure kicks in

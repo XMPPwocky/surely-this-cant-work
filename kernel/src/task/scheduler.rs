@@ -230,6 +230,7 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: crate
     proc.set_name(name);
     let ep_raw = boot_ep.raw();
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
+    proc.channel_handle_count = 1;
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
@@ -275,6 +276,7 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: cr
     proc.set_name(name);
     let ep_raw = boot_ep.raw();
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
+    proc.channel_handle_count = 1;
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
@@ -300,6 +302,7 @@ pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: crate::
     let extra_raw = extra_ep.raw();
     proc.handles[0] = Some(HandleObject::Channel(boot_ep));
     proc.handles[1] = Some(HandleObject::Channel(extra_ep));
+    proc.channel_handle_count = 2;
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
@@ -347,6 +350,16 @@ pub fn current_process_take_handle(handle: usize) -> Option<HandleObject> {
 /// Get current PID
 pub fn current_pid() -> usize {
     SCHEDULER.lock().current
+}
+
+/// Get the number of channel handles held by the current process.
+pub fn current_process_channel_count() -> u16 {
+    let sched = SCHEDULER.lock();
+    let pid = sched.current;
+    match sched.processes[pid].as_ref() {
+        Some(proc) => proc.channel_handle_count,
+        None => 0,
+    }
 }
 
 /// Non-blocking version of current_pid for use in fault handlers
