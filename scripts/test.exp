@@ -7,7 +7,7 @@ log_user 1
 
 cd [file dirname [file dirname [file normalize [info script]]]]
 
-spawn make run
+spawn make run-test
 
 # Wait for the serial shell prompt (may have timer ticks interleaved)
 expect {
