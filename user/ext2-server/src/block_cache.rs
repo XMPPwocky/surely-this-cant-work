@@ -70,6 +70,7 @@ impl BlockCache {
 
     /// Get a mutable reference to a cached block, marking it dirty.
     /// Fetches from disk on cache miss.
+    #[allow(dead_code)] // Used in Step 13
     pub fn read_mut<'a>(&'a mut self, block_num: u64, blk: &BlkClient) -> Result<&'a mut [u8], &'static str> {
         self.ensure_cached(block_num, blk)?;
         let idx = self.find(block_num).unwrap();
@@ -79,6 +80,7 @@ impl BlockCache {
 
     /// Write an entire block (overwrites cache, marks dirty).
     /// Does NOT read from disk first — caller provides the full block.
+    #[allow(dead_code)] // Used in Step 13
     pub fn write(&mut self, block_num: u64, data: &[u8], blk: &BlkClient) -> Result<(), &'static str> {
         let idx = self.ensure_slot(block_num, blk)?;
         let entry = &mut self.entries[idx];
@@ -92,6 +94,7 @@ impl BlockCache {
     }
 
     /// Flush all dirty blocks to disk.
+    #[allow(dead_code)] // Used in Step 13
     pub fn sync(&mut self, blk: &BlkClient) -> Result<(), &'static str> {
         for entry in &mut self.entries {
             if entry.valid && entry.dirty {
@@ -104,6 +107,7 @@ impl BlockCache {
     }
 
     /// Invalidate all cache entries (discard without writing).
+    #[allow(dead_code)] // Used in Step 13
     pub fn invalidate_all(&mut self) {
         for entry in &mut self.entries {
             entry.valid = false;

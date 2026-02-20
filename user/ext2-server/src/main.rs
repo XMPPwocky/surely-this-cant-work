@@ -7,27 +7,26 @@
 //!   blk_device: name of the block device service (e.g., "blk0")
 //!   ro: optional flag to mount read-only
 
-// Scaffold: many fields/methods are defined but not yet called (Step 9 fills them in).
-#![allow(dead_code)]
-
 extern crate rvos_rt;
 extern crate alloc;
 
 mod blk_client;
 mod block_cache;
+mod ext2;
 
 use rvos::raw::{self, NO_CAP};
 use rvos::Message;
 use rvos::Channel;
 use rvos::rvos_wire;
 use rvos_proto::fs::{
-    FsRequest, FsRequestMsg, FsResponse, FsEntryKind, FsError,
+    FsRequest, FsRequestMsg, FsResponse, FsEntryKind, FsError, OpenFlags,
     FileRequest, FileRequestMsg, FileResponse, FileResponseMsg,
     FileOffset, ReaddirResponse,
 };
 
 use blk_client::BlkClient;
 use block_cache::BlockCache;
+use ext2::Superblock;
 
 // Control channel handle (set by kernel at spawn).
 const CONTROL_HANDLE: usize = 1;
@@ -37,6 +36,9 @@ const MAX_CLIENTS: usize = 8;
 
 /// Maximum number of open files across all clients.
 const MAX_OPEN_FILES: usize = 16;
+
+/// Max data payload per chunk: MAX_MSG_SIZE(1024) - 3 (tag u8 + length u16).
+const MAX_DATA_CHUNK: usize = 1021;
 
 /// Per-client state.
 struct ClientState {
@@ -52,6 +54,7 @@ impl ClientState {
 }
 
 /// Per-open-file tracking.
+#[allow(dead_code)] // `inode` and `append` used in Step 13
 struct OpenFile {
     endpoint_handle: usize,
     inode: u32,
@@ -64,11 +67,10 @@ struct OpenFile {
 struct Ext2State {
     blk: BlkClient,
     cache: BlockCache,
+    sb: Superblock,
     read_only: bool,
     open_files: [OpenFile; MAX_OPEN_FILES],
     open_count: usize,
-    // ext2 superblock info (populated in Step 9)
-    block_size: u32,
 }
 
 impl Ext2State {
@@ -120,6 +122,7 @@ fn send_data_sentinel(ch: &Channel<FileResponseMsg, FileRequestMsg>) {
     let _ = ch.send(&FileResponse::Data { chunk: &[] });
 }
 
+#[allow(dead_code)]
 fn send_write_ok(ch: &Channel<FileResponseMsg, FileRequestMsg>, written: u32) {
     let _ = ch.send(&FileResponse::WriteOk { written });
 }
@@ -139,41 +142,278 @@ fn send_dir_sentinel(handle: usize) {
     raw::sys_chan_send_blocking(handle, &msg);
 }
 
-// --- Stub FS operations (implemented in Step 9) ---
+// --- FS operations ---
 
-fn do_stat(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, _path: &[u8]) {
-    let _ = ext2;
-    send_error(ch, FsError::Io {});
+fn do_stat(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path: &[u8]) {
+    if path.is_empty() || path[0] != b'/' {
+        send_error(ch, FsError::InvalidPath {});
+        return;
+    }
+
+    let ino = match ext2::resolve_path(&ext2.sb, path, &mut ext2.cache, &ext2.blk) {
+        Ok(ino) => ino,
+        Err(_) => {
+            send_error(ch, FsError::NotFound {});
+            return;
+        }
+    };
+
+    let inode = match ext2::read_inode(&ext2.sb, ino, &mut ext2.cache, &ext2.blk) {
+        Ok(i) => i,
+        Err(_) => {
+            send_error(ch, FsError::Io {});
+            return;
+        }
+    };
+
+    let kind = if inode.is_dir() {
+        FsEntryKind::Directory {}
+    } else {
+        FsEntryKind::File {}
+    };
+
+    send_stat_ok(ch, kind, inode.size);
 }
 
-fn do_open(ext2: &mut Ext2State, client: &mut ClientState, _flags: rvos_proto::fs::OpenFlags, _path: &[u8]) {
-    let _ = ext2;
-    send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, path: &[u8]) {
+    if path.is_empty() || path[0] != b'/' {
+        send_error(client.ctl.as_ref().unwrap(), FsError::InvalidPath {});
+        return;
+    }
+
+    let create = flags.bits & OpenFlags::CREATE.bits != 0;
+
+    // Resolve the path
+    let ino = match ext2::resolve_path(&ext2.sb, path, &mut ext2.cache, &ext2.blk) {
+        Ok(ino) => ino,
+        Err(_) => {
+            if create && !ext2.read_only {
+                // TODO(step 13): Create file
+                send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+                return;
+            }
+            send_error(client.ctl.as_ref().unwrap(), FsError::NotFound {});
+            return;
+        }
+    };
+
+    let inode = match ext2::read_inode(&ext2.sb, ino, &mut ext2.cache, &ext2.blk) {
+        Ok(i) => i,
+        Err(_) => {
+            send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+            return;
+        }
+    };
+
+    if inode.is_dir() {
+        send_error(client.ctl.as_ref().unwrap(), FsError::NotAFile {});
+        return;
+    }
+
+    // Close existing file channel for this client
+    close_client_file(ext2, client);
+
+    // Create channel pair for file I/O
+    let (my_handle, client_file_handle) = raw::sys_chan_create();
+    if my_handle == usize::MAX {
+        send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+        return;
+    }
+
+    let append = flags.bits & OpenFlags::APPEND.bits != 0;
+    if !ext2.register_open_file(my_handle, ino, append) {
+        raw::sys_chan_close(my_handle);
+        raw::sys_chan_close(client_file_handle);
+        send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+        return;
+    }
+
+    // Send Opened with the file handle as capability
+    let _ = client.ctl.as_ref().unwrap().send(&FsResponse::Opened {
+        kind: FsEntryKind::File {},
+        size: inode.size,
+        file: rvos_wire::RawChannelCap::new(client_file_handle),
+    });
+    // Close our reference to the client's endpoint (they hold their own via cap transfer)
+    raw::sys_chan_close(client_file_handle);
+
+    // Store typed file channel in client state
+    client.file_ch = Some(Channel::from_raw_handle(my_handle));
+    client.file_inode = ino;
 }
 
-fn do_readdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, _path: &[u8]) {
-    let _ = ext2;
-    send_error(ch, FsError::Io {});
+fn do_readdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path: &[u8]) {
+    if path.is_empty() || path[0] != b'/' {
+        send_error(ch, FsError::InvalidPath {});
+        return;
+    }
+
+    let ino = match ext2::resolve_path(&ext2.sb, path, &mut ext2.cache, &ext2.blk) {
+        Ok(ino) => ino,
+        Err(_) => {
+            send_error(ch, FsError::NotFound {});
+            return;
+        }
+    };
+
+    let dir_inode = match ext2::read_inode(&ext2.sb, ino, &mut ext2.cache, &ext2.blk) {
+        Ok(i) => i,
+        Err(_) => {
+            send_error(ch, FsError::Io {});
+            return;
+        }
+    };
+
+    if !dir_inode.is_dir() {
+        send_error(ch, FsError::NotAFile {});
+        return;
+    }
+
+    let raw_handle = ch.raw_handle();
+
+    // Collect entries into a buffer since readdir borrows the cache.
+    // We'll store up to 128 entries.
+    let mut entries: [(u32, u8, [u8; 64], usize); 128] = [(0, 0, [0; 64], 0); 128];
+    let mut count = 0;
+
+    let result = ext2::readdir(&ext2.sb, &dir_inode, &mut ext2.cache, &ext2.blk, |entry_ino, file_type, name| {
+        if count < 128 {
+            entries[count].0 = entry_ino;
+            entries[count].1 = file_type;
+            let nlen = name.len().min(64);
+            entries[count].2[..nlen].copy_from_slice(&name[..nlen]);
+            entries[count].3 = nlen;
+            count += 1;
+        }
+    });
+
+    if result.is_err() {
+        send_error(ch, FsError::Io {});
+        return;
+    }
+
+    // Send collected entries
+    for entry in entries.iter().take(count) {
+        let (entry_ino, file_type, ref name_buf, name_len) = *entry;
+        let name_str = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("");
+
+        // Get size for files
+        let (kind, size) = match file_type {
+            2 => (FsEntryKind::Directory {}, 0u64),
+            _ => {
+                // Try to read the inode for size
+                if let Ok(entry_inode) = ext2::read_inode(&ext2.sb, entry_ino, &mut ext2.cache, &ext2.blk) {
+                    let k = if entry_inode.is_dir() { FsEntryKind::Directory {} } else { FsEntryKind::File {} };
+                    (k, entry_inode.size)
+                } else {
+                    (FsEntryKind::File {}, 0)
+                }
+            }
+        };
+
+        send_dir_entry(raw_handle, kind, size, name_str);
+    }
+
+    send_dir_sentinel(raw_handle);
 }
 
 fn do_delete(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, _path: &[u8]) {
-    let _ = ext2;
+    if ext2.read_only {
+        send_error(ch, FsError::Io {});
+        return;
+    }
+    // TODO(step 13): Implement delete
     send_error(ch, FsError::Io {});
 }
 
 fn do_mkdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, _path: &[u8]) {
-    let _ = ext2;
+    if ext2.read_only {
+        send_error(ch, FsError::Io {});
+        return;
+    }
+    // TODO(step 13): Implement mkdir
     send_error(ch, FsError::Io {});
 }
 
-fn handle_file_read(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequestMsg>, _inode: u32, _offset: FileOffset, _len: u32) {
-    let _ = ext2;
+fn handle_file_read(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequestMsg>, inode_num: u32, offset: FileOffset, len: u32) {
+    let handle = ch.raw_handle();
+
+    let explicit_offset = match offset {
+        FileOffset::Explicit { offset } => Some(offset as usize),
+        FileOffset::Stream {} => None,
+    };
+
+    let file_offset = match explicit_offset {
+        Some(off) => off,
+        None => {
+            match ext2.get_open_file_mut(handle) {
+                Some(of) => of.position,
+                None => 0,
+            }
+        }
+    };
+
+    let inode = match ext2::read_inode(&ext2.sb, inode_num, &mut ext2.cache, &ext2.blk) {
+        Ok(i) => i,
+        Err(_) => {
+            send_file_error(ch, FsError::Io {});
+            return;
+        }
+    };
+
+    if file_offset as u64 >= inode.size {
+        send_data_sentinel(ch);
+        return;
+    }
+
+    let available = (inode.size - file_offset as u64) as usize;
+    let to_send = (len as usize).min(available);
+
+    // Read in chunks via the block cache
+    let mut sent = 0usize;
+    let mut read_buf = [0u8; MAX_DATA_CHUNK];
+
+    while sent < to_send {
+        let chunk_size = MAX_DATA_CHUNK.min(to_send - sent);
+        let n = match ext2::read_data(&ext2.sb, &inode, (file_offset + sent) as u64, &mut read_buf[..chunk_size], &mut ext2.cache, &ext2.blk) {
+            Ok(n) => n,
+            Err(_) => {
+                send_file_error(ch, FsError::Io {});
+                return;
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        send_data_chunk(ch, &read_buf[..n]);
+        sent += n;
+    }
+
+    send_data_sentinel(ch);
+
+    // Update stream position
+    if explicit_offset.is_none() {
+        if let Some(of) = ext2.get_open_file_mut(handle) {
+            of.position = file_offset + sent;
+        }
+    }
+}
+
+fn handle_file_write(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequestMsg>, _inode_num: u32, _offset: FileOffset, _data: &[u8]) {
+    if ext2.read_only {
+        send_file_error(ch, FsError::Io {});
+        return;
+    }
+    // TODO(step 13): Implement write
     send_file_error(ch, FsError::Io {});
 }
 
-fn handle_file_write(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequestMsg>, _inode: u32, _offset: FileOffset, _data: &[u8]) {
-    let _ = ext2;
-    send_file_error(ch, FsError::Io {});
+fn close_client_file(ext2: &mut Ext2State, client: &mut ClientState) {
+    if let Some(ref file_ch) = client.file_ch {
+        ext2.close_open_file(file_ch.raw_handle());
+    }
+    client.file_ch = None; // Drop closes the handle via RAII
+    client.file_inode = 0;
 }
 
 // --- Main ---
@@ -209,19 +449,29 @@ fn main() {
         if read_only { "RO" } else { "RW" }
     );
 
-    // TODO(step 9): Read and validate ext2 superblock, determine block_size.
-    // For now, use default ext2 block size of 1024.
-    let block_size = 1024u32;
+    // Read and validate ext2 superblock
+    let sb = match ext2::read_superblock(&blk) {
+        Ok(sb) => sb,
+        Err(e) => {
+            eprintln!("[ext2-server] superblock error: {}", e);
+            return;
+        }
+    };
 
-    let cache = BlockCache::new(block_size);
+    eprintln!(
+        "[ext2-server] ext2: {} blocks, {} inodes, block_size={}, inode_size={}",
+        sb.blocks_count, sb.inodes_count, sb.block_size, sb.inode_size
+    );
 
-    let mut ext2 = Ext2State {
+    let cache = BlockCache::new(sb.block_size);
+
+    let mut ext2_state = Ext2State {
         blk,
         cache,
+        sb,
         read_only,
         open_files: [const { OpenFile { endpoint_handle: 0, inode: 0, active: false, append: false, position: 0 } }; MAX_OPEN_FILES],
         open_count: 0,
-        block_size,
     };
 
     let mut clients: [ClientState; MAX_CLIENTS] =
@@ -266,6 +516,7 @@ fn main() {
                 let mut read_params: Option<(FileOffset, u32)> = None;
                 let mut write_buf = [0u8; 1024];
                 let mut write_params: Option<(FileOffset, usize)> = None;
+                let mut ioctl = false;
                 let mut file_closed = false;
 
                 {
@@ -280,8 +531,7 @@ fn main() {
                             write_params = Some((offset, dlen));
                         }
                         Ok(FileRequest::Ioctl { .. }) => {
-                            handled = true;
-                            // ext2 doesn't support ioctls — respond inline
+                            ioctl = true;
                         }
                         Err(rvos::RecvError::Closed) => {
                             file_closed = true;
@@ -294,13 +544,17 @@ fn main() {
                 if let Some((offset, len)) = read_params {
                     handled = true;
                     let ch = clients[i].file_ch.as_ref().unwrap();
-                    handle_file_read(&mut ext2, ch, file_inode, offset, len);
+                    handle_file_read(&mut ext2_state, ch, file_inode, offset, len);
                 } else if let Some((offset, dlen)) = write_params {
                     handled = true;
                     let ch = clients[i].file_ch.as_ref().unwrap();
-                    handle_file_write(&mut ext2, ch, file_inode, offset, &write_buf[..dlen]);
+                    handle_file_write(&mut ext2_state, ch, file_inode, offset, &write_buf[..dlen]);
+                } else if ioctl {
+                    handled = true;
+                    let ch = clients[i].file_ch.as_ref().unwrap();
+                    send_file_error(ch, FsError::Io {});
                 } else if file_closed {
-                    ext2.close_open_file(raw_h);
+                    ext2_state.close_open_file(raw_h);
                     clients[i].file_ch = None;
                     clients[i].file_inode = 0;
                 }
@@ -310,7 +564,7 @@ fn main() {
             if clients[i].ctl.is_some() {
                 let mut path_buf = [0u8; 64];
                 let mut path_len = 0usize;
-                let mut open_flags: Option<rvos_proto::fs::OpenFlags> = None;
+                let mut open_flags: Option<OpenFlags> = None;
                 let mut is_delete = false;
                 let mut is_stat = false;
                 let mut is_readdir = false;
@@ -363,19 +617,19 @@ fn main() {
                 // Phase 2: dispatch (ctl borrow released, ext2 and clients are separate)
                 if let Some(flags) = open_flags {
                     handled = true;
-                    do_open(&mut ext2, &mut clients[i], flags, &path_buf[..path_len]);
+                    do_open(&mut ext2_state, &mut clients[i], flags, &path_buf[..path_len]);
                 } else if is_delete {
                     handled = true;
-                    do_delete(&mut ext2, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+                    do_delete(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
                 } else if is_stat {
                     handled = true;
-                    do_stat(&mut ext2, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+                    do_stat(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
                 } else if is_readdir {
                     handled = true;
-                    do_readdir(&mut ext2, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+                    do_readdir(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
                 } else if is_mkdir {
                     handled = true;
-                    do_mkdir(&mut ext2, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+                    do_mkdir(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
                 } else if ctl_closed {
                     clients[i].ctl = None;
                 }

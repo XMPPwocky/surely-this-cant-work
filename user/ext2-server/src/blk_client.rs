@@ -187,6 +187,7 @@ impl BlkClient {
     }
 
     /// Flush any cached writes to stable storage.
+    #[allow(dead_code)] // Used in Step 13 (RW operations)
     pub fn flush(&self) -> Result<(), &'static str> {
         let resp = self.request(&BlkRequest::Flush {})?;
         match resp {
