@@ -1289,6 +1289,13 @@ fn finish_fs_launch(
             return;
         }
 
+        // Send ProcessStarted on watcher channel so the parent knows the child PID
+        let mut started_msg = Message::new();
+        let started = rvos_proto::process::ProcessStarted { pid: pid as u32 };
+        started_msg.len = rvos_wire::to_bytes(&started, &mut started_msg.data).unwrap_or(0);
+        started_msg.sender_pid = my_pid;
+        send_and_wake(init_watcher_raw, started_msg);
+
         // Send Ok response with process handle capability
         send_ok_with_cap(ctx.requester_ep, client_handle_raw, my_pid);
         drop(client_handle_ep); // close our reference
