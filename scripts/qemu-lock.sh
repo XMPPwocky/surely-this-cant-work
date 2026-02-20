@@ -25,17 +25,27 @@ if [[ $# -eq 0 ]]; then
     exit 2
 fi
 
-# Save existing lockfile contents for error reporting
-HOLDER_INFO=$(cat "$LOCKFILE" 2>/dev/null || true)
+try_lock() {
+    # Open lockfile on fd 9 (append mode — avoids truncating holder's info)
+    exec 9>>"$LOCKFILE"
+    flock --nonblock 9
+}
 
-# Open lockfile on fd 9 (append mode — avoids truncating holder's info)
-exec 9>>"$LOCKFILE"
+if ! try_lock; then
+    # Lock held — check if the holder is still alive
+    HOLDER_PID=$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$LOCKFILE" 2>/dev/null || true)
+    if [[ -n "$HOLDER_PID" ]] && ! kill -0 "$HOLDER_PID" 2>/dev/null; then
+        # Holder is dead; remove stale lockfile and retry once
+        rm -f "$LOCKFILE"
+        exec 9>&-  # close old fd so we get the new inode
+        if try_lock; then
+            LOCK_OK=1
+        fi
+    fi
 
-# Try non-blocking exclusive lock
-if ! flock --nonblock 9; then
-    # Re-read in case it changed between our read and the flock attempt
-    HOLDER_INFO=$(cat "$LOCKFILE" 2>/dev/null || true)
-    cat >&2 <<EOF
+    if [[ "${LOCK_OK:-}" != 1 ]]; then
+        HOLDER_INFO=$(cat "$LOCKFILE" 2>/dev/null || true)
+        cat >&2 <<EOF
 ============================================================
 ERROR: QEMU is already running for this project.
 Another QEMU instance holds the lock — you cannot start a
@@ -44,11 +54,12 @@ second one. This may be from another agent or a manual session.
 ${HOLDER_INFO:+Lock holder: $HOLDER_INFO
 }Lockfile:    $LOCKFILE
 
-Wait for the other instance to finish, or kill it if stale.
-Do NOT use 'pkill qemu' — it may kill the wrong instance.
+You must wait for it to finish. Do NOT kill it — it may
+belong to another agent or to the user.
 ============================================================
 EOF
-    exit 1
+        exit 1
+    fi
 fi
 
 # Lock acquired — write our info (truncate via path, not fd)
