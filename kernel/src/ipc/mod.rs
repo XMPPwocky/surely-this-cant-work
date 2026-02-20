@@ -261,6 +261,11 @@ struct Channel {
     ref_count_a: usize, // number of handles referencing endpoint A across all processes
     ref_count_b: usize, // number of handles referencing endpoint B across all processes
     active: bool,
+    // Per-channel statistics: messages and bytes delivered to each queue
+    msgs_a: u64,  // messages delivered to queue_a (from B→A sends)
+    bytes_a: u64, // bytes delivered to queue_a
+    msgs_b: u64,  // messages delivered to queue_b (from A→B sends)
+    bytes_b: u64, // bytes delivered to queue_b
 }
 
 impl Channel {
@@ -275,6 +280,10 @@ impl Channel {
             ref_count_a: 1,
             ref_count_b: 1,
             active: true,
+            msgs_a: 0,
+            bytes_a: 0,
+            msgs_b: 0,
+            bytes_b: 0,
         }
     }
 }
@@ -350,12 +359,15 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, 
         if !channel.active {
             return Err((SendError::ChannelClosed, msg));
         }
+        let msg_bytes = msg.len as u64;
         if is_b {
             // Sending from B side -> push to queue_a (for A to recv)
             if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
                 return Err((SendError::QueueFull, msg));
             }
             channel.queue_a.push_back(msg);
+            channel.msgs_a += 1;
+            channel.bytes_a += msg_bytes;
             crate::kstat::inc(&crate::kstat::IPC_SENDS);
             Ok(channel.blocked_a)
         } else {
@@ -364,6 +376,8 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, 
                 return Err((SendError::QueueFull, msg));
             }
             channel.queue_b.push_back(msg);
+            channel.msgs_b += 1;
+            channel.bytes_b += msg_bytes;
             crate::kstat::inc(&crate::kstat::IPC_SENDS);
             Ok(channel.blocked_b)
         }
@@ -660,19 +674,21 @@ pub fn format_channel_stats() -> alloc::string::String {
     use core::fmt::Write;
     let mgr = CHANNELS.lock();
     let mut out = alloc::string::String::new();
-    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
-        "CH", "EP_A", "EP_B", "QA", "QB", "RC_A", "RC_B");
-    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
-        "----", "-----", "-----", "-----", "-----", "-----", "-----");
+    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>4}  {:>4}  {:>4}  {:>4}  {:>7}  {:>7}  {:>7}  {:>7}",
+        "CH", "EP_A", "EP_B", "QA", "QB", "RC_A", "RC_B", "MSGS_A", "BYTES_A", "MSGS_B", "BYTES_B");
+    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>4}  {:>4}  {:>4}  {:>4}  {:>7}  {:>7}  {:>7}  {:>7}",
+        "----", "-----", "-----", "----", "----", "----", "----", "-------", "-------", "-------", "-------");
     for (i, slot) in mgr.channels.iter().enumerate() {
         if let Some(ref ch) = slot {
             if !ch.active && ch.ref_count_a == 0 && ch.ref_count_b == 0 {
                 continue;
             }
-            let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}{}",
+            let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>4}  {:>4}  {:>4}  {:>4}  {:>7}  {:>7}  {:>7}  {:>7}{}",
                 i, i * 2, i * 2 + 1,
                 ch.queue_a.len(), ch.queue_b.len(),
                 ch.ref_count_a, ch.ref_count_b,
+                ch.msgs_a, ch.bytes_a,
+                ch.msgs_b, ch.bytes_b,
                 if !ch.active { "  (closed)" } else { "" });
         }
     }
