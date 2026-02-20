@@ -2,7 +2,7 @@ use crate::ipc::{self, Message, MAX_MSG_SIZE};
 use crate::drivers::tty;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::service_control::NewConnection;
-use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED};
+use rvos_proto::fs::{FileRequest, FileResponse, FsError, TCRAW, TCCOOKED, TCSETFG};
 
 /// Control endpoint for serial console server (set by kmain before spawn)
 static SERIAL_CONTROL_EP: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -235,6 +235,7 @@ pub fn serial_console_server() {
 
     let mut line_disc = LineDiscipline::new();
     let mut raw_mode = false;
+    let mut foreground_pid: usize = 0;
 
     // Main loop
     loop {
@@ -293,9 +294,15 @@ pub fn serial_console_server() {
             if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
                 if let Some(ch) = tty::SERIAL_INPUT.lock().pop() {
                     handled = true;
-                    send_file_data(clients[stdin_idx].stdin_ep, &[ch], my_pid);
-                    send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
-                    clients[stdin_idx].has_pending_read = false;
+                    if ch == 0x03 && foreground_pid != 0 {
+                        // Ctrl+C: kill foreground process
+                        let _ = crate::task::terminate_process(foreground_pid, -2);
+                        foreground_pid = 0;
+                    } else {
+                        send_file_data(clients[stdin_idx].stdin_ep, &[ch], my_pid);
+                        send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
+                        clients[stdin_idx].has_pending_read = false;
+                    }
                 }
             }
         } else {
@@ -305,16 +312,29 @@ pub fn serial_console_server() {
                 match ch {
                     Some(ch) => {
                         handled = true;
-                        echo_serial(ch);
-                        if let Some(len) = line_disc.push_char(ch) {
-                            let mut buf = [0u8; LINE_BUF_SIZE];
-                            let data = line_disc.line_data(len);
-                            buf[..len].copy_from_slice(data);
-                            // Fulfill pending read on stdin client
-                            if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
-                                send_file_data(clients[stdin_idx].stdin_ep, &buf[..len], my_pid);
-                                send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
-                                clients[stdin_idx].has_pending_read = false;
+                        if ch == 0x03 {
+                            // Ctrl+C: echo ^C, reset line buffer, kill foreground
+                            tty::raw_uart_putchar(b'^');
+                            tty::raw_uart_putchar(b'C');
+                            tty::raw_uart_putchar(b'\r');
+                            tty::raw_uart_putchar(b'\n');
+                            line_disc.line_len = 0;
+                            if foreground_pid != 0 {
+                                let _ = crate::task::terminate_process(foreground_pid, -2);
+                                foreground_pid = 0;
+                            }
+                        } else {
+                            echo_serial(ch);
+                            if let Some(len) = line_disc.push_char(ch) {
+                                let mut buf = [0u8; LINE_BUF_SIZE];
+                                let data = line_disc.line_data(len);
+                                buf[..len].copy_from_slice(data);
+                                // Fulfill pending read on stdin client
+                                if stdin_idx != usize::MAX && clients[stdin_idx].has_pending_read {
+                                    send_file_data(clients[stdin_idx].stdin_ep, &buf[..len], my_pid);
+                                    send_file_sentinel(clients[stdin_idx].stdin_ep, my_pid);
+                                    clients[stdin_idx].has_pending_read = false;
+                                }
                             }
                         }
                     }
@@ -344,7 +364,7 @@ pub fn serial_console_server() {
                                     stdin_stack_len += 1;
                                 }
                             }
-                            Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
+                            Ok(FileRequest::Ioctl { cmd, arg }) => {
                                 match cmd {
                                     TCRAW => {
                                         raw_mode = true;
@@ -352,6 +372,10 @@ pub fn serial_console_server() {
                                     }
                                     TCCOOKED => {
                                         raw_mode = false;
+                                        send_ioctl_ok(client.stdin_ep, 0, my_pid);
+                                    }
+                                    TCSETFG => {
+                                        foreground_pid = arg as usize;
                                         send_ioctl_ok(client.stdin_ep, 0, my_pid);
                                     }
                                     _ => {

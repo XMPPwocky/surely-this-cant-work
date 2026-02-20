@@ -140,6 +140,8 @@ define_message! {
 pub const TCRAW: u32 = 1;
 /// Disable raw mode (arg ignored).
 pub const TCCOOKED: u32 = 2;
+/// Set foreground PID (arg = PID, 0 to clear).
+pub const TCSETFG: u32 = 3;
 
 use rvos_wire::define_protocol;
 
