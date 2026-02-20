@@ -1,3 +1,4 @@
+pub mod blk_server;
 pub mod console;
 pub mod gpu_server;
 pub mod init;
