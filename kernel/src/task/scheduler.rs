@@ -765,6 +765,180 @@ pub fn terminate_current_process() {
     schedule();
 }
 
+/// Terminate an arbitrary process by PID. Since this is single-core, the
+/// target is guaranteed to be Ready or Blocked (not Running — that's the
+/// caller). Cleans up handles, sends exit notification, frees frames.
+///
+/// Returns Ok(()) on success, Err if the PID is invalid (idle, current, dead,
+/// or nonexistent).
+pub fn terminate_process(target_pid: usize, exit_code: i32) -> Result<(), &'static str> {
+    use crate::mm::address::{PhysPageNum, VirtPageNum, PAGE_SIZE};
+    use crate::mm::heap::PGTB_ALLOC;
+
+    // Take handles and cleanup info while holding the lock
+    let mut taken_handles: [Option<HandleObject>; crate::task::process::MAX_HANDLES] =
+        [const { None }; crate::task::process::MAX_HANDLES];
+    let notify_ep_raw: usize;
+    let mut debug_event_ep_raw = 0usize;
+
+    // Frame cleanup info
+    let pt_frames: alloc::vec::Vec<PhysPageNum, crate::mm::heap::PgtbAlloc>;
+    let code_ppn: usize;
+    let code_pages: usize;
+    let mut ustack_ppn: usize = 0;
+    let mut ustack_pages: usize = 0;
+    let kstack_base: usize;
+
+    {
+        let mut sched = SCHEDULER.lock();
+        if target_pid == 0 {
+            return Err("cannot kill idle task");
+        }
+        if target_pid == sched.current {
+            return Err("cannot kill self (use terminate_current_process)");
+        }
+        match sched.processes.get(target_pid) {
+            Some(Some(p)) if p.state != ProcessState::Dead => {}
+            Some(Some(_)) => return Err("already dead"),
+            _ => return Err("pid not found"),
+        }
+
+        // Scope the mutable borrow of the process so we can access
+        // sched.ready_queue afterwards.
+        {
+            let proc = sched.processes[target_pid].as_mut().unwrap();
+
+            // Snapshot exit_notify_ep before cleanup
+            notify_ep_raw = proc.exit_notify_ep;
+            proc.exit_notify_ep = 0;
+
+            // Take handles from the process (RAII ownership transfer)
+            for (i, slot) in taken_handles.iter_mut().enumerate().take(crate::task::process::MAX_HANDLES) {
+                *slot = proc.take_handle(i);
+            }
+
+            // Clean up mmap regions (unmap and free anonymous frames)
+            if proc.user_satp != 0 {
+                let root_ppn = PhysPageNum(proc.user_satp & ((1usize << 44) - 1));
+                let mut pt = crate::mm::page_table::PageTable::from_root(root_ppn);
+                for slot in proc.mmap_regions.iter_mut() {
+                    if let Some(region) = slot.take() {
+                        for j in 0..region.page_count {
+                            let vpn = VirtPageNum(region.base_ppn + j);
+                            pt.unmap(vpn);
+                            if region.shm_id.is_none() {
+                                crate::mm::frame::frame_dealloc(
+                                    PhysPageNum(region.base_ppn + j),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Snapshot frame cleanup info
+            pt_frames = core::mem::replace(&mut proc.pt_frames, alloc::vec::Vec::new_in(PGTB_ALLOC));
+            code_ppn = proc.code_ppn;
+            code_pages = proc.code_pages;
+            if proc.is_user && proc.user_stack_top != 0 {
+                ustack_pages = 8; // USER_STACK_PAGES
+                let stack_top_ppn = proc.user_stack_top / PAGE_SIZE;
+                ustack_ppn = match stack_top_ppn.checked_sub(ustack_pages) {
+                    Some(ppn) => ppn,
+                    None => { ustack_pages = 0; 0 }
+                };
+            }
+
+            // Snapshot debug state for cleanup after lock release
+            if proc.debug_attached {
+                debug_event_ep_raw = proc.debug_event_ep;
+                proc.debug_attached = false;
+                proc.debug_event_ep = 0;
+                proc.debug_suspend_pending = false;
+                proc.debug_suspended = false;
+                proc.debug_breakpoint_count = 0;
+            }
+
+            // Clear wake_deadline and wakeup_pending
+            proc.wake_deadline = 0;
+            proc.wakeup_pending = false;
+
+            // Mark state = Dead and snapshot kernel stack base
+            proc.state = ProcessState::Dead;
+            kstack_base = proc.kernel_stack_base;
+            proc.kernel_stack_base = 0;
+        }
+
+        // Remove from ready_queue if present
+        sched.ready_queue.retain(|&pid| pid != target_pid);
+    }
+    // SCHEDULER lock released
+
+    // Clear any stale blocked registrations in channels
+    crate::ipc::channel_clear_blocked_pid(target_pid);
+
+    // Free kernel stack (safe because target is not running on it)
+    if kstack_base != 0 {
+        let guard_addr = kstack_base - super::process::KERNEL_GUARD_PAGES * crate::mm::address::PAGE_SIZE;
+        super::process::restore_guard_page(guard_addr);
+        let alloc_ppn = guard_addr / crate::mm::address::PAGE_SIZE;
+        for j in 0..super::process::KERNEL_STACK_ALLOC_PAGES {
+            crate::mm::frame::frame_dealloc(
+                crate::mm::address::PhysPageNum(alloc_ppn + j),
+            );
+        }
+    }
+
+    // Send ProcessExited debug event and close the event channel
+    if debug_event_ep_raw != 0 {
+        let debug_ep = unsafe { crate::ipc::OwnedEndpoint::from_raw(debug_event_ep_raw) };
+        let mut msg = crate::ipc::Message::new();
+        let event = rvos_proto::debug::DebugEvent::ProcessExited { exit_code };
+        msg.len = rvos_wire::to_bytes(&event, &mut msg.data).unwrap_or(0);
+        if let Ok(wake) = crate::ipc::channel_send(debug_ep.raw(), msg) {
+            if wake != 0 {
+                crate::task::wake_process(wake);
+            }
+        }
+        drop(debug_ep);
+    }
+
+    // Send exit notification
+    if notify_ep_raw != 0 {
+        let notify_ep = unsafe { crate::ipc::OwnedEndpoint::from_raw(notify_ep_raw) };
+        let mut msg = crate::ipc::Message::new();
+        let notif = rvos_proto::process::ExitNotification { exit_code };
+        msg.len = rvos_wire::to_bytes(&notif, &mut msg.data).unwrap_or(0);
+        if let Ok(wake) = crate::ipc::channel_send(notify_ep.raw(), msg) {
+            if wake != 0 {
+                crate::task::wake_process(wake);
+            }
+        }
+        drop(notify_ep);
+    }
+
+    // Drop all taken handles — RAII auto-closes channels and dec_refs SHMs
+    drop(taken_handles);
+
+    // Free physical frames (code, user stack, page table nodes)
+    if code_pages > 0 {
+        for i in 0..code_pages {
+            crate::mm::frame::frame_dealloc(PhysPageNum(code_ppn + i));
+        }
+    }
+    if ustack_pages > 0 {
+        for i in 0..ustack_pages {
+            crate::mm::frame::frame_dealloc(PhysPageNum(ustack_ppn + i));
+        }
+    }
+    for &frame in &pt_frames {
+        crate::mm::frame::frame_dealloc(frame);
+    }
+    drop(pt_frames);
+
+    Ok(())
+}
+
 /// Convenience alias: terminate from syscall context (SYS_EXIT).
 pub fn exit_current_from_syscall() {
     terminate_current_process();
