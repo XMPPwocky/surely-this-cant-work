@@ -42,6 +42,12 @@ Use an Explore subagent to search these when debugging device or architectural i
 - `priv-csrs.adoc` — all privileged CSR definitions
 - `priv-insns.adoc` — sret, wfi, sfence.vma, etc.
 
+## Bug Tracking
+When you find a bug incidentally while testing, or when the user reports a bug
+(even without explicitly using `/bug`), **use the `/bug` skill** to report and
+track it. If the bug isn't the main task you're working on, use a subagent to
+file it so the main context stays clean.
+
 ## Testing Serial Console
 Use `expect` scripts for interactive testing — **never pipe stdin** to `make run`.
 See `docs/testing-serial.md`.
