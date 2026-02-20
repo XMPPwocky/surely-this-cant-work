@@ -252,8 +252,8 @@ impl Message {
 /// recv(ep_a) pops from queue_a
 /// recv(ep_b) pops from queue_b
 struct Channel {
-    queue_a: VecDeque<Message, IpcAlloc>, // messages waiting for endpoint A to recv
-    queue_b: VecDeque<Message, IpcAlloc>, // messages waiting for endpoint B to recv
+    queue_a: VecDeque<(Message, u64), IpcAlloc>, // messages waiting for endpoint A to recv (msg, send_time)
+    queue_b: VecDeque<(Message, u64), IpcAlloc>, // messages waiting for endpoint B to recv (msg, send_time)
     blocked_a: usize, // PID blocked on recv(ep_a), 0 = none
     blocked_b: usize, // PID blocked on recv(ep_b), 0 = none
     send_blocked_a: usize, // PID blocked on send(ep_a) due to full queue, 0 = none
@@ -360,12 +360,13 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, 
             return Err((SendError::ChannelClosed, msg));
         }
         let msg_bytes = msg.len as u64;
+        let send_time = crate::task::process::rdtime();
         if is_b {
             // Sending from B side -> push to queue_a (for A to recv)
             if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
                 return Err((SendError::QueueFull, msg));
             }
-            channel.queue_a.push_back(msg);
+            channel.queue_a.push_back((msg, send_time));
             channel.msgs_a += 1;
             channel.bytes_a += msg_bytes;
             crate::kstat::inc(&crate::kstat::IPC_SENDS);
@@ -375,7 +376,7 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, 
             if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
                 return Err((SendError::QueueFull, msg));
             }
-            channel.queue_b.push_back(msg);
+            channel.queue_b.push_back((msg, send_time));
             channel.msgs_b += 1;
             channel.bytes_b += msg_bytes;
             crate::kstat::inc(&crate::kstat::IPC_SENDS);
@@ -394,13 +395,15 @@ pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
-        let msg = if is_b {
+        let entry = if is_b {
             channel.queue_b.pop_front()
         } else {
             channel.queue_a.pop_front()
         };
-        if msg.is_some() {
+        if let Some((msg, send_time)) = entry {
             crate::kstat::inc(&crate::kstat::IPC_RECVS);
+            let recv_time = crate::task::process::rdtime();
+            crate::kstat::IPC_LATENCY.record(recv_time.saturating_sub(send_time));
             // A slot freed up — check if a sender was blocked on this channel.
             // send(ep_a) pushes to queue_b, so if we popped from queue_b (is_b),
             // the blocked sender is on ep_a side (send_blocked_a).
@@ -415,7 +418,7 @@ pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
                 if w != 0 { channel.send_blocked_b = 0; }
                 w
             };
-            (msg, wake)
+            (Some(msg), wake)
         } else {
             (None, 0)
         }

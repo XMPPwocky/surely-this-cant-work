@@ -131,6 +131,8 @@ pub struct Process {
     pub debug_suspended: bool,
     pub debug_breakpoints: [(usize, u16); MAX_BREAKPOINTS], // (addr, original_2_bytes)
     pub debug_breakpoint_count: usize,
+    // Scheduler latency: rdtime when this process was last enqueued
+    pub enqueue_time: u64,
 }
 
 /// Unmap a guard page in the kernel page table so any access causes a fault.
@@ -225,6 +227,7 @@ impl Process {
             debug_suspended: false,
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
+            enqueue_time: 0,
         })
     }
 
@@ -306,6 +309,7 @@ impl Process {
             debug_suspended: false,
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
+            enqueue_time: 0,
         })
     }
 
@@ -375,6 +379,7 @@ impl Process {
             debug_suspended: false,
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
+            enqueue_time: 0,
         })
     }
 
@@ -411,6 +416,7 @@ impl Process {
             debug_suspended: false,
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
+            enqueue_time: 0,
         };
         p.set_name("idle");
         p

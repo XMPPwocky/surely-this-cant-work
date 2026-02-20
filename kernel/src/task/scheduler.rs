@@ -177,6 +177,7 @@ pub fn spawn(entry: fn()) -> Option<usize> {
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
+    sched.processes[pid].as_mut().unwrap().enqueue_time = crate::task::process::rdtime();
     sched.ready_queue.push_back(pid);
 
     Some(pid)
@@ -209,6 +210,7 @@ pub fn spawn_user(user_code: &[u8], name: &str) -> Option<usize> {
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
+    sched.processes[pid].as_mut().unwrap().enqueue_time = crate::task::process::rdtime();
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {})", pid, name, pid);
@@ -233,6 +235,7 @@ pub fn spawn_user_with_boot_channel(user_code: &[u8], name: &str, boot_ep: crate
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
+    sched.processes[pid].as_mut().unwrap().enqueue_time = crate::task::process::rdtime();
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, ep_raw);
@@ -255,6 +258,7 @@ pub fn spawn_user_elf(elf_data: &[u8], name: &str) -> Option<usize> {
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
+    sched.processes[pid].as_mut().unwrap().enqueue_time = crate::task::process::rdtime();
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {})", pid, name, pid);
@@ -278,6 +282,7 @@ pub fn spawn_user_elf_with_boot_channel(elf_data: &[u8], name: &str, boot_ep: cr
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
+    sched.processes[pid].as_mut().unwrap().enqueue_time = crate::task::process::rdtime();
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={})", pid, name, pid, ep_raw);
@@ -303,6 +308,7 @@ pub fn spawn_user_elf_with_handles(elf_data: &[u8], name: &str, boot_ep: crate::
 
     sched.processes[pid] = Some(proc);
     fixup_trap_ctx_ptr(&mut sched, pid);
+    sched.processes[pid].as_mut().unwrap().enqueue_time = crate::task::process::rdtime();
     sched.ready_queue.push_back(pid);
 
     crate::println!("  Spawned user ELF [{}] \"{}\" (PID {}, boot_ep={}, extra_ep={})", pid, name, pid, boot_raw, extra_raw);
@@ -403,15 +409,23 @@ pub fn schedule() {
         }
     };
 
+    // Record scheduler latency for the dequeued task
+    let now = crate::task::process::rdtime();
+    if next_pid != 0 {
+        if let Some(ref mut next_proc) = sched.processes[next_pid] {
+            let eq = next_proc.enqueue_time;
+            if eq != 0 {
+                crate::kstat::SCHED_LATENCY.record(now.saturating_sub(eq));
+            }
+        }
+    }
+
     if next_pid == old_pid {
         sched.ready_queue.push_back(next_pid);
         return;
     }
 
     crate::kstat::inc(&crate::kstat::SCHED_SWITCHES);
-
-    // CPU accounting: update old task's EWMA before switching away
-    let now = crate::task::process::rdtime();
     let prev_switch = sched.last_switch_rdtime;
     if let Some(ref mut old_proc) = sched.processes[old_pid] {
         let run_time = now.saturating_sub(prev_switch);
@@ -450,6 +464,7 @@ pub fn schedule() {
         if let Some(ref mut old_proc) = sched.processes[old_pid] {
             if old_proc.state == ProcessState::Running {
                 old_proc.state = ProcessState::Ready;
+                old_proc.enqueue_time = now;
                 sched.ready_queue.push_back(old_pid);
             }
         }
@@ -528,15 +543,23 @@ pub fn preempt(old_tf: &mut TrapFrame) -> *mut TrapFrame {
         }
     };
 
+    // Record scheduler latency for the dequeued task
+    let now = crate::task::process::rdtime();
+    if next_pid != 0 {
+        if let Some(ref mut next_proc) = sched.processes[next_pid] {
+            let eq = next_proc.enqueue_time;
+            if eq != 0 {
+                crate::kstat::SCHED_LATENCY.record(now.saturating_sub(eq));
+            }
+        }
+    }
+
     if next_pid == old_pid {
         sched.ready_queue.push_back(next_pid);
         return old_tf as *mut TrapFrame;
     }
 
     crate::kstat::inc(&crate::kstat::SCHED_PREEMPTS);
-
-    // CPU accounting (same as schedule)
-    let now = crate::task::process::rdtime();
     let prev_switch = sched.last_switch_rdtime;
     if let Some(ref mut old_proc) = sched.processes[old_pid] {
         let run_time = now.saturating_sub(prev_switch);
@@ -571,6 +594,7 @@ pub fn preempt(old_tf: &mut TrapFrame) -> *mut TrapFrame {
         if let Some(ref mut old_proc) = sched.processes[old_pid] {
             if old_proc.state == ProcessState::Running {
                 old_proc.state = ProcessState::Ready;
+                old_proc.enqueue_time = now;
                 sched.ready_queue.push_back(old_pid);
             }
         }
@@ -974,6 +998,7 @@ pub fn check_deadlines(now: u64) {
                 proc.wake_deadline = 0;
                 proc.state = ProcessState::Ready;
                 proc.block_reason = crate::task::process::BlockReason::None;
+                proc.enqueue_time = now;
             }
             sched.ready_queue.push_back(pid);
         }
@@ -1052,6 +1077,7 @@ pub fn wake_process(pid: usize) {
         if proc.state == ProcessState::Blocked {
             proc.state = ProcessState::Ready;
             proc.block_reason = crate::task::process::BlockReason::None;
+            proc.enqueue_time = crate::task::process::rdtime();
             sched.ready_queue.push_front(pid);
         } else if proc.state == ProcessState::Running || proc.state == ProcessState::Ready {
             proc.wakeup_pending = true;

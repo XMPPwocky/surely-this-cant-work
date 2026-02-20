@@ -79,7 +79,7 @@ impl Log2Hist {
 
     /// Record a value into the appropriate bucket.
     #[inline(always)]
-    #[allow(dead_code)] // used in later commits (latency histograms)
+    /// Record a value into the appropriate log2 bucket.
     pub fn record(&self, value: u64) {
         let bucket = if value == 0 {
             0
