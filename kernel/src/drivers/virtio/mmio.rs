@@ -49,6 +49,7 @@ pub const STATUS_FEATURES_OK: u32 = 8;
 
 // Device IDs
 pub const DEVICE_ID_NET: u32 = 1;
+pub const DEVICE_ID_BLK: u32 = 2;
 pub const DEVICE_ID_GPU: u32 = 16;
 pub const DEVICE_ID_INPUT: u32 = 18;
 
