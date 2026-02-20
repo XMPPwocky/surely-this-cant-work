@@ -244,11 +244,11 @@ fn wait_for_exit(proc_handle: usize) {
     // Channel dropped here → handle closed automatically
 }
 
-fn cmd_run(args: &str) {
+fn cmd_run(args: &str) -> bool {
     let args_str = args.trim();
     if args_str.is_empty() {
         println!("Usage: run <path> [args...]  (append & to run in background)");
-        return;
+        return false;
     }
 
     // Check for trailing '&' (background execution)
@@ -316,7 +316,7 @@ fn cmd_run(args: &str) {
     if let Some(redir_path) = redirect_path {
         if redir_path.is_empty() {
             println!("Error: redirect path is empty");
-            return;
+            return false;
         }
         use rvos::rvos_proto::fs::OpenFlags;
         let flags = if redirect_append {
@@ -330,7 +330,7 @@ fn cmd_run(args: &str) {
             }
             Err(_) => {
                 println!("Error: could not open {} for redirect", redir_path);
-                return;
+                return false;
             }
         }
     }
@@ -355,11 +355,10 @@ fn cmd_run(args: &str) {
                 }
             }
             Err(_) => {
-                println!("Spawn failed");
-                return;
+                return false;
             }
         }
-        return;
+        return true;
     }
 
     match rvos::spawn_process_with_args(path, &args_blob[..actual_args_len]) {
@@ -371,10 +370,9 @@ fn cmd_run(args: &str) {
             } else {
                 wait_for_exit(proc_handle);
             }
+            true
         }
-        Err(_) => {
-            println!("Spawn failed");
-        }
+        Err(_) => false,
     }
 }
 
@@ -395,18 +393,29 @@ fn try_complete(line: &str) -> Completion {
     let words: Vec<&str> = line.split_whitespace().collect();
     let trailing_space = line.ends_with(' ');
 
-    // Completing first word (command name)
+    // Completing first word (command name): builtins + /bin/ entries
     if words.is_empty() || (words.len() == 1 && !trailing_space) {
         let prefix = words.first().copied().unwrap_or("");
-        let matches: Vec<&str> = COMMANDS.iter()
+        let mut matches: Vec<String> = COMMANDS.iter()
             .copied()
             .filter(|c| c.starts_with(prefix))
+            .map(|c| c.to_string())
             .collect();
+        // Also include /bin/ entries that don't shadow builtins
+        if let Ok(entries) = std::fs::read_dir("/bin") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with(prefix) && !matches.iter().any(|m| m == &name) {
+                    matches.push(name);
+                }
+            }
+        }
+        matches.sort();
         let replace_from = line.len() - prefix.len();
         return match matches.len() {
             0 => Completion::None,
-            1 => Completion::Single(matches[0].to_string(), replace_from),
-            _ => Completion::Multiple(matches.iter().map(|s| s.to_string()).collect()),
+            1 => Completion::Single(matches.into_iter().next().unwrap(), replace_from),
+            _ => Completion::Multiple(matches),
         };
     }
 
@@ -1051,7 +1060,9 @@ pub fn run() {
             "run" => {
                 let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 set_raw_mode(false);
-                cmd_run(args);
+                if !cmd_run(args) {
+                    println!("Spawn failed");
+                }
                 set_raw_mode(true);
             }
             "help" => cmd_help(),
@@ -1064,8 +1075,17 @@ pub fn run() {
                 raw::sys_shutdown();
             }
             _ => {
-                println!("Unknown command: {cmd}");
-                println!("Type 'help' for available commands.");
+                let bin_path = format!("/bin/{}", cmd);
+                let full_args = if let Some((_, rest)) = line.split_once(' ') {
+                    format!("{} {}", bin_path, rest)
+                } else {
+                    bin_path
+                };
+                set_raw_mode(false);
+                if !cmd_run(&full_args) {
+                    println!("{}: command not found", cmd);
+                }
+                set_raw_mode(true);
             }
         }
     }
