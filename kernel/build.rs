@@ -1,6 +1,13 @@
 use std::fs;
 
 fn main() {
+    // Linker script — use absolute path so it works regardless of cargo's CWD.
+    // This lives in build.rs rather than .cargo/config.toml to avoid duplication
+    // when building from git worktrees nested inside the main repo (bug 0014).
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    println!("cargo:rustc-link-arg=-T{}/linker.ld", manifest_dir);
+    println!("cargo:rerun-if-changed=linker.ld");
+
     // Watch user_programs.S itself — if it changes, we need to re-scan .incbin paths.
     println!("cargo:rerun-if-changed=src/arch/user_programs.S");
 
