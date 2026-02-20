@@ -9,7 +9,7 @@ pub const KERNEL_GUARD_PAGES: usize = 1; // guard page at bottom of each kernel 
 /// Total pages allocated per kernel stack (guard + usable)
 pub const KERNEL_STACK_ALLOC_PAGES: usize = KERNEL_STACK_PAGES + KERNEL_GUARD_PAGES;
 
-const USER_STACK_PAGES: usize = 8; // 32 KiB
+pub const USER_STACK_PAGES: usize = 16; // 64 KiB
 const USER_STACK_SIZE: usize = USER_STACK_PAGES * PAGE_SIZE;
 
 pub const MAX_PROCS: usize = 64;

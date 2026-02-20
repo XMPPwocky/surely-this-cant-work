@@ -723,7 +723,7 @@ pub fn terminate_current_process() {
             code_ppn = proc.code_ppn;
             code_pages = proc.code_pages;
             if proc.is_user && proc.user_stack_top != 0 {
-                ustack_pages = 8; // USER_STACK_PAGES
+                ustack_pages = crate::task::process::USER_STACK_PAGES;
                 let stack_top_ppn = proc.user_stack_top / PAGE_SIZE;
                 ustack_ppn = match stack_top_ppn.checked_sub(ustack_pages) {
                     Some(ppn) => ppn,
@@ -882,7 +882,7 @@ pub fn terminate_process(target_pid: usize, exit_code: i32) -> Result<(), &'stat
             code_ppn = proc.code_ppn;
             code_pages = proc.code_pages;
             if proc.is_user && proc.user_stack_top != 0 {
-                ustack_pages = 8; // USER_STACK_PAGES
+                ustack_pages = crate::task::process::USER_STACK_PAGES;
                 let stack_top_ppn = proc.user_stack_top / PAGE_SIZE;
                 ustack_ppn = match stack_top_ppn.checked_sub(ustack_pages) {
                     Some(ppn) => ppn,
