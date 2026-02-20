@@ -2,6 +2,7 @@
 members = [
     "bench",
     "dbg",
+    "ext2-server",
     "fbcon",
     "fs",
     "gui-bench",
