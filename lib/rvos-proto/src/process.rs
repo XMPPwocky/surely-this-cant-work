@@ -9,6 +9,14 @@
 use rvos_wire::define_message;
 
 define_message! {
+    /// Sent on the process handle channel immediately after spawn.
+    /// Tells the watcher the PID of the newly spawned process.
+    pub struct ProcessStarted {
+        pid: u32,
+    }
+}
+
+define_message! {
     /// Exit notification sent from init to the process watcher.
     /// exit_code: 0 = success, nonzero = failure.
     pub struct ExitNotification {
