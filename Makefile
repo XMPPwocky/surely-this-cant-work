@@ -13,6 +13,9 @@ USER_TARGET = --target riscv64gc-unknown-rvos
 USER_MANIFEST = --manifest-path user/Cargo.toml
 USER_BIN_DIR = user/target/riscv64gc-unknown-rvos/release
 
+# QEMU lockfile wrapper — ensures only one QEMU instance at a time
+QEMU_LOCK = scripts/qemu-lock.sh
+
 # VirtIO net device via TAP (requires: sudo scripts/net-setup.sh)
 QEMU_NET = -device virtio-net-device,netdev=net0 -netdev tap,id=net0,ifname=rvos-tap0,script=no,downscript=no
 
@@ -95,7 +98,7 @@ build: build-fs disk-images
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
 run: build
-	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+	$(QEMU_LOCK) --info "make run" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
 		$(QEMU_NET) \
@@ -103,7 +106,7 @@ run: build
 		-kernel $(KERNEL_BIN)
 
 run-gui: build
-	qemu-system-riscv64 -machine virt -serial stdio \
+	$(QEMU_LOCK) --info "make run-gui" -- qemu-system-riscv64 -machine virt -serial stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
@@ -115,7 +118,7 @@ run-gui: build
 
 # VNC mode: connect with a VNC client to :5900, serial on stdio
 run-vnc: build
-	qemu-system-riscv64 -machine virt -serial stdio \
+	$(QEMU_LOCK) --info "make run-vnc" -- qemu-system-riscv64 -machine virt -serial stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
@@ -130,7 +133,7 @@ DELAY ?= 5
 SCREENSHOT ?= /tmp/rvos-screenshot.ppm
 run-gpu-screenshot: build
 	@echo "Starting QEMU with virtio-gpu (headless)..."
-	qemu-system-riscv64 -machine virt -nographic \
+	$(QEMU_LOCK) --info "make run-gpu-screenshot" -- qemu-system-riscv64 -machine virt -nographic \
 		-serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
@@ -149,7 +152,7 @@ run-gpu-screenshot: build
 	@[ -f $(SCREENSHOT) ] && echo "Screenshot saved: $(SCREENSHOT)" || echo "Screenshot failed (install socat?)"
 
 debug: build
-	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+	$(QEMU_LOCK) --info "make debug" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
 		$(QEMU_NET) \
@@ -172,7 +175,7 @@ gui-bench: build
 	@expect scripts/gui-bench.exp
 
 run-test: build test.img
-	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+	$(QEMU_LOCK) --info "make run-test" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
 		$(QEMU_NET) \
