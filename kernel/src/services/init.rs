@@ -215,6 +215,8 @@ struct FsLaunchCtx {
     args_len: usize,
     /// Namespace overrides for the spawned process.
     ns_overrides: [Option<NsOverride>; MAX_NS_OVERRIDES],
+    /// If true, the spawned process will be suspended before its first instruction.
+    suspended: bool,
 }
 
 impl FsLaunchCtx {
@@ -413,7 +415,7 @@ fn handle_request(
                 send_error(boot_ep_b, "unknown service", my_pid);
             }
         }
-        BootRequest::Spawn { path, args, ns_overrides } => {
+        BootRequest::Spawn { path, args, ns_overrides, suspended } => {
             // Extract extra_cap as raw endpoint from the first cap in the message.
             // clone_from_raw creates a new reference that FsLaunchCtx will own.
             let spawn_cap: usize = if msg.cap_count > 0 {
@@ -431,6 +433,7 @@ fn handle_request(
                 spawn_cap,
                 args,
                 ns_overrides,
+                suspended,
                 orig_msg: msg,
                 fs_launches,
                 my_pid,
@@ -694,6 +697,7 @@ struct SpawnContext<'a> {
     spawn_cap: usize,
     args: &'a [u8],
     ns_overrides: &'a [u8],
+    suspended: bool,
     orig_msg: &'a Message,
     fs_launches: &'a mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES],
     my_pid: usize,
@@ -811,6 +815,7 @@ fn handle_spawn_request(ctx: SpawnContext<'_>) {
         args: args_buf,
         args_len,
         ns_overrides: parsed_overrides,
+        suspended: ctx.suspended,
     };
     launch_ctx.path_buf[..path_bytes.len()].copy_from_slice(path_bytes);
     launch_ctx.name_buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
@@ -980,6 +985,7 @@ fn init_fs_launches(launches: &mut [Option<FsLaunchCtx>; MAX_FS_LAUNCHES], my_pi
             args: [0u8; MAX_ARGS_LEN],
             args_len: 0,
             ns_overrides: [const { None }; MAX_NS_OVERRIDES],
+            suspended: false,
         });
         slot_idx += 1;
     }
@@ -1228,6 +1234,11 @@ fn finish_fs_launch(
             return;
         }
     };
+
+    // If the caller requested suspended spawn, block the process before it runs.
+    if ctx.suspended {
+        crate::task::suspend_spawned_process(pid);
+    }
 
     // If this is a dynamic spawn, set up exit notification and respond to requester
     if ctx.requester_ep != 0 {

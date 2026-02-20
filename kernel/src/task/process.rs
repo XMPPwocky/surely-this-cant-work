@@ -92,6 +92,8 @@ pub enum BlockReason {
     Poll,
     /// Suspended by debugger.
     DebugSuspend,
+    /// Spawned in suspended state (waiting for debugger attach).
+    SpawnSuspended,
 }
 
 pub struct Process {

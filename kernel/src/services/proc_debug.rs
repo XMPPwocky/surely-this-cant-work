@@ -144,6 +144,19 @@ pub fn proc_debug_service() {
         drop(session_b);
         drop(event_b);
 
+        // If the process was spawn-suspended, transition it to debug-suspended
+        // and send a Suspended event so the debugger knows it can inspect immediately.
+        if crate::task::process_is_spawn_suspended(target_pid) {
+            crate::task::mark_debug_suspended(target_pid);
+            crate::task::set_block_reason(target_pid,
+                crate::task::BlockReason::DebugSuspend);
+            let mut evt_msg = ipc::Message::new();
+            evt_msg.len = rvos_wire::to_bytes(&DebugEvent::Suspended {},
+                &mut evt_msg.data).unwrap_or(0);
+            evt_msg.sender_pid = my_pid;
+            let _ = ipc::channel_send_blocking(event_a_raw, evt_msg, my_pid);
+        }
+
         // Enter session loop (session_a is the service's endpoint)
         handle_debug_session(session_a.raw(), target_pid, event_a_raw, my_pid);
 
