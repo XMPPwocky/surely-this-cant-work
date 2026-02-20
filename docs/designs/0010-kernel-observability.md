@@ -1,7 +1,7 @@
 # 0010: Kernel Observability Infrastructure
 
 **Date:** 2026-02-20
-**Status:** Design
+**Status:** Complete (2026-02-20)
 **Subsystem:** kernel/kstat, kernel/ipc, kernel/task, kernel/services, user/shell
 
 ## Motivation
