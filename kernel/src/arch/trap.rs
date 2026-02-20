@@ -122,6 +122,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 });
                             }
                             crate::task::mark_debug_suspended(pid);
+                            crate::task::set_block_reason(pid, crate::task::BlockReason::DebugSuspend);
                             crate::task::force_block_process(pid);
                             crate::task::schedule();
                             return tf as *mut TrapFrame;
@@ -162,6 +163,7 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             if let Some(event_ep) = crate::task::check_and_clear_debug_suspend(pid) {
                 send_debug_event(event_ep, &rvos_proto::debug::DebugEvent::Suspended {});
                 crate::task::mark_debug_suspended(pid);
+                crate::task::set_block_reason(pid, crate::task::BlockReason::DebugSuspend);
                 crate::task::force_block_process(pid);
                 crate::task::schedule();
                 return tf as *mut TrapFrame;

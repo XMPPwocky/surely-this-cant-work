@@ -2,9 +2,9 @@ pub mod context;
 pub mod process;
 pub mod scheduler;
 
-pub use process::{HandleObject, HandleInfo};
+pub use process::{BlockReason, HandleObject, HandleInfo};
 pub use scheduler::{
-    init, spawn_named,
+    init, spawn_named, set_block_reason,
     spawn_user_elf_with_boot_channel,
     spawn_user_elf_with_handles,
     schedule, preempt, current_pid, try_current_pid, global_clock,

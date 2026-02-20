@@ -180,6 +180,7 @@ pub fn sys_chan_recv_blocking(handle: usize, msg_buf_ptr: usize) -> SyscallResul
                     return Err(SyscallError::ChannelClosed);
                 }
                 crate::ipc::channel_set_blocked(endpoint, cur_pid);
+                crate::task::set_block_reason(cur_pid, crate::task::BlockReason::IpcRecv(endpoint));
                 crate::task::block_process(cur_pid);
                 crate::task::schedule();
             }
@@ -217,6 +218,7 @@ pub fn sys_chan_send_blocking(handle: usize, msg_ptr: usize) -> SyscallResult {
                     return Err(SyscallError::Error);
                 }
                 crate::ipc::channel_set_send_blocked(endpoint, cur_pid);
+                crate::task::set_block_reason(cur_pid, crate::task::BlockReason::IpcSend(endpoint));
                 crate::task::block_process(cur_pid);
                 crate::task::schedule();
             }

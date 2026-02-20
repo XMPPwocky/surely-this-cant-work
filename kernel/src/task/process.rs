@@ -66,8 +66,27 @@ pub enum ProcessState {
     Dead,
 }
 
+/// What a Blocked process is waiting on. Used for `ps` display and
+/// future deadlock detection (feature 0011).
+#[derive(Debug, Clone, Copy)]
+pub enum BlockReason {
+    /// Not blocked, or reason not specified.
+    None,
+    /// Waiting to receive on a channel endpoint.
+    IpcRecv(usize),
+    /// Waiting to send on a channel endpoint (queue full).
+    IpcSend(usize),
+    /// Sleeping until a deadline (rdtime tick).
+    Timer(u64),
+    /// Blocked in sys_block (event poll).
+    Poll,
+    /// Suspended by debugger.
+    DebugSuspend,
+}
+
 pub struct Process {
     pub state: ProcessState,
+    pub block_reason: BlockReason,
     pub trap_ctx: TrapContext,
     pub context: TaskContext,
     #[allow(dead_code)]
@@ -177,6 +196,7 @@ impl Process {
 
         Ok(Process {
             state: ProcessState::Ready,
+            block_reason: BlockReason::None,
             trap_ctx,
             context,
             kernel_stack_base: stack_base,
@@ -257,6 +277,7 @@ impl Process {
 
         Ok(Process {
             state: ProcessState::Ready,
+            block_reason: BlockReason::None,
             trap_ctx,
             context,
             kernel_stack_base: kstack_base,
@@ -325,6 +346,7 @@ impl Process {
         crate::trace::trace_kernel(b"new_user_elf-exit");
         Ok(Process {
             state: ProcessState::Ready,
+            block_reason: BlockReason::None,
             trap_ctx,
             context,
             kernel_stack_base: kstack_base,
@@ -360,6 +382,7 @@ impl Process {
     pub fn new_idle() -> Self {
         let mut p = Process {
             state: ProcessState::Running,
+            block_reason: BlockReason::None,
             trap_ctx: TrapContext::zero(),
             context: TaskContext::zero(),
             kernel_stack_base: 0,

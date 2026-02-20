@@ -461,6 +461,7 @@ pub fn channel_send_blocking(endpoint: usize, mut msg: Message, pid: usize) -> R
                     return Err(SendError::ChannelClosed);
                 }
                 channel_set_send_blocked(endpoint, pid);
+                crate::task::set_block_reason(pid, crate::task::BlockReason::IpcSend(endpoint));
                 crate::task::block_process(pid);
                 crate::task::schedule();
             }
@@ -487,6 +488,7 @@ pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
             return None; // channel closed
         }
         channel_set_blocked(endpoint, pid);
+        crate::task::set_block_reason(pid, crate::task::BlockReason::IpcRecv(endpoint));
         crate::task::block_process(pid);
         crate::task::schedule();
     }
