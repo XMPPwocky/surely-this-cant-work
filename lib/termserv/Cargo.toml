@@ -1,0 +1,8 @@
+[package]
+name = "termserv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rvos = { path = "../rvos" }
+rvos-proto = { path = "../rvos-proto" }

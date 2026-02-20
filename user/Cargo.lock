@@ -28,6 +28,7 @@ dependencies = [
  "rvos-gfx",
  "rvos-proto",
  "rvos-rt",
+ "termserv",
 ]
 
 [[package]]
@@ -87,6 +88,7 @@ dependencies = [
  "rvos",
  "rvos-proto",
  "rvos-rt",
+ "termserv",
 ]
 
 [[package]]
@@ -139,6 +141,14 @@ name = "tcp-echo"
 version = "0.1.0"
 dependencies = [
  "rvos-rt",
+]
+
+[[package]]
+name = "termserv"
+version = "0.1.0"
+dependencies = [
+ "rvos",
+ "rvos-proto",
 ]
 
 [[package]]
