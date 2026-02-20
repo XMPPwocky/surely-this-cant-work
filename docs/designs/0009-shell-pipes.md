@@ -1,7 +1,7 @@
 # 0009: Terminal Server Library and nc Exec Mode
 
 **Date:** 2026-02-20
-**Status:** Design
+**Status:** Implemented (2026-02-20)
 **Subsystem:** lib/termserv (new), user/nc, user/fbcon
 
 ## Motivation
@@ -333,8 +333,24 @@ mechanical (move code, add trait calls for echo/write), not a redesign.
 
 ## Implementation Notes
 
-(Updated during Phase 3)
+- `TermServer` uses fixed `MAX_TERM_CLIENTS = 8` rather than const generics
+  to avoid `[const { None }; N]` complications. 8 is sufficient for all
+  current use cases.
+- The worktree linker script issue (`../user.ld` relative path) prevents
+  `cargo build` in worktrees but `cargo check` and `cargo clippy` work
+  fine for verification. Full build/boot testing requires merging to main.
+- `NetOutput::echo_*` methods are all no-ops — the remote terminal handles
+  echo. This means nc exec mode is always "transparent" regardless of
+  LineDiscipline state.
+- nc `-e` is TCP-only; UDP exec is deferred (uncommon use case).
 
 ## Verification
 
-(Updated during Phase 4)
+- [x] `cargo +rvos clippy` passes on termserv, fbcon, and nc — no warnings
+- [x] `cargo +rvos check` passes for all three crates
+- [ ] `nc -e /bin/sh 10.0.2.2 4444` — reverse shell works (connect mode)
+  — needs live boot test after merge to main
+- [ ] `nc -l -e /bin/sh 4444` — reverse shell works (listen mode)
+  — needs live boot test after merge to main
+- [ ] fbcon boots and works after refactoring
+  — needs live boot test after merge to main
