@@ -9,6 +9,8 @@ use rvos::Message;
 use rvos_proto::fs::{FileOffset, FileRequest, FileResponse};
 use rvos_proto::socket::*;
 
+use termserv::{TermOutput, TermServer};
+
 // ── Address parsing ─────────────────────────────────────────────
 
 fn parse_addr(host: &str, port: u16) -> SocketAddr {
@@ -441,12 +443,222 @@ fn udp_server(port: u16, stdin_h: usize) {
     raw::sys_chan_close(h);
 }
 
+// ── Exec mode (nc -e) ──────────────────────────────────────────
+
+/// TermOutput backend: sends child's stdout data over the TCP socket.
+struct NetOutput {
+    sock_h: usize,
+}
+
+impl TermOutput for NetOutput {
+    fn write_output(&mut self, data: &[u8]) {
+        let mut msg = Message::new();
+        msg.len = rvos_wire::to_bytes(
+            &SocketRequest::Send { data },
+            &mut msg.data,
+        )
+        .unwrap();
+        raw::sys_chan_send_blocking(self.sock_h, &msg);
+    }
+
+    // No echo — the remote terminal handles that.
+    fn echo_char(&mut self, _ch: u8) {}
+    fn echo_backspace(&mut self) {}
+    fn echo_newline(&mut self) {}
+}
+
+/// Run exec mode: spawn the command with stdio wired through a TermServer,
+/// relay between the TermServer and the TCP socket.
+fn exec_relay(sock_h: usize, exec_cmd: &str) {
+    // Create channel pairs for child's stdin and stdout
+    let (stdin_our, stdin_child) = raw::sys_chan_create();
+    let (stdout_our, stdout_child) = raw::sys_chan_create();
+
+    // Extract argv[0] from the command path
+    let argv0 = match exec_cmd.rfind('/') {
+        Some(pos) => &exec_cmd[pos + 1..],
+        None => exec_cmd,
+    };
+
+    // Spawn the child with overridden stdio
+    let proc_chan = match rvos::spawn_process_with_overrides(
+        exec_cmd,
+        argv0.as_bytes(),
+        &[
+            rvos::NsOverride::Redirect("stdin", stdin_child),
+            rvos::NsOverride::Redirect("stdout", stdout_child),
+        ],
+    ) {
+        Ok(ch) => ch.into_raw_handle(),
+        Err(e) => {
+            eprintln!("nc: exec {}: {:?}", exec_cmd, e);
+            raw::sys_chan_close(stdin_our);
+            raw::sys_chan_close(stdout_our);
+            raw::sys_chan_close(stdin_child);
+            raw::sys_chan_close(stdout_child);
+            return;
+        }
+    };
+    raw::sys_chan_close(stdin_child);
+    raw::sys_chan_close(stdout_child);
+
+    // Read child PID from process handle channel
+    let mut msg = Message::new();
+    raw::sys_chan_recv_blocking(proc_chan, &mut msg);
+    let child_pid = if let Ok(started) =
+        rvos_wire::from_bytes::<rvos_proto::process::ProcessStarted>(&msg.data[..msg.len])
+    {
+        started.pid
+    } else {
+        0
+    };
+
+    // Set up TermServer with the child as a client
+    let mut term = TermServer::new();
+    term.add_client(stdin_our, stdout_our);
+    let mut net_out = NetOutput { sock_h };
+
+    // Post initial Recv request on the socket
+    let mut recv_pending = false;
+
+    loop {
+        if !recv_pending {
+            let mut m = Message::new();
+            m.len = rvos_wire::to_bytes(
+                &SocketRequest::Recv { max_len: 1024 },
+                &mut m.data,
+            )
+            .unwrap();
+            raw::sys_chan_send_blocking(sock_h, &m);
+            recv_pending = true;
+        }
+
+        // Poll all channels and block
+        raw::sys_chan_poll_add(sock_h);
+        term.poll_add_all();
+        raw::sys_block();
+
+        // Drain socket messages → feed into TermServer
+        let mut socket_closed = false;
+        loop {
+            let mut m = Message::new();
+            let ret = raw::sys_chan_recv(sock_h, &mut m);
+            if ret == 2 {
+                socket_closed = true;
+                break;
+            }
+            if ret != 0 || m.len == 0 {
+                break;
+            }
+            match m.data[0] {
+                0 if m.len == 1 => {} // Ok (shutdown ack)
+                0 => {
+                    // SocketData::Data — network data arrived
+                    recv_pending = false;
+                    if let Ok(SocketData::Data { data }) =
+                        rvos_wire::from_bytes::<SocketData<'_>>(&m.data[..m.len])
+                    {
+                        if data.is_empty() {
+                            socket_closed = true;
+                            break;
+                        }
+                        for &b in data {
+                            term.feed_input(b, &mut net_out);
+                        }
+                    }
+                }
+                1 => {
+                    socket_closed = true;
+                    break;
+                }
+                4 => {} // Sent ack
+                _ => {}
+            }
+        }
+
+        if socket_closed {
+            // Remote closed — kill the child and exit
+            if child_pid != 0 {
+                raw::sys_kill(child_pid as usize, -1);
+            }
+            break;
+        }
+
+        // Poll TermServer: stdin requests + stdout writes → socket
+        term.poll_stdin();
+        term.poll_stdout(&mut net_out);
+
+        if !term.has_active_clients() {
+            // Child exited — shut down socket write side and exit
+            let mut m = Message::new();
+            m.len = rvos_wire::to_bytes(
+                &SocketRequest::Shutdown {
+                    how: ShutdownHow::Write {},
+                },
+                &mut m.data,
+            )
+            .unwrap();
+            raw::sys_chan_send_blocking(sock_h, &m);
+            break;
+        }
+    }
+
+    raw::sys_chan_close(proc_chan);
+}
+
+fn exec_tcp_client(addr: SocketAddr, exec_cmd: &str) {
+    let h = create_socket(SocketType::Stream {});
+    expect_ok(h, &SocketRequest::Connect { addr }, "connect");
+    exec_relay(h, exec_cmd);
+    raw::sys_chan_close(h);
+}
+
+fn exec_tcp_server(port: u16, exec_cmd: &str) {
+    let h = create_socket(SocketType::Stream {});
+    let addr = SocketAddr::Inet4 {
+        a: 0,
+        b: 0,
+        c: 0,
+        d: 0,
+        port,
+    };
+    expect_ok(h, &SocketRequest::Bind { addr }, "bind");
+    expect_ok(
+        h,
+        &SocketRequest::Listen { backlog: 1 },
+        "listen",
+    );
+    eprintln!("Listening on port {}", port);
+
+    match sock_rpc(h, &SocketRequest::Accept {}) {
+        SocketResponse::Accepted { peer_addr, socket } => {
+            let ch = socket.raw();
+            let SocketAddr::Inet4 { a, b, c, d, port: p } = peer_addr;
+            eprintln!("Connection from {}.{}.{}.{}:{}", a, b, c, d, p);
+            raw::sys_chan_close(h);
+            exec_relay(ch, exec_cmd);
+            raw::sys_chan_close(ch);
+        }
+        SocketResponse::Error { code } => {
+            eprintln!("nc: accept: {:?}", code);
+            raw::sys_chan_close(h);
+            process::exit(1);
+        }
+        _ => {
+            eprintln!("nc: accept: unexpected response");
+            raw::sys_chan_close(h);
+            process::exit(1);
+        }
+    }
+}
+
 // ── main ────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut listen = false;
     let mut udp = false;
+    let mut exec_cmd: Option<String> = None;
     let mut positional = Vec::new();
 
     let mut i = 1;
@@ -458,9 +670,17 @@ fn main() {
                 listen = true;
                 udp = true;
             }
+            "-e" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("nc: -e requires a command argument");
+                    process::exit(1);
+                }
+                exec_cmd = Some(args[i].clone());
+            }
             s if s.starts_with('-') => {
                 eprintln!("nc: unknown option: {}", s);
-                eprintln!("usage: nc [-l] [-u] <host> <port>");
+                eprintln!("usage: nc [-l] [-u] [-e cmd] <host> <port>");
                 process::exit(1);
             }
             _ => positional.push(args[i].clone()),
@@ -468,25 +688,32 @@ fn main() {
         i += 1;
     }
 
-    let stdin_h = std::os::rvos::stdin_handle();
+    if exec_cmd.is_some() && udp {
+        eprintln!("nc: -e is not supported with -u (UDP)");
+        process::exit(1);
+    }
 
     if listen {
         if positional.len() != 1 {
-            eprintln!("usage: nc -l [-u] <port>");
+            eprintln!("usage: nc -l [-u] [-e cmd] <port>");
             process::exit(1);
         }
         let port: u16 = positional[0].parse().unwrap_or_else(|_| {
             eprintln!("nc: invalid port: {}", positional[0]);
             process::exit(1);
         });
-        if udp {
+        if let Some(ref cmd) = exec_cmd {
+            exec_tcp_server(port, cmd);
+        } else if udp {
+            let stdin_h = std::os::rvos::stdin_handle();
             udp_server(port, stdin_h);
         } else {
+            let stdin_h = std::os::rvos::stdin_handle();
             tcp_server(port, stdin_h);
         }
     } else {
         if positional.len() != 2 {
-            eprintln!("usage: nc [-u] <host> <port>");
+            eprintln!("usage: nc [-u] [-e cmd] <host> <port>");
             process::exit(1);
         }
         let port: u16 = positional[1].parse().unwrap_or_else(|_| {
@@ -494,9 +721,13 @@ fn main() {
             process::exit(1);
         });
         let addr = parse_addr(&positional[0], port);
-        if udp {
+        if let Some(ref cmd) = exec_cmd {
+            exec_tcp_client(addr, cmd);
+        } else if udp {
+            let stdin_h = std::os::rvos::stdin_handle();
             udp_client(addr, stdin_h);
         } else {
+            let stdin_h = std::os::rvos::stdin_handle();
             tcp_client(addr, stdin_h);
         }
     }
