@@ -870,6 +870,9 @@ fn main() {
                 let mut is_delete = false;
                 let mut is_stat = false;
                 let mut is_readdir = false;
+                let mut is_mkdir = false;
+                let mut mount_flags: Option<u32> = None;
+                let mut is_unmount = false;
                 let mut ctl_closed = false;
 
                 {
@@ -894,6 +897,21 @@ fn main() {
                             path_len = path.len().min(64);
                             path_buf[..path_len].copy_from_slice(path.as_bytes());
                             is_readdir = true;
+                        }
+                        Ok(FsRequest::Mount { target, flags }) => {
+                            path_len = target.len().min(64);
+                            path_buf[..path_len].copy_from_slice(target.as_bytes());
+                            mount_flags = Some(flags);
+                        }
+                        Ok(FsRequest::Unmount { target }) => {
+                            path_len = target.len().min(64);
+                            path_buf[..path_len].copy_from_slice(target.as_bytes());
+                            is_unmount = true;
+                        }
+                        Ok(FsRequest::Mkdir { path }) => {
+                            path_len = path.len().min(64);
+                            path_buf[..path_len].copy_from_slice(path.as_bytes());
+                            is_mkdir = true;
                         }
                         Err(rvos::RecvError::Closed) => {
                             ctl_closed = true;
@@ -920,6 +938,17 @@ fn main() {
                 } else if is_readdir {
                     handled = true;
                     do_readdir(clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+                } else if mount_flags.is_some() {
+                    handled = true;
+                    // TODO(step 10): implement mount table
+                    send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
+                } else if is_unmount {
+                    handled = true;
+                    // TODO(step 10): implement unmount
+                    send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
+                } else if is_mkdir {
+                    handled = true;
+                    do_mkdir(clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
                 } else if ctl_closed {
                     clients[i].ctl = None;
                     // If file channel also gone, client is fully cleaned up
@@ -1106,4 +1135,54 @@ fn do_delete(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
     }
 
     send_stat_ok(ch, FsEntryKind::File {}, 0);
+}
+
+fn do_mkdir(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
+    if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
+        send_error(ch, FsError::InvalidPath {});
+        return;
+    }
+
+    if path_bytes == b"/" {
+        send_error(ch, FsError::AlreadyExists {});
+        return;
+    }
+
+    let fs = fs();
+
+    // Check if it already exists
+    if fs.resolve_path(path_bytes).is_some() {
+        send_error(ch, FsError::AlreadyExists {});
+        return;
+    }
+
+    let (parent_inode, dirname) = match fs.resolve_parent(path_bytes) {
+        Some(v) => v,
+        None => {
+            send_error(ch, FsError::NotFound {});
+            return;
+        }
+    };
+
+    if fs.inodes[parent_inode].kind != InodeKind::Dir {
+        send_error(ch, FsError::NotFound {});
+        return;
+    }
+
+    let new_inode = match fs.alloc_inode() {
+        Some(i) => i,
+        None => {
+            send_error(ch, FsError::NoSpace {});
+            return;
+        }
+    };
+
+    fs.inodes[new_inode].init_dir();
+    if !fs.inodes[parent_inode].add_child(dirname, new_inode) {
+        fs.inodes[new_inode].active = false;
+        send_error(ch, FsError::NoSpace {});
+        return;
+    }
+
+    send_stat_ok(ch, FsEntryKind::Directory {}, 0);
 }

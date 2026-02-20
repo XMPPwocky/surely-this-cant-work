@@ -64,6 +64,13 @@ define_message! {
         Stat(2) { path: &'a str },
         /// List directory entries (streaming response).
         Readdir(3) { path: &'a str },
+        /// Mount a filesystem backend at `target`. Cap sideband carries the
+        /// backend channel endpoint speaking FsRequest/FsResponse.
+        Mount(4) { target: &'a str, flags: u32 },
+        /// Unmount the filesystem at `target`.
+        Unmount(5) { target: &'a str },
+        /// Create a directory at `path`.
+        Mkdir(6) { path: &'a str },
     }
 }
 
@@ -76,6 +83,8 @@ define_message! {
         Error(1) { code: FsError },
         /// Open succeeded — carries the file channel capability.
         Opened(2) { kind: FsEntryKind, size: u64, file: RawChannelCap },
+        /// Mount succeeded.
+        MountOk(3) {},
     }
 }
 
@@ -134,6 +143,11 @@ define_message! {
     }
 }
 
+// ── Mount flags ─────────────────────────────────────────────────
+
+/// Mount the backend filesystem as read-only.
+pub const MOUNT_RO: u32 = 1;
+
 // ── Ioctl command constants ─────────────────────────────────────
 
 /// Enable raw mode (arg ignored).
@@ -174,5 +188,11 @@ define_protocol! {
         rpc stat as Stat(path: &str) -> FsResponse;
         /// List directory entries (streaming response).
         rpc readdir as Readdir(path: &str) -> FsResponse;
+        /// Mount a backend filesystem at a path.
+        rpc mount as Mount(target: &str, flags: u32) -> FsResponse;
+        /// Unmount the filesystem at a path.
+        rpc unmount as Unmount(target: &str) -> FsResponse;
+        /// Create a directory.
+        rpc mkdir as Mkdir(path: &str) -> FsResponse;
     }
 }
