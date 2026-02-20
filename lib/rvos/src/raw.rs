@@ -19,6 +19,7 @@ pub const SYS_TRACE: usize = 230;
 pub const SYS_SHUTDOWN: usize = 231;
 pub const SYS_CLOCK: usize = 232;
 pub const SYS_MEMINFO: usize = 233;
+pub const SYS_KILL: usize = 234;
 
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
@@ -209,5 +210,10 @@ pub struct MemInfo {
 /// Returns 0 on success, usize::MAX on error.
 pub fn sys_meminfo(info: &mut MemInfo) -> usize {
     syscall1(SYS_MEMINFO, info as *mut MemInfo as usize)
+}
+
+/// Kill a process by PID. Returns 0 on success, usize::MAX on error.
+pub fn sys_kill(pid: usize, exit_code: i32) -> usize {
+    syscall2(SYS_KILL, pid, exit_code as usize)
 }
 
