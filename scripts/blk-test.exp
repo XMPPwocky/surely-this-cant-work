@@ -1,0 +1,39 @@
+#!/usr/bin/expect -f
+# Run ktest and capture Block Device section results.
+set timeout 120
+
+cd /home/ubuntu/src/temp2/rvos
+
+spawn make run-test
+
+# Suppress output until we reach the block section
+log_user 0
+
+expect {
+    "rvos>" {}
+    timeout { puts "TIMEOUT waiting for prompt"; exit 1 }
+}
+
+after 1000
+
+send "run /bin/ktest\r"
+
+expect {
+    -exact "--- Block Device ---" {
+        # Turn output on so we see test results
+        log_user 1
+        puts "--- Block Device ---"
+    }
+    timeout { puts "TIMEOUT waiting for Block Device section"; exit 1 }
+}
+
+expect {
+    -exact "--- Process Spawn ---" {
+        log_user 0
+        after 1000
+        send "shutdown\r"
+        expect eof
+        exit 0
+    }
+    timeout { puts "TIMEOUT in block section"; exit 1 }
+}

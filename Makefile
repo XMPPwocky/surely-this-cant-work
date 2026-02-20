@@ -17,15 +17,19 @@ USER_BIN_DIR = user/target/riscv64gc-unknown-rvos/release
 QEMU_NET = -device virtio-net-device,netdev=net0 -netdev tap,id=net0,ifname=rvos-tap0,script=no,downscript=no
 
 # VirtIO block devices: bin.img (RO), persist.img (RW)
-QEMU_BLK = -drive file=bin.img,format=raw,id=blk0,if=none,readonly=on \
-           -device virtio-blk-device,drive=blk0 \
-           -drive file=persist.img,format=raw,id=blk1,if=none \
-           -device virtio-blk-device,drive=blk1
+# NOTE: QEMU virt assigns MMIO slots high-to-low per command-line order,
+# but the kernel probes low-to-high.  List devices in REVERSE order so
+# that the first-listed drive gets the highest slot and the last-listed
+# drive gets the lowest slot (discovered first → blk0).
+QEMU_BLK = -drive file=persist.img,format=raw,id=blk1,if=none \
+           -device virtio-blk-device,drive=blk1 \
+           -drive file=bin.img,format=raw,id=blk0,if=none,readonly=on \
+           -device virtio-blk-device,drive=blk0
 
 # For test: add a third drive (test.img, freshly mkfs'd)
-QEMU_BLK_TEST = $(QEMU_BLK) \
-           -drive file=test.img,format=raw,id=blk2,if=none \
-           -device virtio-blk-device,drive=blk2
+QEMU_BLK_TEST = -drive file=test.img,format=raw,id=blk2,if=none \
+           -device virtio-blk-device,drive=blk2 \
+           $(QEMU_BLK)
 
 # User-space binaries to include in bin.img (ext2 filesystem)
 EXT2_BINS = hello winclient ipc-torture fbcon triangle gui-bench dbg \
@@ -175,7 +179,6 @@ run-test: build test.img
 	qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
-		$(QEMU_NET) \
 		$(QEMU_BLK_TEST) \
 		-kernel $(KERNEL_BIN)
 

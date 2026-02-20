@@ -84,88 +84,99 @@ fn blk_server(server_idx: usize) {
         device_idx, capacity, if read_only { "RO" } else { "RW" }, shm_base,
     );
 
-    // Wait for a client endpoint from init (via control channel)
-    let accepted = ipc::accept_client(control_ep, my_pid);
-    let client = accepted.endpoint;
-    let client_ep = client.raw();
-
-    crate::println!("[blk{}] client connected", device_idx);
-
-    // Track whether we've sent DeviceInfo (SHM cap sent only once)
-    let mut device_info_sent = false;
-
-    // Main loop
+    // Outer loop: accept clients one at a time, re-accept after disconnect
     loop {
-        let mut did_work = false;
+        // Wait for a client endpoint from init (via control channel)
+        let accepted = ipc::accept_client(control_ep, my_pid);
+        let client = accepted.endpoint;
+        let client_ep = client.raw();
 
-        // Check for incoming IPC messages (non-blocking)
-        loop {
-            let (msg, send_wake) = ipc::channel_recv(client_ep);
-            if send_wake != 0 {
-                crate::task::wake_process(send_wake);
-            }
-            match msg {
-                Some(msg) => {
-                    did_work = true;
-                    if msg.len == 0 {
-                        continue;
-                    }
-                    let req: BlkRequest = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
-                        Ok(r) => r,
-                        Err(_) => continue,
-                    };
-                    match req {
-                        BlkRequest::GetDeviceInfo {} => {
-                            let resp = BlkResponse::DeviceInfo {
-                                capacity_sectors: capacity,
-                                sector_size: crate::drivers::virtio::blk::SECTOR_SIZE as u32,
-                                read_only: if read_only { 1 } else { 0 },
-                            };
-                            let mut resp_msg = Message::new();
-                            resp_msg.len = rvos_wire::to_bytes(&resp, &mut resp_msg.data).unwrap_or(0);
-                            resp_msg.sender_pid = my_pid;
-                            if !device_info_sent {
-                                resp_msg.caps[0] = Cap::Shm { owned: shm.clone(), rw: true };
-                                resp_msg.cap_count = 1;
-                                device_info_sent = true;
-                            }
-                            if ipc::channel_send_blocking(client_ep, resp_msg, my_pid).is_err() {
-                                crate::println!("[blk{}] client disconnected (send DeviceInfo)", device_idx);
-                                return;
-                            }
-                        }
-                        BlkRequest::Read { sector, count, shm_offset } => {
-                            let resp = handle_read(device_idx, sector, count, shm_offset, shm_base, capacity, read_only);
-                            send_response(client_ep, &resp, my_pid, device_idx);
-                        }
-                        BlkRequest::Write { sector, count, shm_offset } => {
-                            let resp = handle_write(device_idx, sector, count, shm_offset, shm_base, capacity, read_only);
-                            send_response(client_ep, &resp, my_pid, device_idx);
-                        }
-                        BlkRequest::Flush {} => {
-                            let ok = crate::drivers::virtio::blk::flush(device_idx);
-                            let resp = if ok {
-                                BlkResponse::Ok {}
-                            } else {
-                                BlkResponse::Error { code: 5 } // EIO
-                            };
-                            send_response(client_ep, &resp, my_pid, device_idx);
-                        }
-                    }
+        crate::println!("[blk{}] client connected", device_idx);
+
+        // Send SHM cap with the first DeviceInfo per client
+        let mut device_info_sent = false;
+
+        // Client loop
+        'client: loop {
+            let mut did_work = false;
+
+            // Check for incoming IPC messages (non-blocking)
+            loop {
+                let (msg, send_wake) = ipc::channel_recv(client_ep);
+                if send_wake != 0 {
+                    crate::task::wake_process(send_wake);
                 }
-                None => break,
+                match msg {
+                    Some(msg) => {
+                        did_work = true;
+                        if msg.len == 0 {
+                            continue;
+                        }
+                        let req: BlkRequest = match rvos_wire::from_bytes(&msg.data[..msg.len]) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        match req {
+                            BlkRequest::GetDeviceInfo {} => {
+                                let resp = BlkResponse::DeviceInfo {
+                                    capacity_sectors: capacity,
+                                    sector_size: crate::drivers::virtio::blk::SECTOR_SIZE as u32,
+                                    read_only: if read_only { 1 } else { 0 },
+                                };
+                                let mut resp_msg = Message::new();
+                                resp_msg.len = rvos_wire::to_bytes(&resp, &mut resp_msg.data).unwrap_or(0);
+                                resp_msg.sender_pid = my_pid;
+                                if !device_info_sent {
+                                    resp_msg.caps[0] = Cap::Shm { owned: shm.clone(), rw: true };
+                                    resp_msg.cap_count = 1;
+                                    device_info_sent = true;
+                                }
+                                if ipc::channel_send_blocking(client_ep, resp_msg, my_pid).is_err() {
+                                    crate::println!("[blk{}] client disconnected (send DeviceInfo)", device_idx);
+                                    break 'client;
+                                }
+                            }
+                            BlkRequest::Read { sector, count, shm_offset } => {
+                                let resp = handle_read(device_idx, sector, count, shm_offset, shm_base, capacity, read_only);
+                                if !send_response(client_ep, &resp, my_pid, device_idx) {
+                                    break 'client;
+                                }
+                            }
+                            BlkRequest::Write { sector, count, shm_offset } => {
+                                let resp = handle_write(device_idx, sector, count, shm_offset, shm_base, capacity, read_only);
+                                if !send_response(client_ep, &resp, my_pid, device_idx) {
+                                    break 'client;
+                                }
+                            }
+                            BlkRequest::Flush {} => {
+                                let ok = crate::drivers::virtio::blk::flush(device_idx);
+                                let resp = if ok {
+                                    BlkResponse::Ok {}
+                                } else {
+                                    BlkResponse::Error { code: 5 } // EIO
+                                };
+                                if !send_response(client_ep, &resp, my_pid, device_idx) {
+                                    break 'client;
+                                }
+                            }
+                        }
+                    }
+                    None => break,
+                }
             }
-        }
 
-        if !did_work {
-            if !ipc::channel_is_active(client_ep) {
-                crate::println!("[blk{}] client disconnected", device_idx);
-                return;
+            if !did_work {
+                if !ipc::channel_is_active(client_ep) {
+                    crate::println!("[blk{}] client disconnected", device_idx);
+                    break 'client;
+                }
+                ipc::channel_set_blocked(client_ep, my_pid);
+                crate::task::block_process(my_pid);
+                crate::task::schedule();
             }
-            ipc::channel_set_blocked(client_ep, my_pid);
-            crate::task::block_process(my_pid);
-            crate::task::schedule();
         }
+        // Client disconnected — OwnedEndpoint drops and closes the channel.
+        // Loop back to accept the next client.
     }
 }
 
@@ -230,12 +241,14 @@ fn handle_write(
     }
 }
 
-/// Send a BlkResponse to the client.
-fn send_response(client_ep: usize, resp: &BlkResponse, my_pid: usize, device_idx: usize) {
+/// Send a BlkResponse to the client. Returns false if the client disconnected.
+fn send_response(client_ep: usize, resp: &BlkResponse, my_pid: usize, device_idx: usize) -> bool {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(resp, &mut msg.data).unwrap_or(0);
     msg.sender_pid = my_pid;
     if ipc::channel_send_blocking(client_ep, msg, my_pid).is_err() {
         crate::println!("[blk{}] client disconnected (send response)", device_idx);
+        return false;
     }
+    true
 }

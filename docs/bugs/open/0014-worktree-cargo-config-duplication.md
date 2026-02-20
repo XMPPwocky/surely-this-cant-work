@@ -78,9 +78,36 @@ relative to the repo root... somehow (the exact resolution path is unclear
 but the build succeeds). Running `cargo` directly from inside `user/`
 changes the CWD, breaking the relative path.
 
+## Additional Findings
+
+**There is no way to stop Cargo's directory walk.** Cargo always walks
+from CWD to the filesystem root looking for `.cargo/config.toml` files.
+There is no config key, boundary marker, or `.git` detection that stops
+the walk early. This is a known limitation:
+https://users.rust-lang.org/t/how-to-ignore-cargo-config-file-in-parent-folder/55232
+
+**Cargo's four rustflags sources are mutually exclusive** (checked in
+order, first match wins):
+
+1. `CARGO_ENCODED_RUSTFLAGS` env var
+2. `RUSTFLAGS` env var
+3. All matching `target.<triple>.rustflags` config entries **joined**
+4. `build.rustflags` config value
+
+If an env var is set, config files are completely ignored (not merged).
+This means `CARGO_TARGET_RISCV64GC_UNKNOWN_NONE_ELF_RUSTFLAGS` in the
+Makefile would sidestep the duplication entirely — but moving flags out
+of `.cargo/config.toml` is a larger change to the build setup.
+
+**The user-space duplication is harmless.** The doubled `-T../user.ld`
+doesn't cause errors (the linker tolerates it). Only the kernel's
+`-T kernel/linker.ld` duplication causes actual failures (section
+overlap). `make build-user` works from worktrees; only `make build`
+(which includes the kernel) fails.
+
 ## Fix
 
-Two potential approaches:
+Potential approaches:
 
 ### Option A: Move worktrees outside the repo tree
 
@@ -90,17 +117,21 @@ parent-directory search from finding the main repo's config.
 
 Requires updating the `EnterWorktree` tool configuration.
 
-### Option B: Use absolute linker script paths
+### Option B: Move linker flags to Makefile env vars
 
-Change `.cargo/config.toml` and `user/.cargo/config.toml` to use
-paths based on `CARGO_MANIFEST_DIR` or an absolute path. However,
-cargo config.toml doesn't support environment variable expansion in
-`rustflags`, so this may require a `build.rs` approach instead.
+Set `CARGO_TARGET_RISCV64GC_UNKNOWN_NONE_ELF_RUSTFLAGS` and
+`CARGO_TARGET_RISCV64GC_UNKNOWN_RVOS_RUSTFLAGS` in the Makefile,
+then delete both `.cargo/config.toml` files. Env vars completely
+override config files (no merging). All builds already go through
+`make`, so bare `cargo` invocations are not a supported workflow.
 
-### Option C: Add `.cargo/config.toml` to worktree with adjusted paths
+### Option C: Delete only the root `.cargo/config.toml` from worktrees
 
-Use a post-worktree-creation hook to generate a `.cargo/config.toml`
-that uses absolute paths to the worktree's own linker scripts.
+A post-worktree-creation hook could delete or empty the root-level
+`.cargo/config.toml` in the worktree, leaving only the main repo's
+copy to be found by the walk. Since the walk finds exactly one copy,
+no duplication occurs. Downside: the worktree has uncommitted changes
+to a tracked file.
 
 ## Verification
 

@@ -1626,6 +1626,267 @@ fn test_stress_spawn_exit() -> Result<(), &'static str> {
 }
 
 // ============================================================
+// 23. Block Device
+// ============================================================
+
+/// Connect to a block device, get DeviceInfo + SHM.
+/// Returns (client_handle, shm_addr, shm_handle, capacity_sectors, read_only).
+fn blk_connect(name: &str) -> Result<(usize, usize, usize, u64, bool), &'static str> {
+    use rvos_proto::blk::{BlkRequest, BlkResponse};
+
+    let svc = rvos::connect_to_service(name)
+        .map_err(|_| "connect to blk service failed")?;
+    let handle = svc.into_raw_handle();
+
+    // Send GetDeviceInfo
+    let req = BlkRequest::GetDeviceInfo {};
+    let mut msg = Message::new();
+    msg.len = rvos::rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(handle, &msg);
+
+    // Recv DeviceInfo + SHM cap
+    let mut resp_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(handle, &mut resp_msg);
+    if ret != 0 {
+        raw::sys_chan_close(handle);
+        return Err("recv DeviceInfo failed");
+    }
+
+    let shm_cap = resp_msg.caps[0];
+    if shm_cap == NO_CAP {
+        raw::sys_chan_close(handle);
+        return Err("no SHM cap in DeviceInfo");
+    }
+
+    let resp: BlkResponse = match rvos::rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len]) {
+        Ok(r) => r,
+        Err(_) => {
+            raw::sys_chan_close(handle);
+            raw::sys_chan_close(shm_cap);
+            return Err("decode DeviceInfo failed");
+        }
+    };
+
+    let (capacity, read_only) = match resp {
+        BlkResponse::DeviceInfo { capacity_sectors, read_only, .. } => {
+            (capacity_sectors, read_only != 0)
+        }
+        _ => {
+            raw::sys_chan_close(handle);
+            raw::sys_chan_close(shm_cap);
+            return Err("unexpected response (not DeviceInfo)");
+        }
+    };
+
+    // Map SHM (32 pages = 128KB)
+    let shm_size = 32 * 4096;
+    let shm_addr = raw::sys_mmap(shm_cap, shm_size);
+    if shm_addr == usize::MAX {
+        raw::sys_chan_close(handle);
+        raw::sys_chan_close(shm_cap);
+        return Err("mmap SHM failed");
+    }
+
+    Ok((handle, shm_addr, shm_cap, capacity, read_only))
+}
+
+/// Send a BlkRequest and receive a BlkResponse.
+fn blk_request(handle: usize, req: &rvos_proto::blk::BlkRequest) -> Result<rvos_proto::blk::BlkResponse, &'static str> {
+    let mut msg = Message::new();
+    msg.len = rvos::rvos_wire::to_bytes(req, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(handle, &msg);
+
+    let mut resp_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(handle, &mut resp_msg);
+    if ret != 0 {
+        return Err("recv blk response failed");
+    }
+
+    rvos::rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
+        .map_err(|_| "decode blk response failed")
+}
+
+/// Clean up a block device connection.
+fn blk_cleanup(handle: usize, shm_addr: usize, shm_cap: usize) {
+    raw::sys_munmap(shm_addr, 32 * 4096);
+    raw::sys_chan_close(shm_cap);
+    raw::sys_chan_close(handle);
+}
+
+fn test_blk_device_info() -> Result<(), &'static str> {
+    let (handle, shm_addr, shm_cap, capacity, _read_only) = blk_connect("blk1")?;
+    assert_true(capacity > 0, "capacity should be > 0")?;
+    // 16 MB = 32768 sectors of 512 bytes
+    assert_eq(capacity as usize, 32768, "capacity should be 32768 sectors (16MB)")?;
+    blk_cleanup(handle, shm_addr, shm_cap);
+    Ok(())
+}
+
+fn test_blk_read_write() -> Result<(), &'static str> {
+    use rvos_proto::blk::{BlkRequest, BlkResponse};
+
+    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect("blk2")?;
+
+    // Write a test pattern to sector near the end
+    let test_sector = capacity - 2;
+    let pattern: [u8; 512] = {
+        let mut p = [0u8; 512];
+        for (i, byte) in p.iter_mut().enumerate() {
+            *byte = ((i * 7 + 13) & 0xFF) as u8;
+        }
+        p
+    };
+
+    // Copy pattern to SHM at offset 0
+    unsafe {
+        core::ptr::copy_nonoverlapping(pattern.as_ptr(), shm_addr as *mut u8, 512);
+    }
+
+    // Write 1 sector
+    let resp = blk_request(handle, &BlkRequest::Write { sector: test_sector, count: 1, shm_offset: 0 })?;
+    match resp {
+        BlkResponse::Ok {} => {}
+        _ => {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("write failed");
+        }
+    }
+
+    // Clear SHM
+    unsafe {
+        core::ptr::write_bytes(shm_addr as *mut u8, 0, 512);
+    }
+
+    // Read back
+    let resp = blk_request(handle, &BlkRequest::Read { sector: test_sector, count: 1, shm_offset: 0 })?;
+    match resp {
+        BlkResponse::Ok {} => {}
+        _ => {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("read failed");
+        }
+    }
+
+    // Verify pattern
+    for i in 0..512 {
+        let got = unsafe { *((shm_addr + i) as *const u8) };
+        if got != ((i * 7 + 13) & 0xFF) as u8 {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("read-back data mismatch");
+        }
+    }
+
+    blk_cleanup(handle, shm_addr, shm_cap);
+    Ok(())
+}
+
+fn test_blk_multi_sector() -> Result<(), &'static str> {
+    use rvos_proto::blk::{BlkRequest, BlkResponse};
+
+    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect("blk2")?;
+
+    // Write 8 consecutive sectors (4096 bytes) starting at sector 16
+    let count: u32 = 8;
+    let byte_len = count as usize * 512;
+
+    // Fill SHM with a pattern
+    for i in 0..byte_len {
+        unsafe { *((shm_addr + i) as *mut u8) = ((i * 3) & 0xFF) as u8; }
+    }
+
+    let resp = blk_request(handle, &BlkRequest::Write { sector: 16, count, shm_offset: 0 })?;
+    match resp {
+        BlkResponse::Ok {} => {}
+        _ => {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("multi-sector write failed");
+        }
+    }
+
+    // Clear SHM and read back
+    unsafe { core::ptr::write_bytes(shm_addr as *mut u8, 0, byte_len); }
+
+    let resp = blk_request(handle, &BlkRequest::Read { sector: 16, count, shm_offset: 0 })?;
+    match resp {
+        BlkResponse::Ok {} => {}
+        _ => {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("multi-sector read failed");
+        }
+    }
+
+    for i in 0..byte_len {
+        let got = unsafe { *((shm_addr + i) as *const u8) };
+        if got != ((i * 3) & 0xFF) as u8 {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("multi-sector data mismatch");
+        }
+    }
+
+    blk_cleanup(handle, shm_addr, shm_cap);
+    Ok(())
+}
+
+fn test_blk_read_beyond_capacity() -> Result<(), &'static str> {
+    use rvos_proto::blk::{BlkRequest, BlkResponse};
+
+    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect("blk1")?;
+
+    // Try reading 1 sector past the end
+    let resp = blk_request(handle, &BlkRequest::Read { sector: capacity, count: 1, shm_offset: 0 })?;
+    match resp {
+        BlkResponse::Error { .. } => {}
+        _ => {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("read beyond capacity should return error");
+        }
+    }
+
+    blk_cleanup(handle, shm_addr, shm_cap);
+    Ok(())
+}
+
+fn test_blk_write_read_only() -> Result<(), &'static str> {
+    use rvos_proto::blk::{BlkRequest, BlkResponse};
+
+    let (handle, shm_addr, shm_cap, _cap, read_only) = blk_connect("blk0")?;
+    assert_true(read_only, "blk0 should be read-only")?;
+
+    // Try writing — should fail with EROFS
+    let resp = blk_request(handle, &BlkRequest::Write { sector: 0, count: 1, shm_offset: 0 })?;
+    match resp {
+        BlkResponse::Error { code } => {
+            assert_eq(code as usize, 30, "write to RO should return EROFS (30)")?;
+        }
+        _ => {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("write to RO device should return error");
+        }
+    }
+
+    blk_cleanup(handle, shm_addr, shm_cap);
+    Ok(())
+}
+
+fn test_blk_flush() -> Result<(), &'static str> {
+    use rvos_proto::blk::{BlkRequest, BlkResponse};
+
+    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect("blk1")?;
+
+    let resp = blk_request(handle, &BlkRequest::Flush {})?;
+    match resp {
+        BlkResponse::Ok {} => {}
+        _ => {
+            blk_cleanup(handle, shm_addr, shm_cap);
+            return Err("flush should succeed");
+        }
+    }
+
+    blk_cleanup(handle, shm_addr, shm_cap);
+    Ok(())
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -1718,6 +1979,15 @@ fn main() {
         ("fs_stat", test_fs_stat),
         ("fs_delete", test_fs_delete),
         ("fs_readdir", test_fs_readdir),
+    ]));
+
+    total.merge(&run_section("Block Device", &[
+        ("blk_device_info", test_blk_device_info),
+        ("blk_read_write", test_blk_read_write),
+        ("blk_multi_sector", test_blk_multi_sector),
+        ("blk_read_beyond_capacity", test_blk_read_beyond_capacity),
+        ("blk_write_read_only", test_blk_write_read_only),
+        ("blk_flush", test_blk_flush),
     ]));
 
     total.merge(&run_section("Process Spawn", &[
