@@ -5,7 +5,7 @@ use rvos::{Channel, UserTransport};
 use rvos::rvos_wire::Never;
 use rvos_proto::fs::{
     FileRequest, FileResponse, FileResponseMsg, FileRequestMsg,
-    FsError, TCRAW, TCCOOKED,
+    FsError, TCRAW, TCCOOKED, TCSETFG,
 };
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
@@ -490,6 +490,8 @@ fn main() {
     let mut stdin_stack_len: usize = 0;
     let mut line_disc = LineDiscipline::new();
     let mut shift_pressed = false;
+    let mut ctrl_pressed = false;
+    let mut foreground_pid: u32 = 0;
     let mut swap_seq: u32 = 10;
 
     // Print startup banner
@@ -549,6 +551,8 @@ fn main() {
                     let code = code as usize;
                     if code == 42 || code == 54 {
                         shift_pressed = true;
+                    } else if code == 29 || code == 97 {
+                        ctrl_pressed = true;
                     } else if let Some(seq) = escape_seq_for_keycode(code) {
                         // Special key: send full escape sequence in raw mode
                         if line_disc.raw_mode
@@ -564,13 +568,18 @@ fn main() {
                                 }
                             }
                     } else if code < 128 {
-                        let ascii = if shift_pressed {
+                        let base = if shift_pressed {
                             KEYMAP_SHIFT[code]
                         } else {
                             KEYMAP[code]
                         };
+                        let ascii = if ctrl_pressed && base.is_ascii_lowercase() {
+                            base & 0x1F
+                        } else {
+                            base
+                        };
                         if ascii != 0 {
-                            handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx);
+                            handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx, &mut foreground_pid);
                         }
                     }
                 }
@@ -578,6 +587,8 @@ fn main() {
                     let code = code as usize;
                     if code == 42 || code == 54 {
                         shift_pressed = false;
+                    } else if code == 29 || code == 97 {
+                        ctrl_pressed = false;
                     }
                 }
                 WindowEvent::CloseRequested {} => {
@@ -610,11 +621,12 @@ fn main() {
                             stdin_stack_len += 1;
                         }
                     }
-                    Ok(FileRequest::Ioctl { cmd, arg: _ }) => {
+                    Ok(FileRequest::Ioctl { cmd, arg }) => {
                         handled = true;
                         match cmd {
                             TCRAW => { line_disc.raw_mode = true; fb_send_ioctl_ok(&client.stdin, 0); }
                             TCCOOKED => { line_disc.raw_mode = false; fb_send_ioctl_ok(&client.stdin, 0); }
+                            TCSETFG => { foreground_pid = arg; fb_send_ioctl_ok(&client.stdin, 0); }
                             _ => {
                                 let _ = client.stdin.send(&FileResponse::Error { code: FsError::Io {} });
                             }
@@ -724,7 +736,16 @@ fn handle_key_input(
     line_disc: &mut LineDiscipline,
     clients: &mut [Option<FbconClient>; MAX_CONSOLE_CLIENTS],
     stdin_idx: usize,
+    foreground_pid: &mut u32,
 ) {
+    // Ctrl+C: kill foreground process if set, otherwise pass through
+    if ascii == 0x03 && *foreground_pid != 0 {
+        console.write_str(b"^C\r\n");
+        raw::sys_kill(*foreground_pid as usize, -2);
+        *foreground_pid = 0;
+        return;
+    }
+
     if line_disc.raw_mode {
         // Raw mode: no echo, fulfill pending read directly
         if let Some(len) = line_disc.push_char(ascii) {
