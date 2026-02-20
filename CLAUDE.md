@@ -42,6 +42,17 @@ Use an Explore subagent to search these when debugging device or architectural i
 - `priv-csrs.adoc` — all privileged CSR definitions
 - `priv-insns.adoc` — sret, wfi, sfence.vma, etc.
 
+## Debugging & Observability
+See `docs/debugging-and-observability.md` for the full reference. Key tools:
+- `ps` — process list with blocked-on reason
+- `mem` — kernel heap + per-process memory
+- `kstat` — global atomic counters (scheduler, IPC, IRQs, pages)
+- `chstat` — per-channel message/byte statistics
+- `schedlat` — scheduler runqueue latency histogram
+- `ipclat` — IPC delivery latency histogram
+- `trace` / `trace-clear` — kernel trace ring buffer
+- `dbg <pid>` — interactive user-process debugger
+
 ## Bug Tracking
 When you find a bug incidentally while testing, or when the user reports a bug
 (even without explicitly using `/bug`), **use the `/bug` skill** to report and

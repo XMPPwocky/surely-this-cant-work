@@ -50,6 +50,10 @@ define_message! {
         Memstat(1) {},
         Trace(2) {},
         TraceClear(3) {},
+        Kstat(4) {},
+        Channels(5) {},
+        SchedLatency(6) {},
+        IpcLatency(7) {},
     }
 }
 ```
@@ -57,7 +61,8 @@ define_message! {
 ### Ps — Process List
 
 Returns a formatted text table of all processes with their PID, state,
-CPU usage (1-second and 1-minute EWMA), memory usage, and name.
+CPU usage (1-second and 1-minute EWMA), memory usage, blocked-on reason,
+and name.
 
 **Request:** `SysinfoCommand::Ps {}`
 
@@ -66,12 +71,12 @@ CPU usage (1-second and 1-minute EWMA), memory usage, and name.
 Example output:
 
 ```
-  PID  STATE     CPU1s  CPU1m  MEM     NAME
-  ---  --------  -----  -----  ------  ----------------
-    0  Ready      0.0%   0.0%     0K  idle
-    1  Running   12.3%   8.5%   144K  init
-    2  Blocked    0.0%   0.1%    16K  serial-con
-    3  Ready      0.5%   0.3%    48K  fs
+  PID  STATE     CPU1s  CPU1m  MEM     BLOCKED ON     NAME
+  ---  --------  -----  -----  ------  -------------  ----------------
+    0  Ready      0.0%   0.0%     0K                  idle
+    1  Running   12.3%   8.5%   144K                  init
+    2  Blocked    0.0%   0.1%    16K  recv(ep 4)      serial-con
+    3  Ready      0.5%   0.3%    48K                  fs
 ```
 
 **Columns:**
@@ -83,6 +88,7 @@ Example output:
 | CPU1s  | CPU usage over a 1-second EWMA window (0.0%–100.0%) |
 | CPU1m  | CPU usage over a 1-minute EWMA window (0.0%–100.0%) |
 | MEM    | Total physical pages owned, in KiB (pages × 4K) |
+| BLOCKED ON | What a Blocked process is waiting for (empty if not blocked) |
 | NAME   | Process name (max 16 chars) |
 
 ### Memstat — Kernel Memory Statistics
@@ -130,6 +136,48 @@ Clears the kernel trace ring buffer and responds with `"ok\n"`.
 **Request:** `SysinfoCommand::TraceClear {}`
 
 **Response:** Chunked text containing `"ok\n"`.
+
+### Kstat — Kernel Counters
+
+Returns global atomic counters for scheduler, IPC, channels, memory pages,
+and interrupts. All counters are monotonic (never reset).
+
+**Request:** `SysinfoCommand::Kstat {}`
+
+**Response:** Chunked text (see [Response Format](#response-format)).
+
+Counters include: SCHED_SWITCHES, SCHED_PREEMPTS, SCHED_YIELDS, IPC_SENDS,
+IPC_RECVS, IPC_SEND_BLOCKS, IPC_RECV_BLOCKS, CHANNELS_CREATED,
+CHANNELS_CLOSED, PAGES_ALLOCATED, PAGES_FREED, IRQ_TIMER, IRQ_UART,
+IRQ_VIRTIO_KBD, IRQ_VIRTIO_NET, IRQ_VIRTIO_GPU, IRQ_VIRTIO_BLK,
+IRQ_PLIC_OTHER.
+
+### Channels — Per-Channel Statistics
+
+Returns a table of all active (and recently closed) channels with queue
+depths, reference counts, and cumulative message/byte counters per side.
+
+**Request:** `SysinfoCommand::Channels {}`
+
+**Response:** Chunked text (see [Response Format](#response-format)).
+
+### SchedLatency — Scheduler Latency Histogram
+
+Returns a log2 histogram of scheduler runqueue latency (time from enqueue
+to dequeue, in microseconds at 10 MHz clock).
+
+**Request:** `SysinfoCommand::SchedLatency {}`
+
+**Response:** Chunked text (see [Response Format](#response-format)).
+
+### IpcLatency — IPC Delivery Latency Histogram
+
+Returns a log2 histogram of IPC message delivery latency (time from
+`channel_send` to `channel_recv`, in microseconds at 10 MHz clock).
+
+**Request:** `SysinfoCommand::IpcLatency {}`
+
+**Response:** Chunked text (see [Response Format](#response-format)).
 
 ---
 
