@@ -26,6 +26,7 @@ rvos-rt = { path = "rvos-rt" }
 rvos = { path = "../lib/rvos" }
 rvos-proto = { path = "../lib/rvos-proto" }
 rvos-gfx = { path = "../lib/rvos-gfx" }
+termserv = { path = "../lib/termserv" }
 
 [profile.release]
 panic = "abort"

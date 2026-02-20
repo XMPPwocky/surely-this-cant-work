@@ -1,16 +1,14 @@
 extern crate rvos_rt;
 
 use rvos::raw;
-use rvos::{Channel, UserTransport};
+use rvos::UserTransport;
 use rvos::rvos_wire::Never;
-use rvos_proto::fs::{
-    FileRequest, FileResponse, FileResponseMsg, FileRequestMsg,
-    FsError, TCRAW, TCCOOKED, TCSETFG,
-};
 use rvos_proto::window::{
     CreateWindowRequest, CreateWindowResponse,
     WindowReply, WindowEvent, WindowClient,
 };
+use rvos::Channel;
+use termserv::{TermOutput, TermServer};
 
 // --- Font data (shared from rvos-gfx) ---
 
@@ -19,7 +17,7 @@ use rvos_gfx::font::{FONT_8X16, GLYPH_WIDTH, GLYPH_HEIGHT};
 const FONT_WIDTH: u32 = GLYPH_WIDTH;
 const FONT_HEIGHT: u32 = GLYPH_HEIGHT;
 
-// --- Keymap data (Linux keycodes → ASCII) ---
+// --- Keymap data (Linux keycodes -> ASCII) ---
 
 static KEYMAP: [u8; 128] = {
     let mut map = [0u8; 128];
@@ -27,7 +25,7 @@ static KEYMAP: [u8; 128] = {
     map[2] = b'1'; map[3] = b'2'; map[4] = b'3'; map[5] = b'4';
     map[6] = b'5'; map[7] = b'6'; map[8] = b'7'; map[9] = b'8';
     map[10] = b'9'; map[11] = b'0'; map[12] = b'-'; map[13] = b'=';
-    map[14] = 0x7F; // Backspace → DEL
+    map[14] = 0x7F; // Backspace -> DEL
     map[15] = b'\t';
     map[16] = b'q'; map[17] = b'w'; map[18] = b'e'; map[19] = b'r';
     map[20] = b't'; map[21] = b'y'; map[22] = b'u'; map[23] = b'i';
@@ -51,7 +49,7 @@ static KEYMAP_SHIFT: [u8; 128] = {
     map[2] = b'!'; map[3] = b'@'; map[4] = b'#'; map[5] = b'$';
     map[6] = b'%'; map[7] = b'^'; map[8] = b'&'; map[9] = b'*';
     map[10] = b'('; map[11] = b')'; map[12] = b'_'; map[13] = b'+';
-    map[14] = 0x7F; // Backspace → DEL
+    map[14] = 0x7F; // Backspace -> DEL
     map[15] = b'\t';
     map[16] = b'Q'; map[17] = b'W'; map[18] = b'E'; map[19] = b'R';
     map[20] = b'T'; map[21] = b'Y'; map[22] = b'U'; map[23] = b'I';
@@ -237,31 +235,26 @@ impl FbConsole {
 
         match ch {
             b'A' => {
-                // Cursor up
                 let n = if p0 == 0 { 1 } else { p0 };
                 self.row = self.row.saturating_sub(n);
                 self.dirty = true;
             }
             b'B' => {
-                // Cursor down
                 let n = if p0 == 0 { 1 } else { p0 };
                 self.row = (self.row + n).min(self.rows - 1);
                 self.dirty = true;
             }
             b'C' => {
-                // Cursor right
                 let n = if p0 == 0 { 1 } else { p0 };
                 self.col = (self.col + n).min(self.cols - 1);
                 self.dirty = true;
             }
             b'D' => {
-                // Cursor left
                 let n = if p0 == 0 { 1 } else { p0 };
                 self.col = self.col.saturating_sub(n);
                 self.dirty = true;
             }
             b'H' | b'f' => {
-                // Cursor position (1-based: ESC[row;colH)
                 let row = if p0 == 0 { 0 } else { p0 - 1 };
                 let col = if p1 == 0 { 0 } else { p1 - 1 };
                 self.row = row.min(self.rows - 1);
@@ -270,7 +263,6 @@ impl FbConsole {
             }
             b'J' => {
                 if p0 == 2 {
-                    // Clear entire screen
                     let total = (self.stride * self.height) as usize;
                     for i in 0..total {
                         unsafe { *self.fb.add(i) = self.bg; }
@@ -280,14 +272,13 @@ impl FbConsole {
             }
             b'K' => {
                 if p0 == 0 {
-                    // Erase from cursor to end of line
                     for c in self.col..self.cols {
                         self.put_char(c, self.row, b' ');
                     }
                     self.dirty = true;
                 }
             }
-            _ => {} // ignore unknown CSI sequences
+            _ => {}
         }
     }
 
@@ -302,15 +293,12 @@ impl FbConsole {
                 self.fb,
                 copy_pixels,
             );
-            // Fill last row with bg
             for i in copy_pixels..total_pixels {
                 *self.fb.add(i) = self.bg;
             }
         }
     }
 
-    /// XOR the cursor cell to toggle block cursor visibility.
-    /// Call before swap to show cursor, after swap+copy to erase from back buffer.
     fn toggle_cursor(&mut self) {
         let px = self.col * FONT_WIDTH;
         let py = self.row * FONT_HEIGHT;
@@ -337,92 +325,31 @@ impl FbConsole {
     }
 }
 
-// --- Line discipline ---
+// --- TermOutput implementation for fbcon ---
 
-const LINE_BUF_SIZE: usize = 256;
-
-struct LineDiscipline {
-    buf: [u8; LINE_BUF_SIZE],
-    len: usize,
-    raw_mode: bool,
+struct FbOutput<'a> {
+    console: &'a mut FbConsole,
 }
 
-impl LineDiscipline {
-    const fn new() -> Self {
-        LineDiscipline {
-            buf: [0; LINE_BUF_SIZE],
-            len: 0,
-            raw_mode: false,
-        }
+impl TermOutput for FbOutput<'_> {
+    fn write_output(&mut self, data: &[u8]) {
+        self.console.write_str(data);
     }
 
-    /// Process a character. Returns Some(line_len) when a line is ready.
-    fn push_char(&mut self, ch: u8) -> Option<usize> {
-        if self.raw_mode {
-            self.buf[0] = ch;
-            return Some(1);
-        }
-        match ch {
-            0x7F | 0x08 => {
-                if self.len > 0 {
-                    self.len -= 1;
-                }
-                None
-            }
-            b'\r' | b'\n' => {
-                if self.len < LINE_BUF_SIZE {
-                    self.buf[self.len] = b'\n';
-                    self.len += 1;
-                }
-                let result = self.len;
-                self.len = 0;
-                Some(result)
-            }
-            ch if (0x20..0x7F).contains(&ch) => {
-                if self.len < LINE_BUF_SIZE - 1 {
-                    self.buf[self.len] = ch;
-                    self.len += 1;
-                }
-                None
-            }
-            _ => None,
-        }
+    fn echo_char(&mut self, ch: u8) {
+        self.console.write_char(ch);
     }
 
-    fn line_data(&self, len: usize) -> &[u8] {
-        &self.buf[..len]
+    fn echo_backspace(&mut self) {
+        self.console.write_char(0x08);
+        self.console.write_char(b' ');
+        self.console.write_char(0x08);
     }
-}
 
-// --- Console client management (FileOps protocol) ---
-
-const MAX_CONSOLE_CLIENTS: usize = 8;
-/// Max data payload per chunk: 1024 - 1 (tag) - 2 (length prefix) = 1021
-const MAX_DATA_CHUNK: usize = 1021;
-
-struct FbconClient {
-    stdin: Channel<FileResponseMsg, FileRequestMsg>,
-    stdout: Channel<FileResponseMsg, FileRequestMsg>,
-    has_pending_read: bool,
-}
-
-/// FileOps response helpers for user-space (typed channel)
-fn fb_send_data(ch: &Channel<FileResponseMsg, FileRequestMsg>, data: &[u8]) {
-    for chunk in data.chunks(MAX_DATA_CHUNK) {
-        let _ = ch.send(&FileResponse::Data { chunk });
+    fn echo_newline(&mut self) {
+        self.console.write_char(b'\r');
+        self.console.write_char(b'\n');
     }
-}
-
-fn fb_send_sentinel(ch: &Channel<FileResponseMsg, FileRequestMsg>) {
-    let _ = ch.send(&FileResponse::Data { chunk: &[] });
-}
-
-fn fb_send_write_ok(ch: &Channel<FileResponseMsg, FileRequestMsg>, written: u32) {
-    let _ = ch.send(&FileResponse::WriteOk { written });
-}
-
-fn fb_send_ioctl_ok(ch: &Channel<FileResponseMsg, FileRequestMsg>, result: u32) {
-    let _ = ch.send(&FileResponse::IoctlOk { result });
 }
 
 // --- Main ---
@@ -461,7 +388,7 @@ fn main() {
         _ => (1024, 768, 1024),
     };
 
-    // 5. GetFramebuffer → receive SHM handle
+    // 5. GetFramebuffer -> receive SHM handle
     let shm_handle = match window_client.get_framebuffer(2) {
         Ok(WindowReply::FbReply { fb, .. }) => fb.0,
         _ => panic!("[fbcon] GetFramebuffer failed"),
@@ -484,14 +411,9 @@ fn main() {
 
     // Initialize FbConsole on the back buffer
     let mut console = FbConsole::new(back_fb, width, height, stride);
-    let mut clients: [Option<FbconClient>; MAX_CONSOLE_CLIENTS] = [const { None }; MAX_CONSOLE_CLIENTS];
-    // Stdin stack: indices into clients[]; most recent is on top
-    let mut stdin_stack: [usize; MAX_CONSOLE_CLIENTS] = [usize::MAX; MAX_CONSOLE_CLIENTS];
-    let mut stdin_stack_len: usize = 0;
-    let mut line_disc = LineDiscipline::new();
+    let mut term = TermServer::new();
     let mut shift_pressed = false;
     let mut ctrl_pressed = false;
-    let mut foreground_pid: u32 = 0;
     let mut swap_seq: u32 = 10;
 
     // Print startup banner
@@ -500,7 +422,6 @@ fn main() {
 
     // Do initial present
     do_swap(&mut window_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
-    // Re-point console to new back buffer
     update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
     console.dirty = false;
 
@@ -508,7 +429,6 @@ fn main() {
     let (stdin_our, stdin_shell) = raw::sys_chan_create();
     let (stdout_our, stdout_shell) = raw::sys_chan_create();
 
-    // Spawn shell with stdin/stdout redirected to our channels
     match rvos::spawn_process_with_overrides(
         "/bin/shell",
         b"shell",
@@ -527,12 +447,8 @@ fn main() {
     raw::sys_chan_close(stdin_shell);
     raw::sys_chan_close(stdout_shell);
 
-    // Register shell as client 0
-    clients[0] = Some(FbconClient {
-        stdin: Channel::<FileResponseMsg, FileRequestMsg>::from_raw_handle(stdin_our),
-        stdout: Channel::<FileResponseMsg, FileRequestMsg>::from_raw_handle(stdout_our),
-        has_pending_read: false,
-    });
+    // Register shell as a terminal client
+    term.add_client(stdin_our, stdout_our);
 
     // Typed event channel
     let mut events = Channel::<Never, WindowEvent>::from_raw_handle(event_chan);
@@ -541,9 +457,7 @@ fn main() {
     loop {
         let mut handled = false;
 
-        let stdin_idx = if stdin_stack_len > 0 { stdin_stack[stdin_stack_len - 1] } else { usize::MAX };
-
-        // Check for keyboard events on event channel (typed)
+        // Check for keyboard events on event channel
         while let Some(event) = events.try_next_message() {
             handled = true;
             match event {
@@ -554,19 +468,10 @@ fn main() {
                     } else if code == 29 || code == 97 {
                         ctrl_pressed = true;
                     } else if let Some(seq) = escape_seq_for_keycode(code) {
-                        // Special key: send full escape sequence in raw mode
-                        if line_disc.raw_mode
-                            && stdin_idx != usize::MAX {
-                                if let Some(ref client) = clients[stdin_idx] {
-                                    if client.has_pending_read {
-                                        fb_send_data(&client.stdin, seq);
-                                        fb_send_sentinel(&client.stdin);
-                                    }
-                                }
-                                if let Some(ref mut client) = clients[stdin_idx] {
-                                    client.has_pending_read = false;
-                                }
-                            }
+                        // Special key: send escape sequence in raw mode
+                        if term.is_raw_mode() {
+                            term.feed_raw(seq);
+                        }
                     } else if code < 128 {
                         let base = if shift_pressed {
                             KEYMAP_SHIFT[code]
@@ -579,7 +484,8 @@ fn main() {
                             base
                         };
                         if ascii != 0 {
-                            handle_key_input(ascii, &mut console, &mut line_disc, &mut clients, stdin_idx, &mut foreground_pid);
+                            let mut fb_out = FbOutput { console: &mut console };
+                            term.feed_input(ascii, &mut fb_out);
                         }
                     }
                 }
@@ -592,126 +498,35 @@ fn main() {
                     }
                 }
                 WindowEvent::CloseRequested {} => {
-                    // Close window and exit
                     let _ = window_client.close_window();
                     return;
                 }
-                _ => {
-                    // Ignore mouse events and other window events
-                }
+                _ => {}
             }
         }
 
-        // Poll stdin channels for Read/Ioctl requests (typed).
-        // Also detect closed channels for dead client cleanup.
-        #[allow(clippy::needless_range_loop)] // index needed for clients[i] = None
-        for i in 0..MAX_CONSOLE_CLIENTS {
-            if clients[i].is_none() { continue; }
-            let mut closed = false;
-            loop {
-                let client = clients[i].as_mut().unwrap();
-                match client.stdin.try_recv() {
-                    Ok(FileRequest::Read { offset: _, len: _ }) => {
-                        handled = true;
-                        client.has_pending_read = true;
-                        // Push onto stdin_stack on first Read (lazy)
-                        let already = (0..stdin_stack_len).any(|j| stdin_stack[j] == i);
-                        if !already && stdin_stack_len < MAX_CONSOLE_CLIENTS {
-                            stdin_stack[stdin_stack_len] = i;
-                            stdin_stack_len += 1;
-                        }
-                    }
-                    Ok(FileRequest::Ioctl { cmd, arg }) => {
-                        handled = true;
-                        match cmd {
-                            TCRAW => { line_disc.raw_mode = true; fb_send_ioctl_ok(&client.stdin, 0); }
-                            TCCOOKED => { line_disc.raw_mode = false; fb_send_ioctl_ok(&client.stdin, 0); }
-                            TCSETFG => { foreground_pid = arg; fb_send_ioctl_ok(&client.stdin, 0); }
-                            _ => {
-                                let _ = client.stdin.send(&FileResponse::Error { code: FsError::Io {} });
-                            }
-                        }
-                    }
-                    Ok(_) => {} // ignore unexpected requests on stdin
-                    Err(rvos::RecvError::Closed) => { closed = true; handled = true; break; }
-                    Err(_) => break,
-                }
-            }
-            if closed {
-                clients[i] = None; // channels auto-close on drop
-                remove_from_stdin_stack(&mut stdin_stack, &mut stdin_stack_len, i);
-            }
-        }
-
-        // Poll stdout channels for Write requests (typed).
-        // Use two-phase pattern: recv+process in inner block, respond after.
-        #[allow(clippy::needless_range_loop)] // index needed for clients[i] = None
-        for i in 0..MAX_CONSOLE_CLIENTS {
-            if clients[i].is_none() { continue; }
-            let mut closed = false;
-            loop {
-                // Phase 1: recv and process (data borrows from channel buffer)
-                let written: Option<u32> = {
-                    let client = clients[i].as_mut().unwrap();
-                    match client.stdout.try_recv() {
-                        Ok(FileRequest::Write { offset: _, data }) => {
-                            console.write_str(data);
-                            Some(data.len() as u32)
-                        }
-                        Ok(_) => None,
-                        Err(rvos::RecvError::Closed) => { closed = true; break; }
-                        Err(_) => break,
-                    }
-                };
-                // Phase 2: respond (borrow released)
-                if let Some(w) = written {
-                    handled = true;
-                    fb_send_write_ok(&clients[i].as_ref().unwrap().stdout, w);
-                }
-            }
-            if closed {
-                handled = true;
-                clients[i] = None;
-                remove_from_stdin_stack(&mut stdin_stack, &mut stdin_stack_len, i);
-            }
+        // Poll client channels for FileOps requests
+        {
+            let mut fb_out = FbOutput { console: &mut console };
+            if term.poll_stdin() { handled = true; }
+            if term.poll_stdout(&mut fb_out) { handled = true; }
         }
 
         // If console is dirty, present the frame
         if console.dirty {
-            console.toggle_cursor(); // draw cursor on back buffer
+            console.toggle_cursor();
             do_swap(&mut window_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
             update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
-            console.toggle_cursor(); // erase cursor from new back buffer
+            console.toggle_cursor();
             console.dirty = false;
             handled = true;
         }
 
         if !handled {
-            // Register interest on all channels then block
             raw::sys_chan_poll_add(req_chan);
             events.poll_add();
-            for client in clients.iter().flatten() {
-                client.stdin.poll_add();
-                client.stdout.poll_add();
-            }
+            term.poll_add_all();
             raw::sys_block();
-        }
-    }
-}
-
-/// Remove a client index from the stdin stack.
-fn remove_from_stdin_stack(
-    stdin_stack: &mut [usize; MAX_CONSOLE_CLIENTS],
-    stdin_stack_len: &mut usize,
-    client_idx: usize,
-) {
-    let mut j = 0;
-    while j < *stdin_stack_len {
-        if stdin_stack[j] == client_idx {
-            for k in j..*stdin_stack_len - 1 { stdin_stack[k] = stdin_stack[k + 1]; }
-            *stdin_stack_len -= 1;
-        } else {
-            j += 1;
         }
     }
 }
@@ -730,72 +545,7 @@ fn escape_seq_for_keycode(code: usize) -> Option<&'static [u8]> {
     }
 }
 
-fn handle_key_input(
-    ascii: u8,
-    console: &mut FbConsole,
-    line_disc: &mut LineDiscipline,
-    clients: &mut [Option<FbconClient>; MAX_CONSOLE_CLIENTS],
-    stdin_idx: usize,
-    foreground_pid: &mut u32,
-) {
-    // Ctrl+C: kill foreground process if set, otherwise pass through
-    if ascii == 0x03 && *foreground_pid != 0 {
-        console.write_str(b"^C\r\n");
-        raw::sys_kill(*foreground_pid as usize, -2);
-        *foreground_pid = 0;
-        return;
-    }
-
-    if line_disc.raw_mode {
-        // Raw mode: no echo, fulfill pending read directly
-        if let Some(len) = line_disc.push_char(ascii) {
-            if stdin_idx != usize::MAX {
-                if let Some(ref mut client) = clients[stdin_idx] {
-                    if client.has_pending_read {
-                        fb_send_data(&client.stdin, line_disc.line_data(len));
-                        fb_send_sentinel(&client.stdin);
-                        client.has_pending_read = false;
-                    }
-                }
-            }
-        }
-        return;
-    }
-
-    // Echo to console
-    match ascii {
-        0x7F | 0x08 => {
-            console.write_char(0x08);
-            console.write_char(b' ');
-            console.write_char(0x08);
-        }
-        b'\r' => {
-            console.write_char(b'\r');
-            console.write_char(b'\n');
-        }
-        ch => {
-            console.write_char(ch);
-        }
-    }
-
-    // Feed to line discipline
-    if let Some(len) = line_disc.push_char(ascii) {
-        let mut buf = [0u8; LINE_BUF_SIZE];
-        let data = line_disc.line_data(len);
-        buf[..len].copy_from_slice(data);
-        if stdin_idx != usize::MAX {
-            if let Some(ref mut client) = clients[stdin_idx] {
-                if client.has_pending_read {
-                    fb_send_data(&client.stdin, &buf[..len]);
-                    fb_send_sentinel(&client.stdin);
-                    client.has_pending_read = false;
-                }
-            }
-        }
-    }
-}
-
-/// Swap buffers, wait for swap reply, then copy front→new-back.
+/// Swap buffers, wait for swap reply, then copy front->new-back.
 fn do_swap(
     window_client: &mut WindowClient<UserTransport>,
     seq: &mut u32,
@@ -803,14 +553,9 @@ fn do_swap(
     pixels_per_buffer: usize,
     current_back: &mut u8,
 ) {
-    // Send swap request and wait for reply
     let _ = window_client.swap_buffers(*seq);
     *seq = seq.wrapping_add(1);
-
-    // Toggle back buffer
     *current_back = 1 - *current_back;
-
-    // Copy front (what was just presented) → new back buffer
     let front_offset = if *current_back == 0 { pixels_per_buffer } else { 0 };
     let back_offset = if *current_back == 0 { 0 } else { pixels_per_buffer };
     unsafe {
