@@ -531,6 +531,19 @@ pub fn accept_client(control_ep: usize, pid: usize) -> AcceptedClient {
     }
 }
 
+/// Clear any blocked/send-blocked registrations matching the given PID.
+/// Called when a process is terminated externally to prevent stale blocked
+/// registrations from interfering with future IPC operations.
+pub fn channel_clear_blocked_pid(pid: usize) {
+    let mut mgr = CHANNELS.lock();
+    for ch in mgr.channels.iter_mut().flatten() {
+        if ch.blocked_a == pid { ch.blocked_a = 0; }
+        if ch.blocked_b == pid { ch.blocked_b = 0; }
+        if ch.send_blocked_a == pid { ch.send_blocked_a = 0; }
+        if ch.send_blocked_b == pid { ch.send_blocked_b = 0; }
+    }
+}
+
 /// Check if a channel endpoint is still active.
 #[must_use]
 pub fn channel_is_active(endpoint: usize) -> bool {
