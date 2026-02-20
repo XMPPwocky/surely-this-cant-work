@@ -1,7 +1,7 @@
 # 0014: Worktree builds fail due to duplicate cargo config
 
 **Reported:** 2026-02-20
-**Status:** Open
+**Status:** Fixed
 **Severity:** LOW
 **Subsystem:** build system
 
@@ -107,36 +107,46 @@ overlap). `make build-user` works from worktrees; only `make build`
 
 ## Fix
 
-Potential approaches:
+Move the kernel linker script flag from `.cargo/config.toml` into
+`kernel/build.rs` using `cargo:rustc-link-arg`. The `build.rs` approach
+uses `CARGO_MANIFEST_DIR` for an absolute path, so it works regardless of
+cargo's CWD or directory walk.
 
-### Option A: Move worktrees outside the repo tree
+`.cargo/config.toml` retains only `-C force-frame-pointers=yes`, which is
+harmless when duplicated by the parent-directory walk (the compiler accepts
+the same flag twice).
 
-Instead of `.claude/worktrees/<name>/`, create worktrees at a sibling
-location like `../rvos-worktrees/<name>/`. This prevents cargo's
-parent-directory search from finding the main repo's config.
+The `build.rs` `cargo:rustc-link-arg` mechanism is separate from rustflags
+and is not subject to cargo's hierarchical config merging — it emits link
+args exactly once per build, regardless of how many config files are found.
 
-Requires updating the `EnterWorktree` tool configuration.
+### Changes
 
-### Option B: Move linker flags to Makefile env vars
+- **`kernel/build.rs`**: Added `cargo:rustc-link-arg=-T{manifest_dir}/linker.ld`
+- **`.cargo/config.toml`**: Removed `-C link-arg=-T` and `-C link-arg=kernel/linker.ld`,
+  kept only `-C force-frame-pointers=yes`
 
-Set `CARGO_TARGET_RISCV64GC_UNKNOWN_NONE_ELF_RUSTFLAGS` and
-`CARGO_TARGET_RISCV64GC_UNKNOWN_RVOS_RUSTFLAGS` in the Makefile,
-then delete both `.cargo/config.toml` files. Env vars completely
-override config files (no merging). All builds already go through
-`make`, so bare `cargo` invocations are not a supported workflow.
+### Options considered but rejected
 
-### Option C: Delete only the root `.cargo/config.toml` from worktrees
-
-A post-worktree-creation hook could delete or empty the root-level
-`.cargo/config.toml` in the worktree, leaving only the main repo's
-copy to be found by the walk. Since the walk finds exactly one copy,
-no duplication occurs. Downside: the worktree has uncommitted changes
-to a tracked file.
+- **Option A (move worktrees outside repo):** The `EnterWorktree` tool
+  hardcodes `.claude/worktrees/` — not configurable.
+- **Option B (env vars in Makefile):** Breaks bare `cargo build`.
+- **Option C (delete config from worktrees):** Leaves uncommitted changes
+  to tracked files.
 
 ## Verification
 
-(To be filled when fixed)
+1. Clean build with `CARGO_ENCODED_RUSTFLAGS="-Cforce-frame-pointers=yes"`
+   (simulating post-merge state where config only has frame pointers):
+   kernel links successfully with a single `-T` from build.rs.
+2. `make clippy-kernel` — clean, no warnings.
+3. `make build-user` — unaffected, still works.
 
 ## Lessons Learned
 
-(To be filled when fixed)
+- `cargo:rustc-link-arg` from `build.rs` is immune to cargo's hierarchical
+  config merging — it's a separate mechanism from rustflags. Use it for
+  linker scripts when config duplication is a risk.
+- Cargo's parent-directory `.cargo/config.toml` walk cannot be stopped.
+  Keep config entries idempotent (safe to duplicate) or move them to
+  `build.rs` where they're emitted exactly once.
