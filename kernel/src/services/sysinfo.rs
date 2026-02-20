@@ -54,6 +54,27 @@ pub fn sysinfo_service() {
                 crate::trace::trace_clear();
                 send_chunked(client.raw(), my_pid, b"ok\n");
             }
+            SysinfoCommand::Kstat {} => {
+                let text = crate::kstat::format_counters();
+                send_chunked(client.raw(), my_pid, text.as_bytes());
+            }
+            SysinfoCommand::Channels {} => {
+                let text = crate::ipc::format_channel_stats();
+                send_chunked(client.raw(), my_pid, text.as_bytes());
+            }
+            SysinfoCommand::SchedLatency {} => {
+                // 10 MHz clock → 10 ticks per microsecond
+                let text = crate::kstat::SCHED_LATENCY.format(
+                    "Scheduler run-queue latency", "us", 10,
+                );
+                send_chunked(client.raw(), my_pid, text.as_bytes());
+            }
+            SysinfoCommand::IpcLatency {} => {
+                let text = crate::kstat::IPC_LATENCY.format(
+                    "IPC delivery latency", "us", 10,
+                );
+                send_chunked(client.raw(), my_pid, text.as_bytes());
+            }
         }
         // OwnedEndpoint closes on drop at end of loop iteration
     }

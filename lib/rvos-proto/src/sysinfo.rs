@@ -21,5 +21,13 @@ define_message! {
         Trace(2) {},
         /// Clear the kernel trace ring buffer.
         TraceClear(3) {},
+        /// Global kernel counters (scheduler, IPC, pages, IRQs).
+        Kstat(4) {},
+        /// Per-channel statistics table.
+        Channels(5) {},
+        /// Scheduler latency histogram.
+        SchedLatency(6) {},
+        /// IPC delivery latency histogram.
+        IpcLatency(7) {},
     }
 }

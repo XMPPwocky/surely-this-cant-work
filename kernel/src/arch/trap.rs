@@ -219,6 +219,7 @@ fn send_debug_event(event_ep: usize, event: &rvos_proto::debug::DebugEvent) {
 }
 
 fn timer_tick() {
+    crate::kstat::inc(&crate::kstat::IRQ_TIMER);
     // Check keyboard DMA buffer canary every tick
     crate::drivers::virtio::input::check_canary();
     let time: u64;
@@ -239,6 +240,7 @@ fn external_interrupt() {
     if irq != 0 {
         match irq {
             10 => {
+                crate::kstat::inc(&crate::kstat::IRQ_UART);
                 // UART: read all available chars, then push to TTY
                 let mut chars = [0u8; 16];
                 let mut count = 0;
@@ -258,15 +260,18 @@ fn external_interrupt() {
                 }
             }
             kbd_irq if Some(kbd_irq) == crate::drivers::virtio::input::irq_number() => {
+                crate::kstat::inc(&crate::kstat::IRQ_VIRTIO_KBD);
                 crate::drivers::virtio::input::handle_irq();
             }
             tablet_irq if Some(tablet_irq) == crate::drivers::virtio::tablet::irq_number() => {
                 crate::drivers::virtio::tablet::handle_irq();
             }
             gpu_irq if Some(gpu_irq) == crate::drivers::virtio::gpu::irq_number() => {
+                crate::kstat::inc(&crate::kstat::IRQ_VIRTIO_GPU);
                 crate::drivers::virtio::gpu::handle_irq();
             }
             net_irq if Some(net_irq) == crate::drivers::virtio::net::irq_number() => {
+                crate::kstat::inc(&crate::kstat::IRQ_VIRTIO_NET);
                 crate::drivers::virtio::net::handle_irq();
             }
             other_irq => {
@@ -275,6 +280,7 @@ fn external_interrupt() {
                 let mut handled = false;
                 for i in 0..blk_count {
                     if Some(other_irq) == crate::drivers::virtio::blk::irq_number(i) {
+                        crate::kstat::inc(&crate::kstat::IRQ_VIRTIO_BLK);
                         crate::drivers::virtio::blk::handle_irq(
                             (other_irq - 1) as usize,
                         );
@@ -283,6 +289,7 @@ fn external_interrupt() {
                     }
                 }
                 if !handled {
+                    crate::kstat::inc(&crate::kstat::IRQ_PLIC_OTHER);
                     crate::println!("Unknown external interrupt: irq={}", irq);
                 }
             }

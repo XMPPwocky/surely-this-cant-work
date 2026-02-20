@@ -408,6 +408,8 @@ pub fn schedule() {
         return;
     }
 
+    crate::kstat::inc(&crate::kstat::SCHED_SWITCHES);
+
     // CPU accounting: update old task's EWMA before switching away
     let now = crate::task::process::rdtime();
     let prev_switch = sched.last_switch_rdtime;
@@ -530,6 +532,8 @@ pub fn preempt(old_tf: &mut TrapFrame) -> *mut TrapFrame {
         sched.ready_queue.push_back(next_pid);
         return old_tf as *mut TrapFrame;
     }
+
+    crate::kstat::inc(&crate::kstat::SCHED_PREEMPTS);
 
     // CPU accounting (same as schedule)
     let now = crate::task::process::rdtime();

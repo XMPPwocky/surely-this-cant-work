@@ -31,6 +31,10 @@ fn cmd_help() {
     println!("  math <op> <a> <b>     - Compute math (add/mul/sub)");
     println!("  ps                    - Show process list");
     println!("  mem                   - Show kernel memory stats");
+    println!("  kstat                 - Show kernel counters");
+    println!("  chstat                - Show channel statistics");
+    println!("  schedlat              - Scheduler latency histogram");
+    println!("  ipclat                - IPC latency histogram");
     println!("  trace [clear]         - Show/clear trace ring buffer");
     println!("  ls [path]             - List directory");
     println!("  cat <path>            - Read file");
@@ -160,6 +164,22 @@ fn cmd_ps() {
 
 fn cmd_mem() {
     send_sysinfo_cmd(&SysinfoCommand::Memstat {});
+}
+
+fn cmd_kstat() {
+    send_sysinfo_cmd(&SysinfoCommand::Kstat {});
+}
+
+fn cmd_chstat() {
+    send_sysinfo_cmd(&SysinfoCommand::Channels {});
+}
+
+fn cmd_schedlat() {
+    send_sysinfo_cmd(&SysinfoCommand::SchedLatency {});
+}
+
+fn cmd_ipclat() {
+    send_sysinfo_cmd(&SysinfoCommand::IpcLatency {});
 }
 
 fn cmd_math(args: &str) {
@@ -1068,6 +1088,10 @@ pub fn run() {
                 }
             }
             "ps" => cmd_ps(),
+            "kstat" => cmd_kstat(),
+            "chstat" => cmd_chstat(),
+            "schedlat" => cmd_schedlat(),
+            "ipclat" => cmd_ipclat(),
             "mem" => cmd_mem(),
             "trace" => {
                 let args = line.split_once(' ').map(|x| x.1).unwrap_or("");

@@ -126,6 +126,7 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
             misc::sys_exit();
         }
         SYS_YIELD => {
+            crate::kstat::inc(&crate::kstat::SCHED_YIELDS);
             crate::task::schedule();
             tf.regs[10] = 0;
         }

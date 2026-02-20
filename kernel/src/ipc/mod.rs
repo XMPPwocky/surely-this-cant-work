@@ -318,6 +318,7 @@ pub fn channel_create_pair() -> Option<(OwnedEndpoint, OwnedEndpoint)> {
     for (i, slot) in mgr.channels.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(Channel::new());
+            crate::kstat::inc(&crate::kstat::CHANNELS_CREATED);
             // SAFETY: Channel::new() sets ref_count_a=1, ref_count_b=1,
             // so we own exactly one reference to each endpoint.
             unsafe {
@@ -355,6 +356,7 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, 
                 return Err((SendError::QueueFull, msg));
             }
             channel.queue_a.push_back(msg);
+            crate::kstat::inc(&crate::kstat::IPC_SENDS);
             Ok(channel.blocked_a)
         } else {
             // Sending from A side -> push to queue_b (for B to recv)
@@ -362,6 +364,7 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, 
                 return Err((SendError::QueueFull, msg));
             }
             channel.queue_b.push_back(msg);
+            crate::kstat::inc(&crate::kstat::IPC_SENDS);
             Ok(channel.blocked_b)
         }
     } else {
@@ -383,6 +386,7 @@ pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
             channel.queue_a.pop_front()
         };
         if msg.is_some() {
+            crate::kstat::inc(&crate::kstat::IPC_RECVS);
             // A slot freed up — check if a sender was blocked on this channel.
             // send(ep_a) pushes to queue_b, so if we popped from queue_b (is_b),
             // the blocked sender is on ep_a side (send_blocked_a).
@@ -408,6 +412,7 @@ pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
 
 /// Record that a PID is blocked waiting to recv on this endpoint.
 pub fn channel_set_blocked(endpoint: usize, pid: usize) {
+    crate::kstat::inc(&crate::kstat::IPC_RECV_BLOCKS);
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
@@ -423,6 +428,7 @@ pub fn channel_set_blocked(endpoint: usize, pid: usize) {
 /// send(ep_a) pushes to queue_b, so block is recorded as send_blocked_a.
 /// send(ep_b) pushes to queue_a, so block is recorded as send_blocked_b.
 pub fn channel_set_send_blocked(endpoint: usize, pid: usize) {
+    crate::kstat::inc(&crate::kstat::IPC_SEND_BLOCKS);
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
@@ -608,6 +614,7 @@ fn channel_close(endpoint: usize) {
 
         // This endpoint's last handle is gone — deactivate the channel
         ch.active = false;
+        crate::kstat::inc(&crate::kstat::CHANNELS_CLOSED);
         // Wake the peer blocked on recv on the other endpoint
         wake_recv = if is_b { ch.blocked_a } else { ch.blocked_b };
         if wake_recv != 0 {
@@ -640,6 +647,34 @@ fn channel_close(endpoint: usize) {
     // Drop the channel (and its queued messages) outside the lock.
     // Message caps with OwnedEndpoints/OwnedShms will be cleaned up here.
     drop(dropped_channel);
+}
+
+// ============================================================
+// Channel Statistics
+// ============================================================
+
+/// Format a summary of all active channels for display.
+pub fn format_channel_stats() -> alloc::string::String {
+    use core::fmt::Write;
+    let mgr = CHANNELS.lock();
+    let mut out = alloc::string::String::new();
+    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
+        "CH", "EP_A", "EP_B", "QA", "QB", "RC_A", "RC_B");
+    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}",
+        "----", "-----", "-----", "-----", "-----", "-----", "-----");
+    for (i, slot) in mgr.channels.iter().enumerate() {
+        if let Some(ref ch) = slot {
+            if !ch.active && ch.ref_count_a == 0 && ch.ref_count_b == 0 {
+                continue;
+            }
+            let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}  {:>5}{}",
+                i, i * 2, i * 2 + 1,
+                ch.queue_a.len(), ch.queue_b.len(),
+                ch.ref_count_a, ch.ref_count_b,
+                if !ch.active { "  (closed)" } else { "" });
+        }
+    }
+    out
 }
 
 // ============================================================
