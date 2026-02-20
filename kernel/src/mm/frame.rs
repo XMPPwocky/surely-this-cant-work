@@ -122,10 +122,15 @@ pub fn init() {
 }
 
 pub fn frame_alloc() -> Option<PhysPageNum> {
-    FRAME_ALLOCATOR.lock().alloc()
+    let result = FRAME_ALLOCATOR.lock().alloc();
+    if result.is_some() {
+        crate::kstat::inc(&crate::kstat::PAGES_ALLOCATED);
+    }
+    result
 }
 
 pub fn frame_dealloc(ppn: PhysPageNum) {
+    crate::kstat::inc(&crate::kstat::PAGES_FREED);
     FRAME_ALLOCATOR.lock().dealloc(ppn);
 }
 

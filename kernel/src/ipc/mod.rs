@@ -252,8 +252,8 @@ impl Message {
 /// recv(ep_a) pops from queue_a
 /// recv(ep_b) pops from queue_b
 struct Channel {
-    queue_a: VecDeque<Message, IpcAlloc>, // messages waiting for endpoint A to recv
-    queue_b: VecDeque<Message, IpcAlloc>, // messages waiting for endpoint B to recv
+    queue_a: VecDeque<(Message, u64), IpcAlloc>, // messages waiting for endpoint A to recv (msg, send_time)
+    queue_b: VecDeque<(Message, u64), IpcAlloc>, // messages waiting for endpoint B to recv (msg, send_time)
     blocked_a: usize, // PID blocked on recv(ep_a), 0 = none
     blocked_b: usize, // PID blocked on recv(ep_b), 0 = none
     send_blocked_a: usize, // PID blocked on send(ep_a) due to full queue, 0 = none
@@ -261,6 +261,11 @@ struct Channel {
     ref_count_a: usize, // number of handles referencing endpoint A across all processes
     ref_count_b: usize, // number of handles referencing endpoint B across all processes
     active: bool,
+    // Per-channel statistics: messages and bytes delivered to each queue
+    msgs_a: u64,  // messages delivered to queue_a (from B→A sends)
+    bytes_a: u64, // bytes delivered to queue_a
+    msgs_b: u64,  // messages delivered to queue_b (from A→B sends)
+    bytes_b: u64, // bytes delivered to queue_b
 }
 
 impl Channel {
@@ -275,6 +280,10 @@ impl Channel {
             ref_count_a: 1,
             ref_count_b: 1,
             active: true,
+            msgs_a: 0,
+            bytes_a: 0,
+            msgs_b: 0,
+            bytes_b: 0,
         }
     }
 }
@@ -318,6 +327,7 @@ pub fn channel_create_pair() -> Option<(OwnedEndpoint, OwnedEndpoint)> {
     for (i, slot) in mgr.channels.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(Channel::new());
+            crate::kstat::inc(&crate::kstat::CHANNELS_CREATED);
             // SAFETY: Channel::new() sets ref_count_a=1, ref_count_b=1,
             // so we own exactly one reference to each endpoint.
             unsafe {
@@ -349,19 +359,27 @@ pub fn channel_send(endpoint: usize, msg: Message) -> Result<usize, (SendError, 
         if !channel.active {
             return Err((SendError::ChannelClosed, msg));
         }
+        let msg_bytes = msg.len as u64;
+        let send_time = crate::task::process::rdtime();
         if is_b {
             // Sending from B side -> push to queue_a (for A to recv)
             if channel.queue_a.len() >= MAX_QUEUE_DEPTH {
                 return Err((SendError::QueueFull, msg));
             }
-            channel.queue_a.push_back(msg);
+            channel.queue_a.push_back((msg, send_time));
+            channel.msgs_a += 1;
+            channel.bytes_a += msg_bytes;
+            crate::kstat::inc(&crate::kstat::IPC_SENDS);
             Ok(channel.blocked_a)
         } else {
             // Sending from A side -> push to queue_b (for B to recv)
             if channel.queue_b.len() >= MAX_QUEUE_DEPTH {
                 return Err((SendError::QueueFull, msg));
             }
-            channel.queue_b.push_back(msg);
+            channel.queue_b.push_back((msg, send_time));
+            channel.msgs_b += 1;
+            channel.bytes_b += msg_bytes;
+            crate::kstat::inc(&crate::kstat::IPC_SENDS);
             Ok(channel.blocked_b)
         }
     } else {
@@ -377,12 +395,15 @@ pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
-        let msg = if is_b {
+        let entry = if is_b {
             channel.queue_b.pop_front()
         } else {
             channel.queue_a.pop_front()
         };
-        if msg.is_some() {
+        if let Some((msg, send_time)) = entry {
+            crate::kstat::inc(&crate::kstat::IPC_RECVS);
+            let recv_time = crate::task::process::rdtime();
+            crate::kstat::IPC_LATENCY.record(recv_time.saturating_sub(send_time));
             // A slot freed up — check if a sender was blocked on this channel.
             // send(ep_a) pushes to queue_b, so if we popped from queue_b (is_b),
             // the blocked sender is on ep_a side (send_blocked_a).
@@ -397,7 +418,7 @@ pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
                 if w != 0 { channel.send_blocked_b = 0; }
                 w
             };
-            (msg, wake)
+            (Some(msg), wake)
         } else {
             (None, 0)
         }
@@ -408,6 +429,7 @@ pub fn channel_recv(endpoint: usize) -> (Option<Message>, usize) {
 
 /// Record that a PID is blocked waiting to recv on this endpoint.
 pub fn channel_set_blocked(endpoint: usize, pid: usize) {
+    crate::kstat::inc(&crate::kstat::IPC_RECV_BLOCKS);
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
@@ -423,6 +445,7 @@ pub fn channel_set_blocked(endpoint: usize, pid: usize) {
 /// send(ep_a) pushes to queue_b, so block is recorded as send_blocked_a.
 /// send(ep_b) pushes to queue_a, so block is recorded as send_blocked_b.
 pub fn channel_set_send_blocked(endpoint: usize, pid: usize) {
+    crate::kstat::inc(&crate::kstat::IPC_SEND_BLOCKS);
     let (ch_idx, is_b) = ep_to_channel(endpoint);
     let mut mgr = CHANNELS.lock();
     if let Some(Some(channel)) = mgr.channels.get_mut(ch_idx) {
@@ -455,6 +478,7 @@ pub fn channel_send_blocking(endpoint: usize, mut msg: Message, pid: usize) -> R
                     return Err(SendError::ChannelClosed);
                 }
                 channel_set_send_blocked(endpoint, pid);
+                crate::task::set_block_reason(pid, crate::task::BlockReason::IpcSend(endpoint));
                 crate::task::block_process(pid);
                 crate::task::schedule();
             }
@@ -481,6 +505,7 @@ pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
             return None; // channel closed
         }
         channel_set_blocked(endpoint, pid);
+        crate::task::set_block_reason(pid, crate::task::BlockReason::IpcRecv(endpoint));
         crate::task::block_process(pid);
         crate::task::schedule();
     }
@@ -608,6 +633,7 @@ fn channel_close(endpoint: usize) {
 
         // This endpoint's last handle is gone — deactivate the channel
         ch.active = false;
+        crate::kstat::inc(&crate::kstat::CHANNELS_CLOSED);
         // Wake the peer blocked on recv on the other endpoint
         wake_recv = if is_b { ch.blocked_a } else { ch.blocked_b };
         if wake_recv != 0 {
@@ -640,6 +666,36 @@ fn channel_close(endpoint: usize) {
     // Drop the channel (and its queued messages) outside the lock.
     // Message caps with OwnedEndpoints/OwnedShms will be cleaned up here.
     drop(dropped_channel);
+}
+
+// ============================================================
+// Channel Statistics
+// ============================================================
+
+/// Format a summary of all active channels for display.
+pub fn format_channel_stats() -> alloc::string::String {
+    use core::fmt::Write;
+    let mgr = CHANNELS.lock();
+    let mut out = alloc::string::String::new();
+    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>4}  {:>4}  {:>4}  {:>4}  {:>7}  {:>7}  {:>7}  {:>7}",
+        "CH", "EP_A", "EP_B", "QA", "QB", "RC_A", "RC_B", "MSGS_A", "BYTES_A", "MSGS_B", "BYTES_B");
+    let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>4}  {:>4}  {:>4}  {:>4}  {:>7}  {:>7}  {:>7}  {:>7}",
+        "----", "-----", "-----", "----", "----", "----", "----", "-------", "-------", "-------", "-------");
+    for (i, slot) in mgr.channels.iter().enumerate() {
+        if let Some(ref ch) = slot {
+            if !ch.active && ch.ref_count_a == 0 && ch.ref_count_b == 0 {
+                continue;
+            }
+            let _ = writeln!(out, "  {:>4}  {:>5}  {:>5}  {:>4}  {:>4}  {:>4}  {:>4}  {:>7}  {:>7}  {:>7}  {:>7}{}",
+                i, i * 2, i * 2 + 1,
+                ch.queue_a.len(), ch.queue_b.len(),
+                ch.ref_count_a, ch.ref_count_b,
+                ch.msgs_a, ch.bytes_a,
+                ch.msgs_b, ch.bytes_b,
+                if !ch.active { "  (closed)" } else { "" });
+        }
+    }
+    out
 }
 
 // ============================================================

@@ -126,6 +126,7 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
             misc::sys_exit();
         }
         SYS_YIELD => {
+            crate::kstat::inc(&crate::kstat::SCHED_YIELDS);
             crate::task::schedule();
             tf.regs[10] = 0;
         }
@@ -161,6 +162,7 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
         }
         SYS_BLOCK => {
             let pid = crate::task::current_pid();
+            crate::task::set_block_reason(pid, crate::task::BlockReason::Poll);
             crate::task::block_process(pid);
             crate::task::schedule();
             tf.regs[10] = 0;

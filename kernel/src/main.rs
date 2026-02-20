@@ -11,6 +11,7 @@ mod arch;
 mod console;
 mod drivers;
 mod ipc;
+mod kstat;
 mod mm;
 mod panic;
 mod services;
