@@ -166,6 +166,9 @@ pub fn ram_end() -> usize {
     if end > max_end { max_end } else { end }
 }
 
+// Part of the platform HAL public API — not yet used by kernel code, but
+// available for future drivers or board-support packages.
+#[allow(dead_code)]
 pub fn ram_size() -> usize {
     ram_end() - ram_base()
 }
@@ -182,6 +185,9 @@ pub fn plic_base() -> usize {
     PLATFORM.lock().plic_base
 }
 
+// Part of the platform HAL public API — not yet used by kernel code, but
+// available for future drivers or board-support packages.
+#[allow(dead_code)]
 pub fn plic_size() -> usize {
     PLATFORM.lock().plic_size
 }
@@ -190,20 +196,22 @@ pub fn plic_context() -> u32 {
     PLATFORM.lock().plic_context
 }
 
+// Part of the platform HAL public API — not yet used by kernel code, but
+// available for future drivers (e.g. SMP IPI via CLINT).
+#[allow(dead_code)]
 pub fn clint_base() -> usize {
     PLATFORM.lock().clint_base
 }
 
+// Part of the platform HAL public API — not yet used by kernel code, but
+// available for future drivers (e.g. SMP IPI via CLINT).
+#[allow(dead_code)]
 pub fn clint_size() -> usize {
     PLATFORM.lock().clint_size
 }
 
 pub fn timebase_frequency() -> u64 {
     PLATFORM.lock().timebase_frequency
-}
-
-pub fn boot_hart_id() -> usize {
-    PLATFORM.lock().boot_hart_id
 }
 
 /// Return the list of VirtIO MMIO slots discovered from FDT.

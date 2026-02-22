@@ -65,6 +65,7 @@ fn node_name_starts_with(name: &[u8], prefix: &[u8]) -> bool {
 /// Low-level walker state: position in the structure block.
 struct Walker<'a> {
     data: &'a [u8],
+    #[allow(dead_code)]
     off_struct: usize,
     off_strings: usize,
     pos: usize,
