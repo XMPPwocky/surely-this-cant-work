@@ -50,6 +50,16 @@ fn stringlist_contains(data: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+fn node_name_starts_with(name: &[u8], prefix: &[u8]) -> bool {
+    if name.len() < prefix.len() {
+        return false;
+    }
+    if &name[..prefix.len()] != prefix {
+        return false;
+    }
+    name.len() == prefix.len() || name[prefix.len()] == b'@'
+}
+
 // ── FDT walker ───────────────────────────────────────────────────────
 
 /// Low-level walker state: position in the structure block.
@@ -62,9 +72,9 @@ struct Walker<'a> {
 
 /// What the walker yielded.
 enum Token<'a> {
-    BeginNode { name: &'a [u8], after: usize },
-    EndNode { after: usize },
-    Prop { name_off: u32, value: &'a [u8], after: usize },
+    BeginNode { name: &'a [u8] },
+    EndNode,
+    Prop { name_off: u32, value: &'a [u8] },
     End,
 }
 
@@ -84,28 +94,22 @@ impl<'a> Walker<'a> {
             match tag {
                 FDT_BEGIN_NODE => {
                     let name_start = self.pos;
-                    // Find the null terminator
                     let mut end = name_start;
                     while end < self.data.len() && self.data[end] != 0 {
                         end += 1;
                     }
                     let name = &self.data[name_start..end];
-                    self.pos = align4(end + 1); // skip null + align
-                    let after = self.pos;
-                    return Token::BeginNode { name, after };
+                    self.pos = align4(end + 1);
+                    return Token::BeginNode { name };
                 }
-                FDT_END_NODE => {
-                    let after = self.pos;
-                    return Token::EndNode { after };
-                }
+                FDT_END_NODE => return Token::EndNode,
                 FDT_PROP => {
                     let len = be_u32(self.data, self.pos) as usize;
                     let name_off = be_u32(self.data, self.pos + 4);
                     self.pos += 8;
                     let value = &self.data[self.pos..self.pos + len];
                     self.pos = align4(self.pos + len);
-                    let after = self.pos;
-                    return Token::Prop { name_off, value, after };
+                    return Token::Prop { name_off, value };
                 }
                 FDT_NOP => continue,
                 FDT_END => return Token::End,
@@ -123,9 +127,35 @@ impl<'a> Walker<'a> {
         }
         &self.data[start..end]
     }
+}
 
-    fn reset(&mut self) {
-        self.pos = self.off_struct;
+// ── Per-node property accumulator ────────────────────────────────────
+
+/// Collects the properties we care about for a single FDT node.
+/// Processed when we hit END_NODE (i.e., after ALL properties are seen).
+struct NodeProps<'a> {
+    name: &'a [u8],
+    compatible: &'a [u8],
+    device_type: &'a [u8],
+    reg: &'a [u8],
+    interrupts: &'a [u8],
+    timebase_frequency: &'a [u8],
+    addr_cells: Option<u32>,
+    size_cells: Option<u32>,
+}
+
+impl<'a> NodeProps<'a> {
+    fn new(name: &'a [u8]) -> Self {
+        NodeProps {
+            name,
+            compatible: b"",
+            device_type: b"",
+            reg: b"",
+            interrupts: b"",
+            timebase_frequency: b"",
+            addr_cells: None,
+            size_cells: None,
+        }
     }
 }
 
@@ -135,7 +165,6 @@ impl<'a> Walker<'a> {
 ///
 /// Returns `None` if the FDT is malformed or missing critical nodes.
 pub fn parse_platform_info(dtb: &[u8], hart_id: usize) -> Option<PlatformInfo> {
-    // ── Validate header ──────────────────────────────────────────────
     if dtb.len() < 40 {
         return None;
     }
@@ -145,7 +174,6 @@ pub fn parse_platform_info(dtb: &[u8], hart_id: usize) -> Option<PlatformInfo> {
     }
     let off_struct = be_u32(dtb, 8) as usize;
     let off_strings = be_u32(dtb, 12) as usize;
-    let boot_cpuid = be_u32(dtb, 28);
 
     let mut info = PlatformInfo {
         ram: MemRegion { base: 0, size: 0 },
@@ -164,87 +192,76 @@ pub fn parse_platform_info(dtb: &[u8], hart_id: usize) -> Option<PlatformInfo> {
 
     let mut w = Walker::new(dtb, off_struct, off_strings);
 
-    // ── Pass 1: Find root-level #address-cells and #size-cells ───────
-    // Defaults per spec: address-cells=2, size-cells=1
-    let mut root_addr_cells: u32 = 2;
-    let mut root_size_cells: u32 = 1;
-    find_root_cells(&mut w, &mut root_addr_cells, &mut root_size_cells);
+    // ── Walk the tree ────────────────────────────────────────────────
+    //
+    // Strategy: maintain a stack of NodeProps.  On BEGIN_NODE, push.
+    // On PROP, record into the current node.  On END_NODE, process the
+    // completed node and pop.
+    //
+    // We use a fixed-size stack (max depth 8) to avoid allocation.
 
-    // ── Pass 2: Walk the tree extracting what we need ────────────────
-    w.reset();
+    const MAX_DEPTH: usize = 8;
+    // Stack of (node_props, parent_addr_cells, parent_size_cells)
+    let mut stack: [Option<NodeProps<'_>>; MAX_DEPTH] = [const { None }; MAX_DEPTH];
     let mut depth: usize = 0;
-    // Track #address-cells/#size-cells per depth (max depth 8)
-    let mut addr_cells_stack: [u32; 8] = [root_addr_cells; 8];
-    let mut size_cells_stack: [u32; 8] = [root_size_cells; 8];
-    // Current node name at each depth for path matching
-    let mut node_names: [&[u8]; 8] = [b""; 8];
+
+    // Track inherited #address-cells / #size-cells per depth.
+    // Defaults per DT spec: address-cells=2, size-cells=1
+    let mut addr_cells: [u32; MAX_DEPTH] = [2; MAX_DEPTH];
+    let mut size_cells: [u32; MAX_DEPTH] = [1; MAX_DEPTH];
 
     loop {
         let tok = w.next();
         match tok {
-            Token::BeginNode { name, .. } => {
+            Token::BeginNode { name } => {
+                if depth < MAX_DEPTH {
+                    stack[depth] = Some(NodeProps::new(name));
+                    // Inherit parent's cells (will be overridden if this
+                    // node has its own #address-cells/#size-cells props)
+                    if depth > 0 {
+                        addr_cells[depth] = addr_cells[depth - 1];
+                        size_cells[depth] = size_cells[depth - 1];
+                    }
+                }
                 depth += 1;
-                if depth < 8 {
-                    node_names[depth] = name;
-                    // Inherit parent's cells
-                    addr_cells_stack[depth] = addr_cells_stack[depth.saturating_sub(1)];
-                    size_cells_stack[depth] = size_cells_stack[depth.saturating_sub(1)];
+            }
+            Token::Prop { name_off, value } => {
+                // d = index into our stack (depth-1, clamped)
+                if depth == 0 || depth > MAX_DEPTH { continue; }
+                let d = depth - 1;
+                let pname = w.string_at(name_off);
+                if let Some(ref mut node) = stack[d] {
+                    if pname == b"compatible" {
+                        node.compatible = value;
+                    } else if pname == b"device_type" {
+                        node.device_type = value;
+                    } else if pname == b"reg" {
+                        node.reg = value;
+                    } else if pname == b"interrupts" {
+                        node.interrupts = value;
+                    } else if pname == b"timebase-frequency" {
+                        node.timebase_frequency = value;
+                    } else if pname == b"#address-cells" && value.len() >= 4 {
+                        let v = be_u32(value, 0);
+                        node.addr_cells = Some(v);
+                        addr_cells[d] = v;
+                    } else if pname == b"#size-cells" && value.len() >= 4 {
+                        let v = be_u32(value, 0);
+                        node.size_cells = Some(v);
+                        size_cells[d] = v;
+                    }
                 }
             }
-            Token::EndNode { .. } => {
+            Token::EndNode => {
                 depth = depth.saturating_sub(1);
-            }
-            Token::Prop { name_off, value, .. } => {
-                let prop_name = w.string_at(name_off);
-                let d = if depth < 8 { depth } else { continue };
-
-                // Track #address-cells / #size-cells
-                if prop_name == b"#address-cells" && value.len() >= 4 {
-                    addr_cells_stack[d] = be_u32(value, 0);
-                    continue;
-                }
-                if prop_name == b"#size-cells" && value.len() >= 4 {
-                    size_cells_stack[d] = be_u32(value, 0);
-                    continue;
-                }
-
-                // ── /memory node ─────────────────────────────────────
-                if prop_name == b"device_type" && value.starts_with(b"memory") && info.ram.size == 0 {
-                    // The `reg` property is on the same node — keep scanning
-                }
-                if prop_name == b"reg" && d >= 1 && node_name_starts_with(node_names[d], b"memory") {
-                    let parent_d = d.saturating_sub(1);
-                    let ac = addr_cells_stack[parent_d];
-                    let sc = size_cells_stack[parent_d];
-                    let cell_bytes = (ac + sc) as usize * 4;
-                    if value.len() >= cell_bytes {
-                        info.ram.base = read_cells(value, 0, ac) as usize;
-                        info.ram.size = read_cells(value, ac as usize * 4, sc) as usize;
+                if depth < MAX_DEPTH {
+                    if let Some(node) = stack[depth].take() {
+                        // Parent's #address-cells/#size-cells determine how
+                        // to decode this node's `reg` property.
+                        let parent_ac = if depth > 0 { addr_cells[depth - 1] } else { 2 };
+                        let parent_sc = if depth > 0 { size_cells[depth - 1] } else { 1 };
+                        process_node(&node, parent_ac, parent_sc, depth, &mut info);
                     }
-                    continue;
-                }
-
-                // ── /cpus/timebase-frequency ─────────────────────────
-                if prop_name == b"timebase-frequency" {
-                    if d >= 1 && node_names[d] == b"cpus" {
-                        info.timebase_frequency = if value.len() >= 8 {
-                            ((be_u32(value, 0) as u64) << 32) | be_u32(value, 4) as u64
-                        } else if value.len() >= 4 {
-                            be_u32(value, 0) as u64
-                        } else {
-                            0
-                        };
-                    }
-                    continue;
-                }
-
-                // ── compatible-based matching ────────────────────────
-                if prop_name == b"compatible" {
-                    let parent_d = d.saturating_sub(1);
-                    let ac = addr_cells_stack[parent_d];
-                    let sc = size_cells_stack[parent_d];
-                    extract_by_compatible(&mut w, &mut info, value, ac, sc, boot_cpuid, hart_id);
-                    continue;
                 }
             }
             Token::End => break,
@@ -252,9 +269,7 @@ pub fn parse_platform_info(dtb: &[u8], hart_id: usize) -> Option<PlatformInfo> {
     }
 
     // ── Compute PLIC context ─────────────────────────────────────────
-    // On most RISC-V platforms with SBI, the boot hart's S-mode PLIC
-    // context is (hart_id * 2) + 1 (context 0 = M-mode, 1 = S-mode,
-    // 2 = hart1 M-mode, 3 = hart1 S-mode, ...).
+    // On RISC-V with SBI: boot hart S-mode context = hart_id * 2 + 1
     if info.plic_base != 0 && info.plic_context == 0 {
         info.plic_context = (hart_id as u32) * 2 + 1;
     }
@@ -267,140 +282,100 @@ pub fn parse_platform_info(dtb: &[u8], hart_id: usize) -> Option<PlatformInfo> {
     Some(info)
 }
 
-/// Scan the root node for #address-cells and #size-cells.
-fn find_root_cells(w: &mut Walker<'_>, addr_cells: &mut u32, size_cells: &mut u32) {
-    // The first BEGIN_NODE is the root ("/").  Read its properties until
-    // END_NODE or the next BEGIN_NODE (child).
-    loop {
-        let tok = w.next();
-        match tok {
-            Token::BeginNode { .. } => {
-                // Either the root node itself (first hit) or a child.
-                // Read properties at this level.
-                loop {
-                    let tok2 = w.next();
-                    match tok2 {
-                        Token::Prop { name_off, value, .. } => {
-                            let name = w.string_at(name_off);
-                            if name == b"#address-cells" && value.len() >= 4 {
-                                *addr_cells = be_u32(value, 0);
-                            }
-                            if name == b"#size-cells" && value.len() >= 4 {
-                                *size_cells = be_u32(value, 0);
-                            }
-                        }
-                        Token::BeginNode { .. } | Token::EndNode { .. } | Token::End => return,
-                    }
-                }
-            }
-            Token::End => return,
-            _ => {}
-        }
-    }
-}
-
-/// When we encounter a `compatible` property, check if it matches any
-/// device we're looking for and extract the relevant info.
-///
-/// This is called while the walker is positioned just after the
-/// `compatible` prop.  We need to scan forward for sibling properties
-/// (`reg`, `interrupts`, etc.) within the same node, then restore the
-/// walker position.  Since we do a single forward pass, we instead store
-/// what we found and let the main loop continue collecting properties.
-///
-/// To avoid a second pass, we use a simpler approach: after seeing
-/// `compatible`, we scan ahead within the same node to collect the reg
-/// and interrupts properties.
-fn extract_by_compatible(
-    w: &mut Walker<'_>,
+/// Process a completed node's accumulated properties.
+fn process_node(
+    node: &NodeProps<'_>,
+    parent_ac: u32,
+    parent_sc: u32,
+    depth: usize,
     info: &mut PlatformInfo,
-    compat_value: &[u8],
-    addr_cells: u32,
-    size_cells: u32,
-    _boot_cpuid: u32,
-    _hart_id: usize,
 ) {
-    // Determine what we're looking at
-    let is_plic = stringlist_contains(compat_value, b"riscv,plic0")
-        || stringlist_contains(compat_value, b"sifive,plic-1.0.0");
-    let is_clint = stringlist_contains(compat_value, b"riscv,clint0")
-        || stringlist_contains(compat_value, b"sifive,clint0");
-    let is_uart = stringlist_contains(compat_value, b"ns16550a")
-        || stringlist_contains(compat_value, b"ns16550");
-    let is_virtio = stringlist_contains(compat_value, b"virtio,mmio");
-
-    if !is_plic && !is_clint && !is_uart && !is_virtio {
+    // ── /memory node (identified by device_type or node name) ────────
+    if (node.device_type.starts_with(b"memory") || node_name_starts_with(node.name, b"memory"))
+        && !node.reg.is_empty()
+        && info.ram.size == 0
+    {
+        let cell_bytes = (parent_ac + parent_sc) as usize * 4;
+        if node.reg.len() >= cell_bytes {
+            info.ram.base = read_cells(node.reg, 0, parent_ac) as usize;
+            info.ram.size = read_cells(node.reg, parent_ac as usize * 4, parent_sc) as usize;
+        }
         return;
     }
 
-    // Scan ahead for reg and interrupts properties within this node
+    // ── /cpus node (timebase-frequency) ──────────────────────────────
+    if node.name == b"cpus" && !node.timebase_frequency.is_empty() {
+        let v = node.timebase_frequency;
+        info.timebase_frequency = if v.len() >= 8 {
+            ((be_u32(v, 0) as u64) << 32) | be_u32(v, 4) as u64
+        } else if v.len() >= 4 {
+            be_u32(v, 0) as u64
+        } else {
+            0
+        };
+        return;
+    }
+
+    // ── compatible-based matching ────────────────────────────────────
+    if node.compatible.is_empty() {
+        return;
+    }
+
+    // Parse reg (base, size) using parent's cells
     let mut reg_base: usize = 0;
     let mut reg_size: usize = 0;
-    let mut irq: u32 = 0;
-    let mut found_reg = false;
-
-    // Save position so we can scan ahead, then the main loop continues
-    // from where we leave off.  Since the main loop's own matching for
-    // this node's properties would need the walker advanced past them
-    // anyway, we just consume them here.
-    let mut sub_depth: usize = 0;
-    loop {
-        let tok = w.next();
-        match tok {
-            Token::Prop { name_off, value, .. } => {
-                if sub_depth > 0 { continue; }
-                let pname = w.string_at(name_off);
-                if pname == b"reg" {
-                    let cell_bytes = (addr_cells + size_cells) as usize * 4;
-                    if value.len() >= cell_bytes {
-                        reg_base = read_cells(value, 0, addr_cells) as usize;
-                        reg_size = read_cells(value, addr_cells as usize * 4, size_cells) as usize;
-                        found_reg = true;
-                    }
-                } else if pname == b"interrupts" && value.len() >= 4 {
-                    irq = be_u32(value, 0);
-                }
-            }
-            Token::BeginNode { .. } => { sub_depth += 1; }
-            Token::EndNode { .. } => {
-                if sub_depth == 0 {
-                    // We've consumed this node's END_NODE.  The main loop
-                    // will see the next token after it.
-                    break;
-                }
-                sub_depth -= 1;
-            }
-            Token::End => break,
+    if !node.reg.is_empty() {
+        let cell_bytes = (parent_ac + parent_sc) as usize * 4;
+        if node.reg.len() >= cell_bytes {
+            reg_base = read_cells(node.reg, 0, parent_ac) as usize;
+            reg_size = read_cells(node.reg, parent_ac as usize * 4, parent_sc) as usize;
         }
     }
 
-    if !found_reg {
+    // Parse interrupts (first cell = IRQ number)
+    let irq = if node.interrupts.len() >= 4 {
+        be_u32(node.interrupts, 0)
+    } else {
+        0
+    };
+
+    let _ = depth; // could use for path filtering if needed
+
+    let c = node.compatible;
+
+    // PLIC
+    if (stringlist_contains(c, b"riscv,plic0") || stringlist_contains(c, b"sifive,plic-1.0.0"))
+        && info.plic_base == 0 && reg_base != 0
+    {
+        info.plic_base = reg_base;
+        info.plic_size = reg_size;
         return;
     }
 
-    if is_plic && info.plic_base == 0 {
-        info.plic_base = reg_base;
-        info.plic_size = reg_size;
-    } else if is_clint && info.clint_base == 0 {
+    // CLINT
+    if (stringlist_contains(c, b"riscv,clint0") || stringlist_contains(c, b"sifive,clint0"))
+        && info.clint_base == 0 && reg_base != 0
+    {
         info.clint_base = reg_base;
         info.clint_size = reg_size;
-    } else if is_uart && info.uart_base == 0 {
+        return;
+    }
+
+    // UART (NS16550)
+    if (stringlist_contains(c, b"ns16550a") || stringlist_contains(c, b"ns16550"))
+        && info.uart_base == 0 && reg_base != 0
+    {
         info.uart_base = reg_base;
         info.uart_irq = irq;
-    } else if is_virtio && info.virtio_mmio_count < MAX_VIRTIO_SLOTS {
+        return;
+    }
+
+    // VirtIO MMIO
+    if stringlist_contains(c, b"virtio,mmio")
+        && info.virtio_mmio_count < MAX_VIRTIO_SLOTS && reg_base != 0
+    {
         let idx = info.virtio_mmio_count;
         info.virtio_mmio[idx] = VirtioMmioSlot { base: reg_base, irq };
         info.virtio_mmio_count += 1;
     }
-}
-
-fn node_name_starts_with(name: &[u8], prefix: &[u8]) -> bool {
-    if name.len() < prefix.len() {
-        return false;
-    }
-    if &name[..prefix.len()] != prefix {
-        return false;
-    }
-    // After the prefix there should be either nothing, '@', or end of string
-    name.len() == prefix.len() || name[prefix.len()] == b'@'
 }

@@ -65,7 +65,7 @@ fn user_ext2_server_code() -> &'static [u8] {
 }
 
 #[no_mangle]
-pub extern "C" fn kmain() -> ! {
+pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
     // ---- Phase 1: Boot and hardware init ----
 
     // Drain any chars the UART received during firmware boot BEFORE our init
@@ -89,7 +89,13 @@ pub extern "C" fn kmain() -> ! {
     println!("  |_|  \\_\\_\\/ /\\_\\/__/  \\____/");
     println!();
     println!("  rvOS v0.1.0 -- RISC-V 64-bit Microkernel");
-    println!("  QEMU virt machine, 128 MiB RAM");
+    println!();
+
+    // Parse FDT from firmware (populates global PlatformInfo).
+    // Must happen before mm::init() and driver init, which read platform values.
+    platform::init_from_fdt(hart_id, dtb_ptr);
+    let plat = platform::info();
+    println!("  {} MiB RAM, hart {}", plat.ram.size / 1024 / 1024, plat.boot_hart_id);
     println!();
 
     // ---- Phase 2: Memory management ----
