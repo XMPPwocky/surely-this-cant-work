@@ -27,14 +27,29 @@ from qmp import QMPClient, QMPError
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
-QEMU_LOCK_SH = PROJECT_ROOT / "scripts" / "qemu-lock.sh"
 KERNEL_BIN = PROJECT_ROOT / "target" / "riscv64gc-unknown-none-elf" / "release" / "kernel.bin"
 BIN_IMG = PROJECT_ROOT / "bin.img"
 PERSIST_IMG = PROJECT_ROOT / "persist.img"
 
-SERIAL_PIPE_BASE = "/tmp/rvos-mcp-serial"
-QMP_SOCK = "/tmp/rvos-mcp-qmp.sock"
-LOCKFILE = PROJECT_ROOT / ".qemu.lock"
+# Temp paths include PID to avoid collisions if lock is somehow bypassed,
+# but under normal operation only one QEMU runs at a time (enforced by lock).
+SERIAL_PIPE_BASE = f"/tmp/rvos-mcp-serial-{os.getpid()}"
+QMP_SOCK = f"/tmp/rvos-mcp-qmp-{os.getpid()}.sock"
+
+# Lockfile must be shared across all worktrees — use git's common dir
+# (points to the main repo's .git/ regardless of which worktree we're in).
+def _find_lockfile() -> Path:
+    try:
+        import subprocess as _sp
+        git_common = _sp.check_output(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+        return Path(git_common) / ".qemu.lock"
+    except Exception:
+        return PROJECT_ROOT / ".qemu.lock"
+
+LOCKFILE = _find_lockfile()
 
 # ---------------------------------------------------------------------------
 # MCP Server

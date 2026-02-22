@@ -5,10 +5,14 @@
 # Usage: scripts/qemu-lock.sh --info "make run" -- qemu-system-riscv64 ...
 set -euo pipefail
 
-# Lockfile lives in the project root (same directory as Makefile)
+# Lockfile must be shared across all worktrees so parallel agents don't
+# collide on host-side resources (TAP device, VNC port, named pipes).
+# Use `git rev-parse --git-common-dir` to find the main repo's .git/,
+# which is the same for every worktree.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOCKFILE="$PROJECT_ROOT/.qemu.lock"
+GIT_COMMON="$(git -C "$PROJECT_ROOT" rev-parse --git-common-dir 2>/dev/null || echo "$PROJECT_ROOT/.git")"
+LOCKFILE="$GIT_COMMON/.qemu.lock"
 
 # Parse arguments
 INFO="unknown"
