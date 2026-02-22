@@ -109,3 +109,13 @@ _user_fs_start:
     .incbin "user/target/riscv64gc-unknown-rvos/release/fs"
 _user_fs_end:
 
+    #---------------------------------------------------------------------------
+    # User program: "ext2-server" - ext2 filesystem server
+    #---------------------------------------------------------------------------
+    .globl _user_ext2_server_start
+    .globl _user_ext2_server_end
+    .align 4
+_user_ext2_server_start:
+    .incbin "user/target/riscv64gc-unknown-rvos/release/ext2-server"
+_user_ext2_server_end:
+

@@ -275,6 +275,7 @@ pub fn init_server() {
     let mut fs_launches = alloc::boxed::Box::new_in(
         [const { None::<FsLaunchCtx> }; MAX_FS_LAUNCHES], INIT_ALLOC);
     let mut dyn_spawns: [Option<DynSpawn>; MAX_DYN_SPAWNS] = [const { None }; MAX_DYN_SPAWNS];
+    mount_ext2_filesystems(my_pid);
     init_fs_launches(&mut fs_launches, my_pid);
 
     loop {
@@ -898,6 +899,105 @@ const FS_PROGRAMS: &[FsProgram] = &[
     FsProgram { path: b"/bin/fbcon", name: "fbcon", console_type: ConsoleType::Serial, service_name: None, requires_gpu: true, provides_console: None },
     FsProgram { path: b"/bin/net-stack", name: "net-stack", console_type: ConsoleType::Serial, service_name: Some("net"), requires_gpu: false, provides_console: None },
 ];
+
+/// Mount ext2 filesystems at boot time.
+/// For each registered ext2-blkN service, create a VFS↔ext2 connection and send
+/// a Mount message to the FS server.
+fn mount_ext2_filesystems(my_pid: usize) {
+    let fs_svc = match find_named_service_by_name("fs") {
+        Some(svc) => svc,
+        None => return,
+    };
+    let fs_ctl_ep = fs_svc.control_ep.load(Ordering::Relaxed);
+    if fs_ctl_ep == usize::MAX { return; }
+
+    // (ext2 service name, mount path, flags)
+    let mounts: &[(&str, &str, u32)] = &[
+        ("ext2-blk0", "/bin", 1),     // MOUNT_RO
+        ("ext2-blk1", "/persist", 0), // RW
+    ];
+
+    for &(svc_name, mount_path, flags) in mounts {
+        let ext2_svc = match find_named_service_by_name(svc_name) {
+            Some(svc) => svc,
+            None => continue,
+        };
+        let ext2_ctl_ep = ext2_svc.control_ep.load(Ordering::Relaxed);
+        if ext2_ctl_ep == usize::MAX { continue; }
+
+        // Create VFS↔ext2 channel pair
+        let (vfs_ep, ext2_ep) = match ipc::channel_create_pair() {
+            Some(pair) => pair,
+            None => {
+                crate::println!("[init] no channels for {} mount", svc_name);
+                continue;
+            }
+        };
+
+        // Send ext2 endpoint to ext2-server's control channel (new connection)
+        let mut ctl_msg = Message::new();
+        ctl_msg.caps[0] = Cap::Channel(ext2_ep.clone());
+        ctl_msg.cap_count = 1;
+        ctl_msg.len = rvos_wire::to_bytes(
+            &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
+            &mut ctl_msg.data,
+        ).unwrap_or(0);
+        ctl_msg.sender_pid = my_pid;
+        send_and_wake(ext2_ctl_ep, ctl_msg);
+        drop(ext2_ep);
+
+        // Create temp init↔VFS client channel for the Mount request
+        let (my_fs_ep, fs_server_ep) = match ipc::channel_create_pair() {
+            Some(pair) => pair,
+            None => {
+                crate::println!("[init] no channels for {} fs-mount", svc_name);
+                drop(vfs_ep);
+                continue;
+            }
+        };
+
+        // Send FS server endpoint to FS control channel (new connection)
+        let mut fs_ctl_msg = Message::new();
+        fs_ctl_msg.caps[0] = Cap::Channel(fs_server_ep.clone());
+        fs_ctl_msg.cap_count = 1;
+        fs_ctl_msg.len = rvos_wire::to_bytes(
+            &rvos_proto::service_control::NewConnection { client_pid: my_pid as u32, channel_role: 0 },
+            &mut fs_ctl_msg.data,
+        ).unwrap_or(0);
+        fs_ctl_msg.sender_pid = my_pid;
+        send_and_wake(fs_ctl_ep, fs_ctl_msg);
+        drop(fs_server_ep);
+
+        // Send Mount request with VFS endpoint as backend cap.
+        // to_bytes_with_caps extracts the RawChannelCap handle into the caps sideband.
+        let mut mount_msg = Message::new();
+        let mut cap_handles = [0usize; ipc::MAX_CAPS];
+        let (data_len, cap_count) = rvos_wire::to_bytes_with_caps(
+            &FsRequest::Mount {
+                target: mount_path,
+                flags,
+                backend: rvos_wire::RawChannelCap::new(vfs_ep.raw()),
+            },
+            &mut mount_msg.data,
+            &mut cap_handles,
+        ).unwrap_or((0, 0));
+        mount_msg.len = data_len;
+        // Convert raw handles to kernel Cap::Channel (clone_from_raw = inc_ref)
+        for (i, &cap_h) in cap_handles.iter().enumerate().take(cap_count) {
+            if cap_h != rvos_wire::NO_CAP {
+                mount_msg.caps[i] = Cap::Channel(ipc::OwnedEndpoint::clone_from_raw(cap_h));
+            }
+        }
+        mount_msg.cap_count = cap_count;
+        mount_msg.sender_pid = my_pid;
+        send_and_wake(my_fs_ep.raw(), mount_msg);
+
+        drop(vfs_ep);    // close our original reference (clone in msg has the receiver's)
+        drop(my_fs_ep);  // close temp FS client channel (we don't need MountOk response)
+
+        crate::println!("[init] mount {} at {}", svc_name, mount_path);
+    }
+}
 
 /// Initialize fs launch state machines. For each program, create a client
 /// connection to the fs server and send the initial Stat request (non-blocking).

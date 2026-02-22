@@ -50,6 +50,19 @@ fn user_fs_code() -> &'static [u8] {
     }
 }
 
+fn user_ext2_server_code() -> &'static [u8] {
+    extern "C" {
+        static _user_ext2_server_start: u8;
+        static _user_ext2_server_end: u8;
+    }
+    unsafe {
+        let start = &_user_ext2_server_start as *const u8;
+        let end = &_user_ext2_server_end as *const u8;
+        let len = end as usize - start as usize;
+        core::slice::from_raw_parts(start, len)
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
     // ---- Phase 1: Boot and hardware init ----
@@ -252,6 +265,52 @@ pub extern "C" fn kmain() -> ! {
         task::spawn_named(services::blk_server::BLK_SERVER_ENTRIES[i], name).expect("boot: blk-server");
     }
     task::spawn_named(services::timer::timer_service, "timer").expect("boot: timer");
+
+    // ext2-server instances (one per block device, service + boot + control channels)
+    for i in 0..blk_count {
+        let (svc_name, proc_name): (&str, &str) = match i {
+            0 => ("ext2-blk0", "ext2-blk0"),
+            1 => ("ext2-blk1", "ext2-blk1"),
+            2 => ("ext2-blk2", "ext2-blk2"),
+            3 => ("ext2-blk3", "ext2-blk3"),
+            _ => continue,
+        };
+
+        // Service control channel
+        let (init_ext2_ep, ext2_ctl_ep) = ipc::channel_create_pair().expect("boot: ext2 channel");
+        services::init::register_service(svc_name, init_ext2_ep.into_raw());
+
+        // Boot channel (for ConnectService to blk services etc.)
+        let (ext2_boot_a, ext2_boot_b) = ipc::channel_create_pair().expect("boot: ext2-boot channel");
+
+        // Args: "ext2-server\0blkN[\0ro]"
+        let blk_name: &[u8] = match i {
+            0 => b"blk0", 1 => b"blk1", 2 => b"blk2", 3 => b"blk3", _ => b"blk?",
+        };
+        let is_ro = drivers::virtio::blk::is_read_only(i);
+        let mut args = [0u8; 32];
+        let mut al = 0;
+        let prog = b"ext2-server";
+        args[al..al + prog.len()].copy_from_slice(prog);
+        al += prog.len();
+        args[al] = 0;
+        al += 1;
+        args[al..al + blk_name.len()].copy_from_slice(blk_name);
+        al += blk_name.len();
+        if is_ro {
+            args[al] = 0;
+            al += 1;
+            args[al..al + 2].copy_from_slice(b"ro");
+            al += 2;
+        }
+
+        services::init::register_boot_with_args(
+            ext2_boot_b, services::init::ConsoleType::Serial, false, &args[..al],
+        );
+        task::spawn_user_elf_with_handles(
+            user_ext2_server_code(), proc_name, ext2_boot_a, ext2_ctl_ep,
+        ).expect("boot: ext2-server");
+    }
 
     // Spawn fs server as a user process with boot channel + control channel
     let (fs_boot_a, fs_boot_b) = ipc::channel_create_pair().expect("boot: fs-boot channel");
