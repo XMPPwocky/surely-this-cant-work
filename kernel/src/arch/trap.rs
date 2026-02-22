@@ -241,7 +241,7 @@ fn external_interrupt() {
     let irq = plic::plic_claim();
     if irq != 0 {
         match irq {
-            10 => {
+            uart_irq if uart_irq == crate::platform::uart_irq() => {
                 crate::kstat::inc(&crate::kstat::IRQ_UART);
                 // UART: read all available chars, then push to TTY
                 let mut chars = [0u8; 16];
