@@ -71,10 +71,15 @@ pub fn init_kernel_page_table() -> PhysPageNum {
             let base = plat.virtio_mmio[i].base;
             pt.map_range(base, base, PAGE_SIZE, PTE_R | PTE_W).expect("boot: map VirtIO");
         }
-        let first = plat.virtio_mmio[0].base;
-        let last = plat.virtio_mmio[plat.virtio_mmio_count - 1].base + PAGE_SIZE;
+        let mut lo = plat.virtio_mmio[0].base;
+        let mut hi = lo;
+        for i in 1..plat.virtio_mmio_count {
+            let b = plat.virtio_mmio[i].base;
+            if b < lo { lo = b; }
+            if b > hi { hi = b; }
+        }
         println!("  Mapping VirtIO: {:#x}..{:#x} (R+W, {} slot(s))",
-            first, last, plat.virtio_mmio_count);
+            lo, hi + PAGE_SIZE, plat.virtio_mmio_count);
     }
 
     pt.root_ppn()
