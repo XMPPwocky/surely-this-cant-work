@@ -14,6 +14,7 @@ mod ipc;
 mod kstat;
 mod mm;
 mod panic;
+mod platform;
 mod services;
 mod sync;
 mod task;
