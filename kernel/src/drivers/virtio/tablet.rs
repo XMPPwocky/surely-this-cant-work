@@ -50,17 +50,16 @@ static mut TABLET: Option<Tablet> = None;
 
 /// Probe for tablet device (via input.rs) and initialize if found.
 pub fn init_from_probe() -> bool {
-    let (base, slot) = match super::input::tablet_base_and_slot() {
+    let (base, irq) = match super::input::tablet_base_and_irq() {
         Some(v) => v,
         None => return false,
     };
-    init(base, slot)
+    init(base, irq)
 }
 
-/// Initialize the VirtIO tablet driver at a specific MMIO base/slot.
-fn init(base: usize, slot: usize) -> bool {
-    let irq = 1 + slot as u32;
-    crate::println!("[tablet] Found VirtIO tablet at {:#x} (slot {}, IRQ {})", base, slot, irq);
+/// Initialize the VirtIO tablet driver at a specific MMIO base address and IRQ.
+fn init(base: usize, irq: u32) -> bool {
+    crate::println!("[tablet] Found VirtIO tablet at {:#x} (IRQ {})", base, irq);
 
     if !mmio::init_device(base) {
         crate::println!("[tablet] Device init failed");

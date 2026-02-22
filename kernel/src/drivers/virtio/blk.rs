@@ -68,8 +68,8 @@ pub fn init() -> usize {
             crate::println!("[blk] warning: more than {} block devices, ignoring extras", MAX_BLK_DEVICES);
             break;
         }
-        let (base, slot) = result.entries[i];
-        if let Some(dev) = init_one(base, slot) {
+        let (base, irq) = result.entries[i];
+        if let Some(dev) = init_one(base, irq) {
             crate::println!(
                 "[blk] blk{}: {} sectors ({}), {}{}",
                 count,
@@ -105,8 +105,8 @@ fn format_size(bytes: u64) -> &'static str {
 }
 
 /// Initialize a single block device.
-fn init_one(base: usize, slot: usize) -> Option<BlkDevice> {
-    crate::println!("[blk] Found VirtIO blk at {:#x} (slot {})", base, slot);
+fn init_one(base: usize, irq: u32) -> Option<BlkDevice> {
+    crate::println!("[blk] Found VirtIO blk at {:#x} (IRQ {})", base, irq);
 
     // Custom handshake: we need to negotiate F_RO and F_FLUSH features.
     let (read_only, has_flush) = blk_init_device(base)?;
@@ -121,9 +121,6 @@ fn init_one(base: usize, slot: usize) -> Option<BlkDevice> {
     let cap_lo = mmio::read_config_u32_le(base, 0) as u64;
     let cap_hi = mmio::read_config_u32_le(base, 4) as u64;
     let capacity_sectors = cap_lo | (cap_hi << 32);
-
-    // Compute IRQ: QEMU virt machine uses IRQ = 1 + slot
-    let irq = 1 + slot as u32;
 
     // Allocate DMA buffers
     // outhdr (16 bytes) + status (1 byte) share a single page
@@ -427,8 +424,8 @@ pub fn flush(idx: usize) -> bool {
 }
 
 /// Handle a block device IRQ for the given MMIO slot.
-/// Called from the trap handler.
-pub fn handle_irq(slot: usize) {
+/// Called from the trap handler with the claimed IRQ number.
+pub fn handle_irq(irq: u32) {
     // Find which device index corresponds to this slot
     let count = DEVICE_COUNT.load(Ordering::Relaxed);
     for i in 0..count {
@@ -439,9 +436,7 @@ pub fn handle_irq(slot: usize) {
             }
         };
 
-        let expected_irq = 1 + ((dev.base - 0x1000_1000) / 0x1000) as u32;
-        let incoming_irq = 1 + slot as u32;
-        if expected_irq != incoming_irq {
+        if dev.irq != irq {
             continue;
         }
 

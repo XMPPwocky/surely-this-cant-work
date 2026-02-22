@@ -43,11 +43,11 @@ const CFG_DATA_PRODUCT: usize = 0x0C;
 const PRODUCT_KEYBOARD: u16 = 0x0001;
 const PRODUCT_TABLET: u16 = 0x0003;
 
-/// Stored tablet (base, slot) for deferred initialization by tablet.rs.
-static mut TABLET_INFO: Option<(usize, usize)> = None;
+/// Stored tablet (base, irq) for deferred initialization by tablet.rs.
+static mut TABLET_INFO: Option<(usize, u32)> = None;
 
-/// Return tablet (base, slot) if one was found during init().
-pub fn tablet_base_and_slot() -> Option<(usize, usize)> {
+/// Return tablet (base, irq) if one was found during init().
+pub fn tablet_base_and_irq() -> Option<(usize, u32)> {
     unsafe { *core::ptr::addr_of!(TABLET_INFO) }
 }
 
@@ -74,19 +74,19 @@ pub fn init() -> bool {
     let mut kbd_found = false;
 
     for i in 0..probe.count {
-        let (base, slot) = probe.entries[i];
+        let (base, irq) = probe.entries[i];
         let product = read_product_id(base);
-        crate::println!("[input] slot {} @ {:#x}: product={:#06x}", slot, base, product);
+        crate::println!("[input] @ {:#x} IRQ {}: product={:#06x}", base, irq, product);
 
         match product {
             PRODUCT_KEYBOARD => {
                 if !kbd_found {
-                    kbd_found = init_keyboard(base, slot);
+                    kbd_found = init_keyboard(base, irq);
                 }
             }
             PRODUCT_TABLET => {
-                unsafe { core::ptr::addr_of_mut!(TABLET_INFO).write(Some((base, slot))); }
-                crate::println!("[input] tablet found at slot {} (deferred init)", slot);
+                unsafe { core::ptr::addr_of_mut!(TABLET_INFO).write(Some((base, irq))); }
+                crate::println!("[input] tablet found at {:#x} (deferred init)", base);
             }
             _ => {
                 crate::println!("[input] unknown input device product={:#06x}, skipping", product);
@@ -97,10 +97,9 @@ pub fn init() -> bool {
     kbd_found
 }
 
-/// Initialize a VirtIO keyboard at the given base/slot.
-fn init_keyboard(base: usize, slot: usize) -> bool {
-    let irq = 1 + slot as u32;
-    crate::println!("[keyboard] Found VirtIO keyboard at {:#x} (slot {}, IRQ {})", base, slot, irq);
+/// Initialize a VirtIO keyboard at the given base address and IRQ.
+fn init_keyboard(base: usize, irq: u32) -> bool {
+    crate::println!("[keyboard] Found VirtIO keyboard at {:#x} (IRQ {})", base, irq);
 
     if !mmio::init_device(base) {
         crate::println!("[keyboard] Device init failed");

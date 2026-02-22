@@ -54,15 +54,15 @@ static NET_WAKE_PID: AtomicUsize = AtomicUsize::new(0);
 /// and transmitq, pre-fills RX buffers, and enables the PLIC IRQ.
 /// Returns true on success.
 pub fn init() -> bool {
-    let base = match mmio::probe(mmio::DEVICE_ID_NET) {
-        Some(b) => b,
+    let (base, irq) = match mmio::probe(mmio::DEVICE_ID_NET) {
+        Some(v) => v,
         None => {
             crate::println!("[net] No VirtIO net device found");
             return false;
         }
     };
 
-    crate::println!("[net] Found VirtIO net at {:#x}", base);
+    crate::println!("[net] Found VirtIO net at {:#x} (IRQ {})", base, irq);
 
     // Custom handshake: we need to accept VIRTIO_NET_F_MAC (bit 5),
     // so we cannot use mmio::init_device which accepts no features.
@@ -89,9 +89,6 @@ pub fn init() -> bool {
         "[net] MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-
-    // Compute IRQ: QEMU virt machine uses IRQ = 1 + slot
-    let irq = 1 + ((base - 0x1000_1000) / 0x1000) as u32;
 
     // Allocate RX buffers: 16 slots * 2048 bytes = 32KB = 8 pages
     let rx_pages = RX_SLOT_COUNT * RX_BUF_SIZE / 4096;

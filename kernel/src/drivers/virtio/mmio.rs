@@ -1,11 +1,10 @@
-//! VirtIO MMIO transport layer for QEMU virt machine.
+//! VirtIO MMIO transport layer.
 //!
-//! 8 VirtIO MMIO slots at 0x1000_1000 .. 0x1000_8000, each 0x1000 apart.
-//! QEMU virt machine exposes legacy (v1) devices, so we support both v1 and v2.
+//! Device addresses and IRQ numbers are discovered from the FDT via the
+//! platform module.  Falls back to probing 8 fixed QEMU-virt slots if
+//! no FDT slots were populated.
 
-const VIRTIO_MMIO_BASE: usize = 0x1000_1000;
-const VIRTIO_MMIO_STRIDE: usize = 0x1000;
-const VIRTIO_MMIO_SLOTS: usize = 8;
+use crate::platform;
 
 // Register offsets (common to both v1 and v2)
 pub const REG_MAGIC: usize = 0x000;
@@ -68,11 +67,13 @@ pub fn device_version(base: usize) -> u32 {
     read_reg(base, REG_VERSION)
 }
 
-/// Probe all 8 VirtIO MMIO slots and return the base address
-/// of the first device matching `device_id`, or None.
-pub fn probe(device_id: u32) -> Option<usize> {
-    for i in 0..VIRTIO_MMIO_SLOTS {
-        let base = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
+/// Probe FDT-discovered VirtIO MMIO slots and return the base address
+/// and IRQ of the first device matching `device_id`, or None.
+pub fn probe(device_id: u32) -> Option<(usize, u32)> {
+    let (slots, count) = platform::virtio_mmio_slots();
+    for i in 0..count {
+        let slot = &slots[i];
+        let base = slot.base;
         let magic = read_reg(base, REG_MAGIC);
         if magic != VIRTIO_MAGIC {
             continue;
@@ -84,7 +85,7 @@ pub fn probe(device_id: u32) -> Option<usize> {
         }
         crate::println!("[virtio] slot {} @ {:#x}: version={} device_id={}", i, base, version, id);
         if id == device_id && (version == 1 || version == 2) {
-            return Some(base);
+            return Some((base, slot.irq));
         }
     }
     None
@@ -176,20 +177,22 @@ pub fn read_config_u32_le(base: usize, offset: usize) -> u32 {
 
 // ── Multi-device probe ───────────────────────────────────────────
 
-/// Result of probe_all: an array of (base, slot) pairs and a count.
+/// Result of probe_all: an array of (base, irq) pairs and a count.
 pub struct ProbeResult {
-    pub entries: [(usize, usize); VIRTIO_MMIO_SLOTS],
+    pub entries: [(usize, u32); platform::MAX_VIRTIO_SLOTS],
     pub count: usize,
 }
 
-/// Probe all 8 VirtIO MMIO slots and return ALL devices matching `device_id`.
+/// Probe FDT-discovered slots and return ALL devices matching `device_id`.
 pub fn probe_all(device_id: u32) -> ProbeResult {
+    let (slots, slot_count) = platform::virtio_mmio_slots();
     let mut result = ProbeResult {
-        entries: [(0, 0); VIRTIO_MMIO_SLOTS],
+        entries: [(0, 0); platform::MAX_VIRTIO_SLOTS],
         count: 0,
     };
-    for i in 0..VIRTIO_MMIO_SLOTS {
-        let base = VIRTIO_MMIO_BASE + i * VIRTIO_MMIO_STRIDE;
+    for i in 0..slot_count {
+        let slot = &slots[i];
+        let base = slot.base;
         let magic = read_reg(base, REG_MAGIC);
         if magic != VIRTIO_MAGIC {
             continue;
@@ -200,7 +203,7 @@ pub fn probe_all(device_id: u32) -> ProbeResult {
             continue;
         }
         if id == device_id && (version == 1 || version == 2) {
-            result.entries[result.count] = (base, i);
+            result.entries[result.count] = (base, slot.irq);
             result.count += 1;
         }
     }

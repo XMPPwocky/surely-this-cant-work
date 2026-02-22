@@ -283,9 +283,7 @@ fn external_interrupt() {
                 for i in 0..blk_count {
                     if Some(other_irq) == crate::drivers::virtio::blk::irq_number(i) {
                         crate::kstat::inc(&crate::kstat::IRQ_VIRTIO_BLK);
-                        crate::drivers::virtio::blk::handle_irq(
-                            (other_irq - 1) as usize,
-                        );
+                        crate::drivers::virtio::blk::handle_irq(other_irq);
                         handled = true;
                         break;
                     }
