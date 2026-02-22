@@ -82,6 +82,8 @@ bin.img: build-user
 			debugfs -w -R "write $(USER_BIN_DIR)/$$bin $$bin" $@ 2>/dev/null; \
 		fi; \
 	done
+	@# hello binary is referenced as hello-std in the code
+	debugfs -w -R "write $(USER_BIN_DIR)/hello hello-std" $@ 2>/dev/null || true
 
 persist.img:
 	@if [ ! -f $@ ]; then \

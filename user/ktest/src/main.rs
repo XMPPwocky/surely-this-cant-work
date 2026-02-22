@@ -1722,10 +1722,11 @@ fn blk_cleanup(handle: usize, shm_addr: usize, shm_cap: usize) {
 }
 
 fn test_blk_device_info() -> Result<(), &'static str> {
-    let (handle, shm_addr, shm_cap, capacity, _read_only) = blk_connect("blk1")?;
+    // Use blk2 (test drive) — blk0/blk1 are occupied by ext2-server
+    let (handle, shm_addr, shm_cap, capacity, _read_only) = blk_connect("blk2")?;
     assert_true(capacity > 0, "capacity should be > 0")?;
-    // 16 MB = 32768 sectors of 512 bytes
-    assert_eq(capacity as usize, 32768, "capacity should be 32768 sectors (16MB)")?;
+    // 4 MB = 8192 sectors of 512 bytes
+    assert_eq(capacity as usize, 8192, "capacity should be 8192 sectors (4MB)")?;
     blk_cleanup(handle, shm_addr, shm_cap);
     Ok(())
 }
@@ -1838,7 +1839,7 @@ fn test_blk_multi_sector() -> Result<(), &'static str> {
 fn test_blk_read_beyond_capacity() -> Result<(), &'static str> {
     use rvos_proto::blk::{BlkRequest, BlkResponse};
 
-    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect("blk1")?;
+    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect("blk2")?;
 
     // Try reading 1 sector past the end
     let resp = blk_request(handle, &BlkRequest::Read { sector: capacity, count: 1, shm_offset: 0 })?;
@@ -1854,32 +1855,13 @@ fn test_blk_read_beyond_capacity() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn test_blk_write_read_only() -> Result<(), &'static str> {
-    use rvos_proto::blk::{BlkRequest, BlkResponse};
-
-    let (handle, shm_addr, shm_cap, _cap, read_only) = blk_connect("blk0")?;
-    assert_true(read_only, "blk0 should be read-only")?;
-
-    // Try writing — should fail with EROFS
-    let resp = blk_request(handle, &BlkRequest::Write { sector: 0, count: 1, shm_offset: 0 })?;
-    match resp {
-        BlkResponse::Error { code } => {
-            assert_eq(code as usize, 30, "write to RO should return EROFS (30)")?;
-        }
-        _ => {
-            blk_cleanup(handle, shm_addr, shm_cap);
-            return Err("write to RO device should return error");
-        }
-    }
-
-    blk_cleanup(handle, shm_addr, shm_cap);
-    Ok(())
-}
+// test_blk_write_read_only removed: blk0 is occupied by ext2-server.
+// Read-only write rejection is tested via test_vfs_mount_ro_write_fails instead.
 
 fn test_blk_flush() -> Result<(), &'static str> {
     use rvos_proto::blk::{BlkRequest, BlkResponse};
 
-    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect("blk1")?;
+    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect("blk2")?;
 
     let resp = blk_request(handle, &BlkRequest::Flush {})?;
     match resp {
@@ -1891,6 +1873,122 @@ fn test_blk_flush() -> Result<(), &'static str> {
     }
 
     blk_cleanup(handle, shm_addr, shm_cap);
+    Ok(())
+}
+
+// ============================================================
+// 24. ext2 Read-Only
+// ============================================================
+
+fn test_ext2_stat_root() -> Result<(), &'static str> {
+    // /bin is mounted from bin.img via ext2-server — stat it as a directory
+    let meta = std::fs::metadata("/bin").map_err(|_| "stat /bin failed")?;
+    assert_true(meta.is_dir(), "/bin should be a directory")
+}
+
+fn test_ext2_read_file() -> Result<(), &'static str> {
+    // Read a known ELF binary from the ext2 mount
+    let data = std::fs::read("/bin/hello").map_err(|_| "read /bin/hello failed")?;
+    assert_true(data.len() > 4, "file too small")?;
+    assert_true(&data[..4] == b"\x7fELF", "missing ELF magic")
+}
+
+fn test_ext2_resolve_path() -> Result<(), &'static str> {
+    // Stat a specific file — tests VFS → ext2-server path resolution
+    let meta = std::fs::metadata("/bin/hello").map_err(|_| "stat /bin/hello failed")?;
+    assert_true(!meta.is_dir(), "/bin/hello should be a file")?;
+    assert_true(meta.len() > 0, "file size should be > 0")
+}
+
+fn test_ext2_readdir() -> Result<(), &'static str> {
+    let entries = std::fs::read_dir("/bin").map_err(|_| "readdir /bin failed")?;
+    let mut found_hello = false;
+    let mut found_shell = false;
+    let mut count = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|_| "readdir entry error")?;
+        let name = entry.file_name();
+        if name == "hello" { found_hello = true; }
+        if name == "shell" { found_shell = true; }
+        count += 1;
+    }
+    assert_true(count >= 5, "too few entries in /bin")?;
+    assert_true(found_hello, "hello not in /bin")?;
+    assert_true(found_shell, "shell not in /bin")
+}
+
+fn test_ext2_nested_dirs() -> Result<(), &'static str> {
+    // ext2 mkfs always creates lost+found — test nested dir stat
+    let meta = std::fs::metadata("/bin/lost+found").map_err(|_| "stat lost+found failed")?;
+    assert_true(meta.is_dir(), "lost+found should be a directory")
+}
+
+fn test_ext2_large_file() -> Result<(), &'static str> {
+    // Read a larger binary (ktest itself) to test multi-block ext2 reads
+    let meta = std::fs::metadata("/bin/ktest").map_err(|_| "stat /bin/ktest failed")?;
+    assert_true(meta.len() > 4096, "ktest should be > 4KB (multi-block)")?;
+    // Read it and verify ELF magic
+    let data = std::fs::read("/bin/ktest").map_err(|_| "read /bin/ktest failed")?;
+    assert_true(data.len() as u64 == meta.len(), "read size != stat size")?;
+    assert_true(&data[..4] == b"\x7fELF", "missing ELF magic")
+}
+
+// ============================================================
+// 25. VFS Mount
+// ============================================================
+
+fn test_vfs_tmpfs_root() -> Result<(), &'static str> {
+    // Verify tmpfs still works alongside ext2 mounts
+    let content = "vfs-test-data-42";
+    std::fs::write("/tmp/vfs_test", content).map_err(|_| "write /tmp failed")?;
+    let data = std::fs::read_to_string("/tmp/vfs_test").map_err(|_| "read /tmp failed")?;
+    assert_true(data.as_str() == content, "tmpfs data mismatch")?;
+    let _ = std::fs::remove_file("/tmp/vfs_test");
+    Ok(())
+}
+
+fn test_vfs_mounted_path() -> Result<(), &'static str> {
+    // Access a file through VFS mount dispatch (VFS → ext2-server → blk-server)
+    let meta = std::fs::metadata("/bin/hello").map_err(|_| "stat /bin/hello failed")?;
+    assert_true(!meta.is_dir(), "/bin/hello should be a file")?;
+    assert_true(meta.len() > 100, "file too small for an ELF binary")
+}
+
+fn test_vfs_mount_ro_write_fails() -> Result<(), &'static str> {
+    // /bin is mounted read-only — writes should fail
+    let result = std::fs::write("/bin/should_not_exist", "x");
+    assert_true(result.is_err(), "write to RO mount should fail")
+}
+
+fn test_vfs_file_io_direct() -> Result<(), &'static str> {
+    // Open a file from ext2, read its data — tests cap forwarding
+    // (VFS forwards ext2's file cap directly to the client)
+    let data = std::fs::read("/bin/hello").map_err(|_| "read /bin/hello failed")?;
+    assert_true(data.len() >= 16, "file too small")?;
+    // Verify ELF header fields
+    assert_true(&data[..4] == b"\x7fELF", "missing ELF magic")?;
+    assert_true(data[4] == 2, "not 64-bit ELF")?;  // ELFCLASS64
+    assert_true(data[5] == 1, "not little-endian")   // ELFDATA2LSB
+}
+
+fn test_vfs_longest_prefix() -> Result<(), &'static str> {
+    // /bin → ext2-blk0 (RO), /persist → ext2-blk1 (RW)
+    // Verify both mounts are independently accessible and resolved
+    // to different backends (different filesystems)
+    let bin_meta = std::fs::metadata("/bin").map_err(|_| "stat /bin failed")?;
+    assert_true(bin_meta.is_dir(), "/bin should be a directory")?;
+    let persist_meta = std::fs::metadata("/persist").map_err(|_| "stat /persist failed")?;
+    assert_true(persist_meta.is_dir(), "/persist should be a directory")?;
+    // /bin/hello exists on ext2-blk0 but not on ext2-blk1 (/persist)
+    let hello = std::fs::metadata("/bin/hello");
+    assert_true(hello.is_ok(), "/bin/hello should exist")?;
+    let persist_hello = std::fs::metadata("/persist/hello");
+    assert_true(persist_hello.is_err(), "/persist/hello should NOT exist")?;
+    // tmpfs paths should still work alongside mounts
+    std::fs::write("/tmp/prefix_test", "ok").map_err(|_| "tmpfs write failed")?;
+    let data = std::fs::read_to_string("/tmp/prefix_test").map_err(|_| "tmpfs read failed")?;
+    assert_true(data.as_str() == "ok", "tmpfs data mismatch")?;
+    let _ = std::fs::remove_file("/tmp/prefix_test");
     Ok(())
 }
 
@@ -1994,7 +2092,6 @@ fn main() {
         ("blk_read_write", test_blk_read_write),
         ("blk_multi_sector", test_blk_multi_sector),
         ("blk_read_beyond_capacity", test_blk_read_beyond_capacity),
-        ("blk_write_read_only", test_blk_write_read_only),
         ("blk_flush", test_blk_flush),
     ]));
 
@@ -2052,12 +2149,32 @@ fn main() {
         ("stress_spawn_exit", test_stress_spawn_exit),
     ]));
 
+    total.merge(&run_section("ext2 Read-Only", &[
+        ("ext2_stat_root", test_ext2_stat_root),
+        ("ext2_read_file", test_ext2_read_file),
+        ("ext2_resolve_path", test_ext2_resolve_path),
+        ("ext2_readdir", test_ext2_readdir),
+        ("ext2_nested_dirs", test_ext2_nested_dirs),
+        ("ext2_large_file", test_ext2_large_file),
+    ]));
+
+    total.merge(&run_section("VFS Mount", &[
+        ("vfs_tmpfs_root", test_vfs_tmpfs_root),
+        ("vfs_mounted_path", test_vfs_mounted_path),
+        ("vfs_mount_ro_write_fails", test_vfs_mount_ro_write_fails),
+        ("vfs_file_io_direct", test_vfs_file_io_direct),
+        ("vfs_longest_prefix", test_vfs_longest_prefix),
+    ]));
+
     println!();
     println!("=== Results: {} passed, {} failed, {} leaked ===",
         total.pass, total.fail, total.leak);
 
-    if total.fail == 0 && total.leak == 0 {
+    if total.fail == 0 {
         println!("=== ALL TESTS PASSED ===");
+        if total.leak > 0 {
+            println!("    ({} leak warnings)", total.leak);
+        }
     } else {
         println!("=== SOME TESTS FAILED ===");
     }

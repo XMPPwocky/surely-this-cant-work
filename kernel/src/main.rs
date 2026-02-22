@@ -266,8 +266,11 @@ pub extern "C" fn kmain() -> ! {
     }
     task::spawn_named(services::timer::timer_service, "timer").expect("boot: timer");
 
-    // ext2-server instances (one per block device, service + boot + control channels)
-    for i in 0..blk_count {
+    // ext2-server instances (one per block device, service + boot + control channels).
+    // Only mount the first 2 devices (bin.img + persist.img); additional devices
+    // (e.g., test.img) are left available for direct block-level access by ktest.
+    let ext2_count = blk_count.min(2);
+    for i in 0..ext2_count {
         let (svc_name, proc_name): (&str, &str) = match i {
             0 => ("ext2-blk0", "ext2-blk0"),
             1 => ("ext2-blk1", "ext2-blk1"),
