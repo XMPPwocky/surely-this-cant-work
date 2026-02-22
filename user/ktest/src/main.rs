@@ -1899,7 +1899,13 @@ fn test_blk_flush() -> Result<(), &'static str> {
 // ============================================================
 
 fn main() {
-    println!("=== rvOS Kernel Test Suite ===");
+    let quick = std::env::args().any(|a| a == "--quick");
+
+    if quick {
+        println!("=== rvOS Kernel Test Suite (quick) ===");
+    } else {
+        println!("=== rvOS Kernel Test Suite ===");
+    }
 
     let mut total = TestResult::new();
 
@@ -1989,19 +1995,21 @@ fn main() {
         ("fs_readdir", test_fs_readdir),
     ]));
 
-    total.merge(&run_section("Block Device", &[
-        ("blk_device_info", test_blk_device_info),
-        ("blk_read_write", test_blk_read_write),
-        ("blk_multi_sector", test_blk_multi_sector),
-        ("blk_read_beyond_capacity", test_blk_read_beyond_capacity),
-        ("blk_write_read_only", test_blk_write_read_only),
-        ("blk_flush", test_blk_flush),
-    ]));
+    if !quick {
+        total.merge(&run_section("Block Device", &[
+            ("blk_device_info", test_blk_device_info),
+            ("blk_read_write", test_blk_read_write),
+            ("blk_multi_sector", test_blk_multi_sector),
+            ("blk_read_beyond_capacity", test_blk_read_beyond_capacity),
+            ("blk_write_read_only", test_blk_write_read_only),
+            ("blk_flush", test_blk_flush),
+        ]));
 
-    total.merge(&run_section("Process Spawn", &[
-        ("spawn_hello", test_spawn_hello),
-        ("spawn_exit_notification", test_spawn_exit_notification),
-    ]));
+        total.merge(&run_section("Process Spawn", &[
+            ("spawn_hello", test_spawn_hello),
+            ("spawn_exit_notification", test_spawn_exit_notification),
+        ]));
+    }
 
     total.merge(&run_section("Regression -- Scheduling", &[
         ("yield_latency", test_yield_latency),
@@ -2018,39 +2026,43 @@ fn main() {
         ("buffer_validation_null", test_buffer_validation_null),
     ]));
 
-    total.merge(&run_section("Regression -- Resource Limits", &[
-        ("mmap_many_regions", test_mmap_many_regions),
-        ("mmap_child_region_count", test_mmap_child_region_count),
-    ]));
+    if !quick {
+        total.merge(&run_section("Regression -- Resource Limits", &[
+            ("mmap_many_regions", test_mmap_many_regions),
+            ("mmap_child_region_count", test_mmap_child_region_count),
+        ]));
 
-    total.merge(&run_section("Regression -- Resource Leaks", &[
-        ("spawn_cleanup_no_leak", test_spawn_cleanup_no_leak),
-    ]));
+        total.merge(&run_section("Regression -- Resource Leaks", &[
+            ("spawn_cleanup_no_leak", test_spawn_cleanup_no_leak),
+        ]));
 
-    total.merge(&run_section("Regression -- Fault Isolation", &[
-        ("umode_fault_kills_child", test_umode_fault_kills_child_not_kernel),
-    ]));
+        total.merge(&run_section("Regression -- Fault Isolation", &[
+            ("umode_fault_kills_child", test_umode_fault_kills_child_not_kernel),
+        ]));
 
-    yield_drain();
-    total.merge(&run_section("Regression -- Cap Ref Counting", &[
-        ("ns_override_cap_delivery", test_ns_override_cap_delivery),
-        ("two_children_shared_override", test_two_children_shared_override),
-        ("cap_delivery_via_spawn", test_cap_delivery_via_spawn),
-    ]));
-    yield_drain();
+        yield_drain();
+        total.merge(&run_section("Regression -- Cap Ref Counting", &[
+            ("ns_override_cap_delivery", test_ns_override_cap_delivery),
+            ("two_children_shared_override", test_two_children_shared_override),
+            ("cap_delivery_via_spawn", test_cap_delivery_via_spawn),
+        ]));
+        yield_drain();
 
-    total.merge(&run_section("Regression -- Debugger", &[
-        ("debugger_second_attach", test_debugger_second_attach),
-    ]));
+        total.merge(&run_section("Regression -- Debugger", &[
+            ("debugger_second_attach", test_debugger_second_attach),
+        ]));
+    }
 
     total.merge(&run_section("Timer Service", &[
         ("timer_basic", test_timer_basic),
         ("timer_short", test_timer_short),
     ]));
 
-    total.merge(&run_section("Regression -- Scheduler Stress", &[
-        ("stress_spawn_exit", test_stress_spawn_exit),
-    ]));
+    if !quick {
+        total.merge(&run_section("Regression -- Scheduler Stress", &[
+            ("stress_spawn_exit", test_stress_spawn_exit),
+        ]));
+    }
 
     println!();
     println!("=== Results: {} passed, {} failed, {} leaked ===",

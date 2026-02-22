@@ -38,7 +38,7 @@ QEMU_BLK_TEST = -drive file=test.img,format=raw,id=blk2,if=none \
 EXT2_BINS = hello winclient ipc-torture fbcon triangle gui-bench dbg \
             net-stack udp-echo window-server bench tcp-echo nc ktest ktest-helper shell
 
-.PHONY: build build-user build-fs build-std-lib run run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test bench-save bench-check clippy clippy-kernel clippy-user disk-images
+.PHONY: build build-user build-fs build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images
 
 # Build all user crates except fs (which embeds the others via include_bytes!)
 build-user:
@@ -188,6 +188,17 @@ run-test: build test.img
 test: build test.img
 	@echo "Running rvOS kernel tests..."
 	@expect scripts/test.exp
+
+run-quick: build
+	$(QEMU_LOCK) --info "make run-quick" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+		-bios default -m 128M \
+		-device virtio-keyboard-device \
+		$(QEMU_BLK) \
+		-kernel $(KERNEL_BIN)
+
+test-quick: build
+	@echo "Running rvOS quick tests..."
+	@expect scripts/test-quick.exp
 
 bench-save: build
 	@echo "Running benchmarks and saving baseline..."
