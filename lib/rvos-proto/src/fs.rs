@@ -64,9 +64,9 @@ define_message! {
         Stat(2) { path: &'a str },
         /// List directory entries (streaming response).
         Readdir(3) { path: &'a str },
-        /// Mount a filesystem backend at `target`. Cap sideband carries the
-        /// backend channel endpoint speaking FsRequest/FsResponse.
-        Mount(4) { target: &'a str, flags: u32 },
+        /// Mount a filesystem backend at `target`. The `backend` cap is the
+        /// backend's control channel endpoint speaking FsRequest/FsResponse.
+        Mount(4) { target: &'a str, flags: u32, backend: RawChannelCap },
         /// Unmount the filesystem at `target`.
         Unmount(5) { target: &'a str },
         /// Create a directory at `path`.
@@ -189,7 +189,7 @@ define_protocol! {
         /// List directory entries (streaming response).
         rpc readdir as Readdir(path: &str) -> FsResponse;
         /// Mount a backend filesystem at a path.
-        rpc mount as Mount(target: &str, flags: u32) -> FsResponse;
+        rpc mount as Mount(target: &str, flags: u32, backend: RawChannelCap) -> FsResponse;
         /// Unmount the filesystem at a path.
         rpc unmount as Unmount(target: &str) -> FsResponse;
         /// Create a directory.

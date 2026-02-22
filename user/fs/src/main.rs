@@ -17,6 +17,7 @@ const MAX_FILE_SIZE: usize = 4096;
 const MAX_NAME_LEN: usize = 32;
 const MAX_CHILDREN: usize = 128;
 const MAX_OPEN_FILES: usize = 16;
+const MAX_MOUNTS: usize = 8;
 
 // Max data payload per chunk: MAX_MSG_SIZE(1024) - 3 (tag u8 + length u16)
 const MAX_DATA_CHUNK: usize = 1021;
@@ -143,10 +144,26 @@ struct OpenFile {
     position: usize,
 }
 
+// --- VFS mount table ---
+
+use rvos::transport::UserTransport;
+
+struct MountEntry {
+    path: [u8; 64],
+    path_len: usize,
+    /// Backend ctl channel (RAII — closed on drop/unmount).
+    /// Typed as client-side (sends requests, receives responses).
+    /// Actual RPC uses UserTransport + rpc_call on the raw handle.
+    backend: Channel<FsRequestMsg, FsResponse>,
+    #[allow(dead_code)] // used later for RO mount enforcement
+    flags: u32,
+}
+
 struct Filesystem {
     inodes: [Inode; MAX_FILES],
     open_files: [OpenFile; MAX_OPEN_FILES],
     open_count: usize,
+    mounts: [Option<MountEntry>; MAX_MOUNTS],
 }
 
 impl Filesystem {
@@ -155,6 +172,7 @@ impl Filesystem {
             inodes: [const { Inode::new_empty() }; MAX_FILES],
             open_files: [const { OpenFile { endpoint_handle: 0, inode: 0, active: false, append: false, position: 0 } }; MAX_OPEN_FILES],
             open_count: 0,
+            mounts: [const { None }; MAX_MOUNTS],
         };
         // Inode 0 is the root directory
         fs.inodes[0].init_dir();
@@ -447,6 +465,192 @@ fn send_dir_sentinel(handle: usize) {
     raw::sys_chan_send_blocking(handle, &msg);
 }
 
+// --- VFS mount helpers ---
+
+/// Find the longest-prefix mount entry for a path.
+/// Returns (mount_index, relative_path) where relative_path starts with '/'.
+fn find_mount(path: &[u8]) -> Option<(usize, &[u8])> {
+    let fs = fs();
+    let mut best: Option<(usize, usize)> = None; // (index, mount_path_len)
+    for (i, m) in fs.mounts.iter().enumerate() {
+        if let Some(ref entry) = m {
+            let mp = &entry.path[..entry.path_len];
+            // Match exact or with trailing '/'
+            if (path == mp || (path.len() > mp.len() && path.starts_with(mp) && path[mp.len()] == b'/'))
+                && (best.is_none() || mp.len() > best.unwrap().1)
+            {
+                best = Some((i, mp.len()));
+            }
+        }
+    }
+    if let Some((idx, mp_len)) = best {
+        let rel = if path.len() == mp_len {
+            b"/" as &[u8]
+        } else {
+            &path[mp_len..] // starts with '/'
+        };
+        Some((idx, rel))
+    } else {
+        None
+    }
+}
+
+/// Forward a single-RPC request to a mount backend and relay the response.
+fn forward_rpc(
+    mount_idx: usize,
+    client_ch: &Channel<FsResponse, FsRequestMsg>,
+    request: &impl rvos_wire::Serialize,
+) {
+    let handle = fs().mounts[mount_idx].as_ref().unwrap().backend.raw_handle();
+    let mut transport = UserTransport::new(handle);
+    let mut buf = [0u8; rvos_wire::MAX_MSG_SIZE];
+    match rvos_wire::rpc_call::<_, _, FsResponse>(&mut transport, request, &mut buf) {
+        Ok(resp) => { let _ = client_ch.send(&resp); }
+        Err(_) => send_error(client_ch, FsError::Io {}),
+    }
+}
+
+/// Forward a Stat request to a mount backend.
+fn forward_stat(mount_idx: usize, ch: &Channel<FsResponse, FsRequestMsg>, rel_path: &[u8]) {
+    let path = core::str::from_utf8(rel_path).unwrap_or("/");
+    forward_rpc(mount_idx, ch, &FsRequest::Stat { path });
+}
+
+/// Forward a Delete request to a mount backend.
+fn forward_delete(mount_idx: usize, ch: &Channel<FsResponse, FsRequestMsg>, rel_path: &[u8]) {
+    let path = core::str::from_utf8(rel_path).unwrap_or("/");
+    forward_rpc(mount_idx, ch, &FsRequest::Delete { path });
+}
+
+/// Forward a Mkdir request to a mount backend.
+fn forward_mkdir(mount_idx: usize, ch: &Channel<FsResponse, FsRequestMsg>, rel_path: &[u8]) {
+    let path = core::str::from_utf8(rel_path).unwrap_or("/");
+    forward_rpc(mount_idx, ch, &FsRequest::Mkdir { path });
+}
+
+/// Forward an Open request to a mount backend, relaying the Opened response
+/// (including file channel cap) to the client.
+fn forward_open(mount_idx: usize, ch: &Channel<FsResponse, FsRequestMsg>, flags: OpenFlags, rel_path: &[u8]) {
+    let handle = fs().mounts[mount_idx].as_ref().unwrap().backend.raw_handle();
+    let path = core::str::from_utf8(rel_path).unwrap_or("/");
+    let mut transport = UserTransport::new(handle);
+    let mut buf = [0u8; rvos_wire::MAX_MSG_SIZE];
+    match rvos_wire::rpc_call::<_, _, FsResponse>(
+        &mut transport,
+        &FsRequest::Open { flags, path },
+        &mut buf,
+    ) {
+        Ok(resp) => {
+            // Extract file cap handle before sending (send will inc_ref for receiver)
+            let cap_handle = if let FsResponse::Opened { ref file, .. } = resp {
+                Some(file.raw())
+            } else {
+                None
+            };
+            let _ = ch.send(&resp);
+            // Close our reference to the file cap (client now has their own)
+            if let Some(h) = cap_handle {
+                raw::sys_chan_close(h);
+            }
+        }
+        Err(_) => send_error(ch, FsError::Io {}),
+    }
+}
+
+/// Forward a Readdir request to a mount backend, relaying the streaming
+/// response (Entry... End) to the client.
+///
+/// Uses raw messages because ReaddirResponse is a different type than FsResponse
+/// and can't go through the typed client channel.
+fn forward_readdir(mount_idx: usize, client_handle: usize, rel_path: &[u8]) {
+    let backend_handle = fs().mounts[mount_idx].as_ref().unwrap().backend.raw_handle();
+    let path = core::str::from_utf8(rel_path).unwrap_or("/");
+
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&FsRequest::Readdir { path }, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(backend_handle, &msg);
+
+    // Relay streaming responses until we see End, Error, or decode failure
+    loop {
+        let mut resp = Message::new();
+        let ret = raw::sys_chan_recv_blocking(backend_handle, &mut resp);
+        if ret != 0 { break; }
+
+        raw::sys_chan_send_blocking(client_handle, &resp);
+
+        // Check if this was a terminal message
+        let is_terminal = !matches!(
+            rvos_wire::from_bytes::<ReaddirResponse>(&resp.data[..resp.len]),
+            Ok(ReaddirResponse::Entry { .. })
+        );
+        if is_terminal { break; }
+    }
+}
+
+/// Handle a Mount request: store backend cap in mount table.
+fn do_mount(ch: &Channel<FsResponse, FsRequestMsg>, target: &[u8], flags: u32, cap: usize) {
+    if cap == NO_CAP {
+        send_error(ch, FsError::Io {});
+        return;
+    }
+
+    // Take RAII ownership of the backend cap immediately.
+    // If we don't store it, Channel::drop will close it.
+    let backend = Channel::<FsRequestMsg, FsResponse>::from_raw_handle(cap);
+
+    let fs = fs();
+
+    // Ensure the mount point exists as a directory in tmpfs
+    if target != b"/"
+        && fs.resolve_path(target).is_none()
+    {
+        // Auto-create the mount point directory
+        if let Some((parent_inode, dirname)) = fs.resolve_parent(target) {
+            if fs.inodes[parent_inode].kind == InodeKind::Dir {
+                if let Some(new_inode) = fs.alloc_inode() {
+                    fs.inodes[new_inode].init_dir();
+                    if !fs.inodes[parent_inode].add_child(dirname, new_inode) {
+                        fs.inodes[new_inode].active = false;
+                    }
+                }
+            }
+        }
+    }
+
+    // Find a free mount slot
+    let slot = fs.mounts.iter_mut().find(|m| m.is_none());
+    if let Some(slot) = slot {
+        let mut entry = MountEntry {
+            path: [0u8; 64],
+            path_len: target.len(),
+            backend,
+            flags,
+        };
+        entry.path[..target.len()].copy_from_slice(target);
+        *slot = Some(entry);
+
+        let _ = ch.send(&FsResponse::MountOk {});
+    } else {
+        // backend dropped here — Channel::drop closes the cap
+        send_error(ch, FsError::NoSpace {});
+    }
+}
+
+/// Handle an Unmount request: remove from mount table and close backend channel.
+fn do_unmount(ch: &Channel<FsResponse, FsRequestMsg>, target: &[u8]) {
+    let fs = fs();
+    for mount in &mut fs.mounts {
+        if let Some(ref entry) = mount {
+            if &entry.path[..entry.path_len] == target {
+                *mount = None; // Channel::drop closes the backend handle
+                send_stat_ok(ch, FsEntryKind::Directory {}, 0);
+                return;
+            }
+        }
+    }
+    send_error(ch, FsError::NotFound {});
+}
+
 // --- Main server ---
 
 use core::cell::UnsafeCell;
@@ -602,6 +806,12 @@ fn do_stat(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
         return;
     }
 
+    // Check mounts first
+    if let Some((mount_idx, rel_path)) = find_mount(path_bytes) {
+        forward_stat(mount_idx, ch, rel_path);
+        return;
+    }
+
     let fs = fs();
     match fs.resolve_path(path_bytes) {
         Some(idx) => {
@@ -622,6 +832,12 @@ fn do_stat(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
 fn do_readdir(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
     if path_bytes.is_empty() || path_bytes[0] != b'/' || path_bytes.len() > 60 {
         send_error(ch, FsError::InvalidPath {});
+        return;
+    }
+
+    // Check mounts first
+    if let Some((mount_idx, rel_path)) = find_mount(path_bytes) {
+        forward_readdir(mount_idx, ch.raw_handle(), rel_path);
         return;
     }
 
@@ -871,7 +1087,7 @@ fn main() {
                 let mut is_stat = false;
                 let mut is_readdir = false;
                 let mut is_mkdir = false;
-                let mut mount_flags: Option<u32> = None;
+                let mut mount_flags: Option<(u32, usize)> = None; // (flags, backend_cap)
                 let mut is_unmount = false;
                 let mut ctl_closed = false;
 
@@ -898,10 +1114,10 @@ fn main() {
                             path_buf[..path_len].copy_from_slice(path.as_bytes());
                             is_readdir = true;
                         }
-                        Ok(FsRequest::Mount { target, flags }) => {
+                        Ok(FsRequest::Mount { target, flags, backend }) => {
                             path_len = target.len().min(64);
                             path_buf[..path_len].copy_from_slice(target.as_bytes());
-                            mount_flags = Some(flags);
+                            mount_flags = Some((flags, backend.raw()));
                         }
                         Ok(FsRequest::Unmount { target }) => {
                             path_len = target.len().min(64);
@@ -938,14 +1154,12 @@ fn main() {
                 } else if is_readdir {
                     handled = true;
                     do_readdir(clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
-                } else if mount_flags.is_some() {
+                } else if let Some((flags, backend_cap)) = mount_flags {
                     handled = true;
-                    // TODO(step 10): implement mount table
-                    send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
+                    do_mount(clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len], flags, backend_cap);
                 } else if is_unmount {
                     handled = true;
-                    // TODO(step 10): implement unmount
-                    send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
+                    do_unmount(clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
                 } else if is_mkdir {
                     handled = true;
                     do_mkdir(clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
@@ -981,6 +1195,12 @@ fn close_client_file(client: &mut ClientState) {
 }
 
 fn do_open(client: &mut ClientState, flags: OpenFlags, path_bytes: &[u8]) {
+    // Check mounts first — forward Open and relay the file cap directly
+    if let Some((mount_idx, rel_path)) = find_mount(path_bytes) {
+        forward_open(mount_idx, client.ctl.as_ref().unwrap(), flags, rel_path);
+        return;
+    }
+
     let create = flags.bits & OpenFlags::CREATE.bits != 0;
     let truncate = flags.bits & OpenFlags::TRUNCATE.bits != 0;
     let excl = flags.bits & OpenFlags::EXCL.bits != 0;
@@ -1099,6 +1319,12 @@ fn do_delete(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
         return;
     }
 
+    // Check mounts first
+    if let Some((mount_idx, rel_path)) = find_mount(path_bytes) {
+        forward_delete(mount_idx, ch, rel_path);
+        return;
+    }
+
     let fs = fs();
 
     let (parent_inode, filename) = match fs.resolve_parent(path_bytes) {
@@ -1145,6 +1371,12 @@ fn do_mkdir(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
 
     if path_bytes == b"/" {
         send_error(ch, FsError::AlreadyExists {});
+        return;
+    }
+
+    // Check mounts first
+    if let Some((mount_idx, rel_path)) = find_mount(path_bytes) {
+        forward_mkdir(mount_idx, ch, rel_path);
         return;
     }
 

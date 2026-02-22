@@ -737,8 +737,10 @@ impl<'a, S, R> Deserialize<'a> for ChannelCap<S, R> {
 /// Use this when the protocol spoken by the channel is not known at compile
 /// time. Prefer [`ChannelCap<S, R>`] when the protocol is known.
 ///
-/// Like `ChannelCap`, this is move-only.
-#[derive(Debug)]
+/// Unlike `ChannelCap<S, R>`, this is a plain wire-level value with no type
+/// safety. It implements Copy because it's a protocol data type — the raw
+/// handle has no Drop/RAII semantics at this layer.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct RawChannelCap {
     handle: usize,
 }
