@@ -71,8 +71,7 @@ pub fn device_version(base: usize) -> u32 {
 /// and IRQ of the first device matching `device_id`, or None.
 pub fn probe(device_id: u32) -> Option<(usize, u32)> {
     let (slots, count) = platform::virtio_mmio_slots();
-    for i in 0..count {
-        let slot = &slots[i];
+    for (i, slot) in slots.iter().take(count).enumerate() {
         let base = slot.base;
         let magic = read_reg(base, REG_MAGIC);
         if magic != VIRTIO_MAGIC {
@@ -190,8 +189,7 @@ pub fn probe_all(device_id: u32) -> ProbeResult {
         entries: [(0, 0); platform::MAX_VIRTIO_SLOTS],
         count: 0,
     };
-    for i in 0..slot_count {
-        let slot = &slots[i];
+    for slot in slots.iter().take(slot_count) {
         let base = slot.base;
         let magic = read_reg(base, REG_MAGIC);
         if magic != VIRTIO_MAGIC {
