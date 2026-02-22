@@ -10,6 +10,8 @@ A from-scratch RISC-V 64-bit microkernel OS written in Rust, targeting qemu-syst
 - `make test-quick` — fast smoke test (~15s): core kernel tests, no child spawning or test.img. **Use this after code changes to confirm the system boots and core functionality works.**
 - `make test` — full test suite (~80 tests, 300s timeout), includes spawn/block device tests
 - `make debug` — QEMU with GDB attach
+- `make mcp-setup` — create Python venv for the QEMU MCP server
+- `make mcp-server` — start the QEMU MCP server (for agent interaction)
 
 ## Linting
 - `make clippy` — run clippy on all crates (kernel + user)
@@ -64,6 +66,26 @@ file it so the main context stays clean.
 If you encounter a pre-existing issue, check `docs/bugs/open/` for an existing
 bug report first. If you can't find one, use the `/bug` skill to report it (in
 a subagent to keep context clean).
+
+## Interactive QEMU (MCP Server)
+For interactive debugging and exploratory testing, use the QEMU MCP server.
+It provides structured tools for booting QEMU, sending serial commands,
+taking screenshots, injecting input, and capturing network traffic.
+
+**When to use the MCP server** vs. other testing methods:
+- **`make test` / `make test-quick`**: Use for automated regression testing
+  ("does my change break anything?"). Prefer writing ktests for new features.
+- **MCP server**: Use for interactive debugging, exploratory testing, or
+  scenarios that need dynamic decision-making (e.g., "boot, check ps output,
+  then decide what to investigate based on what you see"). Also useful for
+  GUI testing (screenshots + input events) and network debugging (PCAP).
+- **Writing a ktest**: Prefer this over MCP interaction for "verify this new
+  feature works" — ktests are permanent, reproducible, and run in CI.
+
+**Important:** Even if you reproduce a bug using the MCP server, strongly
+consider writing a ktest afterwards once you understand how to reproduce it.
+Regression tests are critical — an MCP session is ephemeral but a ktest
+catches the bug forever.
 
 ## Testing Serial Console
 Use `expect` scripts for interactive testing — **never pipe stdin** to `make run`.

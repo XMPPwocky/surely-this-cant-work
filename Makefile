@@ -38,7 +38,7 @@ QEMU_BLK_TEST = -drive file=test.img,format=raw,id=blk2,if=none \
 EXT2_BINS = hello winclient ipc-torture fbcon triangle gui-bench dbg \
             net-stack udp-echo window-server bench tcp-echo nc ktest ktest-helper shell
 
-.PHONY: build build-user build-fs build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images
+.PHONY: build build-user build-fs build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images mcp-setup mcp-server
 
 # Build all user crates except fs (which embeds the others via include_bytes!)
 build-user:
@@ -222,3 +222,11 @@ clippy-user:
 		--workspace -- -W clippy::all
 
 clippy: clippy-kernel clippy-user
+
+# --- MCP Server ---
+
+mcp-setup:
+	@scripts/qemu-mcp/setup.sh
+
+mcp-server: mcp-setup
+	@scripts/qemu-mcp/.venv/bin/python3 scripts/qemu-mcp/server.py
