@@ -4,12 +4,12 @@ A from-scratch RISC-V 64-bit microkernel OS written in Rust, targeting qemu-syst
 
 ## Build & Run
 - `make build` — build kernel binary
-- `make run` — boot in QEMU with serial
-- `make run-gui` — boot with virtio-gpu display
+- `make run` — boot in QEMU with serial (**human use only** — needs interactive terminal)
+- `make run-gui` — boot with virtio-gpu display (**human use only**)
 - `make bench` — build and run benchmark suite (boots QEMU, runs /bin/bench, shuts down)
 - `make test-quick` — fast smoke test (~15s): core kernel tests, no child spawning or test.img. **Use this after code changes to confirm the system boots and core functionality works.**
 - `make test` — full test suite (~80 tests, 300s timeout), includes spawn/block device tests
-- `make debug` — QEMU with GDB attach
+- `make debug` — QEMU with GDB attach (**human use only**)
 - `make mcp-setup` — create Python venv for the QEMU MCP server
 - `make mcp-server` — start the QEMU MCP server (for agent interaction)
 
@@ -88,8 +88,13 @@ Regression tests are critical — an MCP session is ephemeral but a ktest
 catches the bug forever.
 
 ## Testing Serial Console
-Use `expect` scripts for interactive testing — **never pipe stdin** to `make run`.
-See `docs/testing-serial.md`.
+**Agents: Do NOT use `make run`, `make run-gui`, or spawn QEMU directly.**
+These require an interactive terminal. For agent interaction with QEMU, use
+the MCP server tools (`qemu_boot`, `qemu_send`, etc.) described above.
+For scripted regression tests, use `make test` / `make test-quick` (expect scripts).
+
+For human-authored expect scripts, see `docs/testing-serial.md`.
+Never pipe stdin to `make run`.
 
 ## Key Addresses (QEMU virt)
 RAM_BASE: 0x80000000, KERNEL_BASE: 0x80200000, UART: 0x10000000,
