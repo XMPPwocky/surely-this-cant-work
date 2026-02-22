@@ -7,6 +7,8 @@ A from-scratch RISC-V 64-bit microkernel OS written in Rust, targeting qemu-syst
 - `make run` — boot in QEMU with serial
 - `make run-gui` — boot with virtio-gpu display
 - `make bench` — build and run benchmark suite (boots QEMU, runs /bin/bench, shuts down)
+- `make test-quick` — fast smoke test (~15s): core kernel tests, no child spawning or test.img. **Use this after code changes to confirm the system boots and core functionality works.**
+- `make test` — full test suite (~80 tests, 300s timeout), includes spawn/block device tests
 - `make debug` — QEMU with GDB attach
 
 ## Linting
@@ -58,6 +60,10 @@ When you find a bug incidentally while testing, or when the user reports a bug
 (even without explicitly using `/bug`), **use the `/bug` skill** to report and
 track it. If the bug isn't the main task you're working on, use a subagent to
 file it so the main context stays clean.
+
+If you encounter a pre-existing issue, check `docs/bugs/open/` for an existing
+bug report first. If you can't find one, use the `/bug` skill to report it (in
+a subagent to keep context clean).
 
 ## Testing Serial Console
 Use `expect` scripts for interactive testing — **never pipe stdin** to `make run`.
