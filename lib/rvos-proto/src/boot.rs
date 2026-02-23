@@ -19,7 +19,7 @@ define_message! {
         /// `args` is a null-separated blob (e.g. b"arg1\0arg2\0arg3"), empty if none.
         /// `ns_overrides` is a packed blob for namespace overrides, empty if none.
         /// Response cap = process handle channel.
-        Spawn(1) { path: &'a str, args: &'a [u8], ns_overrides: &'a [u8] },
+        Spawn(1) { path: &'a str, args: &'a [u8], ns_overrides: &'a [u8], suspended: bool },
         /// Fetch command-line arguments for this process.
         /// Response = Args with null-separated blob.
         GetArgs(2) {},

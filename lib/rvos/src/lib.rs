@@ -19,7 +19,7 @@ pub mod socket;
 pub use error::{RecvError, SysError, SysResult};
 pub use message::Message;
 pub use channel::{RawChannel, Channel, channel_pair};
-pub use service::{connect_to_service, spawn_process, spawn_process_with_args, spawn_process_with_cap, spawn_process_with_overrides, NsOverride};
+pub use service::{connect_to_service, spawn_process, spawn_process_with_args, spawn_process_with_cap, spawn_process_with_overrides, spawn_process_suspended, NsOverride};
 pub use raw::NO_CAP;
 pub use transport::UserTransport;
 

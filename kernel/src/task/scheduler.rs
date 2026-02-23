@@ -1080,6 +1080,24 @@ pub fn set_block_reason(pid: usize, reason: crate::task::process::BlockReason) {
     }
 }
 
+/// Suspend a freshly spawned process before it runs its first instruction.
+/// Removes it from the ready queue and sets its state to Blocked with SpawnSuspended.
+pub fn suspend_spawned_process(pid: usize) {
+    let mut sched = SCHEDULER.lock();
+    sched.ready_queue.retain(|&p| p != pid);
+    if let Some(ref mut proc) = sched.processes.get_mut(pid).and_then(|s| s.as_mut()) {
+        proc.state = ProcessState::Blocked;
+        proc.block_reason = crate::task::process::BlockReason::SpawnSuspended;
+    }
+}
+
+/// Check if a process is blocked with SpawnSuspended.
+pub fn process_is_spawn_suspended(pid: usize) -> bool {
+    let sched = SCHEDULER.lock();
+    matches!(sched.processes.get(pid),
+        Some(Some(p)) if matches!(p.block_reason, crate::task::process::BlockReason::SpawnSuspended))
+}
+
 /// Wake a blocked process (set to Ready and add to FRONT of ready queue).
 /// Pushing to front gives woken receivers priority, enabling fast IPC round-trips.
 /// If the process is Running or Ready, set wakeup_pending so a subsequent
@@ -1164,6 +1182,7 @@ pub fn process_list() -> String {
                 }
                 crate::task::process::BlockReason::Poll => String::from("poll"),
                 crate::task::process::BlockReason::DebugSuspend => String::from("debug"),
+                crate::task::process::BlockReason::SpawnSuspended => String::from("spawn-susp"),
             };
             let (e1s, e1m) = effective_ewma(proc, now, i == current_pid, last_switch);
             let mem_kb = proc.mem_pages as usize * 4; // 4 KiB per page

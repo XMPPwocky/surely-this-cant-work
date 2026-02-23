@@ -52,7 +52,7 @@ fn spawn_impl(
     let mut buf = [0u8; MAX_MSG_SIZE];
     let (resp, cap) = rvos_wire::rpc_call_with_cap(
         &mut transport,
-        &BootRequest::Spawn { path, args, ns_overrides: &[] },
+        &BootRequest::Spawn { path, args, ns_overrides: &[], suspended: false },
         cap_handle,
         &mut buf,
     ).map_err(|_| SysError::NoResources)?;
@@ -96,6 +96,32 @@ pub fn spawn_process_with_args(path: &str, args: &[u8]) -> SysResult<RawChannel>
 /// Spawn a process with args via a specific boot handle.
 pub fn spawn_process_with_args_on(boot_handle: usize, path: &str, args: &[u8]) -> SysResult<RawChannel> {
     spawn_impl(boot_handle, path, args, NO_CAP)
+}
+
+/// Spawn a process in the suspended state via the boot channel (handle 0).
+///
+/// The process is created but blocked before its first instruction executes.
+/// A debugger can attach and inspect it before calling resume.
+/// Returns a process handle channel (same as `spawn_process`).
+pub fn spawn_process_suspended(path: &str) -> SysResult<RawChannel> {
+    spawn_suspended_impl(0, path)
+}
+
+/// Spawn a suspended process via a specific boot handle.
+pub fn spawn_process_suspended_on(boot_handle: usize, path: &str) -> SysResult<RawChannel> {
+    spawn_suspended_impl(boot_handle, path)
+}
+
+fn spawn_suspended_impl(boot_handle: usize, path: &str) -> SysResult<RawChannel> {
+    let mut transport = UserTransport::new(boot_handle);
+    let mut buf = [0u8; MAX_MSG_SIZE];
+    let (resp, cap) = rvos_wire::rpc_call_with_cap(
+        &mut transport,
+        &BootRequest::Spawn { path, args: &[], ns_overrides: &[], suspended: true },
+        NO_CAP,
+        &mut buf,
+    ).map_err(|_| SysError::NoResources)?;
+    boot_response_cap(resp, cap)
 }
 
 /// A namespace override for process spawning.
@@ -177,7 +203,7 @@ pub fn spawn_process_with_overrides_on(
     let mut transport = UserTransport::new(boot_handle);
     let mut send_buf = [0u8; MAX_MSG_SIZE];
     let n = rvos_wire::to_bytes(
-        &BootRequest::Spawn { path, args, ns_overrides: &blob[..pos] },
+        &BootRequest::Spawn { path, args, ns_overrides: &blob[..pos], suspended: false },
         &mut send_buf,
     ).map_err(|_| SysError::BadAddress)?;
     transport.send(&send_buf[..n], &caps[..cap_count])

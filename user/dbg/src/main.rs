@@ -361,6 +361,48 @@ impl Debugger {
         }
     }
 
+    fn cmd_spawn(&mut self, path: &str) {
+        if self.is_attached() {
+            println!("Already attached. Detach first.");
+            return;
+        }
+
+        // Spawn the process in suspended state
+        let handle = match rvos::spawn_process_suspended(path) {
+            Ok(h) => h,
+            Err(_) => {
+                println!("Failed to spawn '{}'", path);
+                return;
+            }
+        };
+
+        // Read ProcessStarted to get the PID
+        let handle_raw = handle.raw_handle();
+        let mut msg = rvos::Message::new();
+        if raw::sys_chan_recv_blocking(handle_raw, &mut msg) != 0 {
+            println!("Failed to receive ProcessStarted");
+            return;
+        }
+        let started: rvos_proto::process::ProcessStarted =
+            match rvos_wire::from_bytes(&msg.data[..msg.len]) {
+                Ok(s) => s,
+                Err(_) => {
+                    println!("Bad ProcessStarted response");
+                    return;
+                }
+            };
+        let pid = started.pid;
+        println!("Spawned '{}' as PID {} (suspended)", path, pid);
+
+        // Attach to the suspended process
+        self.attach(pid);
+
+        // Store the process handle so we get exit notification later.
+        // The handle channel stays open; events will be polled naturally.
+        // We leak the handle intentionally — it will be closed on dbg exit.
+        core::mem::forget(handle);
+    }
+
     fn poll_events(&mut self) {
         let event_h = match self.event_handle {
             Some(h) => h,
@@ -437,6 +479,7 @@ fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
 fn print_help() {
     println!("Commands:");
     println!("  attach <pid>         Attach to a process");
+    println!("  spawn <path>         Spawn a process suspended and attach");
     println!("  detach               Detach from current process");
     println!("  suspend / s          Suspend the target process");
     println!("  continue / c         Resume execution");
@@ -560,6 +603,13 @@ fn main() {
                     Ok(pid) => dbg.attach(pid),
                     Err(_) => println!("Bad PID: {}", parts[1]),
                 }
+            }
+            "spawn" => {
+                if parts.len() < 2 {
+                    println!("Usage: spawn <path>");
+                    continue;
+                }
+                dbg.cmd_spawn(parts[1]);
             }
             "detach" => dbg.detach(),
             "suspend" | "s" => dbg.cmd_suspend(),
