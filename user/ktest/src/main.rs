@@ -1993,6 +1993,120 @@ fn test_vfs_longest_prefix() -> Result<(), &'static str> {
 }
 
 // ============================================================
+// 26. ext2 Read-Write
+// ============================================================
+
+fn test_ext2_create_file() -> Result<(), &'static str> {
+    let path = "/persist/test_create";
+    // Clean up from any previous run
+    let _ = std::fs::remove_file(path);
+
+    // Create the file by writing to it
+    std::fs::write(path, b"hello ext2").map_err(|_| "create file failed")?;
+
+    // Stat it — should exist and be a regular file
+    let meta = std::fs::metadata(path).map_err(|_| "stat created file failed")?;
+    assert_true(!meta.is_dir(), "should be a file, not dir")?;
+    assert_eq(meta.len() as usize, 10, "file size mismatch")?;
+
+    // Clean up
+    std::fs::remove_file(path).map_err(|_| "cleanup remove failed")?;
+    Ok(())
+}
+
+fn test_ext2_write_read() -> Result<(), &'static str> {
+    let path = "/persist/test_wrrd";
+    let _ = std::fs::remove_file(path);
+
+    let data = b"The quick brown fox jumps over the lazy dog. 0123456789!";
+    std::fs::write(path, data).map_err(|_| "write failed")?;
+
+    let got = std::fs::read(path).map_err(|_| "read back failed")?;
+    assert_eq(got.len(), data.len(), "read size mismatch")?;
+    assert_true(got == data, "data content mismatch")?;
+
+    std::fs::remove_file(path).map_err(|_| "cleanup failed")?;
+    Ok(())
+}
+
+fn test_ext2_delete_file() -> Result<(), &'static str> {
+    let path = "/persist/test_del";
+    let _ = std::fs::remove_file(path);
+
+    // Create
+    std::fs::write(path, b"delete me").map_err(|_| "create failed")?;
+    assert_true(std::fs::metadata(path).is_ok(), "file should exist after create")?;
+
+    // Delete
+    std::fs::remove_file(path).map_err(|_| "delete failed")?;
+
+    // Verify gone
+    assert_true(std::fs::metadata(path).is_err(), "file should not exist after delete")
+}
+
+fn test_ext2_mkdir() -> Result<(), &'static str> {
+    let path = "/persist/test_dir";
+    // Clean up from previous run (remove any file inside first, then dir)
+    let _ = std::fs::remove_file("/persist/test_dir/inner");
+    let _ = std::fs::remove_file(path);  // in case it's a file somehow
+
+    std::fs::create_dir(path).map_err(|_| "mkdir failed")?;
+
+    let meta = std::fs::metadata(path).map_err(|_| "stat dir failed")?;
+    assert_true(meta.is_dir(), "should be a directory")?;
+
+    // Clean up: delete the directory (ext2 unlink works on empty dirs)
+    std::fs::remove_file(path).map_err(|_| "cleanup rmdir failed")?;
+    Ok(())
+}
+
+fn test_ext2_grow_file() -> Result<(), &'static str> {
+    let path = "/persist/test_grow";
+    let _ = std::fs::remove_file(path);
+
+    // Write a small file first
+    std::fs::write(path, b"small").map_err(|_| "initial write failed")?;
+
+    // Now write a larger file (multiple blocks: > 4096 bytes)
+    let large = vec![0x42u8; 8192];
+    std::fs::write(path, &large).map_err(|_| "large write failed")?;
+
+    let got = std::fs::read(path).map_err(|_| "read back failed")?;
+    assert_eq(got.len(), 8192, "large file size mismatch")?;
+    // Verify first and last bytes
+    assert_true(got[0] == 0x42, "first byte wrong")?;
+    assert_true(got[8191] == 0x42, "last byte wrong")?;
+
+    std::fs::remove_file(path).map_err(|_| "cleanup failed")?;
+    Ok(())
+}
+
+fn test_ext2_persistence() -> Result<(), &'static str> {
+    // Write a file, close it completely, reopen and read — verify write-through works
+    let path = "/persist/test_persist";
+    let _ = std::fs::remove_file(path);
+
+    let data = b"persistent data check 12345";
+
+    // Write and fully close the file
+    {
+        let mut f = std::fs::File::create(path).map_err(|_| "create failed")?;
+        std::io::Write::write_all(&mut f, data).map_err(|_| "write failed")?;
+        // f is dropped here, closing the file handle
+    }
+
+    // Reopen and read — this must work through the block cache
+    {
+        let got = std::fs::read(path).map_err(|_| "read back failed")?;
+        assert_eq(got.len(), data.len(), "persistence size mismatch")?;
+        assert_true(got == data, "persistence data mismatch")?;
+    }
+
+    std::fs::remove_file(path).map_err(|_| "cleanup failed")?;
+    Ok(())
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -2177,6 +2291,17 @@ fn main() {
         ("vfs_file_io_direct", test_vfs_file_io_direct),
         ("vfs_longest_prefix", test_vfs_longest_prefix),
     ]));
+
+    if !quick {
+        total.merge(&run_section("ext2 Read-Write", &[
+            ("ext2_create_file", test_ext2_create_file),
+            ("ext2_write_read", test_ext2_write_read),
+            ("ext2_delete_file", test_ext2_delete_file),
+            ("ext2_mkdir", test_ext2_mkdir),
+            ("ext2_grow_file", test_ext2_grow_file),
+            ("ext2_persistence", test_ext2_persistence),
+        ]));
+    }
 
     println!();
     println!("=== Results: {} passed, {} failed, {} leaked ===",

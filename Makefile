@@ -27,10 +27,13 @@ QEMU_BLK = -drive file=bin.img,format=raw,id=hd-bin,if=none,readonly=on \
            -drive file=persist.img,format=raw,id=hd-persist,if=none \
            -device virtio-blk-device,drive=hd-persist,serial=persist
 
-# For test: add a third drive (test.img, freshly mkfs'd)
-QEMU_BLK_TEST = -drive file=test.img,format=raw,id=hd-test,if=none \
-           -device virtio-blk-device,drive=hd-test,serial=test \
-           $(QEMU_BLK)
+# For test: add a third drive (test.img, freshly mkfs'd).
+# test.img must be declared AFTER the standard drives so it gets the
+# highest blk index (QEMU assigns MMIO slots in reverse declaration order,
+# and the kernel probes high-to-low, so last-declared = highest index).
+QEMU_BLK_TEST = $(QEMU_BLK) \
+           -drive file=test.img,format=raw,id=hd-test,if=none \
+           -device virtio-blk-device,drive=hd-test,serial=test
 
 # User-space binaries to include in bin.img (ext2 filesystem)
 EXT2_BINS = hello winclient ipc-torture fbcon triangle gui-bench dbg \
