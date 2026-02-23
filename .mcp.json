@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "qemu": {
+      "command": "scripts/qemu-mcp/.venv/bin/python3",
+      "args": ["scripts/qemu-mcp/server.py"]
+    }
+  }
+}

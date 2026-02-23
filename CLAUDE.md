@@ -72,6 +72,10 @@ For interactive debugging and exploratory testing, use the QEMU MCP server.
 It provides structured tools for booting QEMU, sending serial commands,
 taking screenshots, injecting input, and capturing network traffic.
 
+**`qemu_boot` requires `project_root`** — pass the absolute path to your
+working directory (main repo or worktree). This ensures the correct
+`kernel.bin`, `bin.img`, and `persist.img` are used.
+
 **When to use the MCP server** vs. other testing methods:
 - **`make test` / `make test-quick`**: Use for automated regression testing
   ("does my change break anything?"). Prefer writing ktests for new features.

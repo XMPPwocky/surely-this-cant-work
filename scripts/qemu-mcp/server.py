@@ -26,10 +26,16 @@ from qmp import QMPClient, QMPError
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
-KERNEL_BIN = PROJECT_ROOT / "target" / "riscv64gc-unknown-none-elf" / "release" / "kernel.bin"
-BIN_IMG = PROJECT_ROOT / "bin.img"
-PERSIST_IMG = PROJECT_ROOT / "persist.img"
+DEFAULT_PROJECT_ROOT = SCRIPT_DIR.parent.parent
+
+
+def _resolve_paths(root: Path) -> tuple[Path, Path, Path]:
+    """Return (kernel_bin, bin_img, persist_img) for a given project root."""
+    return (
+        root / "target" / "riscv64gc-unknown-none-elf" / "release" / "kernel.bin",
+        root / "bin.img",
+        root / "persist.img",
+    )
 
 # Temp paths include PID to avoid collisions if lock is somehow bypassed,
 # but under normal operation only one QEMU runs at a time (enforced by lock).
@@ -38,18 +44,18 @@ QMP_SOCK = f"/tmp/rvos-mcp-qmp-{os.getpid()}.sock"
 
 # Lockfile must be shared across all worktrees — use git's common dir
 # (points to the main repo's .git/ regardless of which worktree we're in).
-def _find_lockfile() -> Path:
+def _find_lockfile(root: Path) -> Path:
     try:
         import subprocess as _sp
         git_common = _sp.check_output(
-            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "--git-common-dir"],
+            ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
             text=True,
         ).strip()
         return Path(git_common) / ".qemu.lock"
     except Exception:
-        return PROJECT_ROOT / ".qemu.lock"
+        return root / ".qemu.lock"
 
-LOCKFILE = _find_lockfile()
+LOCKFILE = _find_lockfile(DEFAULT_PROJECT_ROOT)
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -77,6 +83,11 @@ class QEMUInstance:
         self.pcap_proc: subprocess.Popen[bytes] | None = None
         self.pcap_file: str | None = None
         self._lock_fd: int | None = None
+        # Per-boot paths (set in boot(), default to main project root)
+        self._project_root: Path = DEFAULT_PROJECT_ROOT
+        self._kernel_bin: Path = Path()
+        self._bin_img: Path = Path()
+        self._persist_img: Path = Path()
 
     @property
     def running(self) -> bool:
@@ -170,15 +181,26 @@ class QEMUInstance:
         extra_drives: list[dict[str, Any]] | None = None,
         memory: str = "128M",
         wait_for_prompt: bool = True,
+        project_root: str = "",
     ) -> str:
         """Start QEMU with the given configuration."""
         if self.running:
             raise RuntimeError("QEMU is already running. Shut it down first.")
 
-        # Check kernel binary exists
-        if not KERNEL_BIN.exists():
+        if not project_root:
             raise RuntimeError(
-                f"Kernel binary not found at {KERNEL_BIN}. Run 'make build' first."
+                "project_root is required. Pass the absolute path to the project "
+                "(or worktree) directory, e.g. '/home/ubuntu/src/temp2/rvos'."
+            )
+
+        # Resolve project root (worktree agents pass their path here)
+        self._project_root = Path(project_root).resolve()
+        self._kernel_bin, self._bin_img, self._persist_img = _resolve_paths(self._project_root)
+
+        # Check kernel binary exists
+        if not self._kernel_bin.exists():
+            raise RuntimeError(
+                f"Kernel binary not found at {self._kernel_bin}. Run 'make build' first."
             )
 
         # Acquire project-wide lock
@@ -206,7 +228,7 @@ class QEMUInstance:
             # QMP monitor
             "-qmp", f"unix:{QMP_SOCK},server=on,wait=off",
             # Kernel
-            "-kernel", str(KERNEL_BIN),
+            "-kernel", str(self._kernel_bin),
         ]
 
         if gpu:
@@ -225,14 +247,14 @@ class QEMUInstance:
             ])
 
         # Standard block devices (reverse order for MMIO slot assignment)
-        if PERSIST_IMG.exists():
+        if self._persist_img.exists():
             cmd.extend([
-                "-drive", f"file={PERSIST_IMG},format=raw,id=blk1,if=none",
+                "-drive", f"file={self._persist_img},format=raw,id=blk1,if=none",
                 "-device", "virtio-blk-device,drive=blk1",
             ])
-        if BIN_IMG.exists():
+        if self._bin_img.exists():
             cmd.extend([
-                "-drive", f"file={BIN_IMG},format=raw,id=blk0,if=none,readonly=on",
+                "-drive", f"file={self._bin_img},format=raw,id=blk0,if=none,readonly=on",
                 "-device", "virtio-blk-device,drive=blk0",
             ])
 
@@ -259,7 +281,7 @@ class QEMUInstance:
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(PROJECT_ROOT),
+            cwd=str(self._project_root),
         )
         self.boot_time = time.time()
         self.output_buffer = ""
@@ -576,6 +598,7 @@ qemu = QEMUInstance()
 
 @mcp.tool()
 async def qemu_boot(
+    project_root: str,
     gpu: bool = False,
     network: bool = False,
     extra_drives: list[dict[str, Any]] | None = None,
@@ -585,6 +608,8 @@ async def qemu_boot(
     """Start QEMU with rvOS.
 
     Args:
+        project_root: Absolute path to the project (or worktree) directory.
+                      Required — ensures correct kernel.bin, bin.img, persist.img.
         gpu: Enable virtio-gpu + VNC display (needed for screenshots)
         network: Enable TAP networking
         extra_drives: Additional block devices [{path, readonly}]
@@ -594,6 +619,7 @@ async def qemu_boot(
     Returns: Boot log up to first prompt (or timeout).
     """
     return await qemu.boot(
+        project_root=project_root,
         gpu=gpu,
         network=network,
         extra_drives=extra_drives,
