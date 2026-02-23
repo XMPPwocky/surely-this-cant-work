@@ -69,5 +69,22 @@ fi
 # Lock acquired — write our info (truncate via path, not fd)
 echo "pid=$$ target=\"$INFO\" started=\"$(date '+%H:%M:%S')\" user=${USER:-unknown}" > "$LOCKFILE"
 
-# Run QEMU — lock held via fd 9 until process exits
-exec "$@"
+# Run QEMU as a background child so we can clean up on signal/exit.
+# Previously this used `exec "$@"`, but that replaces the script with QEMU,
+# leaving no parent to handle cleanup when the process tree is torn down
+# (e.g., Ctrl-C on `make test` where QEMU is on a separate PTY via expect).
+"$@" &
+QEMU_PID=$!
+
+# Kill QEMU when this script exits for any reason.
+# We must explicitly trap INT/TERM/HUP (not just EXIT) because bash only
+# interrupts `wait` for signals with explicit traps.  An untrapped SIGTERM
+# kills the script without running the EXIT handler.
+cleanup() { kill $QEMU_PID 2>/dev/null; wait $QEMU_PID 2>/dev/null; }
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
+trap 'cleanup'            EXIT
+
+# Wait for QEMU; lock (fd 9) is released when this script exits
+wait $QEMU_PID 2>/dev/null || true

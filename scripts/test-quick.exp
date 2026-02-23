@@ -8,6 +8,7 @@ log_user 1
 cd [file dirname [file dirname [file normalize [info script]]]]
 
 spawn make run-quick
+source [file dirname [info script]]/expect-cleanup.tcl
 
 # Wait for the serial shell prompt (may have timer ticks interleaved)
 expect {

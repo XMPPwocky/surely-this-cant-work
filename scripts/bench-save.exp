@@ -12,6 +12,7 @@ set baseline_file "bench-baseline.txt"
 set outfd [open $baseline_file w]
 
 spawn make run
+source [file dirname [info script]]/expect-cleanup.tcl
 
 expect {
     "rvos>" {}
