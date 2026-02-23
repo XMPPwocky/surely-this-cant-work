@@ -1972,14 +1972,14 @@ fn test_vfs_file_io_direct() -> Result<(), &'static str> {
 }
 
 fn test_vfs_longest_prefix() -> Result<(), &'static str> {
-    // /bin → ext2-blk0 (RO), /persist → ext2-blk1 (RW)
+    // /bin → ext2-bin (RO), /persist → ext2-persist (RW)
     // Verify both mounts are independently accessible and resolved
     // to different backends (different filesystems)
     let bin_meta = std::fs::metadata("/bin").map_err(|_| "stat /bin failed")?;
     assert_true(bin_meta.is_dir(), "/bin should be a directory")?;
     let persist_meta = std::fs::metadata("/persist").map_err(|_| "stat /persist failed")?;
     assert_true(persist_meta.is_dir(), "/persist should be a directory")?;
-    // /bin/hello exists on ext2-blk0 but not on ext2-blk1 (/persist)
+    // /bin/hello exists on ext2-bin but not on ext2-persist (/persist)
     let hello = std::fs::metadata("/bin/hello");
     assert_true(hello.is_ok(), "/bin/hello should exist")?;
     let persist_hello = std::fs::metadata("/persist/hello");

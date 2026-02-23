@@ -918,8 +918,8 @@ fn mount_ext2_filesystems(my_pid: usize) {
 
     // (ext2 service name, mount path, flags)
     let mounts: &[(&str, &str, u32)] = &[
-        ("ext2-blk0", "/bin", 1),     // MOUNT_RO
-        ("ext2-blk1", "/persist", 0), // RW
+        ("ext2-bin",     "/bin",     1), // MOUNT_RO
+        ("ext2-persist", "/persist", 0), // RW
     ];
 
     for &(svc_name, mount_path, flags) in mounts {

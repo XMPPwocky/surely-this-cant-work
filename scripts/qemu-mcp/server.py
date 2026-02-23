@@ -246,16 +246,17 @@ class QEMUInstance:
                 "-netdev", "tap,id=net0,ifname=rvos-tap0,script=no,downscript=no",
             ])
 
-        # Standard block devices (reverse order for MMIO slot assignment)
-        if self._persist_img.exists():
-            cmd.extend([
-                "-drive", f"file={self._persist_img},format=raw,id=blk1,if=none",
-                "-device", "virtio-blk-device,drive=blk1",
-            ])
+        # Standard block devices — serial= tags let the kernel identify
+        # drives regardless of MMIO probe order.
         if self._bin_img.exists():
             cmd.extend([
-                "-drive", f"file={self._bin_img},format=raw,id=blk0,if=none,readonly=on",
-                "-device", "virtio-blk-device,drive=blk0",
+                "-drive", f"file={self._bin_img},format=raw,id=hd-bin,if=none,readonly=on",
+                "-device", "virtio-blk-device,drive=hd-bin,serial=bin",
+            ])
+        if self._persist_img.exists():
+            cmd.extend([
+                "-drive", f"file={self._persist_img},format=raw,id=hd-persist,if=none",
+                "-device", "virtio-blk-device,drive=hd-persist,serial=persist",
             ])
 
         # Extra drives

@@ -20,18 +20,16 @@ QEMU_LOCK = scripts/qemu-lock.sh
 QEMU_NET = -device virtio-net-device,netdev=net0 -netdev tap,id=net0,ifname=rvos-tap0,script=no,downscript=no
 
 # VirtIO block devices: bin.img (RO), persist.img (RW)
-# NOTE: QEMU virt assigns MMIO slots high-to-low per command-line order,
-# but the kernel probes low-to-high.  List devices in REVERSE order so
-# that the first-listed drive gets the highest slot and the last-listed
-# drive gets the lowest slot (discovered first → blk0).
-QEMU_BLK = -drive file=persist.img,format=raw,id=blk1,if=none \
-           -device virtio-blk-device,drive=blk1 \
-           -drive file=bin.img,format=raw,id=blk0,if=none,readonly=on \
-           -device virtio-blk-device,drive=blk0
+# Each drive has a serial= tag so the kernel can identify it regardless of
+# MMIO probe order (QEMU virt assigns slots non-deterministically).
+QEMU_BLK = -drive file=bin.img,format=raw,id=hd-bin,if=none,readonly=on \
+           -device virtio-blk-device,drive=hd-bin,serial=bin \
+           -drive file=persist.img,format=raw,id=hd-persist,if=none \
+           -device virtio-blk-device,drive=hd-persist,serial=persist
 
 # For test: add a third drive (test.img, freshly mkfs'd)
-QEMU_BLK_TEST = -drive file=test.img,format=raw,id=blk2,if=none \
-           -device virtio-blk-device,drive=blk2 \
+QEMU_BLK_TEST = -drive file=test.img,format=raw,id=hd-test,if=none \
+           -device virtio-blk-device,drive=hd-test,serial=test \
            $(QEMU_BLK)
 
 # User-space binaries to include in bin.img (ext2 filesystem)
