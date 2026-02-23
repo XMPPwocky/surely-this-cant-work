@@ -73,7 +73,11 @@ echo "pid=$$ target=\"$INFO\" started=\"$(date '+%H:%M:%S')\" user=${USER:-unkno
 # Previously this used `exec "$@"`, but that replaces the script with QEMU,
 # leaving no parent to handle cleanup when the process tree is torn down
 # (e.g., Ctrl-C on `make test` where QEMU is on a separate PTY via expect).
-"$@" &
+# Explicit 0<&0 keeps stdin connected to the terminal.  Without it,
+# bash redirects a background job's stdin from /dev/null (POSIX rule
+# for async commands when job control is off), which silently breaks
+# QEMU's -serial mon:stdio input path.
+"$@" 0<&0 &
 QEMU_PID=$!
 
 # Kill QEMU when this script exits for any reason.
