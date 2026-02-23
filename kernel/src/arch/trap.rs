@@ -3,7 +3,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::csr;
 use crate::arch::sbi;
 
-const TIMER_INTERVAL: u64 = 1_000_000; // 100ms at 10MHz
+/// Timer tick interval, computed at boot from platform timebase frequency.
+/// Targets 100 ms ticks (frequency / 10).
+static mut TIMER_INTERVAL: u64 = 1_000_000; // default for 10 MHz
 
 /// Per-CPU preemption flag. Set by timer_tick(), checked by trap_handler()
 /// after handling the trap. If set, trap_handler calls preempt() to switch
@@ -187,14 +189,15 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
 /// `start_fp` should be the s0 register value from a trap frame,
 /// or the current s0 for a live backtrace.
 pub fn print_backtrace(start_fp: usize) {
-    const KERN_LO: usize = 0x8020_0000;
-    const KERN_HI: usize = 0x8800_0000;
+    extern "C" { static _text_start: u8; }
+    let kern_lo = unsafe { &_text_start as *const u8 as usize };
+    let kern_hi = crate::platform::ram_end();
     const MAX_DEPTH: usize = 32;
 
     crate::println!("  Backtrace:");
     let mut fp = start_fp;
     let mut depth = 0;
-    while (KERN_LO..KERN_HI).contains(&fp) && fp.is_multiple_of(8) && depth < MAX_DEPTH {
+    while (kern_lo..kern_hi).contains(&fp) && fp.is_multiple_of(8) && depth < MAX_DEPTH {
         let ra = unsafe { *((fp - 8) as *const usize) };
         let prev_fp = unsafe { *((fp - 16) as *const usize) };
         crate::println!("    #{}: ra={:#x} fp={:#x}", depth, ra, fp);
@@ -228,7 +231,8 @@ fn timer_tick() {
     unsafe {
         core::arch::asm!("rdtime {}", out(reg) time);
     }
-    sbi::sbi_set_timer(time + TIMER_INTERVAL);
+    let interval = unsafe { core::ptr::addr_of!(TIMER_INTERVAL).read_volatile() };
+    sbi::sbi_set_timer(time + interval);
 
     // Check for expired timer deadlines and wake blocked processes
     crate::task::check_deadlines(time);
@@ -241,7 +245,7 @@ fn external_interrupt() {
     let irq = plic::plic_claim();
     if irq != 0 {
         match irq {
-            10 => {
+            uart_irq if uart_irq == crate::platform::uart_irq() => {
                 crate::kstat::inc(&crate::kstat::IRQ_UART);
                 // UART: read all available chars, then push to TTY
                 let mut chars = [0u8; 16];
@@ -283,9 +287,7 @@ fn external_interrupt() {
                 for i in 0..blk_count {
                     if Some(other_irq) == crate::drivers::virtio::blk::irq_number(i) {
                         crate::kstat::inc(&crate::kstat::IRQ_VIRTIO_BLK);
-                        crate::drivers::virtio::blk::handle_irq(
-                            (other_irq - 1) as usize,
-                        );
+                        crate::drivers::virtio::blk::handle_irq(other_irq);
                         handled = true;
                         break;
                     }
@@ -309,6 +311,12 @@ pub fn init() {
 }
 
 pub fn enable_timer() {
+    // Compute timer interval from platform timebase frequency (100 ms ticks)
+    let freq = crate::platform::timebase_frequency();
+    let interval = freq / 10;
+    unsafe { core::ptr::addr_of_mut!(TIMER_INTERVAL).write_volatile(interval); }
+    crate::println!("Timer interval: {} ticks ({} Hz / 10)", interval, freq);
+
     crate::set_csr!("sie", 1 << 5); // STIE
     crate::set_csr!("sie", 1 << 9); // SEIE
     crate::set_csr!("sie", 1 << 1); // SSIE
@@ -317,7 +325,8 @@ pub fn enable_timer() {
     unsafe {
         core::arch::asm!("rdtime {}", out(reg) time);
     }
-    sbi::sbi_set_timer(time + TIMER_INTERVAL);
+    let interval = unsafe { core::ptr::addr_of!(TIMER_INTERVAL).read_volatile() };
+    sbi::sbi_set_timer(time + interval);
 
     csr::enable_interrupts();
     crate::println!("Interrupts enabled (timer + external + software)");

@@ -216,7 +216,7 @@ pub fn set_raw_mouse_wake_pid(pid: usize) {
 /// Safe to call from interrupt context where interrupts are already disabled
 /// and we are single-threaded on a single-hart system.
 pub fn raw_uart_putchar(ch: u8) {
-    let uart_base: *mut u8 = 0x1000_0000 as *mut u8;
+    let uart_base: *mut u8 = crate::platform::uart_base() as *mut u8;
     unsafe {
         // Wait for THR empty (LSR bit 5)
         while (uart_base.add(5).read_volatile() & (1 << 5)) == 0 {

@@ -203,15 +203,15 @@ fn send_cmd_in_buf(gpu: &mut Gpu, cmd_offset: usize, cmd_len: usize, resp_offset
 /// Initialise the VirtIO GPU.
 /// Returns true on success.
 pub fn init() -> bool {
-    let base = match mmio::probe(mmio::DEVICE_ID_GPU) {
-        Some(b) => b,
+    let (base, irq) = match mmio::probe(mmio::DEVICE_ID_GPU) {
+        Some(v) => v,
         None => {
             crate::println!("[gpu] No VirtIO GPU found");
             return false;
         }
     };
 
-    crate::println!("[gpu] Found VirtIO GPU at {:#x}", base);
+    crate::println!("[gpu] Found VirtIO GPU at {:#x} (IRQ {})", base, irq);
 
     if !mmio::init_device(base) {
         crate::println!("[gpu] Device init failed (features negotiation)");
@@ -226,9 +226,6 @@ pub fn init() -> bool {
 
     // Allocate a page for command/response DMA buffers
     let cmd_buf = alloc_dma_buffer(1);
-
-    // Compute IRQ: QEMU virt machine uses IRQ = 1 + slot
-    let irq = 1 + ((base - 0x1000_1000) / 0x1000) as u32;
 
     let mut gpu = Gpu {
         base,

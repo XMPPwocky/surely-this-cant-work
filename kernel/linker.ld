@@ -47,5 +47,3 @@ SECTIONS
         *(.eh_frame)
     }
 }
-
-PROVIDE(_memory_end = 0x88000000);

@@ -60,7 +60,7 @@ pub struct MmapRegion {
     pub shm_id: Option<usize>, // None = anonymous, Some(id) = SHM-backed
 }
 
-/// Read the RISC-V `rdtime` counter (10 MHz on QEMU virt).
+/// Read the RISC-V `rdtime` counter (frequency from platform::timebase_frequency()).
 #[inline(always)]
 pub fn rdtime() -> u64 {
     let t: u64;
@@ -527,6 +527,19 @@ impl Process {
 }
 
 /// Create a user page table with identity-mapped user pages.
+/// Identity-map device MMIO regions (UART, PLIC, CLINT, VirtIO) from platform info.
+fn map_device_regions(pt: &mut PageTable) -> Result<(), &'static str> {
+    let plat = crate::platform::info();
+    pt.map_range(plat.uart_base, plat.uart_base, PAGE_SIZE, PTE_R | PTE_W)?;
+    pt.map_range(plat.plic_base, plat.plic_base, plat.plic_size, PTE_R | PTE_W)?;
+    pt.map_range(plat.clint_base, plat.clint_base, plat.clint_size, PTE_R | PTE_W)?;
+    for i in 0..plat.virtio_mmio_count {
+        let base = plat.virtio_mmio[i].base;
+        pt.map_range(base, base, PAGE_SIZE, PTE_R | PTE_W)?;
+    }
+    Ok(())
+}
+
 /// All kernel memory is identity-mapped without U bit.
 /// User code and stack pages are identity-mapped WITH U bit at their
 /// physical addresses, so the same addresses work under both kernel
@@ -558,8 +571,11 @@ fn create_user_page_table_elf(
 
     let mut pt = PageTable::new()?;
 
+    let ram_base = crate::platform::ram_base();
+    let ram_end = crate::platform::ram_end();
+
     // Identity-map SBI region
-    pt.map_range(0x8000_0000, 0x8000_0000, text_start - 0x8000_0000, PTE_R | PTE_X)?;
+    pt.map_range(ram_base, ram_base, text_start - ram_base, PTE_R | PTE_X)?;
 
     // Identity-map kernel text as R+X (no U bit)
     pt.map_range(text_start, text_start, text_end - text_start, PTE_R | PTE_X)?;
@@ -583,7 +599,6 @@ fn create_user_page_table_elf(
     }
 
     let mut cursor = free_start;
-    let ram_end: usize = 0x8800_0000;
     for &(ex_start, ex_end) in &excludes {
         if cursor < ex_start {
             pt.map_range(cursor, cursor, ex_start - cursor, PTE_R | PTE_W)?;
@@ -596,17 +611,8 @@ fn create_user_page_table_elf(
         pt.map_range(cursor, cursor, ram_end - cursor, PTE_R | PTE_W)?;
     }
 
-    // Identity-map UART
-    pt.map_range(0x1000_0000, 0x1000_0000, PAGE_SIZE, PTE_R | PTE_W)?;
-
-    // Identity-map PLIC
-    pt.map_range(0x0C00_0000, 0x0C00_0000, 0x0400_0000, PTE_R | PTE_W)?;
-
-    // Identity-map CLINT
-    pt.map_range(0x0200_0000, 0x0200_0000, 0x0001_0000, PTE_R | PTE_W)?;
-
-    // Identity-map VirtIO
-    pt.map_range(0x1000_1000, 0x1000_1000, 0x0000_8000, PTE_R | PTE_W)?;
+    // Identity-map devices from platform info
+    map_device_regions(&mut pt)?;
 
     // Map user code pages at their original ELF VAs with U+R+W+X
     let base_vpn = base_va / PAGE_SIZE;
@@ -648,8 +654,11 @@ fn create_user_page_table_identity(
 
     let mut pt = PageTable::new()?;
 
+    let ram_base = crate::platform::ram_base();
+    let ram_end = crate::platform::ram_end();
+
     // Identity-map SBI region
-    pt.map_range(0x8000_0000, 0x8000_0000, text_start - 0x8000_0000, PTE_R | PTE_X)?;
+    pt.map_range(ram_base, ram_base, text_start - ram_base, PTE_R | PTE_X)?;
 
     // Identity-map kernel text as R+X (no U bit)
     pt.map_range(text_start, text_start, text_end - text_start, PTE_R | PTE_X)?;
@@ -660,10 +669,7 @@ fn create_user_page_table_identity(
     // Identity-map data + bss + stack as R+W (no U bit)
     pt.map_range(data_start, data_start, stack_top - data_start, PTE_R | PTE_W)?;
 
-    // Identity-map ALL free memory as R+W (no U bit).
-    // The user code/stack pages are allocated from this pool and will be
-    // re-mapped below with the U bit (the second map call will override).
-    // Actually, we need to skip the user pages to avoid double-mapping.
+    // Identity-map ALL free memory as R+W (no U bit), skipping user pages.
     let free_start = (stack_top + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
     // Compute ranges to skip (user code and stack physical pages)
@@ -680,7 +686,6 @@ fn create_user_page_table_identity(
 
     // Map free memory, skipping excluded ranges
     let mut cursor = free_start;
-    let ram_end: usize = 0x8800_0000;
     for &(ex_start, ex_end) in &excludes {
         if cursor < ex_start {
             pt.map_range(cursor, cursor, ex_start - cursor, PTE_R | PTE_W)?;
@@ -693,17 +698,8 @@ fn create_user_page_table_identity(
         pt.map_range(cursor, cursor, ram_end - cursor, PTE_R | PTE_W)?;
     }
 
-    // Identity-map UART
-    pt.map_range(0x1000_0000, 0x1000_0000, PAGE_SIZE, PTE_R | PTE_W)?;
-
-    // Identity-map PLIC
-    pt.map_range(0x0C00_0000, 0x0C00_0000, 0x0400_0000, PTE_R | PTE_W)?;
-
-    // Identity-map CLINT
-    pt.map_range(0x0200_0000, 0x0200_0000, 0x0001_0000, PTE_R | PTE_W)?;
-
-    // Identity-map VirtIO
-    pt.map_range(0x1000_1000, 0x1000_1000, 0x0000_8000, PTE_R | PTE_W)?;
+    // Identity-map devices from platform info
+    map_device_regions(&mut pt)?;
 
     // Identity-map user code pages with U+R+W+X at their physical address
     // (includes .text, .rodata, .data, .bss — all in the same contiguous region)

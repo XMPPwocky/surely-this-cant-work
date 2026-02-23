@@ -1,7 +1,8 @@
 use core::fmt;
 use crate::sync::SpinLock;
 
-const UART_BASE: usize = 0x1000_0000;
+/// Default base address (QEMU virt); overwritten from FDT at boot.
+const DEFAULT_BASE: usize = 0x1000_0000;
 
 // UART 16550 register offsets
 const RBR: usize = 0; // Receive Buffer Register (read)
@@ -85,8 +86,11 @@ impl fmt::Write for Uart {
     }
 }
 
-pub static UART: SpinLock<Uart> = SpinLock::new(Uart::new(UART_BASE));
+pub static UART: SpinLock<Uart> = SpinLock::new(Uart::new(DEFAULT_BASE));
 
 pub fn init() {
-    UART.lock().init();
+    let base = crate::platform::uart_base();
+    let mut uart = UART.lock();
+    *uart = Uart::new(base);
+    uart.init();
 }
