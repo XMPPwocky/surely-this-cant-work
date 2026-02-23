@@ -4,12 +4,14 @@ A from-scratch RISC-V 64-bit microkernel OS written in Rust, targeting qemu-syst
 
 ## Build & Run
 - `make build` — build kernel binary
-- `make run` — boot in QEMU with serial
-- `make run-gui` — boot with virtio-gpu display
+- `make run` — boot in QEMU with serial (**human use only** — needs interactive terminal)
+- `make run-gui` — boot with virtio-gpu display (**human use only**)
 - `make bench` — build and run benchmark suite (boots QEMU, runs /bin/bench, shuts down)
 - `make test-quick` — fast smoke test (~15s): core kernel tests, no child spawning or test.img. **Use this after code changes to confirm the system boots and core functionality works.**
 - `make test` — full test suite (~80 tests, 300s timeout), includes spawn/block device tests
-- `make debug` — QEMU with GDB attach
+- `make debug` — QEMU with GDB attach (**human use only**)
+- `make mcp-setup` — create Python venv for the QEMU MCP server
+- `make mcp-server` — start the QEMU MCP server (for agent interaction)
 
 ## Linting
 - `make clippy` — run clippy on all crates (kernel + user)
@@ -65,9 +67,34 @@ If you encounter a pre-existing issue, check `docs/bugs/open/` for an existing
 bug report first. If you can't find one, use the `/bug` skill to report it (in
 a subagent to keep context clean).
 
+## Interactive QEMU (MCP Server)
+For interactive debugging and exploratory testing, use the QEMU MCP server.
+It provides structured tools for booting QEMU, sending serial commands,
+taking screenshots, injecting input, and capturing network traffic.
+
+**When to use the MCP server** vs. other testing methods:
+- **`make test` / `make test-quick`**: Use for automated regression testing
+  ("does my change break anything?"). Prefer writing ktests for new features.
+- **MCP server**: Use for interactive debugging, exploratory testing, or
+  scenarios that need dynamic decision-making (e.g., "boot, check ps output,
+  then decide what to investigate based on what you see"). Also useful for
+  GUI testing (screenshots + input events) and network debugging (PCAP).
+- **Writing a ktest**: Prefer this over MCP interaction for "verify this new
+  feature works" — ktests are permanent, reproducible, and run in CI.
+
+**Important:** Even if you reproduce a bug using the MCP server, strongly
+consider writing a ktest afterwards once you understand how to reproduce it.
+Regression tests are critical — an MCP session is ephemeral but a ktest
+catches the bug forever.
+
 ## Testing Serial Console
-Use `expect` scripts for interactive testing — **never pipe stdin** to `make run`.
-See `docs/testing-serial.md`.
+**Agents: Do NOT use `make run`, `make run-gui`, or spawn QEMU directly.**
+These require an interactive terminal. For agent interaction with QEMU, use
+the MCP server tools (`qemu_boot`, `qemu_send`, etc.) described above.
+For scripted regression tests, use `make test` / `make test-quick` (expect scripts).
+
+For human-authored expect scripts, see `docs/testing-serial.md`.
+Never pipe stdin to `make run`.
 
 ## Key Addresses (QEMU virt)
 RAM_BASE: 0x80000000, KERNEL_BASE: 0x80200000, UART: 0x10000000,
