@@ -54,9 +54,9 @@ impl ClientState {
 }
 
 /// Per-open-file tracking.
-#[allow(dead_code)] // `inode` and `append` used in Step 13
 struct OpenFile {
     endpoint_handle: usize,
+    #[allow(dead_code)]
     inode: u32,
     active: bool,
     append: bool,
@@ -122,7 +122,6 @@ fn send_data_sentinel(ch: &Channel<FileResponseMsg, FileRequestMsg>) {
     let _ = ch.send(&FileResponse::Data { chunk: &[] });
 }
 
-#[allow(dead_code)]
 fn send_write_ok(ch: &Channel<FileResponseMsg, FileRequestMsg>, written: u32) {
     let _ = ch.send(&FileResponse::WriteOk { written });
 }
@@ -140,6 +139,28 @@ fn send_dir_sentinel(handle: usize) {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(&ReaddirResponse::End {}, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_blocking(handle, &msg);
+}
+
+// --- Path helpers ---
+
+/// Split a path into (parent, name). E.g., "/foo/bar" -> (b"/foo", b"bar").
+fn split_parent_name(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    if path.is_empty() || path[0] != b'/' {
+        return None;
+    }
+    // Find last '/'
+    let mut last_slash = 0;
+    for (i, &b) in path.iter().enumerate().skip(1) {
+        if b == b'/' {
+            last_slash = i;
+        }
+    }
+    if last_slash == 0 {
+        // Name is directly under root
+        Some((b"/", &path[1..]))
+    } else {
+        Some((&path[..last_slash], &path[last_slash + 1..]))
+    }
 }
 
 // --- FS operations ---
@@ -182,22 +203,50 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
     }
 
     let create = flags.bits & OpenFlags::CREATE.bits != 0;
+    let truncate = flags.bits & OpenFlags::TRUNCATE.bits != 0;
 
-    // Resolve the path
+    // Resolve the path — or create if needed
     let ino = match ext2::resolve_path(&ext2.sb, path, &mut ext2.cache, &ext2.blk) {
         Ok(ino) => ino,
         Err(_) => {
             if create && !ext2.read_only {
-                // TODO(step 13): Create file
-                send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+                // Create the file
+                let (parent_path, name) = match split_parent_name(path) {
+                    Some(p) => p,
+                    None => {
+                        send_error(client.ctl.as_ref().unwrap(), FsError::InvalidPath {});
+                        return;
+                    }
+                };
+                if name.is_empty() {
+                    send_error(client.ctl.as_ref().unwrap(), FsError::InvalidPath {});
+                    return;
+                }
+                let parent_ino = match ext2::resolve_path(&ext2.sb, parent_path, &mut ext2.cache, &ext2.blk) {
+                    Ok(ino) => ino,
+                    Err(_) => {
+                        send_error(client.ctl.as_ref().unwrap(), FsError::NotFound {});
+                        return;
+                    }
+                };
+                match ext2::create_file(&ext2.sb, parent_ino, name, &mut ext2.cache, &ext2.blk) {
+                    Ok(ino) => {
+                        ext2.cache.sync(&ext2.blk).ok();
+                        ino
+                    }
+                    Err(_) => {
+                        send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+                        return;
+                    }
+                }
+            } else {
+                send_error(client.ctl.as_ref().unwrap(), FsError::NotFound {});
                 return;
             }
-            send_error(client.ctl.as_ref().unwrap(), FsError::NotFound {});
-            return;
         }
     };
 
-    let inode = match ext2::read_inode(&ext2.sb, ino, &mut ext2.cache, &ext2.blk) {
+    let mut inode = match ext2::read_inode(&ext2.sb, ino, &mut ext2.cache, &ext2.blk) {
         Ok(i) => i,
         Err(_) => {
             send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
@@ -208,6 +257,18 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
     if inode.is_dir() {
         send_error(client.ctl.as_ref().unwrap(), FsError::NotAFile {});
         return;
+    }
+
+    // Handle truncate
+    if truncate && !ext2.read_only && inode.size > 0 {
+        inode.size = 0;
+        inode.i_blocks = 0;
+        inode.blocks = [0u32; 15];
+        if ext2::write_inode(&ext2.sb, ino, &inode, &mut ext2.cache, &ext2.blk).is_err() {
+            send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+            return;
+        }
+        ext2.cache.sync(&ext2.blk).ok();
     }
 
     // Close existing file channel for this client
@@ -317,22 +378,83 @@ fn do_readdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path
     send_dir_sentinel(raw_handle);
 }
 
-fn do_delete(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, _path: &[u8]) {
+fn do_delete(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path: &[u8]) {
     if ext2.read_only {
         send_error(ch, FsError::Io {});
         return;
     }
-    // TODO(step 13): Implement delete
-    send_error(ch, FsError::Io {});
+    let (parent_path, name) = match split_parent_name(path) {
+        Some(p) => p,
+        None => {
+            send_error(ch, FsError::InvalidPath {});
+            return;
+        }
+    };
+    if name.is_empty() {
+        send_error(ch, FsError::InvalidPath {});
+        return;
+    }
+    let parent_ino = match ext2::resolve_path(&ext2.sb, parent_path, &mut ext2.cache, &ext2.blk) {
+        Ok(ino) => ino,
+        Err(_) => {
+            send_error(ch, FsError::NotFound {});
+            return;
+        }
+    };
+    match ext2::unlink(&ext2.sb, parent_ino, name, &mut ext2.cache, &ext2.blk) {
+        Ok(()) => {
+            ext2.cache.sync(&ext2.blk).ok();
+            let _ = ch.send(&FsResponse::Ok {
+                kind: FsEntryKind::File {},
+                size: 0,
+            });
+        }
+        Err(_) => {
+            send_error(ch, FsError::Io {});
+        }
+    }
 }
 
-fn do_mkdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, _path: &[u8]) {
+fn do_mkdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path: &[u8]) {
     if ext2.read_only {
         send_error(ch, FsError::Io {});
         return;
     }
-    // TODO(step 13): Implement mkdir
-    send_error(ch, FsError::Io {});
+    // Check if it already exists
+    if ext2::resolve_path(&ext2.sb, path, &mut ext2.cache, &ext2.blk).is_ok() {
+        send_error(ch, FsError::AlreadyExists {});
+        return;
+    }
+    let (parent_path, name) = match split_parent_name(path) {
+        Some(p) => p,
+        None => {
+            send_error(ch, FsError::InvalidPath {});
+            return;
+        }
+    };
+    if name.is_empty() {
+        send_error(ch, FsError::InvalidPath {});
+        return;
+    }
+    let parent_ino = match ext2::resolve_path(&ext2.sb, parent_path, &mut ext2.cache, &ext2.blk) {
+        Ok(ino) => ino,
+        Err(_) => {
+            send_error(ch, FsError::NotFound {});
+            return;
+        }
+    };
+    match ext2::create_dir(&ext2.sb, parent_ino, name, &mut ext2.cache, &ext2.blk) {
+        Ok(_) => {
+            ext2.cache.sync(&ext2.blk).ok();
+            let _ = ch.send(&FsResponse::Ok {
+                kind: FsEntryKind::Directory {},
+                size: 0,
+            });
+        }
+        Err(_) => {
+            send_error(ch, FsError::Io {});
+        }
+    }
 }
 
 fn handle_file_read(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequestMsg>, inode_num: u32, offset: FileOffset, len: u32) {
@@ -399,13 +521,56 @@ fn handle_file_read(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequ
     }
 }
 
-fn handle_file_write(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequestMsg>, _inode_num: u32, _offset: FileOffset, _data: &[u8]) {
+fn handle_file_write(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileRequestMsg>, inode_num: u32, offset: FileOffset, data: &[u8]) {
     if ext2.read_only {
         send_file_error(ch, FsError::Io {});
         return;
     }
-    // TODO(step 13): Implement write
-    send_file_error(ch, FsError::Io {});
+
+    let handle = ch.raw_handle();
+
+    let mut inode = match ext2::read_inode(&ext2.sb, inode_num, &mut ext2.cache, &ext2.blk) {
+        Ok(i) => i,
+        Err(_) => {
+            send_file_error(ch, FsError::Io {});
+            return;
+        }
+    };
+
+    // Determine write offset
+    let write_offset = match offset {
+        FileOffset::Explicit { offset: off } => off,
+        FileOffset::Stream {} => {
+            let of = ext2.get_open_file_mut(handle);
+            match of {
+                Some(of) if of.append => inode.size,
+                Some(of) => of.position as u64,
+                None => inode.size,
+            }
+        }
+    };
+
+    let written = match ext2::write_data(&ext2.sb, &mut inode, write_offset, data, &mut ext2.cache, &ext2.blk) {
+        Ok(n) => n,
+        Err(_) => {
+            send_file_error(ch, FsError::Io {});
+            return;
+        }
+    };
+
+    // Write back the inode
+    if ext2::write_inode(&ext2.sb, inode_num, &inode, &mut ext2.cache, &ext2.blk).is_err() {
+        send_file_error(ch, FsError::Io {});
+        return;
+    }
+    ext2.cache.sync(&ext2.blk).ok();
+
+    // Update stream position
+    if let Some(of) = ext2.get_open_file_mut(handle) {
+        of.position = write_offset as usize + written;
+    }
+
+    send_write_ok(ch, written as u32);
 }
 
 fn close_client_file(ext2: &mut Ext2State, client: &mut ClientState) {
