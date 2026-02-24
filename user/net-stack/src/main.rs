@@ -1902,16 +1902,12 @@ fn send_sock_error(handle: usize, code: SocketError, msg: &mut Message) -> bool 
 }
 
 /// Allocate an ephemeral port (49152..65535) that isn't in use.
-fn alloc_ephemeral_port(sockets: &[Socket; MAX_SOCKETS]) -> u16 {
-    static mut NEXT_EPHEMERAL: u16 = 49152;
+fn alloc_ephemeral_port(sockets: &[Socket; MAX_SOCKETS], next_ephemeral: &mut u16) -> u16 {
     for _ in 0..1000 {
-        let port = unsafe {
-            let p = NEXT_EPHEMERAL;
-            NEXT_EPHEMERAL = if p >= 65534 { 49152 } else { p + 1 };
-            p
-        };
-        if !sockets.iter().any(|s| s.active && s.port == port) {
-            return port;
+        let p = *next_ephemeral;
+        *next_ephemeral = if p >= 65534 { 49152 } else { p + 1 };
+        if !sockets.iter().any(|s| s.active && s.port == p) {
+            return p;
         }
     }
     0 // shouldn't happen with 16K range and 16 sockets
@@ -1948,6 +1944,7 @@ fn handle_client_message(
     interfaces: &mut [Interface; MAX_INTERFACES],
     now: u64,
     tx: &mut TxScratch,
+    next_ephemeral: &mut u16,
 ) {
     let req = match rvos_wire::from_bytes::<SocketRequest<'_>>(&msg.data[..msg.len]) {
         Ok(r) => r,
@@ -2115,7 +2112,7 @@ fn handle_client_message(
             let src_port = sockets[sock_idx].port;
             // Auto-assign ephemeral port if not bound
             let src_port = if src_port == 0 {
-                let p = alloc_ephemeral_port(sockets);
+                let p = alloc_ephemeral_port(sockets, next_ephemeral);
                 sockets[sock_idx].port = p;
                 p
             } else {
@@ -2826,6 +2823,7 @@ fn main() {
 
     // 5. Initialize state
     let mut sockets = [const { Socket::new() }; MAX_SOCKETS];
+    let mut next_ephemeral: u16 = 49152;
     let mut tcp_conns: Box<TcpConns> = {
         let layout = alloc::alloc::Layout::new::<TcpConns>();
         let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut TcpConns };
@@ -3063,6 +3061,7 @@ fn main() {
                     &mut interfaces,
                     now,
                     &mut tx,
+                    &mut next_ephemeral,
                 );
             }
         }
