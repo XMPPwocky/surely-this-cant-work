@@ -49,7 +49,7 @@ impl BlkClient {
             return Err("no SHM cap in DeviceInfo");
         }
 
-        let resp: BlkResponse = rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
+        let resp: BlkResponse<'_> = rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
             .map_err(|_| {
                 raw::sys_chan_close(handle);
                 raw::sys_chan_close(shm_cap);
@@ -57,7 +57,7 @@ impl BlkClient {
             })?;
 
         let (capacity_sectors, sector_size, read_only) = match resp {
-            BlkResponse::DeviceInfo { capacity_sectors, sector_size, read_only } => {
+            BlkResponse::DeviceInfo { capacity_sectors, sector_size, read_only, .. } => {
                 (capacity_sectors, sector_size, read_only != 0)
             }
             _ => {
@@ -85,8 +85,9 @@ impl BlkClient {
         })
     }
 
-    /// Send a request and receive a response.
-    fn request(&self, req: &BlkRequest) -> Result<BlkResponse, &'static str> {
+    /// Send a request and receive Ok/Error response.
+    /// Returns Ok(()) on BlkResponse::Ok, Err(code) on BlkResponse::Error.
+    fn request(&self, req: &BlkRequest) -> Result<(), u32> {
         let mut msg = Message::new();
         msg.len = rvos_wire::to_bytes(req, &mut msg.data).unwrap_or(0);
         raw::sys_chan_send_blocking(self.handle, &msg);
@@ -94,11 +95,16 @@ impl BlkClient {
         let mut resp_msg = Message::new();
         let ret = raw::sys_chan_recv_blocking(self.handle, &mut resp_msg);
         if ret != 0 {
-            return Err("recv blk response failed");
+            return Err(u32::MAX); // recv failed
         }
 
-        rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
-            .map_err(|_| "decode blk response failed")
+        let resp: BlkResponse<'_> = rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
+            .map_err(|_| u32::MAX)?;
+        match resp {
+            BlkResponse::Ok {} => Ok(()),
+            BlkResponse::Error { code } => Err(code),
+            _ => Err(u32::MAX),
+        }
     }
 
     /// Read `count` sectors starting at `sector` into `buf`.
@@ -112,28 +118,21 @@ impl BlkClient {
             return Err("too many sectors for single I/O");
         }
 
-        let resp = self.request(&BlkRequest::Read { sector, count, shm_offset: 0 })?;
-        match resp {
-            BlkResponse::Ok {} => {
-                // Copy from SHM to caller's buffer
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        self.shm_addr as *const u8,
-                        buf.as_mut_ptr(),
-                        byte_len,
-                    );
-                }
-                Ok(())
-            }
-            BlkResponse::Error { code } => {
-                Err(match code {
-                    22 => "read: out of bounds",
-                    5 => "read: I/O error",
-                    _ => "read: unknown error",
-                })
-            }
-            _ => Err("read: unexpected response"),
+        self.request(&BlkRequest::Read { sector, count, shm_offset: 0 })
+            .map_err(|code| match code {
+                22 => "read: out of bounds",
+                5 => "read: I/O error",
+                _ => "read: unknown error",
+            })?;
+        // Copy from SHM to caller's buffer
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.shm_addr as *const u8,
+                buf.as_mut_ptr(),
+                byte_len,
+            );
         }
+        Ok(())
     }
 
     /// Write `count` sectors starting at `sector` from `buf`.
@@ -156,19 +155,13 @@ impl BlkClient {
             );
         }
 
-        let resp = self.request(&BlkRequest::Write { sector, count, shm_offset: 0 })?;
-        match resp {
-            BlkResponse::Ok {} => Ok(()),
-            BlkResponse::Error { code } => {
-                Err(match code {
-                    30 => "write: read-only device",
-                    22 => "write: out of bounds",
-                    5 => "write: I/O error",
-                    _ => "write: unknown error",
-                })
-            }
-            _ => Err("write: unexpected response"),
-        }
+        self.request(&BlkRequest::Write { sector, count, shm_offset: 0 })
+            .map_err(|code| match code {
+                30 => "write: read-only device",
+                22 => "write: out of bounds",
+                5 => "write: I/O error",
+                _ => "write: unknown error",
+            })
     }
 
     /// Read a single block (ext2 block = `block_size` bytes, typically 1024 or 4096).
@@ -187,14 +180,9 @@ impl BlkClient {
     }
 
     /// Flush any cached writes to stable storage.
-    #[allow(dead_code)] // Used in Step 13 (RW operations)
     pub fn flush(&self) -> Result<(), &'static str> {
-        let resp = self.request(&BlkRequest::Flush {})?;
-        match resp {
-            BlkResponse::Ok {} => Ok(()),
-            BlkResponse::Error { .. } => Err("flush failed"),
-            _ => Err("flush: unexpected response"),
-        }
+        self.request(&BlkRequest::Flush {})
+            .map_err(|_| "flush failed")
     }
 }
 

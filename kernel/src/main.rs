@@ -273,17 +273,27 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
     }
     task::spawn_named(services::timer::timer_service, "timer").expect("boot: timer");
 
-    // ext2-server instances (one per block device, service + boot + control channels).
-    // Only mount the first 2 devices (bin.img + persist.img); additional devices
-    // (e.g., test.img) are left available for direct block-level access by ktest.
-    let ext2_count = blk_count.min(2);
-    for i in 0..ext2_count {
-        let (svc_name, proc_name): (&str, &str) = match i {
-            0 => ("ext2-blk0", "ext2-blk0"),
-            1 => ("ext2-blk1", "ext2-blk1"),
-            2 => ("ext2-blk2", "ext2-blk2"),
-            3 => ("ext2-blk3", "ext2-blk3"),
-            _ => continue,
+    // ext2-server instances — one per known filesystem, identified by VirtIO serial.
+    // Devices not matching a known serial (e.g., "test") are left for direct
+    // block-level access by ktest.
+    //
+    // Table: (serial, service_name, process_name)
+    let ext2_mounts: &[(&[u8], &str, &str)] = &[
+        (b"bin",     "ext2-bin",     "ext2-bin"),
+        (b"persist", "ext2-persist", "ext2-persist"),
+    ];
+
+    for &(serial, svc_name, proc_name) in ext2_mounts {
+        // Find the block device with this serial
+        let dev_idx = (0..blk_count).find(|&i| {
+            drivers::virtio::blk::serial(i) == serial
+        });
+        let dev_idx = match dev_idx {
+            Some(i) => i,
+            None => {
+                println!("[boot] no block device with serial {:?}, skipping {}", core::str::from_utf8(serial).unwrap_or("?"), svc_name);
+                continue;
+            }
         };
 
         // Service control channel
@@ -294,10 +304,10 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
         let (ext2_boot_a, ext2_boot_b) = ipc::channel_create_pair().expect("boot: ext2-boot channel");
 
         // Args: "ext2-server\0blkN[\0ro]"
-        let blk_name: &[u8] = match i {
+        let blk_name: &[u8] = match dev_idx {
             0 => b"blk0", 1 => b"blk1", 2 => b"blk2", 3 => b"blk3", _ => b"blk?",
         };
-        let is_ro = drivers::virtio::blk::is_read_only(i);
+        let is_ro = drivers::virtio::blk::is_read_only(dev_idx);
         let mut args = [0u8; 32];
         let mut al = 0;
         let prog = b"ext2-server";

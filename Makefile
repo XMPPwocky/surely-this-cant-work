@@ -20,33 +20,30 @@ QEMU_LOCK = scripts/qemu-lock.sh
 QEMU_NET = -device virtio-net-device,netdev=net0 -netdev tap,id=net0,ifname=rvos-tap0,script=no,downscript=no
 
 # VirtIO block devices: bin.img (RO), persist.img (RW)
-# NOTE: QEMU virt assigns MMIO slots high-to-low per command-line order,
-# but the kernel probes low-to-high.  List devices in REVERSE order so
-# that the first-listed drive gets the highest slot and the last-listed
-# drive gets the lowest slot (discovered first → blk0).
-QEMU_BLK = -drive file=persist.img,format=raw,id=blk1,if=none \
-           -device virtio-blk-device,drive=blk1 \
-           -drive file=bin.img,format=raw,id=blk0,if=none,readonly=on \
-           -device virtio-blk-device,drive=blk0
+# Each drive has a serial= tag so the kernel can identify it regardless of
+# MMIO probe order (QEMU virt assigns slots non-deterministically).
+QEMU_BLK = -drive file=bin.img,format=raw,id=hd-bin,if=none,readonly=on \
+           -device virtio-blk-device,drive=hd-bin,serial=bin \
+           -drive file=persist.img,format=raw,id=hd-persist,if=none \
+           -device virtio-blk-device,drive=hd-persist,serial=persist
 
-# For test: add a third drive (test.img, freshly mkfs'd)
-QEMU_BLK_TEST = -drive file=test.img,format=raw,id=blk2,if=none \
-           -device virtio-blk-device,drive=blk2 \
-           $(QEMU_BLK)
+# For test: add a third drive (test.img, freshly mkfs'd).
+# test.img must be declared AFTER the standard drives so it gets the
+# highest blk index (QEMU assigns MMIO slots in reverse declaration order,
+# and the kernel probes high-to-low, so last-declared = highest index).
+QEMU_BLK_TEST = $(QEMU_BLK) \
+           -drive file=test.img,format=raw,id=hd-test,if=none \
+           -device virtio-blk-device,drive=hd-test,serial=test
 
 # User-space binaries to include in bin.img (ext2 filesystem)
 EXT2_BINS = hello winclient ipc-torture fbcon triangle gui-bench dbg \
             net-stack udp-echo window-server bench tcp-echo nc ktest ktest-helper shell
 
-.PHONY: build build-user build-fs build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images mcp-setup mcp-server
+.PHONY: build build-user build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images mcp-setup mcp-server
 
-# Build all user crates except fs (which embeds the others via include_bytes!)
+# Build all user-space crates
 build-user:
-	$(USER_CARGO) build --release $(USER_MANIFEST) $(USER_TARGET) --workspace --exclude fs
-
-# fs embeds user binaries via include_bytes!, so build the rest first
-build-fs: build-user
-	$(USER_CARGO) build --release $(USER_MANIFEST) $(USER_TARGET) -p fs
+	$(USER_CARGO) build --release $(USER_MANIFEST) $(USER_TARGET) --workspace
 
 # Rebuild the rvOS std library + clippy via x.py.
 # Run after modifying vendor/rust/library/ or lib/rvos-wire/ or lib/rvos-proto/.
@@ -98,7 +95,7 @@ test.img:
 # Build all disk images
 disk-images: bin.img persist.img
 
-build: build-fs disk-images
+build: build-user disk-images
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml \
 		--target riscv64gc-unknown-none-elf $(BUILD_STD)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)

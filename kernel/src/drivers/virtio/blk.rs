@@ -13,6 +13,10 @@ use super::queue::{Virtqueue, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE, alloc_dma_b
 const VIRTIO_BLK_T_IN: u32 = 0;   // read
 const VIRTIO_BLK_T_OUT: u32 = 1;  // write
 const VIRTIO_BLK_T_FLUSH: u32 = 4;
+const VIRTIO_BLK_T_GET_ID: u32 = 8;
+
+/// VirtIO block device serial/ID length.
+const VIRTIO_BLK_ID_BYTES: usize = 20;
 
 const VIRTIO_BLK_S_OK: u8 = 0;
 
@@ -49,6 +53,9 @@ struct BlkDevice {
     status_buf: usize,
     /// DMA buffer for data transfer (8 pages = 32 KB).
     data_buf: usize,
+    /// Device serial/ID string (from VIRTIO_BLK_T_GET_ID), NUL-terminated.
+    serial: [u8; VIRTIO_BLK_ID_BYTES],
+    serial_len: usize,
 }
 
 static mut DEVICES: [Option<BlkDevice>; MAX_BLK_DEVICES] = [const { None }; MAX_BLK_DEVICES];
@@ -70,13 +77,15 @@ pub fn init() -> usize {
         }
         let (base, irq) = result.entries[i];
         if let Some(dev) = init_one(base, irq) {
+            let serial_str = core::str::from_utf8(&dev.serial[..dev.serial_len]).unwrap_or("?");
             crate::println!(
-                "[blk] blk{}: {} sectors ({}), {}{}",
+                "[blk] blk{}: {} sectors ({}), {}{} serial=\"{}\"",
                 count,
                 dev.capacity_sectors,
                 format_size(dev.capacity_sectors * SECTOR_SIZE as u64),
                 if dev.read_only { "RO" } else { "RW" },
                 if dev.has_flush { " +flush" } else { "" },
+                serial_str,
             );
             unsafe {
                 core::ptr::addr_of_mut!(DEVICES[count]).write(Some(dev));
@@ -140,7 +149,7 @@ fn init_one(base: usize, irq: u32) -> Option<BlkDevice> {
     // Enable IRQ in PLIC
     crate::drivers::plic::enable_irq(irq);
 
-    Some(BlkDevice {
+    let mut dev = BlkDevice {
         base,
         irq,
         requestq,
@@ -150,7 +159,14 @@ fn init_one(base: usize, irq: u32) -> Option<BlkDevice> {
         outhdr_buf,
         status_buf,
         data_buf,
-    })
+        serial: [0u8; VIRTIO_BLK_ID_BYTES],
+        serial_len: 0,
+    };
+
+    // Read serial/ID before interrupts and scheduler are enabled
+    read_serial_into(&mut dev);
+
+    Some(dev)
 }
 
 /// Perform the VirtIO device handshake, negotiating F_RO and F_FLUSH.
@@ -421,6 +437,62 @@ pub fn flush(idx: usize) -> bool {
 
     let status = unsafe { (dev.status_buf as *const u8).read_volatile() };
     status == VIRTIO_BLK_S_OK
+}
+
+/// Read the device serial via VIRTIO_BLK_T_GET_ID and store it in the device.
+/// Called during init_one() at boot — uses spin polling (no wfi) since
+/// interrupts may not be fully configured yet.
+fn read_serial_into(dev: &mut BlkDevice) {
+    write_outhdr(dev.outhdr_buf, VIRTIO_BLK_T_GET_ID, 0);
+
+    unsafe { (dev.status_buf as *mut u8).write_volatile(0xFF); }
+    unsafe {
+        core::ptr::write_bytes(dev.data_buf as *mut u8, 0, VIRTIO_BLK_ID_BYTES);
+    }
+
+    let d0 = dev.requestq.alloc_desc().expect("blk: no desc for get_id outhdr");
+    let d1 = dev.requestq.alloc_desc().expect("blk: no desc for get_id data");
+    let d2 = dev.requestq.alloc_desc().expect("blk: no desc for get_id status");
+
+    dev.requestq.write_desc(d0, dev.outhdr_buf as u64, OUTHDR_SIZE as u32, VIRTQ_DESC_F_NEXT, d1);
+    dev.requestq.write_desc(d1, dev.data_buf as u64, VIRTIO_BLK_ID_BYTES as u32, VIRTQ_DESC_F_WRITE | VIRTQ_DESC_F_NEXT, d2);
+    dev.requestq.write_desc(d2, dev.status_buf as u64, 1, VIRTQ_DESC_F_WRITE, 0);
+
+    dev.requestq.push_avail(d0);
+    dev.requestq.notify(dev.base, 0);
+
+    // Spin-poll for completion (no wfi — interrupts not yet configured at boot)
+    loop {
+        if let Some((head, _len)) = dev.requestq.pop_used() {
+            dev.requestq.free_chain(head);
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    let status = unsafe { (dev.status_buf as *const u8).read_volatile() };
+    if status != VIRTIO_BLK_S_OK {
+        return;
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            dev.data_buf as *const u8,
+            dev.serial.as_mut_ptr(),
+            VIRTIO_BLK_ID_BYTES,
+        );
+    }
+    dev.serial_len = dev.serial.iter().position(|&b| b == 0).unwrap_or(VIRTIO_BLK_ID_BYTES);
+}
+
+/// Return the serial/ID string for device `idx` (trimmed of NULs).
+pub fn serial(idx: usize) -> &'static [u8] {
+    unsafe {
+        match (*core::ptr::addr_of!(DEVICES[idx])).as_ref() {
+            Some(dev) => &dev.serial[..dev.serial_len],
+            None => b"",
+        }
+    }
 }
 
 /// Handle a block device IRQ for the given MMIO slot.

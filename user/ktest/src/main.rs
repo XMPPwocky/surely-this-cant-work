@@ -1666,7 +1666,7 @@ fn blk_connect(name: &str) -> Result<(usize, usize, usize, u64, bool), &'static 
         return Err("no SHM cap in DeviceInfo");
     }
 
-    let resp: BlkResponse = match rvos::rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len]) {
+    let resp: BlkResponse<'_> = match rvos::rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len]) {
         Ok(r) => r,
         Err(_) => {
             raw::sys_chan_close(handle);
@@ -1698,20 +1698,72 @@ fn blk_connect(name: &str) -> Result<(usize, usize, usize, u64, bool), &'static 
     Ok((handle, shm_addr, shm_cap, capacity, read_only))
 }
 
-/// Send a BlkRequest and receive a BlkResponse.
-fn blk_request(handle: usize, req: &rvos_proto::blk::BlkRequest) -> Result<rvos_proto::blk::BlkResponse, &'static str> {
+/// Find the blk service name whose VirtIO serial matches `target_serial`.
+/// Tries devices in reverse order (highest index first) because lower-indexed
+/// devices may already have ext2-server clients connected, and connecting
+/// to a busy blk_server would block until that client disconnects.
+fn blk_find_by_serial(target_serial: &[u8]) -> Result<&'static str, &'static str> {
+    use rvos_proto::blk::{BlkRequest, BlkResponse};
+    const NAMES: &[&str] = &["blk3", "blk2", "blk1", "blk0"];
+
+    for &name in NAMES {
+        let svc = match rvos::connect_to_service(name) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let handle = svc.into_raw_handle();
+
+        let req = BlkRequest::GetDeviceInfo {};
+        let mut msg = Message::new();
+        msg.len = rvos::rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+        raw::sys_chan_send_blocking(handle, &msg);
+
+        let mut resp_msg = Message::new();
+        let ret = raw::sys_chan_recv_blocking(handle, &mut resp_msg);
+        // Close SHM cap if present, then close the connection
+        if resp_msg.caps[0] != NO_CAP {
+            raw::sys_chan_close(resp_msg.caps[0]);
+        }
+        raw::sys_chan_close(handle);
+
+        if ret != 0 { continue; }
+
+        if let Ok(BlkResponse::DeviceInfo { serial, .. }) =
+            rvos::rvos_wire::from_bytes::<BlkResponse<'_>>(&resp_msg.data[..resp_msg.len])
+        {
+            if serial == target_serial {
+                return Ok(name);
+            }
+        }
+    }
+    Err("no blk device with matching serial")
+}
+
+/// Send a BlkRequest and receive the raw response into caller-owned message.
+/// Returns the response message; caller must deserialize.
+fn blk_request_raw(handle: usize, req: &rvos_proto::blk::BlkRequest, resp_msg: &mut Message) -> Result<(), &'static str> {
     let mut msg = Message::new();
     msg.len = rvos::rvos_wire::to_bytes(req, &mut msg.data).unwrap_or(0);
     raw::sys_chan_send_blocking(handle, &msg);
 
-    let mut resp_msg = Message::new();
-    let ret = raw::sys_chan_recv_blocking(handle, &mut resp_msg);
+    let ret = raw::sys_chan_recv_blocking(handle, resp_msg);
     if ret != 0 {
         return Err("recv blk response failed");
     }
+    Ok(())
+}
 
-    rvos::rvos_wire::from_bytes(&resp_msg.data[..resp_msg.len])
-        .map_err(|_| "decode blk response failed")
+/// Send a BlkRequest expecting Ok/Error response (no borrowed data).
+/// Returns true for Ok, false for Error.
+fn blk_request_ok(handle: usize, req: &rvos_proto::blk::BlkRequest) -> Result<bool, &'static str> {
+    use rvos_proto::blk::BlkResponse;
+    let mut resp_msg = Message::new();
+    blk_request_raw(handle, req, &mut resp_msg)?;
+    match rvos::rvos_wire::from_bytes::<BlkResponse>(&resp_msg.data[..resp_msg.len]) {
+        Ok(BlkResponse::Ok { .. }) => Ok(true),
+        Ok(BlkResponse::Error { .. }) => Ok(false),
+        _ => Err("unexpected blk response"),
+    }
 }
 
 /// Clean up a block device connection.
@@ -1722,8 +1774,8 @@ fn blk_cleanup(handle: usize, shm_addr: usize, shm_cap: usize) {
 }
 
 fn test_blk_device_info() -> Result<(), &'static str> {
-    // Use blk2 (test drive) — blk0/blk1 are occupied by ext2-server
-    let (handle, shm_addr, shm_cap, capacity, _read_only) = blk_connect("blk2")?;
+    let test_svc = blk_find_by_serial(b"test")?;
+    let (handle, shm_addr, shm_cap, capacity, _read_only) = blk_connect(test_svc)?;
     assert_true(capacity > 0, "capacity should be > 0")?;
     // 4 MB = 8192 sectors of 512 bytes
     assert_eq(capacity as usize, 8192, "capacity should be 8192 sectors (4MB)")?;
@@ -1732,9 +1784,10 @@ fn test_blk_device_info() -> Result<(), &'static str> {
 }
 
 fn test_blk_read_write() -> Result<(), &'static str> {
-    use rvos_proto::blk::{BlkRequest, BlkResponse};
+    use rvos_proto::blk::BlkRequest;
 
-    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect("blk2")?;
+    let test_svc = blk_find_by_serial(b"test")?;
+    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect(test_svc)?;
 
     // Write a test pattern to sector near the end
     let test_sector = capacity - 2;
@@ -1752,13 +1805,9 @@ fn test_blk_read_write() -> Result<(), &'static str> {
     }
 
     // Write 1 sector
-    let resp = blk_request(handle, &BlkRequest::Write { sector: test_sector, count: 1, shm_offset: 0 })?;
-    match resp {
-        BlkResponse::Ok {} => {}
-        _ => {
-            blk_cleanup(handle, shm_addr, shm_cap);
-            return Err("write failed");
-        }
+    if !blk_request_ok(handle, &BlkRequest::Write { sector: test_sector, count: 1, shm_offset: 0 })? {
+        blk_cleanup(handle, shm_addr, shm_cap);
+        return Err("write failed");
     }
 
     // Clear SHM
@@ -1767,13 +1816,9 @@ fn test_blk_read_write() -> Result<(), &'static str> {
     }
 
     // Read back
-    let resp = blk_request(handle, &BlkRequest::Read { sector: test_sector, count: 1, shm_offset: 0 })?;
-    match resp {
-        BlkResponse::Ok {} => {}
-        _ => {
-            blk_cleanup(handle, shm_addr, shm_cap);
-            return Err("read failed");
-        }
+    if !blk_request_ok(handle, &BlkRequest::Read { sector: test_sector, count: 1, shm_offset: 0 })? {
+        blk_cleanup(handle, shm_addr, shm_cap);
+        return Err("read failed");
     }
 
     // Verify pattern
@@ -1790,9 +1835,10 @@ fn test_blk_read_write() -> Result<(), &'static str> {
 }
 
 fn test_blk_multi_sector() -> Result<(), &'static str> {
-    use rvos_proto::blk::{BlkRequest, BlkResponse};
+    use rvos_proto::blk::BlkRequest;
 
-    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect("blk2")?;
+    let test_svc = blk_find_by_serial(b"test")?;
+    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect(test_svc)?;
 
     // Write 8 consecutive sectors (4096 bytes) starting at sector 16
     let count: u32 = 8;
@@ -1803,25 +1849,17 @@ fn test_blk_multi_sector() -> Result<(), &'static str> {
         unsafe { *((shm_addr + i) as *mut u8) = ((i * 3) & 0xFF) as u8; }
     }
 
-    let resp = blk_request(handle, &BlkRequest::Write { sector: 16, count, shm_offset: 0 })?;
-    match resp {
-        BlkResponse::Ok {} => {}
-        _ => {
-            blk_cleanup(handle, shm_addr, shm_cap);
-            return Err("multi-sector write failed");
-        }
+    if !blk_request_ok(handle, &BlkRequest::Write { sector: 16, count, shm_offset: 0 })? {
+        blk_cleanup(handle, shm_addr, shm_cap);
+        return Err("multi-sector write failed");
     }
 
     // Clear SHM and read back
     unsafe { core::ptr::write_bytes(shm_addr as *mut u8, 0, byte_len); }
 
-    let resp = blk_request(handle, &BlkRequest::Read { sector: 16, count, shm_offset: 0 })?;
-    match resp {
-        BlkResponse::Ok {} => {}
-        _ => {
-            blk_cleanup(handle, shm_addr, shm_cap);
-            return Err("multi-sector read failed");
-        }
+    if !blk_request_ok(handle, &BlkRequest::Read { sector: 16, count, shm_offset: 0 })? {
+        blk_cleanup(handle, shm_addr, shm_cap);
+        return Err("multi-sector read failed");
     }
 
     for i in 0..byte_len {
@@ -1837,18 +1875,15 @@ fn test_blk_multi_sector() -> Result<(), &'static str> {
 }
 
 fn test_blk_read_beyond_capacity() -> Result<(), &'static str> {
-    use rvos_proto::blk::{BlkRequest, BlkResponse};
+    use rvos_proto::blk::BlkRequest;
 
-    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect("blk2")?;
+    let test_svc = blk_find_by_serial(b"test")?;
+    let (handle, shm_addr, shm_cap, capacity, _ro) = blk_connect(test_svc)?;
 
-    // Try reading 1 sector past the end
-    let resp = blk_request(handle, &BlkRequest::Read { sector: capacity, count: 1, shm_offset: 0 })?;
-    match resp {
-        BlkResponse::Error { .. } => {}
-        _ => {
-            blk_cleanup(handle, shm_addr, shm_cap);
-            return Err("read beyond capacity should return error");
-        }
+    // Try reading 1 sector past the end — should return error (false)
+    if blk_request_ok(handle, &BlkRequest::Read { sector: capacity, count: 1, shm_offset: 0 })? {
+        blk_cleanup(handle, shm_addr, shm_cap);
+        return Err("read beyond capacity should return error");
     }
 
     blk_cleanup(handle, shm_addr, shm_cap);
@@ -1859,17 +1894,14 @@ fn test_blk_read_beyond_capacity() -> Result<(), &'static str> {
 // Read-only write rejection is tested via test_vfs_mount_ro_write_fails instead.
 
 fn test_blk_flush() -> Result<(), &'static str> {
-    use rvos_proto::blk::{BlkRequest, BlkResponse};
+    use rvos_proto::blk::BlkRequest;
 
-    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect("blk2")?;
+    let test_svc = blk_find_by_serial(b"test")?;
+    let (handle, shm_addr, shm_cap, _cap, _ro) = blk_connect(test_svc)?;
 
-    let resp = blk_request(handle, &BlkRequest::Flush {})?;
-    match resp {
-        BlkResponse::Ok {} => {}
-        _ => {
-            blk_cleanup(handle, shm_addr, shm_cap);
-            return Err("flush should succeed");
-        }
+    if !blk_request_ok(handle, &BlkRequest::Flush {})? {
+        blk_cleanup(handle, shm_addr, shm_cap);
+        return Err("flush should succeed");
     }
 
     blk_cleanup(handle, shm_addr, shm_cap);
@@ -1972,14 +2004,14 @@ fn test_vfs_file_io_direct() -> Result<(), &'static str> {
 }
 
 fn test_vfs_longest_prefix() -> Result<(), &'static str> {
-    // /bin → ext2-blk0 (RO), /persist → ext2-blk1 (RW)
+    // /bin → ext2-bin (RO), /persist → ext2-persist (RW)
     // Verify both mounts are independently accessible and resolved
     // to different backends (different filesystems)
     let bin_meta = std::fs::metadata("/bin").map_err(|_| "stat /bin failed")?;
     assert_true(bin_meta.is_dir(), "/bin should be a directory")?;
     let persist_meta = std::fs::metadata("/persist").map_err(|_| "stat /persist failed")?;
     assert_true(persist_meta.is_dir(), "/persist should be a directory")?;
-    // /bin/hello exists on ext2-blk0 but not on ext2-blk1 (/persist)
+    // /bin/hello exists on ext2-bin but not on ext2-persist (/persist)
     let hello = std::fs::metadata("/bin/hello");
     assert_true(hello.is_ok(), "/bin/hello should exist")?;
     let persist_hello = std::fs::metadata("/persist/hello");
@@ -1989,6 +2021,120 @@ fn test_vfs_longest_prefix() -> Result<(), &'static str> {
     let data = std::fs::read_to_string("/tmp/prefix_test").map_err(|_| "tmpfs read failed")?;
     assert_true(data.as_str() == "ok", "tmpfs data mismatch")?;
     let _ = std::fs::remove_file("/tmp/prefix_test");
+    Ok(())
+}
+
+// ============================================================
+// 26. ext2 Read-Write
+// ============================================================
+
+fn test_ext2_create_file() -> Result<(), &'static str> {
+    let path = "/persist/test_create";
+    // Clean up from any previous run
+    let _ = std::fs::remove_file(path);
+
+    // Create the file by writing to it
+    std::fs::write(path, b"hello ext2").map_err(|_| "create file failed")?;
+
+    // Stat it — should exist and be a regular file
+    let meta = std::fs::metadata(path).map_err(|_| "stat created file failed")?;
+    assert_true(!meta.is_dir(), "should be a file, not dir")?;
+    assert_eq(meta.len() as usize, 10, "file size mismatch")?;
+
+    // Clean up
+    std::fs::remove_file(path).map_err(|_| "cleanup remove failed")?;
+    Ok(())
+}
+
+fn test_ext2_write_read() -> Result<(), &'static str> {
+    let path = "/persist/test_wrrd";
+    let _ = std::fs::remove_file(path);
+
+    let data = b"The quick brown fox jumps over the lazy dog. 0123456789!";
+    std::fs::write(path, data).map_err(|_| "write failed")?;
+
+    let got = std::fs::read(path).map_err(|_| "read back failed")?;
+    assert_eq(got.len(), data.len(), "read size mismatch")?;
+    assert_true(got == data, "data content mismatch")?;
+
+    std::fs::remove_file(path).map_err(|_| "cleanup failed")?;
+    Ok(())
+}
+
+fn test_ext2_delete_file() -> Result<(), &'static str> {
+    let path = "/persist/test_del";
+    let _ = std::fs::remove_file(path);
+
+    // Create
+    std::fs::write(path, b"delete me").map_err(|_| "create failed")?;
+    assert_true(std::fs::metadata(path).is_ok(), "file should exist after create")?;
+
+    // Delete
+    std::fs::remove_file(path).map_err(|_| "delete failed")?;
+
+    // Verify gone
+    assert_true(std::fs::metadata(path).is_err(), "file should not exist after delete")
+}
+
+fn test_ext2_mkdir() -> Result<(), &'static str> {
+    let path = "/persist/test_dir";
+    // Clean up from previous run (remove any file inside first, then dir)
+    let _ = std::fs::remove_file("/persist/test_dir/inner");
+    let _ = std::fs::remove_file(path);  // in case it's a file somehow
+
+    std::fs::create_dir(path).map_err(|_| "mkdir failed")?;
+
+    let meta = std::fs::metadata(path).map_err(|_| "stat dir failed")?;
+    assert_true(meta.is_dir(), "should be a directory")?;
+
+    // Clean up: delete the directory (ext2 unlink works on empty dirs)
+    std::fs::remove_file(path).map_err(|_| "cleanup rmdir failed")?;
+    Ok(())
+}
+
+fn test_ext2_grow_file() -> Result<(), &'static str> {
+    let path = "/persist/test_grow";
+    let _ = std::fs::remove_file(path);
+
+    // Write a small file first
+    std::fs::write(path, b"small").map_err(|_| "initial write failed")?;
+
+    // Now write a larger file (multiple blocks: > 4096 bytes)
+    let large = vec![0x42u8; 8192];
+    std::fs::write(path, &large).map_err(|_| "large write failed")?;
+
+    let got = std::fs::read(path).map_err(|_| "read back failed")?;
+    assert_eq(got.len(), 8192, "large file size mismatch")?;
+    // Verify first and last bytes
+    assert_true(got[0] == 0x42, "first byte wrong")?;
+    assert_true(got[8191] == 0x42, "last byte wrong")?;
+
+    std::fs::remove_file(path).map_err(|_| "cleanup failed")?;
+    Ok(())
+}
+
+fn test_ext2_persistence() -> Result<(), &'static str> {
+    // Write a file, close it completely, reopen and read — verify write-through works
+    let path = "/persist/test_persist";
+    let _ = std::fs::remove_file(path);
+
+    let data = b"persistent data check 12345";
+
+    // Write and fully close the file
+    {
+        let mut f = std::fs::File::create(path).map_err(|_| "create failed")?;
+        std::io::Write::write_all(&mut f, data).map_err(|_| "write failed")?;
+        // f is dropped here, closing the file handle
+    }
+
+    // Reopen and read — this must work through the block cache
+    {
+        let got = std::fs::read(path).map_err(|_| "read back failed")?;
+        assert_eq(got.len(), data.len(), "persistence size mismatch")?;
+        assert_true(got == data, "persistence data mismatch")?;
+    }
+
+    std::fs::remove_file(path).map_err(|_| "cleanup failed")?;
     Ok(())
 }
 
@@ -2177,6 +2323,17 @@ fn main() {
         ("vfs_file_io_direct", test_vfs_file_io_direct),
         ("vfs_longest_prefix", test_vfs_longest_prefix),
     ]));
+
+    if !quick {
+        total.merge(&run_section("ext2 Read-Write", &[
+            ("ext2_create_file", test_ext2_create_file),
+            ("ext2_write_read", test_ext2_write_read),
+            ("ext2_delete_file", test_ext2_delete_file),
+            ("ext2_mkdir", test_ext2_mkdir),
+            ("ext2_grow_file", test_ext2_grow_file),
+            ("ext2_persistence", test_ext2_persistence),
+        ]));
+    }
 
     println!();
     println!("=== Results: {} passed, {} failed, {} leaked ===",

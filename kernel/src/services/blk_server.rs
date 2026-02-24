@@ -118,10 +118,12 @@ fn blk_server(server_idx: usize) {
                         };
                         match req {
                             BlkRequest::GetDeviceInfo {} => {
+                                let serial = crate::drivers::virtio::blk::serial(device_idx);
                                 let resp = BlkResponse::DeviceInfo {
                                     capacity_sectors: capacity,
                                     sector_size: crate::drivers::virtio::blk::SECTOR_SIZE as u32,
                                     read_only: if read_only { 1 } else { 0 },
+                                    serial,
                                 };
                                 let mut resp_msg = Message::new();
                                 resp_msg.len = rvos_wire::to_bytes(&resp, &mut resp_msg.data).unwrap_or(0);
@@ -189,7 +191,7 @@ fn handle_read(
     shm_base: usize,
     capacity: u64,
     _read_only: bool,
-) -> BlkResponse {
+) -> BlkResponse<'static> {
     let shm_size = SHM_PAGE_COUNT * 4096;
     let data_len = count as usize * crate::drivers::virtio::blk::SECTOR_SIZE;
 
@@ -218,7 +220,7 @@ fn handle_write(
     shm_base: usize,
     capacity: u64,
     read_only: bool,
-) -> BlkResponse {
+) -> BlkResponse<'static> {
     if read_only {
         return BlkResponse::Error { code: 30 }; // EROFS
     }
@@ -242,7 +244,7 @@ fn handle_write(
 }
 
 /// Send a BlkResponse to the client. Returns false if the client disconnected.
-fn send_response(client_ep: usize, resp: &BlkResponse, my_pid: usize, device_idx: usize) -> bool {
+fn send_response(client_ep: usize, resp: &BlkResponse<'_>, my_pid: usize, device_idx: usize) -> bool {
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(resp, &mut msg.data).unwrap_or(0);
     msg.sender_pid = my_pid;
