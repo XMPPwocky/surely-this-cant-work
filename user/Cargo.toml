@@ -7,6 +7,7 @@ members = [
     "fs",
     "gui-bench",
     "hello",
+    "http-client",
     "ipc-torture",
     "ktest",
     "ktest-helper",
