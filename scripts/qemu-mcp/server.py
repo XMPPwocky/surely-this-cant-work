@@ -37,25 +37,9 @@ def _resolve_paths(root: Path) -> tuple[Path, Path, Path]:
         root / "persist.img",
     )
 
-# Temp paths include PID to avoid collisions if lock is somehow bypassed,
-# but under normal operation only one QEMU runs at a time (enforced by lock).
+# Temp paths include PID to avoid collisions between concurrent instances.
 SERIAL_PIPE_BASE = f"/tmp/rvos-mcp-serial-{os.getpid()}"
 QMP_SOCK = f"/tmp/rvos-mcp-qmp-{os.getpid()}.sock"
-
-# Lockfile must be shared across all worktrees — use git's common dir
-# (points to the main repo's .git/ regardless of which worktree we're in).
-def _find_lockfile(root: Path) -> Path:
-    try:
-        import subprocess as _sp
-        git_common = _sp.check_output(
-            ["git", "-C", str(root), "rev-parse", "--git-common-dir"],
-            text=True,
-        ).strip()
-        return Path(git_common) / ".qemu.lock"
-    except Exception:
-        return root / ".qemu.lock"
-
-LOCKFILE = _find_lockfile(DEFAULT_PROJECT_ROOT)
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -82,7 +66,7 @@ class QEMUInstance:
         self.gpu_enabled: bool = False
         self.pcap_proc: subprocess.Popen[bytes] | None = None
         self.pcap_file: str | None = None
-        self._lock_fd: int | None = None
+        self._tap_name: str | None = None
         # Per-boot paths (set in boot(), default to main project root)
         self._project_root: Path = DEFAULT_PROJECT_ROOT
         self._kernel_bin: Path = Path()
@@ -92,36 +76,6 @@ class QEMUInstance:
     @property
     def running(self) -> bool:
         return self.proc is not None and self.proc.returncode is None
-
-    def _acquire_lock(self) -> None:
-        """Acquire the project-wide QEMU lock via flock."""
-        fd = os.open(str(LOCKFILE), os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, BlockingIOError):
-            os.close(fd)
-            raise RuntimeError(
-                "QEMU lock held by another process. "
-                "Another QEMU instance is already running for this project."
-            )
-        # Write lock info
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        info = f'pid={os.getpid()} target="mcp-server" started="{time.strftime("%H:%M:%S")}"\n'
-        os.write(fd, info.encode())
-        self._lock_fd = fd
-
-    def _release_lock(self) -> None:
-        """Release the project-wide QEMU lock."""
-        if self._lock_fd is not None:
-            import fcntl
-            try:
-                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(self._lock_fd)
-            self._lock_fd = None
 
     def _create_fifos(self) -> None:
         """Create named pipes for serial communication."""
@@ -203,9 +157,6 @@ class QEMUInstance:
                 f"Kernel binary not found at {self._kernel_bin}. Run 'make build' first."
             )
 
-        # Acquire project-wide lock
-        self._acquire_lock()
-
         # Clean up any stale resources
         self._cleanup_fifos()
         self._cleanup_socket()
@@ -235,15 +186,48 @@ class QEMUInstance:
             cmd.extend([
                 "-device", "virtio-gpu-device",
                 "-device", "virtio-tablet-device",
-                "-display", "vnc=:0",
+                "-display", "vnc=localhost:0,to=99",
             ])
         else:
             cmd.extend(["-nographic"])
 
         if network:
+            # Generate unique TAP name and MAC from PID
+            pid = os.getpid()
+            self._tap_name = f"rvos-tap-{pid}"
+            mac = "52:54:00:{:02x}:{:02x}:{:02x}".format(
+                (pid >> 16) & 0xFF, (pid >> 8) & 0xFF, pid & 0xFF,
+            )
+
+            # Verify bridge exists
+            br_check = subprocess.run(
+                ["ip", "link", "show", "rvos-br0"],
+                capture_output=True,
+            )
+            if br_check.returncode != 0:
+                raise RuntimeError(
+                    "Bridge rvos-br0 not found. Run: sudo scripts/net-setup.sh"
+                )
+
+            # Create and attach TAP device
+            user = os.environ.get("USER", os.environ.get("SUDO_USER", "root"))
+            subprocess.run(
+                ["sudo", "ip", "tuntap", "add", "dev", self._tap_name,
+                 "mode", "tap", "user", user],
+                check=True,
+            )
+            subprocess.run(
+                ["sudo", "ip", "link", "set", self._tap_name, "master", "rvos-br0"],
+                check=True,
+            )
+            subprocess.run(
+                ["sudo", "ip", "link", "set", self._tap_name, "up"],
+                check=True,
+            )
+
             cmd.extend([
-                "-device", "virtio-net-device,netdev=net0",
-                "-netdev", "tap,id=net0,ifname=rvos-tap0,script=no,downscript=no",
+                "-device", f"virtio-net-device,netdev=net0,mac={mac}",
+                "-netdev", f"tap,id=net0,ifname={self._tap_name},script=no,downscript=no",
             ])
 
         # Standard block devices — serial= tags let the kernel identify
@@ -305,6 +289,17 @@ class QEMUInstance:
             # QMP connection failed but QEMU may still be running
             sys.stderr.write(f"QMP connect warning: {e}\n")
             self.qmp = None
+
+        # Log actual VNC port (useful for debugging multi-instance setups)
+        if gpu and self.qmp is not None:
+            try:
+                vnc_info = await self.qmp.execute("query-vnc", None)
+                sys.stderr.write(
+                    f"VNC listening on {vnc_info.get('host', '?')}:"
+                    f"{vnc_info.get('service', '?')}\n"
+                )
+            except Exception:
+                pass
 
         if wait_for_prompt:
             output = await self._wait_for(r"rvos>", timeout=60)
@@ -566,8 +561,17 @@ class QEMUInstance:
         self._cleanup_fifos()
         self._cleanup_socket()
 
-        # Release lock
-        self._release_lock()
+        # Destroy dynamic TAP device
+        if self._tap_name is not None:
+            try:
+                subprocess.run(
+                    ["sudo", "ip", "tuntap", "del", "dev", self._tap_name,
+                     "mode", "tap"],
+                    check=False, capture_output=True,
+                )
+            except Exception:
+                pass
+            self._tap_name = None
 
         self.proc = None
         self.boot_time = None

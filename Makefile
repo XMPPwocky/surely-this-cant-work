@@ -13,7 +13,7 @@ USER_TARGET = --target riscv64gc-unknown-rvos
 USER_MANIFEST = --manifest-path user/Cargo.toml
 USER_BIN_DIR = user/target/riscv64gc-unknown-rvos/release
 
-# QEMU lockfile wrapper — ensures only one QEMU instance at a time
+# QEMU wrapper — runs QEMU as background child with signal cleanup
 QEMU_LOCK = scripts/qemu-lock.sh
 
 # VirtIO net device via TAP (requires: sudo scripts/net-setup.sh)
@@ -101,7 +101,7 @@ build: build-user disk-images
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
 
 run: build
-	$(QEMU_LOCK) --info "make run" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
 		$(QEMU_NET) \
@@ -109,7 +109,7 @@ run: build
 		-kernel $(KERNEL_BIN)
 
 run-gui: build
-	$(QEMU_LOCK) --info "make run-gui" -- qemu-system-riscv64 -machine virt -serial stdio \
+	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -serial stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
@@ -121,14 +121,14 @@ run-gui: build
 
 # VNC mode: connect with a VNC client to :5900, serial on stdio
 run-vnc: build
-	$(QEMU_LOCK) --info "make run-vnc" -- qemu-system-riscv64 -machine virt -serial stdio \
+	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -serial stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
 		-device virtio-keyboard-device \
 		-device virtio-tablet-device \
 		$(QEMU_NET) \
 		$(QEMU_BLK) \
-		-display vnc=:0 \
+		-display vnc=localhost:0,to=99 \
 		-kernel $(KERNEL_BIN)
 
 # Headless GPU with screenshot via monitor socket
@@ -136,7 +136,8 @@ DELAY ?= 5
 SCREENSHOT ?= /tmp/rvos-screenshot.ppm
 run-gpu-screenshot: build
 	@echo "Starting QEMU with virtio-gpu (headless)..."
-	$(QEMU_LOCK) --info "make run-gpu-screenshot" -- qemu-system-riscv64 -machine virt -nographic \
+	@sock="/tmp/qemu-monitor-$$$$.sock"; \
+	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -nographic \
 		-serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-gpu-device \
@@ -144,18 +145,19 @@ run-gpu-screenshot: build
 		-device virtio-tablet-device \
 		$(QEMU_NET) \
 		$(QEMU_BLK) \
-		-display vnc=:0 \
+		-display vnc=localhost:0,to=99 \
 		-kernel $(KERNEL_BIN) \
-		-monitor unix:/tmp/qemu-monitor.sock,server,nowait &
-	@sleep $(DELAY)
-	@echo "Taking screenshot to $(SCREENSHOT)..."
-	@echo "screendump $(SCREENSHOT)" | socat - UNIX-CONNECT:/tmp/qemu-monitor.sock 2>/dev/null || true
-	@sleep 1
-	@kill %1 2>/dev/null || true
-	@[ -f $(SCREENSHOT) ] && echo "Screenshot saved: $(SCREENSHOT)" || echo "Screenshot failed (install socat?)"
+		-monitor unix:$$sock,server,nowait & \
+	sleep $(DELAY); \
+	echo "Taking screenshot to $(SCREENSHOT)..."; \
+	echo "screendump $(SCREENSHOT)" | socat - UNIX-CONNECT:$$sock 2>/dev/null || true; \
+	sleep 1; \
+	kill %1 2>/dev/null || true; \
+	rm -f "$$sock"; \
+	[ -f $(SCREENSHOT) ] && echo "Screenshot saved: $(SCREENSHOT)" || echo "Screenshot failed (install socat?)"
 
 debug: build
-	$(QEMU_LOCK) --info "make debug" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
 		$(QEMU_NET) \
@@ -178,7 +180,7 @@ gui-bench: build
 	@expect scripts/gui-bench.exp
 
 run-test: build test.img
-	$(QEMU_LOCK) --info "make run-test" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
 		$(QEMU_BLK_TEST) \
@@ -189,7 +191,7 @@ test: build test.img
 	@expect scripts/test.exp
 
 run-quick: build
-	$(QEMU_LOCK) --info "make run-quick" -- qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
+	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
 		$(QEMU_BLK) \
