@@ -1,11 +1,12 @@
 #!/bin/bash
-# Set up TAP device + bridge + DHCP server for rvOS networking.
+# Set up TAP device + bridge + DHCP/DNS + NAT for rvOS networking.
 # Must be run as root (or via sudo).
 #
 # Creates (if not already present):
 #   rvos-tap0  — TAP device owned by $SUDO_USER (or $USER)
 #   rvos-br0   — bridge with IP 10.0.2.2/24
-#   dnsmasq    — DHCP server on the bridge (if installed)
+#   dnsmasq    — DHCP + DNS server on the bridge (if installed)
+#   iptables   — NAT masquerade for internet access (if installed)
 #
 # The guest obtains its IP via DHCP (range 10.0.2.10–10.0.2.200).
 # If DHCP fails, the guest falls back to static 10.0.2.15/24.
@@ -40,7 +41,43 @@ else
     echo "TAP $TAP already exists"
 fi
 
-# Start dnsmasq DHCP server on the bridge (if not already running)
+# Enable IP forwarding (required for NAT)
+if [ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]; then
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo "Enabled IP forwarding"
+fi
+
+# Set up NAT so rvOS guests can reach the internet
+if command -v iptables &>/dev/null; then
+    # Masquerade outbound traffic from 10.0.2.0/24 (except to the bridge itself)
+    iptables -t nat -C POSTROUTING -s 10.0.2.0/24 ! -o "$BR" -j MASQUERADE 2>/dev/null ||
+      iptables -t nat -A POSTROUTING -s 10.0.2.0/24 ! -o "$BR" -j MASQUERADE
+    # Allow forwarding from the bridge
+    iptables -C FORWARD -i "$BR" -j ACCEPT 2>/dev/null ||
+      iptables -A FORWARD -i "$BR" -j ACCEPT
+    # Allow return traffic
+    iptables -C FORWARD -o "$BR" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+      iptables -A FORWARD -o "$BR" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    echo "NAT configured (masquerade 10.0.2.0/24)"
+else
+    echo "WARNING: iptables not installed — no NAT (guests won't reach the internet)"
+fi
+
+# Discover upstream DNS server from systemd-resolved or /etc/resolv.conf
+UPSTREAM_DNS=""
+if command -v resolvectl &>/dev/null; then
+    UPSTREAM_DNS=$(resolvectl status 2>/dev/null | sed -n 's/.*Current DNS Server: //p' | head -1)
+fi
+if [ -z "$UPSTREAM_DNS" ]; then
+    # Fall back to first non-localhost nameserver in resolv.conf
+    UPSTREAM_DNS=$(sed -n 's/^nameserver[[:space:]]\+//p' /etc/resolv.conf | grep -v '^127\.' | head -1)
+fi
+if [ -z "$UPSTREAM_DNS" ]; then
+    # Last resort: use systemd-resolved stub (works if resolved is running)
+    UPSTREAM_DNS="127.0.0.53"
+fi
+
+# Start dnsmasq DHCP + DNS server on the bridge (if not already running)
 if command -v dnsmasq &>/dev/null; then
     if [ -f "$DNSMASQ_PID" ] && kill -0 "$(cat "$DNSMASQ_PID")" 2>/dev/null; then
         echo "dnsmasq already running (PID $(cat "$DNSMASQ_PID"))"
@@ -51,11 +88,11 @@ bind-interfaces
 dhcp-range=10.0.2.10,10.0.2.200,255.255.255.0,1h
 dhcp-option=option:router,10.0.2.2
 dhcp-option=option:dns-server,10.0.2.2
-no-resolv
+server=$UPSTREAM_DNS
 no-hosts
 EOF
         dnsmasq -C "$DNSMASQ_CONF" --pid-file="$DNSMASQ_PID"
-        echo "Started dnsmasq (PID $(cat "$DNSMASQ_PID"), DHCP 10.0.2.10–10.0.2.200)"
+        echo "Started dnsmasq (PID $(cat "$DNSMASQ_PID"), DHCP 10.0.2.10–10.0.2.200, DNS→$UPSTREAM_DNS)"
     fi
 else
     echo "WARNING: dnsmasq not installed — no DHCP server"
