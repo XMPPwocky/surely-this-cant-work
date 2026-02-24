@@ -203,7 +203,7 @@ CLAUDE.md states "No static mut. Pass state through function parameters." This s
 
 | Location | Variable | Status |
 |----------|----------|--------|
-| `net-stack/main.rs:1906` | `NEXT_EPHEMERAL: u16` | Still open (from review 6) |
+| ~~`net-stack/main.rs:1906`~~ | ~~`NEXT_EPHEMERAL: u16`~~ | **DONE** (ccfa500) |
 
 ---
 
@@ -471,15 +471,15 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 
 ### Soon (next sprint)
 
-5. **Add explicit frame length validation in net-stack RX** — bounds check before `.min()` (LOW safety)
-6. **Refactor `static mut NEXT_EPHEMERAL` to local variable** — violates design rule (LOW quality)
+5. ~~**Add explicit frame length validation in net-stack RX** — bounds check before `.min()` (LOW safety)~~ **DONE** (dbbaeca)
+6. ~~**Refactor `static mut NEXT_EPHEMERAL` to local variable** — violates design rule (LOW quality)~~ **DONE** (ccfa500)
 7. **Add regression test for Bug 0013** — per-process channel limit enforcement (MEDIUM testing)
 8. **Add SYS_KILL ktest** — new syscall with no test (MEDIUM testing)
 9. **Add spawn-suspended ktest** — new feature with no test (MEDIUM testing)
 10. **Add HTTP loopback integration ktest** — validates net-stack loopback + http-server + http-client (HIGH testing value)
-11. **Create missing protocol docs** — HTTP, DNS, DHCP, block device, ext2 (MEDIUM documentation)
+11. ~~**Create missing protocol docs** — HTTP, DNS, DHCP, block device, ext2 (MEDIUM documentation)~~ **DONE** (c4a3d87)
 12. ~~**Update architecture.md** — add loopback, ext2, block devices, platform abstraction (MEDIUM documentation)~~ **DONE** (1b38f49)
-13. **Improve http-server error handling** — return 400/413 on malformed requests (LOW robustness)
+13. ~~**Improve http-server error handling** — return 400/413 on malformed requests (LOW robustness)~~ **DONE** (3ec4289)
 14. ~~**Fix named services silent overwrite** — return error when full (MEDIUM robustness)~~ **DONE** (587d32d)
 
 ### Backlog (when convenient)
@@ -512,7 +512,7 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 | ~~Add timer service ktest~~ | **DONE** (410b0c3) |
 | ~~Create docs/protocols/socket.md~~ | **DONE** (44b0d80) |
 | ~~Create docs/protocols/timer.md~~ | **DONE** (3bc1a1a) |
-| ~~Update architecture.md + kernel-abi.md~~ | **PARTIAL** (timer added, ext2/blk/loopback missing) |
+| ~~Update architecture.md + kernel-abi.md~~ | **DONE** (1122aa6, 1b38f49) |
 | ~~Update README process list + syscall table~~ | **DONE** (6d8efc2) |
 | ~~Replace register_service() assert with Result~~ | **DONE** (587d32d) |
 | Extract SHM volatile helpers to shared lib | OPEN |
@@ -521,10 +521,10 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 | Add socket exhaustion tests | OPEN |
 | Map IPv6 to Unsupported in std::net backend | OPEN |
 | Define EPHEMERAL_PORT_MIN/MAX constants | OPEN |
-| Replace static mut NEXT_EPHEMERAL | OPEN |
+| ~~Replace static mut NEXT_EPHEMERAL~~ | **DONE** (ccfa500) |
 | Add #[must_use] to IPC functions | OPEN |
 | Document lock ordering | OPEN |
 | VirtIO net transmit WFI timeout | OPEN |
 | Socket port access control | OPEN |
 
-**Completion rate**: 14 of 26 review 6 items completed (54%). All HIGH-priority items completed.
+**Completion rate**: 15 of 26 review 6 items completed (58%). All HIGH-priority items completed.
