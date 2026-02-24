@@ -38,6 +38,11 @@ Numbered steps to trigger the bug. Include make targets, shell commands,
 expect scripts, or benchmark invocations. If the bug is intermittent, note
 the success rate (e.g., "fails ~1 in 3 runs").
 
+## Investigation
+
+(Updated as you go during Phases 2-3. Document your debugging process:
+what you tried, what you observed, what led to dead ends, what worked.)
+
 ## Root Cause
 
 (Filled in during Phase 3)
@@ -56,7 +61,13 @@ the success rate (e.g., "fails ~1 in 3 runs").
 ```
 
 4. **Update the doc as you go.** Every phase should update the relevant section
-   of the bug doc in-place. The final closed doc is a complete post-mortem.
+   of the bug doc in-place. Document your **investigation process**, not just
+   your eventual conclusions — what you tried, what you observed, what led to
+   dead ends, and what finally worked. This is valuable for future debugging:
+   knowing that "enabling syscall tracing showed no unusual patterns, but adding
+   a println in `schedule()` revealed the wrong PID" teaches more than just
+   stating the root cause. The final closed doc is a complete post-mortem that
+   captures both the answer and the path to finding it.
 
 ## Phase 2: Reproduce
 
@@ -201,22 +212,28 @@ to these questions:
 What other code might have the same bug? Grep for similar patterns. If you
 find siblings, either fix them now (if trivial) or file them as new bugs.
 
-### 2. Prevention
+### 2. Regression Test
+Write a regression test that fails without the fix and passes with it. This
+is not optional — bugs that aren't tested come back. The test should:
+- Exercise the specific triggering condition from Phase 2
+- Be a ktest if possible (permanent, runs in CI via `make test`)
+- Be an expect script if the bug requires shell interaction or timing
+- At minimum, be a `debug_assert!` at the violation site if a full test
+  isn't feasible
+
+### 3. Prevention
 What test, assertion, or compile-time check would have caught this bug before
 it shipped? Consider:
-- A unit test for the specific edge case
-- A stress test that exercises the failing path
-- A `debug_assert!` for the violated invariant
 - A type-system change that makes the bug unrepresentable
 - A `#[must_use]` annotation on a return value that was ignored
+- A `debug_assert!` for the violated invariant
+- A coding guideline for CLAUDE.md
 
-If a simple test or assertion would help, implement it as part of this bug fix.
-
-### 3. Invariants
+### 4. Invariants
 Is there a key invariant that was violated? Should it be documented in a
 CLAUDE.md or as a code comment? If so, add it.
 
-### 4. Memory & Documentation
+### 5. Memory & Documentation
 Should anything be added to:
 - **MEMORY.md**: Add a "Critical Bugs Found & Fixed" entry if the bug is
   non-trivial. Use the established format: `**symptom**: explanation. Fix: fix.`
@@ -225,7 +242,7 @@ Should anything be added to:
 - **docs/**: Update any protocol docs, architecture docs, or API docs that
   were wrong or incomplete
 
-### 5. Debug Tooling
+### 6. Debug Tooling
 Would a new debugging tool or diagnostic have made root-causing faster?
 Consider:
 - A new kernel shell command
@@ -236,7 +253,7 @@ Consider:
 
 If a small tool (<50 lines) would help future debugging, implement it.
 
-### 6. Escalation Notes
+### 7. Escalation Notes
 Following the agent model escalation policy in MEMORY.md: was this bug in
 "Opus territory" (page tables, traps, user/kernel transitions, subtle
 scheduling races)? If so, note it so future agents know to use Opus for
