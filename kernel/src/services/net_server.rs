@@ -8,6 +8,8 @@
 use crate::ipc::{self, Message, Cap};
 use crate::mm::frame;
 use crate::mm::address::PhysAddr;
+use crate::mm::heap::NETS_ALLOC;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rvos_proto::net::{NetRawRequest, NetRawResponse};
 
@@ -107,6 +109,10 @@ pub fn net_server() {
 
     // Track whether we have sent DeviceInfo (the SHM cap is only sent once)
     let mut device_info_sent = false;
+
+    // Pre-allocate TX frame copy buffer on the heap (avoids 1534 bytes on stack)
+    let mut frame_buf: Vec<u8, _> = Vec::with_capacity_in(1534, NETS_ALLOC);
+    frame_buf.resize(1534, 0);
 
     // Main loop: service IPC messages, poll RX, drain TX
     loop {
@@ -219,8 +225,7 @@ pub fn net_server() {
             let slot_offset = TX_RING_OFFSET + slot_idx * TX_SLOT_SIZE;
             let frame_len = shm_read_u16(shm_base, slot_offset) as usize;
 
-            // Copy frame data to a stack buffer
-            let mut frame_buf = [0u8; 1534];
+            // Copy frame data to pre-allocated heap buffer
             let copy_len = frame_len.min(1534);
             unsafe {
                 core::ptr::copy_nonoverlapping(
