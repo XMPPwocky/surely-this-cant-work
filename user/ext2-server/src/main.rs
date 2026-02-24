@@ -739,30 +739,47 @@ fn main() {
             let mut is_stat = false;
             let mut is_readdir = false;
             let mut is_mkdir = false;
+            let mut path_too_long = false;
             let mut ctl_closed = false;
 
             {
                 let ch = clients[i].ctl.as_mut().unwrap();
                 match ch.try_recv() {
                     Ok(FsRequest::Open { flags, path }) => {
-                        path_len = path.len().min(64);
-                        path_buf[..path_len].copy_from_slice(path.as_bytes());
-                        open_flags = Some(flags);
+                        if path.len() > path_buf.len() {
+                            path_too_long = true;
+                        } else {
+                            path_len = path.len();
+                            path_buf[..path_len].copy_from_slice(path.as_bytes());
+                            open_flags = Some(flags);
+                        }
                     }
                     Ok(FsRequest::Delete { path }) => {
-                        path_len = path.len().min(64);
-                        path_buf[..path_len].copy_from_slice(path.as_bytes());
-                        is_delete = true;
+                        if path.len() > path_buf.len() {
+                            path_too_long = true;
+                        } else {
+                            path_len = path.len();
+                            path_buf[..path_len].copy_from_slice(path.as_bytes());
+                            is_delete = true;
+                        }
                     }
                     Ok(FsRequest::Stat { path }) => {
-                        path_len = path.len().min(64);
-                        path_buf[..path_len].copy_from_slice(path.as_bytes());
-                        is_stat = true;
+                        if path.len() > path_buf.len() {
+                            path_too_long = true;
+                        } else {
+                            path_len = path.len();
+                            path_buf[..path_len].copy_from_slice(path.as_bytes());
+                            is_stat = true;
+                        }
                     }
                     Ok(FsRequest::Readdir { path }) => {
-                        path_len = path.len().min(64);
-                        path_buf[..path_len].copy_from_slice(path.as_bytes());
-                        is_readdir = true;
+                        if path.len() > path_buf.len() {
+                            path_too_long = true;
+                        } else {
+                            path_len = path.len();
+                            path_buf[..path_len].copy_from_slice(path.as_bytes());
+                            is_readdir = true;
+                        }
                     }
                     Ok(FsRequest::Mount { .. }) => {
                         handled = true;
@@ -773,9 +790,13 @@ fn main() {
                         send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
                     }
                     Ok(FsRequest::Mkdir { path }) => {
-                        path_len = path.len().min(64);
-                        path_buf[..path_len].copy_from_slice(path.as_bytes());
-                        is_mkdir = true;
+                        if path.len() > path_buf.len() {
+                            path_too_long = true;
+                        } else {
+                            path_len = path.len();
+                            path_buf[..path_len].copy_from_slice(path.as_bytes());
+                            is_mkdir = true;
+                        }
                     }
                     Err(rvos::RecvError::Closed) => {
                         ctl_closed = true;
@@ -785,7 +806,10 @@ fn main() {
             }
 
             // Phase 2: dispatch (ctl borrow released, ext2 and clients are separate)
-            if let Some(flags) = open_flags {
+            if path_too_long {
+                handled = true;
+                send_error(clients[i].ctl.as_ref().unwrap(), FsError::InvalidPath {});
+            } else if let Some(flags) = open_flags {
                 handled = true;
                 let ctl_ch = clients[i].ctl.as_ref().unwrap();
                 do_open(&mut ext2_state, ctl_ch, &mut file_slots, flags, &path_buf[..path_len]);
