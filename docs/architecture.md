@@ -45,12 +45,19 @@ The boot sequence has six phases, all orchestrated by `kmain()` in
 2. **PLIC** — the Platform-Level Interrupt Controller is initialized. UART
    (IRQ 10) and VirtIO keyboard IRQs are enabled at priority 1; the hart
    threshold is set to 0 (accept all priorities).
-3. **VirtIO GPU** (optional) — probed at `0x10001000`..`0x10008000`. If
-   present, a framebuffer is allocated via the GPU command protocol
-   (`RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`, `SET_SCANOUT`). The
-   framebuffer console (8x16 bitmap font) is initialized.
-4. **VirtIO keyboard** (optional) — if present, initialized and its IRQ
-   registered with the PLIC.
+3. **VirtIO device probe** — the 8 VirtIO MMIO slots at `0x10001000`..
+   `0x10008000` are probed. Recognized device types:
+   - **GPU** — framebuffer allocated via GPU command protocol
+     (`RESOURCE_CREATE_2D`, `RESOURCE_ATTACH_BACKING`, `SET_SCANOUT`);
+     framebuffer console (8x16 bitmap font) initialized.
+   - **Keyboard / Tablet** — input devices; IRQs registered with PLIC.
+   - **Network** — VirtIO net device; SHM ring allocated for raw frame I/O.
+   - **Block** — VirtIO blk device; up to 4 block devices supported.
+4. **Platform abstraction (FDT)** — the kernel parses the Flattened Device
+   Tree (passed by OpenSBI in `a1`) to discover hardware addresses for UART,
+   PLIC, CLINT, VirtIO MMIO regions, and RAM geometry. This replaces
+   hardcoded constants and enables future board support without code changes.
+   See `kernel/src/platform/`.
 
 ### Phase 4: Scheduler and IPC
 
@@ -70,6 +77,7 @@ kmain
  ├── creates boot channels for: shell-serial
  ├── (with GPU) creates control channels for: gpu, kbd, mouse
  ├── (with net) creates control channels for: net-raw
+ ├── (with blk) creates control channels for: blk0, blk1, ... (per device)
  ├── spawns kernel tasks:
  │   ├── init         (service directory + process loader)
  │   ├── serial-con   (serial console server)
@@ -77,20 +85,25 @@ kmain
  │   ├── math         (computation service)
  │   ├── proc-debug   (process debugger attach/step/breakpoint)
  │   ├── timer        (timed wakeups via IPC)
+ │   ├── blk_server   (VirtIO blk wrapper, one per block device, up to 4)
  │   ├── gpu-server   (VirtIO GPU wrapper, if GPU)
  │   ├── kbd-server   (VirtIO keyboard wrapper, if GPU)
  │   ├── mouse-server (VirtIO tablet wrapper, if GPU)
  │   └── net-server   (VirtIO net wrapper, if net device present)
  └── spawns user processes (ELF):
-     ├── fs           (filesystem server, tmpfs)
+     ├── fs           (filesystem server, tmpfs + VFS mount point)
      ├── shell-serial (interactive shell on serial)
      └── (with GPU) shell-fb (interactive shell on framebuffer)
 ```
 
 Additional user processes spawned by init on demand:
 
+- **ext2-server** — user-space ext2 filesystem server, connects to a
+  `blk` device, speaks the filesystem protocol, mounted under `/persist`
 - **net-stack** — user-space TCP/IP stack, connects to `net-raw`, registers
-  as `"net"` service, provides TCP and UDP socket API
+  as `"net"` service, provides TCP/UDP sockets with DHCP, DNS, and loopback
+- **http-server** — static file HTTP server serving from `/persist/www`
+- **http-client** — command-line HTTP GET client with DNS resolution
 - **window-server** — compositing window manager (GPU mode)
 - **fbcon** — framebuffer console multiplexer (GPU mode)
 
@@ -335,23 +348,24 @@ through the init server's service discovery protocol.
                               ┌──────────┐
                               │   init   │ ← service directory + process loader
                               └────┬─────┘
-        ┌──────────┬──────────┬────┼────┬────────────┬─────────────┐
-        ↓          ↓          ↓    ↓    ↓            ↓             ↓
-  ┌──────────┐ ┌────────┐ ┌────┐ ┌───┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-  │serial-con│ │sysinfo │ │math│ │tmr│ │proc-debug│ │net-server│ │gpu-server│
-  └────┬─────┘ └────────┘ └────┘ └───┘ └──────────┘ └────┬─────┘ └──────────┘
-       ↓                                                   ↓
-  [shell-serial]                                      [net-stack] ← "net" service
-  [shell-fb]                                               ↓
-                                                      [tcp-echo]
-                                                      [udp-echo]
+     ┌──────────┬──────────┬───┼───┬────────────┬──────────┬────────────┐
+     ↓          ↓          ↓   ↓   ↓            ↓          ↓            ↓
+┌──────────┐ ┌────────┐ ┌────┐┌───┐┌──────────┐┌──────────┐┌──────────┐┌──────────┐
+│serial-con│ │sysinfo │ │math││tmr││proc-debug││blk_server││net-server││gpu-server│
+└────┬─────┘ └────────┘ └────┘└───┘└──────────┘└────┬─────┘└────┬─────┘└──────────┘
+     ↓                                               ↓           ↓
+[shell-serial]                                  [ext2-server][net-stack] ← "net"
+[shell-fb]                                           ↓           ↓
+                                                  [fs mount] [http-server]
+                                                              [http-client]
 ```
 
 Kernel tasks (in-process): init, serial-con, sysinfo, math, timer, proc-debug,
-gpu-server, kbd-server, mouse-server, net-server.
+blk_server, gpu-server, kbd-server, mouse-server, net-server.
 
-User processes (ELF): fs, shell, net-stack, udp-echo, window-server, fbcon,
-dbg, bench, winclient, triangle, gui-bench, ktest.
+User processes (ELF): fs, shell, ext2-server, net-stack, http-server,
+http-client, udp-echo, window-server, fbcon, dbg, bench, winclient, triangle,
+gui-bench, ktest.
 
 ### Service Discovery Flow
 
@@ -411,7 +425,99 @@ channels and shared memory regions the process can access.
 
 ---
 
-## 8. Assembly Files
+## 8. Block Device and ext2 Filesystem
+
+### VirtIO Block Device
+
+The kernel's `blk_server` is a kernel task that wraps VirtIO block device
+access. One instance runs per detected block device, registered as named
+services `"blk0"`, `"blk1"`, etc. Each server:
+
+1. Allocates a 128 KiB SHM region for bulk data transfer.
+2. Accepts one client connection at a time via a control channel.
+3. Sends `DeviceInfo` (capacity, sector size, read-only flag, serial) with
+   the SHM capability on first connect.
+4. Handles `Read`, `Write`, and `Flush` requests. Read/Write operate on
+   sectors and reference offsets within the shared SHM region.
+
+Protocol definition: `lib/rvos-proto/src/blk.rs`. See
+`docs/protocols/block-device.md`.
+
+### ext2 Filesystem Server
+
+`ext2-server` is a user-space process that implements a read-write ext2
+filesystem backed by a block device. It connects to a `blk` device service,
+reads the ext2 superblock and block group descriptors, and speaks the
+standard filesystem protocol (`FsRequest`/`FsResponse`).
+
+At boot, init spawns `ext2-server` pointed at `blk0`. The ext2-server
+registers with the VFS layer: the tmpfs server (`fs`) mounts it at
+`/persist` via the `Mount` request. User processes access ext2 files
+transparently through the unified `/persist/...` path namespace.
+
+Features: file create/read/write/delete, directory create/list, block
+caching, inode/block bitmap management. See `docs/protocols/ext2.md`.
+
+---
+
+## 9. Networking
+
+### Multi-Interface Architecture
+
+The net-stack supports multiple network interfaces via a typed `Interface`
+struct array (`MAX_INTERFACES = 4`). Each interface has its own IP config,
+MAC address, ARP table, and SHM ring for raw frame I/O. Two interface types
+exist at boot:
+
+- **Loopback** (index 0) — software-only interface for `127.0.0.1`.
+  TX pushes frames directly to the interface's own RX queue. No hardware
+  involvement.
+- **eth0** (index 1) — hardware NIC backed by VirtIO net via `net-raw`.
+  IP address acquired via DHCP (with static fallback).
+
+Routing is per-packet: `send_ip_packet()` selects the interface by matching
+the destination IP against each interface's subnet. Packets to `127.0.0.1`
+route to loopback. Packets to the host's own eth0 IP are also looped back.
+All other traffic goes through eth0 (default route via gateway).
+
+### DHCP
+
+At boot, the net-stack runs a DHCP client (DISCOVER/OFFER/REQUEST/ACK)
+using raw Ethernet frames via the `net-raw` shared memory ring. If DHCP
+succeeds, it configures eth0's IP, subnet mask, gateway, and DNS server.
+If no OFFER arrives within the timeout (exponential backoff, 3 retries),
+a static fallback config is used. See `docs/protocols/dhcp.md`.
+
+### DNS
+
+A minimal DNS resolver library (`lib/rvos/src/dns.rs`) provides A record
+lookups over UDP. Used by `http-client` to resolve hostnames before
+connecting. See `docs/protocols/dns.md`.
+
+---
+
+## 10. Platform Abstraction
+
+The kernel's `platform` module (`kernel/src/platform/`) extracts hardware
+configuration from the Flattened Device Tree (FDT) blob passed by firmware
+at boot. This replaces hardcoded MMIO addresses and RAM sizes with
+runtime-discovered values.
+
+Parameterized subsystems:
+- **UART** — base address from FDT `compatible = "ns16550a"` node
+- **PLIC** — base address and hart context from FDT
+- **CLINT** — base address from FDT
+- **VirtIO MMIO** — device slot addresses from FDT `compatible = "virtio,mmio"`
+- **Frame allocator** — RAM base and size from FDT `/memory` node
+- **Page tables** — MMIO regions mapped based on FDT-discovered addresses
+
+The FDT parser handles the DTB binary format (magic, struct block, strings
+block) and walks the tree to extract `reg`, `compatible`, and
+`interrupts-extended` properties.
+
+---
+
+## 11. Assembly Files
 
 rvOS has exactly 4 assembly files (< 400 lines total):
 
