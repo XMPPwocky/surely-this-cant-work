@@ -85,7 +85,7 @@ if path.len() > path_buf.len() {
 
 ---
 
-### MEDIUM: SHM creation panics on slot exhaustion
+### ~~MEDIUM: SHM creation panics on slot exhaustion~~ ALREADY FIXED
 
 **Location**: `kernel/src/ipc/mod.rs:14` (MAX_SHM_REGIONS)
 
@@ -93,7 +93,7 @@ if path.len() > path_buf.len() {
 
 **Impact**: User-triggerable kernel panic if a process creates many SHM regions.
 
-**Fix**: Return `Option` or `Result` instead of panicking. Propagate error to syscall handler.
+**Fix**: ~~Return `Option` or `Result` instead of panicking. Propagate error to syscall handler.~~ Already fixed: `shm_create()` returns `Option<OwnedShm>` and `sys_shm_create` handles `None` by freeing frames and returning `Err(SyscallError::Error)`. The `shm_inc_ref`/`shm_dec_ref` panics are correct per kernel convention — they take kernel-internal IDs where invalid inputs indicate a bug. Syscall handlers validate handles before reaching these functions.
 
 ---
 
@@ -467,7 +467,7 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 1. ~~**Return error from ext2-server for paths > 64 bytes** — silent truncation is a data corruption risk (MEDIUM correctness)~~ **DONE** (6bdfb9c)
 2. ~~**Update `docs/kernel-abi.md` MAX_CHANNELS** — says 64, actual is 1024 (CRITICAL doc drift)~~ **DONE** (1122aa6)
 3. ~~**Replace process spawn panic with error return**~~ **ALREADY FIXED** — `find_free_slot()` returns `Option`, init server handles gracefully
-4. **Replace SHM creation panic with error return** — user-triggerable kernel crash (MEDIUM robustness)
+4. ~~**Replace SHM creation panic with error return**~~ **ALREADY FIXED** — `shm_create()` returns `Option`, syscall handler propagates error
 
 ### Soon (next sprint)
 
