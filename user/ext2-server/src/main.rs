@@ -34,27 +34,31 @@ const CONTROL_HANDLE: usize = 1;
 /// Maximum number of concurrent clients.
 const MAX_CLIENTS: usize = 8;
 
-/// Maximum number of open files across all clients.
+/// Maximum number of open files (flat, not per-client).
 const MAX_OPEN_FILES: usize = 16;
 
 /// Max data payload per chunk: MAX_MSG_SIZE(1024) - 3 (tag u8 + length u16).
 const MAX_DATA_CHUNK: usize = 1021;
 
-/// Per-client state.
+/// Per-client state (control channel only).
 struct ClientState {
     ctl: Option<Channel<FsResponse, FsRequestMsg>>,
-    file_ch: Option<Channel<FileResponseMsg, FileRequestMsg>>,
-    file_inode: u32,
 }
 
 impl ClientState {
     fn is_active(&self) -> bool {
-        self.ctl.is_some() || self.file_ch.is_some()
+        self.ctl.is_some()
     }
 }
 
-/// Per-open-file tracking.
-struct OpenFile {
+/// An open file channel with its associated inode.
+struct FileSlot {
+    ch: Channel<FileResponseMsg, FileRequestMsg>,
+    inode: u32,
+}
+
+/// Per-open-file position/state tracking (keyed by endpoint handle).
+struct OpenFileState {
     endpoint_handle: usize,
     #[allow(dead_code)]
     inode: u32,
@@ -69,15 +73,15 @@ struct Ext2State {
     cache: BlockCache,
     sb: Superblock,
     read_only: bool,
-    open_files: [OpenFile; MAX_OPEN_FILES],
+    open_file_state: [OpenFileState; MAX_OPEN_FILES],
     open_count: usize,
 }
 
 impl Ext2State {
     fn register_open_file(&mut self, endpoint_handle: usize, inode: u32, append: bool) -> bool {
-        for of in &mut self.open_files {
+        for of in &mut self.open_file_state {
             if !of.active {
-                *of = OpenFile { endpoint_handle, inode, active: true, append, position: 0 };
+                *of = OpenFileState { endpoint_handle, inode, active: true, append, position: 0 };
                 self.open_count += 1;
                 return true;
             }
@@ -85,12 +89,12 @@ impl Ext2State {
         false
     }
 
-    fn get_open_file_mut(&mut self, endpoint_handle: usize) -> Option<&mut OpenFile> {
-        self.open_files.iter_mut().find(|of| of.active && of.endpoint_handle == endpoint_handle)
+    fn get_open_file_mut(&mut self, endpoint_handle: usize) -> Option<&mut OpenFileState> {
+        self.open_file_state.iter_mut().find(|of| of.active && of.endpoint_handle == endpoint_handle)
     }
 
     fn close_open_file(&mut self, endpoint_handle: usize) {
-        for of in &mut self.open_files {
+        for of in &mut self.open_file_state {
             if of.active && of.endpoint_handle == endpoint_handle {
                 of.active = false;
                 self.open_count -= 1;
@@ -196,9 +200,15 @@ fn do_stat(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path: &
     send_stat_ok(ch, kind, inode.size);
 }
 
-fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, path: &[u8]) {
+fn do_open(
+    ext2: &mut Ext2State,
+    ctl_ch: &Channel<FsResponse, FsRequestMsg>,
+    file_slots: &mut [Option<FileSlot>; MAX_OPEN_FILES],
+    flags: OpenFlags,
+    path: &[u8],
+) {
     if path.is_empty() || path[0] != b'/' {
-        send_error(client.ctl.as_ref().unwrap(), FsError::InvalidPath {});
+        send_error(ctl_ch, FsError::InvalidPath {});
         return;
     }
 
@@ -214,18 +224,18 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
                 let (parent_path, name) = match split_parent_name(path) {
                     Some(p) => p,
                     None => {
-                        send_error(client.ctl.as_ref().unwrap(), FsError::InvalidPath {});
+                        send_error(ctl_ch, FsError::InvalidPath {});
                         return;
                     }
                 };
                 if name.is_empty() {
-                    send_error(client.ctl.as_ref().unwrap(), FsError::InvalidPath {});
+                    send_error(ctl_ch, FsError::InvalidPath {});
                     return;
                 }
                 let parent_ino = match ext2::resolve_path(&ext2.sb, parent_path, &mut ext2.cache, &ext2.blk) {
                     Ok(ino) => ino,
                     Err(_) => {
-                        send_error(client.ctl.as_ref().unwrap(), FsError::NotFound {});
+                        send_error(ctl_ch, FsError::NotFound {});
                         return;
                     }
                 };
@@ -235,12 +245,12 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
                         ino
                     }
                     Err(_) => {
-                        send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+                        send_error(ctl_ch, FsError::Io {});
                         return;
                     }
                 }
             } else {
-                send_error(client.ctl.as_ref().unwrap(), FsError::NotFound {});
+                send_error(ctl_ch, FsError::NotFound {});
                 return;
             }
         }
@@ -249,13 +259,13 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
     let mut inode = match ext2::read_inode(&ext2.sb, ino, &mut ext2.cache, &ext2.blk) {
         Ok(i) => i,
         Err(_) => {
-            send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+            send_error(ctl_ch, FsError::Io {});
             return;
         }
     };
 
     if inode.is_dir() {
-        send_error(client.ctl.as_ref().unwrap(), FsError::NotAFile {});
+        send_error(ctl_ch, FsError::NotAFile {});
         return;
     }
 
@@ -265,19 +275,25 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
         inode.i_blocks = 0;
         inode.blocks = [0u32; 15];
         if ext2::write_inode(&ext2.sb, ino, &inode, &mut ext2.cache, &ext2.blk).is_err() {
-            send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+            send_error(ctl_ch, FsError::Io {});
             return;
         }
         ext2.cache.sync(&ext2.blk).ok();
     }
 
-    // Close existing file channel for this client
-    close_client_file(ext2, client);
+    // Find a free file slot
+    let slot_idx = match file_slots.iter().position(|s| s.is_none()) {
+        Some(idx) => idx,
+        None => {
+            send_error(ctl_ch, FsError::Io {});
+            return;
+        }
+    };
 
     // Create channel pair for file I/O
     let (my_handle, client_file_handle) = raw::sys_chan_create();
     if my_handle == usize::MAX {
-        send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+        send_error(ctl_ch, FsError::Io {});
         return;
     }
 
@@ -285,12 +301,12 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
     if !ext2.register_open_file(my_handle, ino, append) {
         raw::sys_chan_close(my_handle);
         raw::sys_chan_close(client_file_handle);
-        send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
+        send_error(ctl_ch, FsError::Io {});
         return;
     }
 
     // Send Opened with the file handle as capability
-    let _ = client.ctl.as_ref().unwrap().send(&FsResponse::Opened {
+    let _ = ctl_ch.send(&FsResponse::Opened {
         kind: FsEntryKind::File {},
         size: inode.size,
         file: rvos_wire::RawChannelCap::new(client_file_handle),
@@ -298,9 +314,11 @@ fn do_open(ext2: &mut Ext2State, client: &mut ClientState, flags: OpenFlags, pat
     // Close our reference to the client's endpoint (they hold their own via cap transfer)
     raw::sys_chan_close(client_file_handle);
 
-    // Store typed file channel in client state
-    client.file_ch = Some(Channel::from_raw_handle(my_handle));
-    client.file_inode = ino;
+    // Store file channel in the flat file slot array
+    file_slots[slot_idx] = Some(FileSlot {
+        ch: Channel::from_raw_handle(my_handle),
+        inode: ino,
+    });
 }
 
 fn do_readdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path: &[u8]) {
@@ -573,14 +591,6 @@ fn handle_file_write(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileReq
     send_write_ok(ch, written as u32);
 }
 
-fn close_client_file(ext2: &mut Ext2State, client: &mut ClientState) {
-    if let Some(ref file_ch) = client.file_ch {
-        ext2.close_open_file(file_ch.raw_handle());
-    }
-    client.file_ch = None; // Drop closes the handle via RAII
-    client.file_inode = 0;
-}
-
 // --- Main ---
 
 fn main() {
@@ -635,12 +645,16 @@ fn main() {
         cache,
         sb,
         read_only,
-        open_files: [const { OpenFile { endpoint_handle: 0, inode: 0, active: false, append: false, position: 0 } }; MAX_OPEN_FILES],
+        open_file_state: [const { OpenFileState { endpoint_handle: 0, inode: 0, active: false, append: false, position: 0 } }; MAX_OPEN_FILES],
         open_count: 0,
     };
 
     let mut clients: [ClientState; MAX_CLIENTS] =
-        [const { ClientState { ctl: None, file_ch: None, file_inode: 0 } }; MAX_CLIENTS];
+        [const { ClientState { ctl: None } }; MAX_CLIENTS];
+
+    // Flat array of open file channels (not per-client).
+    let mut file_slots: [Option<FileSlot>; MAX_OPEN_FILES] =
+        [const { None }; MAX_OPEN_FILES];
 
     // Main event loop
     loop {
@@ -658,8 +672,6 @@ fn main() {
                 if let Some(slot) = slot {
                     *slot = ClientState {
                         ctl: Some(Channel::from_raw_handle(cap)),
-                        file_ch: None,
-                        file_inode: 0,
                     };
                 } else {
                     raw::sys_chan_close(cap);
@@ -667,137 +679,130 @@ fn main() {
             }
         }
 
-        // Poll each active client
+        // Poll all open file channels
+        for slot in &mut file_slots {
+            let Some(file) = slot.as_mut() else { continue };
+
+            let file_inode = file.inode;
+            let raw_h = file.ch.raw_handle();
+
+            // Phase 1: recv, copy borrowed data to stack
+            let mut read_params: Option<(FileOffset, u32)> = None;
+            let mut write_buf = [0u8; 1024];
+            let mut write_params: Option<(FileOffset, usize)> = None;
+            let mut ioctl = false;
+            let mut file_closed = false;
+
+            match file.ch.try_recv() {
+                Ok(FileRequest::Read { offset, len }) => {
+                    read_params = Some((offset, len));
+                }
+                Ok(FileRequest::Write { offset, data }) => {
+                    let dlen = data.len().min(1024);
+                    write_buf[..dlen].copy_from_slice(&data[..dlen]);
+                    write_params = Some((offset, dlen));
+                }
+                Ok(FileRequest::Ioctl { .. }) => {
+                    ioctl = true;
+                }
+                Err(rvos::RecvError::Closed) => {
+                    file_closed = true;
+                }
+                Err(_) => {}
+            }
+
+            // Phase 2: act on extracted data
+            if let Some((offset, len)) = read_params {
+                handled = true;
+                handle_file_read(&mut ext2_state, &file.ch, file_inode, offset, len);
+            } else if let Some((offset, dlen)) = write_params {
+                handled = true;
+                handle_file_write(&mut ext2_state, &file.ch, file_inode, offset, &write_buf[..dlen]);
+            } else if ioctl {
+                handled = true;
+                send_file_error(&file.ch, FsError::Io {});
+            } else if file_closed {
+                ext2_state.close_open_file(raw_h);
+                *slot = None; // Drop closes the channel handle via RAII
+            }
+        }
+
+        // Poll each active client's ctl channel
         #[allow(clippy::needless_range_loop)]
         for i in 0..MAX_CLIENTS {
             if !clients[i].is_active() { continue; }
 
-            // Poll file channel
-            if clients[i].file_ch.is_some() {
-                let file_inode = clients[i].file_inode;
-                let raw_h = clients[i].file_ch.as_ref().unwrap().raw_handle();
+            let mut path_buf = [0u8; 64];
+            let mut path_len = 0usize;
+            let mut open_flags: Option<OpenFlags> = None;
+            let mut is_delete = false;
+            let mut is_stat = false;
+            let mut is_readdir = false;
+            let mut is_mkdir = false;
+            let mut ctl_closed = false;
 
-                // Phase 1: recv, copy borrowed data to stack
-                let mut read_params: Option<(FileOffset, u32)> = None;
-                let mut write_buf = [0u8; 1024];
-                let mut write_params: Option<(FileOffset, usize)> = None;
-                let mut ioctl = false;
-                let mut file_closed = false;
-
-                {
-                    let ch = clients[i].file_ch.as_mut().unwrap();
-                    match ch.try_recv() {
-                        Ok(FileRequest::Read { offset, len }) => {
-                            read_params = Some((offset, len));
-                        }
-                        Ok(FileRequest::Write { offset, data }) => {
-                            let dlen = data.len().min(1024);
-                            write_buf[..dlen].copy_from_slice(&data[..dlen]);
-                            write_params = Some((offset, dlen));
-                        }
-                        Ok(FileRequest::Ioctl { .. }) => {
-                            ioctl = true;
-                        }
-                        Err(rvos::RecvError::Closed) => {
-                            file_closed = true;
-                        }
-                        Err(_) => {}
+            {
+                let ch = clients[i].ctl.as_mut().unwrap();
+                match ch.try_recv() {
+                    Ok(FsRequest::Open { flags, path }) => {
+                        path_len = path.len().min(64);
+                        path_buf[..path_len].copy_from_slice(path.as_bytes());
+                        open_flags = Some(flags);
                     }
-                }
-
-                // Phase 2: act on extracted data (borrow released)
-                if let Some((offset, len)) = read_params {
-                    handled = true;
-                    let ch = clients[i].file_ch.as_ref().unwrap();
-                    handle_file_read(&mut ext2_state, ch, file_inode, offset, len);
-                } else if let Some((offset, dlen)) = write_params {
-                    handled = true;
-                    let ch = clients[i].file_ch.as_ref().unwrap();
-                    handle_file_write(&mut ext2_state, ch, file_inode, offset, &write_buf[..dlen]);
-                } else if ioctl {
-                    handled = true;
-                    let ch = clients[i].file_ch.as_ref().unwrap();
-                    send_file_error(ch, FsError::Io {});
-                } else if file_closed {
-                    ext2_state.close_open_file(raw_h);
-                    clients[i].file_ch = None;
-                    clients[i].file_inode = 0;
+                    Ok(FsRequest::Delete { path }) => {
+                        path_len = path.len().min(64);
+                        path_buf[..path_len].copy_from_slice(path.as_bytes());
+                        is_delete = true;
+                    }
+                    Ok(FsRequest::Stat { path }) => {
+                        path_len = path.len().min(64);
+                        path_buf[..path_len].copy_from_slice(path.as_bytes());
+                        is_stat = true;
+                    }
+                    Ok(FsRequest::Readdir { path }) => {
+                        path_len = path.len().min(64);
+                        path_buf[..path_len].copy_from_slice(path.as_bytes());
+                        is_readdir = true;
+                    }
+                    Ok(FsRequest::Mount { .. }) => {
+                        handled = true;
+                        send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
+                    }
+                    Ok(FsRequest::Unmount { .. }) => {
+                        handled = true;
+                        send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
+                    }
+                    Ok(FsRequest::Mkdir { path }) => {
+                        path_len = path.len().min(64);
+                        path_buf[..path_len].copy_from_slice(path.as_bytes());
+                        is_mkdir = true;
+                    }
+                    Err(rvos::RecvError::Closed) => {
+                        ctl_closed = true;
+                    }
+                    Err(_) => {}
                 }
             }
 
-            // Poll ctl channel
-            if clients[i].ctl.is_some() {
-                let mut path_buf = [0u8; 64];
-                let mut path_len = 0usize;
-                let mut open_flags: Option<OpenFlags> = None;
-                let mut is_delete = false;
-                let mut is_stat = false;
-                let mut is_readdir = false;
-                let mut is_mkdir = false;
-                let mut ctl_closed = false;
-
-                {
-                    let ch = clients[i].ctl.as_mut().unwrap();
-                    match ch.try_recv() {
-                        Ok(FsRequest::Open { flags, path }) => {
-                            path_len = path.len().min(64);
-                            path_buf[..path_len].copy_from_slice(path.as_bytes());
-                            open_flags = Some(flags);
-                        }
-                        Ok(FsRequest::Delete { path }) => {
-                            path_len = path.len().min(64);
-                            path_buf[..path_len].copy_from_slice(path.as_bytes());
-                            is_delete = true;
-                        }
-                        Ok(FsRequest::Stat { path }) => {
-                            path_len = path.len().min(64);
-                            path_buf[..path_len].copy_from_slice(path.as_bytes());
-                            is_stat = true;
-                        }
-                        Ok(FsRequest::Readdir { path }) => {
-                            path_len = path.len().min(64);
-                            path_buf[..path_len].copy_from_slice(path.as_bytes());
-                            is_readdir = true;
-                        }
-                        Ok(FsRequest::Mount { .. }) => {
-                            handled = true;
-                            send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
-                        }
-                        Ok(FsRequest::Unmount { .. }) => {
-                            handled = true;
-                            send_error(clients[i].ctl.as_ref().unwrap(), FsError::Io {});
-                        }
-                        Ok(FsRequest::Mkdir { path }) => {
-                            path_len = path.len().min(64);
-                            path_buf[..path_len].copy_from_slice(path.as_bytes());
-                            is_mkdir = true;
-                        }
-                        Err(rvos::RecvError::Closed) => {
-                            ctl_closed = true;
-                        }
-                        Err(_) => {}
-                    }
-                }
-
-                // Phase 2: dispatch (ctl borrow released, ext2 and clients are separate)
-                if let Some(flags) = open_flags {
-                    handled = true;
-                    do_open(&mut ext2_state, &mut clients[i], flags, &path_buf[..path_len]);
-                } else if is_delete {
-                    handled = true;
-                    do_delete(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
-                } else if is_stat {
-                    handled = true;
-                    do_stat(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
-                } else if is_readdir {
-                    handled = true;
-                    do_readdir(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
-                } else if is_mkdir {
-                    handled = true;
-                    do_mkdir(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
-                } else if ctl_closed {
-                    clients[i].ctl = None;
-                }
+            // Phase 2: dispatch (ctl borrow released, ext2 and clients are separate)
+            if let Some(flags) = open_flags {
+                handled = true;
+                let ctl_ch = clients[i].ctl.as_ref().unwrap();
+                do_open(&mut ext2_state, ctl_ch, &mut file_slots, flags, &path_buf[..path_len]);
+            } else if is_delete {
+                handled = true;
+                do_delete(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+            } else if is_stat {
+                handled = true;
+                do_stat(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+            } else if is_readdir {
+                handled = true;
+                do_readdir(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+            } else if is_mkdir {
+                handled = true;
+                do_mkdir(&mut ext2_state, clients[i].ctl.as_ref().unwrap(), &path_buf[..path_len]);
+            } else if ctl_closed {
+                clients[i].ctl = None;
             }
         }
 
@@ -808,9 +813,9 @@ fn main() {
                 if let Some(ref ctl) = client.ctl {
                     ctl.poll_add();
                 }
-                if let Some(ref file_ch) = client.file_ch {
-                    file_ch.poll_add();
-                }
+            }
+            for file in file_slots.iter().flatten() {
+                file.ch.poll_add();
             }
             raw::sys_block();
         }
