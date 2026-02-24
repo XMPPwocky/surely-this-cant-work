@@ -13,6 +13,15 @@ A from-scratch RISC-V 64-bit microkernel OS written in Rust, targeting qemu-syst
 - `make mcp-setup` — create Python venv for the QEMU MCP server
 - `make mcp-server` — start the QEMU MCP server (for agent interaction)
 
+## Command Output
+Never pipe `make` commands (or other build/test commands) directly to `tail`
+or `grep` — if the command fails you'll need the full output to debug. Always
+`tee` to a temporary file first, then inspect that file:
+```
+make test 2>&1 | tee /tmp/test.log
+# then: tail -40 /tmp/test.log
+```
+
 ## Linting
 - `make clippy` — run clippy on all crates (kernel + user)
 - `make clippy-kernel` — run clippy on the kernel only
