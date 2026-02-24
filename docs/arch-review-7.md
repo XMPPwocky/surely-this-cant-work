@@ -61,7 +61,7 @@ if path.len() > path_buf.len() {
 
 ---
 
-### MEDIUM: Named services register silently overwrites on capacity overflow
+### ~~MEDIUM: Named services register silently overwrites on capacity overflow~~ FIXED (587d32d)
 
 **Location**: `kernel/src/services/init.rs:50` (MAX_NAMED_SERVICES)
 
@@ -69,7 +69,7 @@ if path.len() > path_buf.len() {
 
 **Impact**: Silent service deregistration. A new service could overwrite `"stdio"` or `"fs"`, breaking all subsequent connections.
 
-**Fix**: Return `Option<()>` and reject registration when full. Log a warning.
+**Fix**: ~~Return `Option<()>` and reject registration when full. Log a warning.~~ Changed `register_service()` to return `Option<()>`, rolls back atomic counter on failure, logs warning. Boot callers use `.expect()`, runtime caller (fs launches) handles gracefully.
 
 ---
 
@@ -170,7 +170,7 @@ CLAUDE.md states "No static mut. Pass state through function parameters." This s
 | Page frames | ~32K | Returns None | Yes | No | Adequate |
 | mmap regions/proc | 256 | Returns false | Yes (bool) | No | Change to Result |
 | Message queue depth | 64 | Returns Err(QueueFull) | Yes | No | Excellent |
-| Named services | 16 | **Silent overwrite** | **No** | **Yes** (12→16) | Return error |
+| Named services | 16 | Returns None | Yes | **FIXED** (587d32d) | Adequate |
 | Boot registrations | 16 | Logs warning, skips | Partial | No | Adequate |
 | Console clients | 8 | **Silent drop** | **No** | No | Log + reject |
 | Dynamic spawns | 8 | Error response | Yes | No | Adequate |
@@ -186,7 +186,7 @@ CLAUDE.md states "No static mut. Pass state through function parameters." This s
 
 **Key changes from review 6**: Channel pool expanded 16x (64→1024). Per-process channel limit added (32). TCP connection exhaustion now sends RST instead of silent drop. ext2 file management redesigned with flat slot array (Bug 0021).
 
-**Still problematic**: Process spawn panics. SHM creation panics. Named services silently overwrite. Console clients silently dropped.
+**Still problematic**: Process spawn panics. SHM creation panics. Console clients silently dropped.
 
 ---
 
@@ -465,7 +465,7 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 ### Immediate (fix this week)
 
 1. **Return error from ext2-server for paths > 64 bytes** — silent truncation is a data corruption risk (MEDIUM correctness)
-2. **Update `docs/kernel-abi.md` MAX_CHANNELS** — says 64, actual is 1024 (CRITICAL doc drift)
+2. ~~**Update `docs/kernel-abi.md` MAX_CHANNELS** — says 64, actual is 1024 (CRITICAL doc drift)~~ **DONE** (1122aa6)
 3. **Replace process spawn panic with error return** — user-triggerable kernel crash (MEDIUM robustness)
 4. **Replace SHM creation panic with error return** — user-triggerable kernel crash (MEDIUM robustness)
 
@@ -478,9 +478,9 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 9. **Add spawn-suspended ktest** — new feature with no test (MEDIUM testing)
 10. **Add HTTP loopback integration ktest** — validates net-stack loopback + http-server + http-client (HIGH testing value)
 11. **Create missing protocol docs** — HTTP, DNS, DHCP, block device, ext2 (MEDIUM documentation)
-12. **Update architecture.md** — add loopback, ext2, block devices, platform abstraction (MEDIUM documentation)
+12. ~~**Update architecture.md** — add loopback, ext2, block devices, platform abstraction (MEDIUM documentation)~~ **DONE** (1b38f49)
 13. **Improve http-server error handling** — return 400/413 on malformed requests (LOW robustness)
-14. **Fix named services silent overwrite** — return error when full (MEDIUM robustness)
+14. ~~**Fix named services silent overwrite** — return error when full (MEDIUM robustness)~~ **DONE** (587d32d)
 
 ### Backlog (when convenient)
 
@@ -514,7 +514,7 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 | ~~Create docs/protocols/timer.md~~ | **DONE** (3bc1a1a) |
 | ~~Update architecture.md + kernel-abi.md~~ | **PARTIAL** (timer added, ext2/blk/loopback missing) |
 | ~~Update README process list + syscall table~~ | **DONE** (6d8efc2) |
-| Replace register_service() assert with Result | OPEN |
+| ~~Replace register_service() assert with Result~~ | **DONE** (587d32d) |
 | Extract SHM volatile helpers to shared lib | OPEN |
 | Extract spawn_impl() helper | OPEN |
 | Add TCP state machine tests | OPEN (partial coverage via integration) |
