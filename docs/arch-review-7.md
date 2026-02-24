@@ -166,7 +166,7 @@ CLAUDE.md states "No static mut. Pass state through function parameters." This s
 | Channels/process | 32 | Returns Error | Yes | **New** (Bug 0013 fix) | Adequate |
 | Handles/process | 32 | Returns None | Yes | No | Consider increase to 64 |
 | Processes | 64 | Returns None | Yes | No (already Option) | Adequate |
-| SHM regions | 32 | **Panics** | **No** | No | Return Option |
+| SHM regions | 32 | Returns None | Yes | No (already Option) | Adequate |
 | Page frames | ~32K | Returns None | Yes | No | Adequate |
 | mmap regions/proc | 256 | Returns false | Yes (bool) | No | Change to Result |
 | Message queue depth | 64 | Returns Err(QueueFull) | Yes | No | Excellent |
@@ -186,7 +186,7 @@ CLAUDE.md states "No static mut. Pass state through function parameters." This s
 
 **Key changes from review 6**: Channel pool expanded 16x (64→1024). Per-process channel limit added (32). TCP connection exhaustion now sends RST instead of silent drop. ext2 file management redesigned with flat slot array (Bug 0021).
 
-**Still problematic**: SHM creation panics. Console clients silently dropped.
+**Still problematic**: Console clients silently dropped.
 
 ---
 
@@ -416,7 +416,7 @@ All unsafe blocks in reviewed code are necessary and minimal:
 | Error Path | Tested? | Risk |
 |------------|---------|------|
 | Process table full (>64 procs) | **No** | MEDIUM (returns None, handled gracefully) |
-| SHM creation exhaustion (>32 regions) | **No** | HIGH (panics) |
+| SHM creation exhaustion (>32 regions) | **No** | MEDIUM (returns None, handled gracefully) |
 | Global channel pool exhaustion | **No** | MEDIUM |
 | ext2 disk full | **No** | HIGH |
 | ext2 path > 64 bytes | **No** | HIGH (silent truncation) |
