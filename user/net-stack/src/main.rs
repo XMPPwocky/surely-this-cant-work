@@ -2692,6 +2692,12 @@ fn dhcp_transact(
             let slot_idx = (rx_tail % RX_SLOTS as u32) as usize;
             let slot_offset = RX_RING_OFFSET + slot_idx * RX_SLOT_SIZE;
             let frame_len = shm_read_u16(shm_base, slot_offset) as usize;
+            if frame_len > RX_SLOT_SIZE - 2 {
+                // Bogus length from device — skip frame
+                core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+                shm_write_u32(shm_base, CTRL_RX_TAIL, rx_tail.wrapping_add(1));
+                continue;
+            }
             let copy_len = frame_len.min(rx.rx_buf.len());
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -2906,8 +2912,13 @@ fn main() {
             let slot_idx = (rx_tail % RX_SLOTS as u32) as usize;
             let slot_offset = RX_RING_OFFSET + slot_idx * RX_SLOT_SIZE;
             let frame_len = shm_read_u16(shm_base, slot_offset) as usize;
+            if frame_len > RX_SLOT_SIZE - 2 {
+                // Bogus length from device — skip frame
+                shm_write_u32(shm_base, CTRL_RX_TAIL, rx_tail.wrapping_add(1));
+                continue;
+            }
 
-            let copy_len = frame_len.min(1534);
+            let copy_len = frame_len.min(rx.rx_buf.len());
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (shm_base + slot_offset + 2) as *const u8,
