@@ -584,7 +584,7 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
     };
 
     let ctl_ep = svc.control_ep.load(Ordering::Relaxed);
-    if ctl_ep != usize::MAX {
+    if ctl_ep != usize::MAX && ipc::channel_is_active(ctl_ep) {
         // Send server endpoint to the service via its control channel with NewConnection.
         // clone = inc_ref for the transfer; drop server_ep closes our reference.
         let mut ctl_msg = Message::new();
@@ -602,6 +602,10 @@ fn handle_service_request(boot_ep_b: usize, svc: &NamedService, client_pid: u32,
         send_ok_with_cap(boot_ep_b, client_ep.raw(), my_pid);
         drop(client_ep); // close our reference
     } else {
+        // Service not registered or service process has exited (control channel inactive).
+        // Drop both endpoints — the channel deactivates automatically.
+        drop(server_ep);
+        drop(client_ep);
         send_error(boot_ep_b, "service not ready", my_pid);
     }
 }
@@ -627,6 +631,13 @@ fn handle_stdio_request(boot_ep_b: usize, _console_type: ConsoleType, client_pid
     };
 
     if let Some(ctl_ep) = control_ep {
+        if !ipc::channel_is_active(ctl_ep) {
+            // Console server has exited (control channel inactive).
+            drop(server_ep);
+            drop(client_ep);
+            send_error(boot_ep_b, "console not ready", my_pid);
+            return;
+        }
         // Send NewConnection to console server via its control channel with role.
         // clone = inc_ref for the transfer; drop server_ep closes our reference.
         let mut ctl_msg = Message::new();
