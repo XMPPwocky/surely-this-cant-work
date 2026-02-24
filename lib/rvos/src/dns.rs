@@ -33,8 +33,10 @@ pub fn resolve(name: &str, dns_server: [u8; 4]) -> Result<[u8; 4], DnsError> {
     let mut query = [0u8; 512];
     let len = build_query(name, &mut query)?;
 
-    // Send via UDP to dns_server:53
-    let mut sock = UdpSocket::new()?;
+    // Bind to an ephemeral port (port 0 is rejected by many DNS servers)
+    let mut sock = UdpSocket::bind(SocketAddr::Inet4 {
+        a: 0, b: 0, c: 0, d: 0, port: 0,
+    })?;
     let server_addr = SocketAddr::Inet4 {
         a: dns_server[0],
         b: dns_server[1],

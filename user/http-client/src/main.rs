@@ -23,7 +23,23 @@ fn main() {
     };
 
     // Resolve hostname to IP
-    let ip = match rvos::dns::resolve_default(&host) {
+    eprintln!("[http-client] getting net config...");
+    let net_config = match rvos::socket::get_net_config() {
+        Ok(c) => {
+            eprintln!(
+                "[http-client] config: ip={}.{}.{}.{} dns={}.{}.{}.{}",
+                c.ip[0], c.ip[1], c.ip[2], c.ip[3],
+                c.dns[0], c.dns[1], c.dns[2], c.dns[3],
+            );
+            c
+        }
+        Err(e) => {
+            eprintln!("[http-client] get_net_config failed: {:?}", e);
+            process::exit(1);
+        }
+    };
+    eprintln!("[http-client] resolving '{}'...", host);
+    let ip = match rvos::dns::resolve(&host, net_config.dns) {
         Ok(ip) => ip,
         Err(e) => {
             eprintln!("http-get: DNS resolve '{}': {:?}", host, e);

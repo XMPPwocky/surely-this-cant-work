@@ -66,6 +66,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-client"
+version = "0.1.0"
+dependencies = [
+ "rvos",
+ "rvos-rt",
+]
+
+[[package]]
+name = "http-server"
+version = "0.1.0"
+dependencies = [
+ "rvos-rt",
+]
+
+[[package]]
 name = "ipc-torture"
 version = "0.1.0"
 dependencies = [

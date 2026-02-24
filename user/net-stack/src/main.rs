@@ -1886,6 +1886,11 @@ fn assign_accepted_socket(sockets: &mut [Socket; MAX_SOCKETS], tcp_conns: &mut T
     sockets[idx].port = tcp_conns[conn_idx].local_port;
 }
 
+/// Allocate an ephemeral port (49152–65535) not currently in use.
+fn allocate_ephemeral_port(sockets: &[Socket; MAX_SOCKETS]) -> Option<u16> {
+    (49152u16..=65535).find(|&port| !sockets.iter().any(|s| s.active && s.port == port))
+}
+
 #[allow(clippy::too_many_arguments)] // inherent complexity of passing service state
 fn handle_client_message(
     sock_idx: usize,
@@ -1912,20 +1917,36 @@ fn handle_client_message(
     match req {
         SocketRequest::Bind { addr } => {
             let SocketAddr::Inet4 { port, .. } = addr;
-            // Check if port is already bound
-            let already_bound = sockets.iter().any(|s| s.active && s.port == port);
-            tx.msg = Message::new();
-            if already_bound {
-                tx.msg.len = rvos_wire::to_bytes(
-                    &SocketResponse::Error { code: SocketError::AddrInUse {} },
-                    &mut tx.msg.data,
-                ).expect("serialize");
+            // Assign ephemeral port if requested port is 0
+            let port = if port == 0 {
+                allocate_ephemeral_port(sockets)
             } else {
-                sockets[sock_idx].port = port;
-                tx.msg.len = rvos_wire::to_bytes(
-                    &SocketResponse::Ok {},
-                    &mut tx.msg.data,
-                ).expect("serialize");
+                Some(port)
+            };
+            tx.msg = Message::new();
+            match port {
+                Some(p) => {
+                    let already_bound = sockets.iter().enumerate()
+                        .any(|(i, s)| i != sock_idx && s.active && s.port == p);
+                    if already_bound {
+                        tx.msg.len = rvos_wire::to_bytes(
+                            &SocketResponse::Error { code: SocketError::AddrInUse {} },
+                            &mut tx.msg.data,
+                        ).expect("serialize");
+                    } else {
+                        sockets[sock_idx].port = p;
+                        tx.msg.len = rvos_wire::to_bytes(
+                            &SocketResponse::Ok {},
+                            &mut tx.msg.data,
+                        ).expect("serialize");
+                    }
+                }
+                None => {
+                    tx.msg.len = rvos_wire::to_bytes(
+                        &SocketResponse::Error { code: SocketError::NoResources {} },
+                        &mut tx.msg.data,
+                    ).expect("serialize");
+                }
             }
             if raw::sys_chan_send(handle, &tx.msg) == raw::CHAN_CLOSED {
                 sockets[sock_idx].deactivate(tcp_conns);
@@ -1934,6 +1955,12 @@ fn handle_client_message(
         SocketRequest::SendTo { addr, data } => {
             let SocketAddr::Inet4 { a, b, c, d, port: dst_port } = addr;
             let dst_ip = [a, b, c, d];
+            // Auto-bind to ephemeral port if not yet bound
+            if sockets[sock_idx].port == 0 {
+                if let Some(p) = allocate_ephemeral_port(sockets) {
+                    sockets[sock_idx].port = p;
+                }
+            }
             let src_port = sockets[sock_idx].port;
 
             // Build UDP payload
