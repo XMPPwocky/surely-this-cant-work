@@ -237,6 +237,9 @@ fn timer_tick() {
     // Check for expired timer deadlines and wake blocked processes
     crate::task::check_deadlines(time);
 
+    // Watchdog: check kernel task and critical process heartbeats
+    crate::watchdog::check(time);
+
     NEED_RESCHED.store(true, Ordering::Relaxed);
 }
 

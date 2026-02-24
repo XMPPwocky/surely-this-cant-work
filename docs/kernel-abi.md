@@ -86,6 +86,7 @@ All wrappers use `options(nostack)` since no stack manipulation is needed.
 | 232    | `SYS_CLOCK`           | (none)                        | `a0` = wall_ticks, `a1` = cpu_ticks | Returns wall-clock and global CPU ticks.           |
 | 233    | `SYS_MEMINFO`         | `a0` = info_ptr               | `a0` = 0 or `usize::MAX` | Fills a MemInfo struct with kernel memory statistics. |
 | 234    | `SYS_KILL`            | `a0` = target_pid, `a1` = exit_code | `a0` = 0 or `usize::MAX` | Terminates another process by PID.               |
+| 235    | `SYS_HEARTBEAT`       | (none)                        | `a0` = 0                  | Pets the system watchdog for the calling process. |
 
 ### Detailed Syscall Descriptions
 
@@ -379,6 +380,20 @@ with exit code `-2` when it receives 0x03 (Ctrl+C).
 
 Returns 0 on success, `usize::MAX` on error (invalid PID, target is idle
 task, target is self, target already dead).
+
+#### SYS_HEARTBEAT (235)
+
+Pets the system watchdog for the calling process. Updates the process's
+`last_heartbeat` timestamp to the current `rdtime` value.
+
+Critical user processes (those marked with `watchdog_critical = true` at
+spawn time) should call this in their main loop. The kernel's watchdog
+module checks these timestamps periodically from `timer_tick()`. If a
+critical process hasn't heartbeated within the configured timeout (default
+10 seconds), the watchdog fires: it prints diagnostics and shuts down the
+system via SBI.
+
+Takes no arguments. Always returns 0.
 
 ---
 

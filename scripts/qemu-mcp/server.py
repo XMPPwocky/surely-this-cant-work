@@ -183,6 +183,7 @@ class QEMUInstance:
         memory: str = "128M",
         wait_for_prompt: bool = True,
         project_root: str = "",
+        bootargs: str | None = None,
     ) -> str:
         """Start QEMU with the given configuration."""
         if self.running:
@@ -231,6 +232,9 @@ class QEMUInstance:
             # Kernel
             "-kernel", str(self._kernel_bin),
         ]
+
+        if bootargs:
+            cmd.extend(["-append", bootargs])
 
         if gpu:
             cmd.extend([
@@ -693,6 +697,7 @@ async def qemu_boot(
     extra_drives: list[dict[str, Any]] | None = None,
     memory: str = "128M",
     wait_for_prompt: bool = True,
+    bootargs: str | None = None,
 ) -> str:
     """Start QEMU with rvOS.
 
@@ -704,6 +709,7 @@ async def qemu_boot(
         extra_drives: Additional block devices [{path, readonly}]
         memory: RAM size (default 128M)
         wait_for_prompt: Wait for rvos> prompt before returning
+        bootargs: Kernel boot arguments (e.g. "no-watchdog", "watchdog=30")
 
     Returns: Boot log up to first prompt (or timeout).
     """
@@ -714,6 +720,7 @@ async def qemu_boot(
         extra_drives=extra_drives,
         memory=memory,
         wait_for_prompt=wait_for_prompt,
+        bootargs=bootargs,
     )
 
 

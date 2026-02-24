@@ -11,12 +11,15 @@ pub use scheduler::{
     terminate_current_process, terminate_process, exit_current_from_syscall,
     block_process, block_with_deadline, force_block_process, wake_process, save_kernel_satp,
     check_deadlines,
-    process_list, process_mem_list,
+    process_list, try_process_list, process_mem_list,
     current_process_handle, current_process_alloc_handle, current_process_take_handle,
     current_process_user_satp, current_process_alloc_mmap_va,
     current_process_add_mmap, current_process_remove_mmap,
     current_process_mem_pages, current_process_adjust_mem_pages,
     set_exit_notify_ep,
+    // Watchdog
+    update_current_heartbeat, set_watchdog_critical_by_name,
+    check_critical_heartbeats, watchdog_process_status,
     // Debug accessors
     process_is_user, process_debug_attached, set_process_debug_state,
     set_debug_suspend_pending, check_and_clear_debug_suspend,

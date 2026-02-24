@@ -19,6 +19,7 @@ pub fn sysinfo_service() {
     let my_pid = crate::task::current_pid();
 
     loop {
+        crate::watchdog::heartbeat(crate::watchdog::SLOT_SYSINFO);
         let accepted = ipc::accept_client(control_ep, my_pid);
         let client = accepted.endpoint;
 
@@ -73,6 +74,10 @@ pub fn sysinfo_service() {
                 let text = crate::kstat::IPC_LATENCY.format(
                     "IPC delivery latency", "us", 10,
                 );
+                send_chunked(client.raw(), my_pid, text.as_bytes());
+            }
+            SysinfoCommand::Watchdog {} => {
+                let text = crate::watchdog::status();
                 send_chunked(client.raw(), my_pid, text.as_bytes());
             }
         }

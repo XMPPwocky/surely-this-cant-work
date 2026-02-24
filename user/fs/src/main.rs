@@ -877,6 +877,7 @@ fn main() {
 
     // Multiplexed event loop: poll control channel + all active client channels
     loop {
+        raw::sys_heartbeat();
         let mut handled = false;
 
         // Accept new clients from control channel (raw — receives caps in sideband)

@@ -1200,6 +1200,123 @@ pub fn process_list() -> String {
     out
 }
 
+/// Like `process_list()` but uses `try_lock()` — returns `None` if the
+/// scheduler lock is held.  Used by the watchdog to avoid deadlock in
+/// interrupt context.
+pub fn try_process_list() -> Option<String> {
+    let sched = SCHEDULER.try_lock()?;
+    let now = crate::task::process::rdtime();
+    let current_pid = sched.current;
+    let last_switch = sched.last_switch_rdtime;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "  PID  STATE     CPU1s  CPU1m  MEM     BLOCKED ON     NAME");
+    let _ = writeln!(out, "  ---  --------  -----  -----  ------  -------------  ----------------");
+    for (i, slot) in sched.processes.iter().enumerate() {
+        if let Some(proc) = slot {
+            let state = match proc.state {
+                ProcessState::Ready => "Ready   ",
+                ProcessState::Running => "Running ",
+                ProcessState::Blocked => "Blocked ",
+                ProcessState::Dead => "Dead    ",
+            };
+            let blocked_on = match proc.block_reason {
+                crate::task::process::BlockReason::None => String::new(),
+                crate::task::process::BlockReason::IpcRecv(ep) => {
+                    alloc::format!("recv(ep {})", ep)
+                }
+                crate::task::process::BlockReason::IpcSend(ep) => {
+                    alloc::format!("send(ep {})", ep)
+                }
+                crate::task::process::BlockReason::Timer(deadline) => {
+                    let remaining = deadline.saturating_sub(now) / 10_000;
+                    alloc::format!("timer(+{}ms)", remaining)
+                }
+                crate::task::process::BlockReason::Poll => String::from("poll"),
+                crate::task::process::BlockReason::DebugSuspend => String::from("debug"),
+                crate::task::process::BlockReason::SpawnSuspended => String::from("spawn-susp"),
+            };
+            let (e1s, e1m) = effective_ewma(proc, now, i == current_pid, last_switch);
+            let mem_kb = proc.mem_pages as usize * 4;
+            let _ = writeln!(out, "  {:3}  {}  {:2}.{:<1}%  {:2}.{:<1}%  {:>4}K  {:<13}  {}",
+                i, state,
+                e1s / 100, (e1s / 10) % 10,
+                e1m / 100, (e1m / 10) % 10,
+                mem_kb,
+                blocked_on,
+                proc.name());
+        }
+    }
+    Some(out)
+}
+
+/// Check critical user process heartbeats. Returns Some((pid, elapsed_ms))
+/// of the first timed-out process, or None. Uses try_lock to avoid deadlock.
+pub fn check_critical_heartbeats(now: u64, timeout_ticks: u64) -> Option<(usize, [u8; 16], u64)> {
+    let sched = SCHEDULER.try_lock()?;
+    for (i, slot) in sched.processes.iter().enumerate() {
+        if let Some(proc) = slot {
+            if proc.state == ProcessState::Dead || !proc.watchdog_critical {
+                continue;
+            }
+            let last_hb = proc.last_heartbeat;
+            if last_hb != 0 && now.wrapping_sub(last_hb) > timeout_ticks {
+                let mut name_buf = [0u8; 16];
+                let name = proc.name();
+                let n = name.len().min(16);
+                name_buf[..n].copy_from_slice(&name.as_bytes()[..n]);
+                return Some((i, name_buf, last_hb));
+            }
+        }
+    }
+    None
+}
+
+/// Update the `last_heartbeat` timestamp for the current process.
+/// Called by the `sys_heartbeat` syscall handler.
+pub fn update_current_heartbeat(time: u64) {
+    let mut sched = SCHEDULER.lock();
+    let pid = sched.current;
+    if let Some(ref mut proc) = sched.processes[pid] {
+        proc.last_heartbeat = time;
+    }
+}
+
+/// Mark a process as watchdog-critical by name. Called during boot to flag
+/// shell and fs-server as critical.
+pub fn set_watchdog_critical_by_name(name: &str) {
+    let mut sched = SCHEDULER.lock();
+    for proc in sched.processes.iter_mut().flatten() {
+        if proc.name() == name {
+            proc.watchdog_critical = true;
+            return;
+        }
+    }
+}
+
+/// Format watchdog status for critical user processes. Uses try_lock.
+pub fn watchdog_process_status() -> Option<String> {
+    let sched = SCHEDULER.try_lock()?;
+    let now = crate::task::process::rdtime();
+    let freq = crate::platform::timebase_frequency();
+    let mut out = String::new();
+    for (i, slot) in sched.processes.iter().enumerate() {
+        if let Some(proc) = slot {
+            if proc.state == ProcessState::Dead || !proc.watchdog_critical {
+                continue;
+            }
+            let last_hb = proc.last_heartbeat;
+            let ago_ms = if last_hb > 0 {
+                now.saturating_sub(last_hb) / (freq / 1000)
+            } else {
+                0
+            };
+            let _ = writeln!(out, "    PID {:3} {:<16} last heartbeat {}ms ago", i, proc.name(), ago_ms);
+        }
+    }
+    Some(out)
+}
+
 /// Return a formatted string listing per-process memory usage.
 pub fn process_mem_list() -> String {
     let sched = SCHEDULER.lock();

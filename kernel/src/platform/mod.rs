@@ -62,6 +62,11 @@ pub struct PlatformInfo {
     // ── VirtIO MMIO ──────────────────────────────────────────────────
     pub virtio_mmio: [VirtioMmioSlot; MAX_VIRTIO_SLOTS],
     pub virtio_mmio_count: usize,
+
+    // ── Bootargs ─────────────────────────────────────────────────────
+    /// Pointer to the bootargs string in the FDT blob (persists in SBI memory).
+    bootargs_ptr: usize,
+    bootargs_len: usize,
 }
 
 // ── QEMU virt defaults (compile-time fallback) ───────────────────────
@@ -81,6 +86,8 @@ impl PlatformInfo {
         clint_size: 0x0001_0000,
         virtio_mmio: [VirtioMmioSlot { base: 0, irq: 0 }; MAX_VIRTIO_SLOTS],
         virtio_mmio_count: 0,
+        bootargs_ptr: 0,
+        bootargs_len: 0,
     };
 
     pub fn ram_end(&self) -> usize {
@@ -219,4 +226,16 @@ pub fn timebase_frequency() -> u64 {
 pub fn virtio_mmio_slots() -> ([VirtioMmioSlot; MAX_VIRTIO_SLOTS], usize) {
     let p = PLATFORM.lock();
     (p.virtio_mmio, p.virtio_mmio_count)
+}
+
+/// Return the bootargs string from the FDT `/chosen` node.
+/// Returns an empty slice if no bootargs were provided.
+pub fn bootargs() -> &'static [u8] {
+    let p = PLATFORM.lock();
+    if p.bootargs_ptr == 0 || p.bootargs_len == 0 {
+        return b"";
+    }
+    // SAFETY: The FDT blob persists in SBI memory for the kernel's lifetime.
+    // The pointer and length were validated during FDT parsing.
+    unsafe { core::slice::from_raw_parts(p.bootargs_ptr as *const u8, p.bootargs_len) }
 }

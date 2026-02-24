@@ -19,6 +19,7 @@ mod services;
 mod sync;
 mod task;
 mod trace;
+mod watchdog;
 
 global_asm!(include_str!("arch/boot.S"));
 global_asm!(include_str!("arch/trap.S"));
@@ -97,6 +98,9 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
     let plat = platform::info();
     println!("  {} MiB RAM, hart {}", plat.ram.size / 1024 / 1024, plat.boot_hart_id);
     println!();
+
+    // Initialize watchdog from bootargs (must be after FDT parse, before timer)
+    watchdog::init();
 
     // ---- Phase 2: Memory management ----
     mm::init();
@@ -347,6 +351,17 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
 
     // ---- Phase 6: Enable preemptive scheduling ----
 
+    // Register watchdog heartbeat slots for critical kernel tasks
+    watchdog::register(watchdog::SLOT_INIT, "init");
+    watchdog::register(watchdog::SLOT_CONSOLE, "console");
+    watchdog::register(watchdog::SLOT_TIMER, "timer");
+    watchdog::register(watchdog::SLOT_SYSINFO, "sysinfo");
+
+    // Mark critical user processes for watchdog monitoring.
+    // The shell is not critical — it legitimately idles waiting for stdin and
+    // uses high-level std IO that can't easily heartbeat while blocked.
+    task::set_watchdog_critical_by_name("fs");
+
     // Drain any chars that arrived at the UART during boot (before IRQs were enabled).
     // They're sitting in the FIFO — move them to the ring buffer so the console server
     // will see them once it starts running.
@@ -357,6 +372,8 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
         }
     }
 
+    // Reset watchdog deadlines to "now" so boot time doesn't count
+    watchdog::pet_all();
     arch::trap::enable_timer();
     println!("[boot] System ready.\n");
 

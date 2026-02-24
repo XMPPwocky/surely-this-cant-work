@@ -63,6 +63,7 @@ pub fn timer_service() {
     crate::println!("[timer] ready");
 
     loop {
+        crate::watchdog::heartbeat(crate::watchdog::SLOT_TIMER);
         let mut did_work = false;
         let now = crate::task::process::rdtime();
 

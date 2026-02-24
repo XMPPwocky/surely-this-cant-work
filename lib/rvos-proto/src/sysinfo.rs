@@ -29,5 +29,7 @@ define_message! {
         SchedLatency(6) {},
         /// IPC delivery latency histogram.
         IpcLatency(7) {},
+        /// Watchdog status (enabled, timeout, per-slot heartbeats).
+        Watchdog(8) {},
     }
 }

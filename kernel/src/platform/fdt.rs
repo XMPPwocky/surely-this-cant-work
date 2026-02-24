@@ -141,6 +141,7 @@ struct NodeProps<'a> {
     reg: &'a [u8],
     interrupts: &'a [u8],
     timebase_frequency: &'a [u8],
+    bootargs: &'a [u8],
     addr_cells: Option<u32>,
     size_cells: Option<u32>,
 }
@@ -154,6 +155,7 @@ impl<'a> NodeProps<'a> {
             reg: b"",
             interrupts: b"",
             timebase_frequency: b"",
+            bootargs: b"",
             addr_cells: None,
             size_cells: None,
         }
@@ -189,6 +191,8 @@ pub fn parse_platform_info(dtb: &[u8], hart_id: usize) -> Option<PlatformInfo> {
         clint_size: 0,
         virtio_mmio: [VirtioMmioSlot { base: 0, irq: 0 }; MAX_VIRTIO_SLOTS],
         virtio_mmio_count: 0,
+        bootargs_ptr: 0,
+        bootargs_len: 0,
     };
 
     let mut w = Walker::new(dtb, off_struct, off_strings);
@@ -242,6 +246,8 @@ pub fn parse_platform_info(dtb: &[u8], hart_id: usize) -> Option<PlatformInfo> {
                         node.interrupts = value;
                     } else if pname == b"timebase-frequency" {
                         node.timebase_frequency = value;
+                    } else if pname == b"bootargs" {
+                        node.bootargs = value;
                     } else if pname == b"#address-cells" && value.len() >= 4 {
                         let v = be_u32(value, 0);
                         node.addr_cells = Some(v);
@@ -291,6 +297,20 @@ fn process_node(
     depth: usize,
     info: &mut PlatformInfo,
 ) {
+    // ── /chosen node (bootargs) ─────────────────────────────────────
+    if node.name == b"chosen" && depth == 1 && !node.bootargs.is_empty() {
+        // Strip trailing NUL if present (FDT strings are NUL-terminated)
+        let mut len = node.bootargs.len();
+        if len > 0 && node.bootargs[len - 1] == 0 {
+            len -= 1;
+        }
+        if len > 0 {
+            info.bootargs_ptr = node.bootargs.as_ptr() as usize;
+            info.bootargs_len = len;
+        }
+        return;
+    }
+
     // ── /memory node (identified by device_type or node name) ────────
     if (node.device_type.starts_with(b"memory") || node_name_starts_with(node.name, b"memory"))
         && !node.reg.is_empty()

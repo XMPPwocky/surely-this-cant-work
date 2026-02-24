@@ -292,6 +292,8 @@ pub fn init_server() {
     init_fs_launches(&mut fs_launches, my_pid);
 
     loop {
+        crate::watchdog::heartbeat(crate::watchdog::SLOT_INIT);
+
         // Snapshot boot registrations under the lock
         let mut endpoints = [(0usize, ConsoleType::Serial, false); MAX_BOOT_REGS];
         let mut count = 0;

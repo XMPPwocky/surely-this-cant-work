@@ -148,6 +148,10 @@ pub struct Process {
     pub debug_breakpoint_count: usize,
     // Scheduler latency: rdtime when this process was last enqueued
     pub enqueue_time: u64,
+    // Watchdog: last heartbeat timestamp (set by sys_heartbeat syscall)
+    pub last_heartbeat: u64,
+    // Watchdog: if true, the watchdog monitors this process's heartbeat
+    pub watchdog_critical: bool,
 }
 
 /// Unmap a guard page in the kernel page table so any access causes a fault.
@@ -245,6 +249,8 @@ impl Process {
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
             enqueue_time: 0,
+            last_heartbeat: 0,
+            watchdog_critical: false,
         })
     }
 
@@ -329,6 +335,8 @@ impl Process {
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
             enqueue_time: 0,
+            last_heartbeat: 0,
+            watchdog_critical: false,
         })
     }
 
@@ -401,6 +409,8 @@ impl Process {
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
             enqueue_time: 0,
+            last_heartbeat: 0,
+            watchdog_critical: false,
         })
     }
 
@@ -440,6 +450,8 @@ impl Process {
             debug_breakpoints: [(0, 0); MAX_BREAKPOINTS],
             debug_breakpoint_count: 0,
             enqueue_time: 0,
+            last_heartbeat: 0,
+            watchdog_critical: false,
         };
         p.set_name("idle");
         p

@@ -20,6 +20,7 @@ pub const SYS_SHUTDOWN: usize = 231;
 pub const SYS_CLOCK: usize = 232;
 pub const SYS_MEMINFO: usize = 233;
 pub const SYS_KILL: usize = 234;
+pub const SYS_HEARTBEAT: usize = 235;
 
 /// No capability sentinel value.
 pub const NO_CAP: usize = usize::MAX;
@@ -215,5 +216,11 @@ pub fn sys_meminfo(info: &mut MemInfo) -> usize {
 /// Kill a process by PID. Returns 0 on success, usize::MAX on error.
 pub fn sys_kill(pid: usize, exit_code: i32) -> usize {
     syscall2(SYS_KILL, pid, exit_code as usize)
+}
+
+/// Pet the system watchdog. Updates the calling process's heartbeat timestamp.
+/// Critical processes should call this in their main loop.
+pub fn sys_heartbeat() {
+    syscall0(SYS_HEARTBEAT);
 }
 

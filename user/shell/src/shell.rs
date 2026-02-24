@@ -35,6 +35,7 @@ fn cmd_help() {
     println!("  chstat                - Show channel statistics");
     println!("  schedlat              - Scheduler latency histogram");
     println!("  ipclat                - IPC latency histogram");
+    println!("  watchdog              - Watchdog status");
     println!("  trace [clear]         - Show/clear trace ring buffer");
     println!("  ls [path]             - List directory");
     println!("  cat <path>            - Read file");
@@ -180,6 +181,10 @@ fn cmd_schedlat() {
 
 fn cmd_ipclat() {
     send_sysinfo_cmd(&SysinfoCommand::IpcLatency {});
+}
+
+fn cmd_watchdog() {
+    send_sysinfo_cmd(&SysinfoCommand::Watchdog {});
 }
 
 fn cmd_math(args: &str) {
@@ -432,7 +437,7 @@ fn cmd_run(args: &str) -> bool {
 
 const COMMANDS: &[&str] = &[
     "cat", "clear", "echo", "help", "ls", "math", "mem",
-    "ps", "read", "run", "shutdown", "stat", "trace", "write",
+    "ps", "read", "run", "shutdown", "stat", "trace", "watchdog", "write",
 ];
 
 enum Completion {
@@ -1093,6 +1098,7 @@ pub fn run() {
             "schedlat" => cmd_schedlat(),
             "ipclat" => cmd_ipclat(),
             "mem" => cmd_mem(),
+            "watchdog" => cmd_watchdog(),
             "trace" => {
                 let args = line.split_once(' ').map(|x| x.1).unwrap_or("");
                 cmd_trace(args);

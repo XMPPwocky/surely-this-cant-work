@@ -33,6 +33,7 @@ pub const SYS_SHUTDOWN: usize = 231;
 pub const SYS_CLOCK: usize = 232;
 pub const SYS_MEMINFO: usize = 233;
 pub const SYS_KILL: usize = 234;
+pub const SYS_HEARTBEAT: usize = 235;
 
 /// Syscall error type used by all handlers. Converted to a raw usize at the
 /// ABI boundary in `handle_syscall`. User-space code in `lib/rvos/src/raw.rs`
@@ -197,6 +198,11 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
         SYS_KILL => {
             tf.regs[10] = result_to_a0(misc::sys_kill(a0, a1));
         }
+        SYS_HEARTBEAT => {
+            let time = crate::task::process::rdtime();
+            crate::task::update_current_heartbeat(time);
+            tf.regs[10] = 0;
+        }
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);
             tf.regs[10] = SyscallError::Error.into_raw();
@@ -318,6 +324,7 @@ fn syscall_name(num: usize) -> &'static [u8] {
         SYS_CLOCK => b"clock",
         SYS_MEMINFO => b"minfo",
         SYS_KILL => b"kill",
+        SYS_HEARTBEAT => b"hbeat",
         _ => b"?",
     }
 }

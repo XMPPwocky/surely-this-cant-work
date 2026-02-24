@@ -239,6 +239,7 @@ pub fn serial_console_server() {
 
     // Main loop
     loop {
+        crate::watchdog::heartbeat(crate::watchdog::SLOT_CONSOLE);
         let mut handled = false;
 
         // Check control channel for new client registrations
