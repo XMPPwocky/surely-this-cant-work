@@ -38,7 +38,7 @@ QEMU_BLK_TEST = $(QEMU_BLK) \
 # User-space binaries to include in bin.img (ext2 filesystem)
 EXT2_BINS = hello winclient ipc-torture fbcon triangle gui-bench dbg \
             net-stack udp-echo window-server bench tcp-echo nc ktest ktest-helper shell \
-            http-client
+            http-client http-server
 
 .PHONY: build build-user build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images mcp-setup mcp-server
 

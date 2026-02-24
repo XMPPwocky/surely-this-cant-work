@@ -8,6 +8,7 @@ members = [
     "gui-bench",
     "hello",
     "http-client",
+    "http-server",
     "ipc-torture",
     "ktest",
     "ktest-helper",
