@@ -19,6 +19,48 @@ Running `run /bin/fbcon 800 600` in the GUI console creates a new window, but:
 3. Observe: a new fullscreen window appears with only the banner text
 4. No shell prompt appears; keyboard input is not processed
 
+## Investigation
+
+The bugs were surfaced when implementing the feature "allow spawning fbcon as a
+normal window from the GUI shell" (design doc 0002-windowed-fbcon.md,
+session e3de715e, 2026-02-10).
+
+**Step 1 — Code exploration.** The investigation began by reading
+`user/fbcon/src/main.rs` and `kernel/src/services/init.rs` to understand how
+fbcon was launched and how it connected to the shell. This immediately revealed
+the hardcoded `CreateWindowRequest { width: 0, height: 0 }` at line 466 of
+fbcon's main — fbcon never read its command-line arguments at all.
+
+**Step 2 — Tracing shell spawning.** Investigation of why a user-spawned fbcon
+had no shell required following the full boot orchestration path. Init's
+`FS_PROGRAMS` table showed `provides_console: Some(ConsoleType::GpuConsole)` for
+fbcon. The `start_gpu_shell()` function and `gpu_shell_launched` flag were found
+in init's main loop: init waited for fbcon to register a `GpuConsole` endpoint,
+then loaded and spawned `/bin/shell-gpu` against it. User-spawned copies of fbcon
+never triggered this path, so no shell was launched.
+
+**Step 3 — Identifying the architectural issue.** Reading `handle_stdio_request`
+showed it routing stdin/stdout to different console servers based on a
+`ConsoleType` enum (Serial vs. GpuConsole). This tight coupling between init and
+fbcon was identified as the root cause of the second bug — fbcon could not be
+self-contained as long as init controlled shell spawning for it. The existing
+namespace-override mechanism (already used by the shell for `>` redirection) was
+the correct solution.
+
+**Step 4 — Dead client detection.** During implementation, reading fbcon's event
+loop revealed a `sys_chan_recv(CONSOLE_CONTROL_HANDLE, &mut msg)` call inside the
+main polling loop. This was intended to check for dead/disconnected clients, but
+it consumed the first message from any new connection before the normal processing
+path could see it. This explained silent message drops that had been observed. The
+fix was to replace this out-of-band check with inline detection of the `ret == 2`
+(CHAN_CLOSED) return code in the normal polling loops.
+
+**Step 5 — Fix and follow-up.** The fix (commit 24b273b) made fbcon fully
+self-contained. A follow-up issue was then found: namespace overrides were not
+propagated to grandchildren (e.g., a shell spawned by a user-launched fbcon would
+not inherit the stdin/stdout remapping). This was fixed in commit a33a409
+(design 0004-ns-override-propagation).
+
 ## Root Cause
 
 Two distinct bugs, plus an architectural issue:

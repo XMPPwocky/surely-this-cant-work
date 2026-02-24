@@ -30,6 +30,69 @@ child exited.
 
 Discovered by the `test_two_children_shared_override` regression test.
 
+## Investigation
+
+The bug was discovered incidentally while writing ktest regression tests for
+past bugs. The goal was to add a `test_two_children_shared_override` test that
+would catch a recurrence of Bug 0002 — spawning two sequential children that
+share the same namespace override endpoint.
+
+**Initial test design and first deadlock.** The first test attempt redirected
+`hello-std`'s `stdout` service to a raw channel under ktest's control. This
+caused a test timeout. Investigation revealed that the rvOS std's `send_write()`
+function sends a `FileRequest::Write` message and then blocks waiting for a
+`WriteOk` response. When stdout is redirected to a raw channel with no server
+on the other end, the child hangs permanently on its first `println!` call,
+never exiting.
+
+**First fix attempt: concurrent drain.** A `drain_and_wait` helper was written
+to drain the output channel in parallel with waiting for the process exit
+notification. This also failed: the child blocked before the ktest side could
+start draining — the block happened on the very first write, before the queue
+could fill.
+
+**Root cause of the deadlock.** Reading `vendor/rust/library/std/src/sys/stdio/rvos.rs`
+confirmed that `send_write()` always awaits `WriteOk`. The redirect was
+fundamentally incompatible with the file protocol.
+
+**Workaround enabling further testing.** Instead of redirecting `stdout`, the
+tests were changed to redirect a custom service name (`"ktest-svc"`) that
+`hello-std` never connects to. This exercised the cap ref-counting path (the
+override is stored in the `BootRegistration`) without triggering the file
+protocol deadlock.
+
+**Bug discovery.** With the corrected tests, `make test` ran the cap ref
+counting section. The first test (`test_ns_override_cap_delivery`) passed.
+The second (`test_two_children_shared_override`) triggered a kernel panic:
+
+```
+!!! KERNEL PANIC !!!
+panicked at kernel/src/ipc/mod.rs:475:5:
+channel_inc_ref: channel 17 is inactive
+scause:  0x8
+stval:   0x0
+sepc:    0x203b4
+sstatus: 0x200040020
+Backtrace:
+    #0: ra=0x80203988 fp=0x812651b0
+    #1: ra=0x80216140 fp=0x812651f0
+    #2: ra=0x8021c112 fp=0x81265220
+    #3: ra=0x8020f22e fp=0x81265240
+    #4: ra=0x80200104 fp=0x81266000
+```
+
+**Root cause identification.** Examining `parse_ns_overrides()` in
+`kernel/src/services/init.rs` showed it decoded the cap endpoint from
+`message.caps[]` and stored it in `NsOverride.endpoint` with no call to
+`channel_inc_ref()`. The IPC transfer path (`translate_cap_for_send`) had
+already called `channel_inc_ref` once — but that covered only the `extra_cap`
+delivery to handle 1 in the child. The `BootRegistration` storing the override
+endpoint was a separate ownership that required its own ref count. When child
+1 exited and both its handle 1 and the boot registration cleanup closed the
+endpoint, the ref count dropped to zero and the channel deactivated. Spawning
+child 2 with the same override then attempted `channel_inc_ref` on an inactive
+channel, causing the panic.
+
 ## Root Cause
 
 **Mechanism:** When `handle_spawn_request` processes a spawn message containing

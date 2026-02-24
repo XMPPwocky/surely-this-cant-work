@@ -12,6 +12,74 @@ suspended" event appeared to show up without the user issuing another suspend
 command. Observed during bug 0009 testing when commands were issued in quick
 succession via an expect script.
 
+## Investigation
+
+The bug was first noticed as a side-effect during bug 0009 testing. One expect
+script run produced output showing "[event] Process suspended" appearing after
+the "Resumed." line — which looked like a spurious re-suspend. The user was
+asked to file it, and the following investigation was carried out.
+
+**Step 1 — Code analysis.**
+The `debug_suspend_pending` flag lifecycle was traced through the kernel:
+`proc_debug.rs` sets it only in the Suspend command handler;
+`trap.rs` atomically checks and clears it via `check_and_clear_debug_suspend()`
+when returning to U-mode; the Resume handler (`clear_debug_suspended`) runs
+only *after* the flag is already cleared. No code path could re-set the flag
+without a new explicit Suspend command. Code analysis thus suggested the
+behavior was not a real bug.
+
+**Step 2 — First reproduction attempt (`/tmp/test-spurious-suspend.exp`).**
+An expect script attached to `fs` (PID 6), issued `suspend`, waited for the
+suspend event, issued `continue`, then monitored for any spurious subsequent
+event over 4 seconds. The script timed out: `fs` spends almost all of its time
+blocked waiting for IPC. A blocked process never takes a U-mode trap, so
+`debug_suspend_pending` is never checked and the suspend command just hangs
+waiting for an event that never comes. This led to the secondary finding that
+debug suspend only works on actively running processes.
+
+**Step 3 — Search for an active target.**
+The ktest-helper and other user binaries were examined to find a process that
+loops continuously and would reliably take traps. No suitable long-lived
+looping target was found in the default system configuration.
+
+**Step 4 — Second reproduction attempt (`/tmp/test-spurious-suspend2.exp`).**
+The script attempted to replicate the exact bug 0009 test conditions: trigger
+filesystem activity immediately before suspending (to catch `fs` while it was
+actively handling a request), then repeat suspend/continue five times.
+Result: the suspend either timed out (fs went back to blocked too quickly) or
+completed cleanly with no spurious events observed across multiple runs.
+
+**Step 5 — Reproduce original bug 0009 sequence (`/tmp/test-bug0009-repro.exp`).**
+The exact command sequence from the original bug 0009 test was scripted and
+run three times. Two runs produced no output at all from the filtered grep
+(grep reported binary matches, indicating expect's control characters). One
+run showed:
+
+```
+Suspend requested (waiting for event.
+>>> Got suspend event
+Resumed.
+[event] Process suspended
+Detached.
+```
+
+This output ordering — "[event] Process suspended" appearing after "Resumed." —
+was the original observation. On closer examination, this is output buffering
+and display interleaving: the event line was generated before `continue` was
+processed but printed after "Resumed." due to expect's output buffering. The
+old (pre-bug-0009-fix) debugger had inherent timing issues that made event
+delivery and display ordering unreliable.
+
+**Step 6 — Final reproduction attempt (`/tmp/test-spurious-final.exp`).**
+A more careful script with full output capture via `log_file` attached to `fs`,
+issued `suspend` (waiting for the suspend event), issued `continue`, then
+waited 4 seconds watching for any further `[event]` output. The script timed
+out at 1.5 minutes because `fs` was blocked and suspend never fired.
+
+**Conclusion.** After four distinct reproduction scripts and multiple runs,
+no genuine spurious event was produced. Code analysis confirms the flag
+lifecycle is correct. The original observation was an output-ordering artifact.
+
 ## Reproduction Steps
 
 Could not be reliably reproduced. Multiple expect scripts were tried:

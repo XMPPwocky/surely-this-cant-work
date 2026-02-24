@@ -24,6 +24,24 @@ Key observations:
 - `current_pid=13`: winclient (a user process)
 - Nondeterministic: requires sustained mouse activity to trigger
 
+## Investigation
+
+The crash was reported after running `/bin/winclient` in GUI mode and moving the mouse. The first step was ruling out obvious causes from the register dump:
+
+**Initial hypothesis — stack overflow.** The `s0=s1=0xFFFFFFFFFFFFFFFF` pattern with a kernel-mode crash looked like callee-saved registers trampled by a stack overflow. This was ruled out immediately: stack overflow would show `stval` near the bottom of the stack (e.g., `0x8101XXXX`), but here `stval=0x0`. Kernel task stacks already had guard pages at the bottom, and a guard-page fault would have a non-zero `stval`.
+
+**Conclusion from register dump.** With `ra=0x0` and corrupted callee-saved registers, the pattern indicated `switch_context` had loaded a corrupted `TaskContext`. Something overwrote the `TaskContext` in the `Process` struct with bad values. A `ret` with `ra=0` then faulted at address 0.
+
+**Second hypothesis — use-after-free on process slot reuse.** A subagent analysis proposed that `find_free_slot()` could free a `Process` struct while `sscratch` still pointed to its `TrapContext`. A new process reusing that slot would stomp the old `TrapContext`, causing register corruption on the next trap. Reading the code showed `sscratch` is updated atomically as part of `schedule()`/`preempt()` with interrupts disabled, so this specific race does not exist in the current design. The hypothesis was discarded.
+
+**Bug B found first — kernel task `ra=0`.** Tracing what happens when a kernel task's entry function returns revealed that `TrapContext::new_kernel()` left `frame.regs[1]` (ra) at 0. Any kernel task that returns from its entry function executes `ret` → jumps to address 0 → page fault. The gpu-server has an explicit return path when its client disconnects. This was fixed immediately as Bug B. However, the crash shows `current_pid=13` (winclient), which has no return path and is never PID 3 (gpu-server), so Bug B alone did not explain the original crash.
+
+**Bug A found — SpinLock interrupt window.** Re-reading `schedule()` with the knowledge that kernel tasks run with SIE=1 revealed the actual race: after `sched.current = next_pid` is written inside the lock, `drop(sched)` re-enables interrupts (because `irq_was_enabled=true` for kernel tasks). There is a window of roughly one instruction before the subsequent `disable_interrupts()` call. If a timer fires in that window, `preempt()` reads `sched.current = next_pid` and calls `switch_context(next_pid_ctx, ...)`, saving the **actually-running task's** callee-saved registers into `next_pid`'s `TaskContext`, corrupting it. When `next_pid` later resumes, it loads garbage — including `ra=0x0` and `s0=s1=0xFFFFFFFFFFFFFFFF` from the previous task's dead-frame content. This matched the symptom exactly.
+
+**Why winclient (PID 13) and not the directly corrupted task.** The corrupted task (whichever kernel server had its `TaskContext` overwritten) eventually jumped somewhere invalid. Depending on PID scheduling and what the corrupted `ra` pointed to, the crash could surface on a different CPU context. Under heavy mouse activity, gpu-server, kbd-server, and mouse-server all call `schedule()` repeatedly via blocking IPC, compounding the probability per second.
+
+**Verification approach.** The race window is too narrow to reproduce deterministically in a headless test. Verification relied on eliminating the race mechanically (keeping interrupts disabled through `switch_context`) and confirming the system remained stable under `make bench` and GPU headless boot.
+
 ## Root Causes
 
 Two independent bugs were found:

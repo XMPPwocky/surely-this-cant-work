@@ -31,6 +31,95 @@ Two failure modes were observed:
 
 Intermittent: fails roughly 1 in 3-5 attempts with sustained mouse movement.
 
+## Investigation
+
+The investigation proceeded through several phases, each revealing a deeper layer of the problem.
+
+### Phase 1: Static code analysis
+
+The bug was reported with `ps` output showing gpu-server (PID 3) in `Ready` state at 99% CPU.
+The `Ready` (not `Blocked`) state with high CPU immediately pointed to a spin loop rather than an
+IPC deadlock. Three background subagents explored the GPU driver, window-server, and IPC subsystem
+in parallel while the main agent traced the call path from mouse event to GPU flush.
+
+Several theories were evaluated:
+- **Lost wakeup race in IPC**: Ruled out — would result in both parties `Blocked`, not one at 99% CPU `Ready`.
+- **Channel deadlock**: Lock-step protocol means at most 1 message in flight; no deadlock path found.
+- **Frame allocator double-allocation**: Ruled out by bitmap implementation.
+- **Descriptor free list corruption**: Traced through carefully, appeared correct.
+- **Non-volatile DMA reads (initial primary theory)**: `pop_used()` in `queue.rs` read `used.idx`
+  through a regular pointer dereference rather than `read_volatile`. If the compiler cached this read,
+  the spin loop would never observe the device updating the used ring.
+
+### Phase 2: Volatile DMA fix — necessary but not sufficient
+
+The non-volatile DMA theory was plausible and the fix was correct practice, so volatile reads/writes
+were applied to all DMA shared memory accesses in `queue.rs`. A spin timeout with panic was also added
+to `send_command()` in `gpu.rs` to convert silent hangs to observable panics.
+
+After deploying these changes and triggering the bug, the kernel panic fired — confirming the
+gpu-server was genuinely stuck waiting for a VirtIO command that never completed. The volatile fix
+was correct but had not resolved the hang: the VirtIO GPU device itself was not responding.
+
+### Phase 3: QEMU source analysis — discovering deferred BH processing
+
+With the timeout confirming a device-level issue, the QEMU source (`vendor/qemu/hw/display/virtio-gpu.c`)
+was examined. The critical finding: `virtio_gpu_handle_ctrl_cb()` does NOT process commands
+synchronously when the guest writes `QUEUE_NOTIFY`. Instead, it calls `qemu_bh_schedule(g->ctrl_bh)`
+to schedule a bottom-half (BH) that runs later from QEMU's main event loop (`main_loop_wait()`).
+
+The BH only executes when `cpu_exec()` yields back to the event loop. Under normal load, QEMU's
+host alarm timer (~10ms) periodically fires `exit_request`, causing `cpu_exec()` to yield.
+Under heavy load (rapid mouse movement generating continuous flush requests), the guest's tight spin
+loop kept the CPU emulation running without interruption, starving the event loop and preventing the
+BH from ever running.
+
+An intermediate theory considered adding a VirtIO MMIO register read inside the spin loop: MMIO
+accesses force Translation Block (TB) boundaries in QEMU TCG, which would give the host alarm timer
+opportunities to set `exit_request`. This approach was superseded by the cleaner WFI solution.
+
+### Phase 4: WFI fix and secondary bug (SEIE not set during gpu init)
+
+The WFI (`wfi`) instruction was chosen as the fix: it yields the RISC-V CPU, causing QEMU to break
+out of `cpu_exec()` and run its event loop, processing the GPU BH. A GPU PLIC interrupt handler was
+added so WFI would return when the device completed a command.
+
+An initial boot attempt with this fix failed — the GPU init sequence hung at the first `send_command`
+call. Investigation revealed that `gpu::init()` runs before `enable_timer()` which sets `sie.SEIE`
+(external interrupt enable). Without SEIE, WFI never woke on GPU interrupts. Fix: explicitly enable
+`sie.SEIE` in `gpu::init()` before the first `send_command` call.
+
+After this fix, boot succeeded and the GPU init completed all six initialization commands via
+WFI-based polling.
+
+### Phase 5: Tertiary bug — shared KERNEL_TRAP_STACK corruption
+
+After the WFI fix was deployed, interactive testing with `make run-gui` revealed a new failure mode:
+during mouse movement, the display still froze, but now with a kernel diagnostic:
+
+```
+Page fault (instruction): sepc=0x15e1a, stval=0x15e1a, SPP=0 (U-mode)
+  sstatus=0x8000000200046020 ra=0x15de4 sp=0x81f51de0
+  current_pid=3
+  Killing user process due to page fault
+```
+
+The gpu-server (PID 3) was dying with `SPP=0` (U-mode) even though it is a kernel task running in
+S-mode, and `sepc`/`ra` pointed into user-address space. This indicated trap frame corruption.
+
+Analysis of `trap.S` revealed the root cause: the `_from_kernel` path used a single shared
+`KERNEL_TRAP_STACK` for all kernel task traps. When gpu-server executed `wfi` and a timer interrupt
+fired: (1) the trap frame was saved on the shared stack, (2) `timer_tick()` called `schedule()`,
+(3) another kernel task ran and took a timer interrupt — overwriting the same shared trap stack
+location, (4) when gpu-server was rescheduled, it restored the corrupted trap frame and jumped to
+a garbage address.
+
+This secondary bug was architectural: the `_from_kernel` trap handler called `schedule()` which
+re-enabled interrupts mid-handler, making the handler re-entrant against the shared trap stack.
+This issue was always latent but only became visible once WFI made kernel tasks susceptible to
+being interrupted while waiting for device completions. The resolution was feature 0007
+(per-task trap frames), which moved trap frames from the shared stack into each `Process` struct.
+
 ## Root Cause
 
 **QEMU's VirtIO GPU uses deferred command processing (bottom-half).**

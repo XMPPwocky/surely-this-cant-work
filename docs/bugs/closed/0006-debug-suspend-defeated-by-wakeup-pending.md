@@ -26,6 +26,49 @@ The bug is timing-dependent: it occurs when the target process has
 `wakeup_pending == true` at the moment the trap handler tries to block it.
 For fbcon, which receives frequent keyboard/mouse events, this is common.
 
+## Investigation
+
+The bug was discovered through first-hand testing immediately after the debugger
+was implemented: attaching to fbcon with `dbg`, running `suspend`, observing
+`[event] Process suspended` in the client, but seeing fbcon continue to render.
+
+The investigation started by searching for the `suspend` handling path in
+`kernel/src/services/proc_debug.rs`. This showed the service calls
+`set_debug_suspend_pending(target_pid)` at line 208 — it sets a flag on the
+target process and returns; the actual blocking happens asynchronously in the
+trap handler when the target process next takes a trap.
+
+Next, `debug_suspend` was searched in `kernel/src/arch/trap.rs`, which showed
+two paths that call `block_process`: the breakpoint hit path (line 125) and the
+forced-suspend path (line 165). Both followed the pattern of sending the
+`Suspended` event, calling `mark_debug_suspended`, and then calling
+`block_process`.
+
+Searching for `pub fn block_process` in `scheduler.rs` revealed the
+`wakeup_pending` guard (lines 780–790): if `wakeup_pending` is true, the
+function clears the flag and returns without setting the process to `Blocked`.
+This is intentional for IPC — it prevents a lost wakeup when a message arrives
+between a failed `channel_recv` poll and the subsequent block call.
+
+Reading `pub fn wake_process` confirmed the mechanism: when a message arrives
+for a `Running` or `Ready` process, `wake_process` sets `wakeup_pending = true`
+instead of blocking (since the process is already runnable). For fbcon, which
+receives frequent keyboard and mouse events, `wakeup_pending` was almost always
+set at the moment the trap handler ran.
+
+The client-side code in `user/dbg/src/main.rs` was also checked to confirm the
+event arrives in the client before the block takes effect. This confirmed the
+ordering: the Suspended event is sent and received by the debugger client before
+`block_process` is called, so the debugger always believes the suspend succeeded
+even when the block silently fails.
+
+With both code paths identified and the mechanism understood, the root cause was
+clear: the `wakeup_pending` bail-out in `block_process` is semantically correct
+for IPC but wrong for debug suspend, which must be unconditional. Two fix options
+were considered: clearing `wakeup_pending` at the call sites in `trap.rs`
+(simpler), or adding a dedicated `force_block_process` function (cleaner). The
+cleaner option was chosen.
+
 ## Root Cause
 
 The trap handler's debug suspend path (both forced-suspend and breakpoint-hit)

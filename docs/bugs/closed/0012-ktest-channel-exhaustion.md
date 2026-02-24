@@ -28,6 +28,58 @@ prints its LEAK message and before `cap_delivery_via_spawn` can complete.
 5. The test suite hangs indefinitely. It never reaches the "Block Device"
    section or prints final pass/fail results.
 
+## Investigation
+
+The bug was discovered incidentally during a session adding block device support
+and block device ktests. After adding the new test section, `make test` was run
+to verify the changes. The test suite hung and never produced final pass/fail
+results.
+
+**Initial observation:** The console showed a stream of output from hello-std
+child processes (printing "done"), but ktest itself was stuck. This was
+initially confusing because the output looked like activity, but none of it
+was ktest progress messages.
+
+**Identifying where the hang was:** The test output showed the "Cap Ref
+Counting" section had started (`ns_override_cap_delivery` and
+`two_children_shared_override` completed or partially completed) with a LEAK
+message, but `cap_delivery_via_spawn` never printed its result. The block
+device section was never reached.
+
+**Reading the kernel log:** The console showed repeated
+`[ipc] channel_create_pair: all 64 slots exhausted` messages. This identified
+the proximate cause: the IPC channel pool (`MAX_CHANNELS = 64`) was full.
+
+**Tracing why channels were exhausted:** The Cap Ref Counting tests spawn
+hello-std child processes. The test framework's `run_test()` helper runs each
+test twice (warmup pass + measured pass), doubling the number of spawned
+processes. Each spawned process consumes multiple channel slots (boot channel,
+stdio channels, etc.). Processes from earlier tests had not fully exited and
+released their channels by the time the next test started. With 64 total
+slots, the cumulative allocation from successive spawn-heavy tests caused
+exhaustion.
+
+**Tracing why the hang was permanent:** `sys_chan_create()` returns
+`(usize::MAX, usize::MAX)` when the pool is exhausted. The `cap_delivery_via_spawn`
+test did not check this return value. It proceeded to call
+`sys_chan_recv_blocking(usize::MAX, ...)` on the invalid handle, which blocked
+forever because `usize::MAX` is not a valid channel handle.
+
+**Confirming the root cause was pre-existing:** The issue was confirmed to be
+unrelated to the new block device code; the block device section appears later
+in the test order and was simply never reached. The fix for the main session's
+goal (verifying block device tests) was temporarily to reorder the block device
+section earlier in ktest, before the spawn-heavy Cap Ref Counting section.
+
+**Determining the fix:** Two approaches were considered: (1) increase
+`MAX_CHANNELS` to give enough headroom, and (2) add explicit yield loops
+between spawn-heavy sections so child processes can exit and release slots
+before the next test runs. Both were applied. The increase to `MAX_CHANNELS`
+(64 → 1024) also addressed Bug 0013 (per-process channel limit) which was
+filed at the same time. The `yield_drain()` helper (50 yields) was added
+before and after the Cap Ref Counting section as a belt-and-suspenders
+safeguard.
+
 ## Root Cause
 
 **Channel slot exhaustion from spawn-heavy tests without draining.**

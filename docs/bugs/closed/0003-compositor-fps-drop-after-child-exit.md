@@ -38,6 +38,57 @@ processes with IPC channels).
 
 **Note:** This does NOT happen when closing a `winclient` window — only `fbcon`.
 
+## Investigation
+
+The initial symptom pointed at the GPU flush path: `flush` time increased from
+~1ms to ~91ms while `composite` time stayed constant (~8-9ms). The first
+hypothesis was a slow GPU service response.
+
+**Checked GPU driver code** (`kernel/src/drivers/virtio/gpu.rs`,
+`kernel/src/services/gpu_server.rs`): the VirtIO GPU path was straightforward
+and showed no reason to slow down just because a window was destroyed.
+
+**Key clue from user:** the FPS drop does not happen with `winclient` — only
+with `fbcon`. This narrowed the search to what fbcon does differently on exit.
+Comparing the exit paths showed that `winclient` is a single-process paint app
+with no child processes or IPC channels, while fbcon spawns a shell
+(`/bin/shell`) with stdin/stdout connected via IPC channels.
+
+**Checked timer interval:** `TIMER_INTERVAL = 1_000_000` ticks at 10MHz =
+100ms per scheduler tick. The ~91ms flush time aligned almost exactly with one
+scheduler tick, suggesting the GPU kernel task's spin-wait was being preempted
+for nearly a full tick.
+
+**Second clue from user:** `ps` showed the shell process (PID 14) at ~90% CPU
+after the child fbcon window closed. This confirmed the preemption theory: the
+orphaned shell was spinning at high CPU, starving the GPU kernel task.
+
+**Read `user/shell/src/shell.rs`:** found line 891 — the inner character-read
+loop used `continue` when `read()` returned 0, meaning it treated EOF as "no
+data yet, try again":
+
+```rust
+if io::stdin().lock().read(&mut byte).unwrap_or(0) == 0 {
+    continue;  // BUG: spins forever on EOF
+}
+```
+
+**Verified the syscall return values** by reading the kernel IPC and trap
+handler code (`kernel/src/ipc/mod.rs`, `kernel/src/arch/trap.rs`):
+`SYS_CHAN_SEND_BLOCKING` returns `usize::MAX` immediately when the peer is
+closed; `SYS_CHAN_RECV_BLOCKING` returns `2` (ChannelClosed) immediately.
+Both return without blocking, so the shell spun in a tight two-syscall loop.
+
+**Verified the std layer** (`vendor/rust/library/std/src/sys/stdio/rvos.rs`):
+`recv_read` ignores the return value of the blocking send, then the receive
+returns `ChannelClosed` → `recv_read` returns `total = 0` → `Stdin::read()`
+returns `Ok(0)`. Also confirmed that `io::stdin()` wraps stdin in a
+`BufReader` (1024-byte capacity), but in raw mode fbcon replies with one byte
+per keystroke so the buffer provides no protection against the EOF spin.
+
+Root cause confirmed: the shell spun on EOF → ~90% CPU → GPU task preempted
+for ~100ms → flush time ~91ms.
+
 ## Root Cause
 
 **Mechanism:**

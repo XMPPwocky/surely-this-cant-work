@@ -22,6 +22,70 @@ Page fault (store/AMO): sepc=0x1fd6e, stval=0x819e45b8, SPP=0 (U-mode)
 1. `make run-vnc`
 2. Observe the page fault in serial output — fbcon crashes at startup.
 
+## Investigation
+
+The initial analysis (from a subagent that read the crash dump and kernel source)
+concluded that the fault at `stval=0x819e45b8` — only 0x68 bytes above
+`sp=0x819e4550` — was caused by SHM identity-mapping collision: `sys_mmap_shm()`
+allocated physical frames whose addresses (used directly as VAs) overlapped the
+user stack's virtual range, and `pt.map()` silently overwrote the stack PTEs.
+That analysis was plausible and the identity-mapping design flaw was real
+(confirmed in `kernel/src/arch/syscall/mem.rs:166`).
+
+A fix was implemented and committed (`a989d50`): a per-process bump-pointer VA
+allocator starting at `MMAP_VA_BASE = 0x4000_0000` so mmap/SHM regions would no
+longer identity-map and could not overlap with the stack at `0x8000_0000+`.
+
+After that fix, `make run-vnc` was run with an expect script to verify. fbcon
+still crashed with a nearly identical fault:
+
+```
+Page fault (store/AMO): sepc=0x1fd6e, stval=0x819ea5b8, SPP=0 (U-mode)
+  sstatus=0x200040020 ra=0x1a6ae sp=0x819ea550
+  current_pid=16
+```
+
+The SHM for net-stack now appeared at `0x40005000` (confirming the VA allocator
+was working), but fbcon still died. Investigating why the stack-area fault
+persisted led to examining the page table more carefully — `pt.map()` overwrites
+silently, so a collision from a different source was considered.
+
+To narrow it down, PTE inspection and stack-range display were added to the
+page fault handler (`kernel/src/arch/trap.rs`):
+
+```rust
+match pt.translate(faulting_vpn) {
+    Some(ppn) => crate::println!("  PTE exists: vpn={:#x} -> ppn={:#x}", ...),
+    None      => crate::println!("  PTE missing for vpn={:#x}", faulting_vpn.0),
+}
+crate::println!("  user_stack_top={:#x}", stack_top_va);
+```
+
+The instrumented kernel produced:
+
+```
+PTE missing for vpn=0x819ea
+user_stack_top=0x819f4000
+```
+
+This was the turning point. The stack range was `0x819ec000..0x819f4000`
+(32 KiB, 8 pages), but `sp=0x819ea550` was 5 KB *below* the stack base —
+the stack had overflowed its allocation. The page at `0x819ea000` was not
+mapped with the U bit (it was part of the kernel identity-map without U),
+causing the U-mode store fault.
+
+Notably, the crash happened before `[fbcon] starting` was ever printed,
+meaning the overflow occurred in the Rust std runtime initialization
+(argument parsing, stdio setup, `connect_to_service` × 2) before `main()`
+was even reached. Analysis of the call chain showed that each IPC round-trip
+(`connect_to_service`, `Channel::send/recv`, `WindowClient` RPCs) places one
+or two 1080-byte `Message` structs on the stack — quickly accumulating past
+the 32 KiB limit for deeply nested initialization.
+
+The original SHM identity-mapping bug was a separate design flaw that did
+exist and has been fixed, but it was not the immediate crash trigger in this
+run — the stack overflow was.
+
 ## Root Cause
 
 **Two issues combined:**

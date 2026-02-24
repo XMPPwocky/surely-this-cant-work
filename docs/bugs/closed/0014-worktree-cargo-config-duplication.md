@@ -46,6 +46,58 @@ in the main tree too (it's a pre-existing issue, not worktree-specific).
    cd user && cargo +rvos build --release --target riscv64gc-unknown-rvos -p nc
    ```
 
+## Investigation
+
+The bug was discovered incidentally while working on an unrelated feature in a worktree.
+`make build` failed with an unexpected linker error — section overlap rather than a missing
+file, which was unusual.
+
+**Initial misdiagnosis.** The first theory (logged when filing the bug) was that the
+user-space linker script path `../user.ld` resolved to a non-existent location inside the
+worktree. This would explain `cannot find linker script` errors. However, the kernel error
+(`section .text file range overlaps with .comment`) was different and pointed elsewhere.
+
+**Noticing the duplicate flag.** Examining the linker command line in the error output
+revealed `-T kernel/linker.ld` appearing **twice**. This was the actual cause of section
+overlap: two identical linker scripts caused conflicting section placements. The `user/`
+config duplication was also present but harmless (the linker tolerates a repeated `-T` for
+the same file).
+
+**Hunting the second source.** Since `.cargo/config.toml` only contained the flag once, the
+question was where the second copy came from. Checked: no `kernel/.cargo/config.toml`, no
+global `~/.cargo/config.toml`, no flag in `kernel/Cargo.toml`. The worktree itself had a
+`.cargo/config.toml` — a copy of the main repo's.
+
+**Identifying cargo's parent-directory walk.** The realization was that the worktree at
+`.claude/worktrees/<name>/` is physically nested inside the main repo at `rvos/`. Cargo
+walks from the working directory up to the filesystem root collecting all `.cargo/config.toml`
+files it finds. From the worktree, the walk hits the worktree's copy at
+`.claude/worktrees/<name>/.cargo/config.toml` and then, several levels up, the main repo's
+copy at `rvos/.cargo/config.toml`. Cargo merges array values from all discovered configs,
+so the rustflags array got doubled.
+
+**Exploring fixes and dead ends.**
+
+- *Option A (move worktrees outside the repo):* The `EnterWorktree` tool hardcodes
+  `.claude/worktrees/` with no configuration knob. Ruled out.
+- *Merging configs into one root file:* Would eliminate the separate `user/` config but
+  still leave the worktree's root config exposed to the parent walk hitting the main repo's
+  copy. Same duplication, just at a different level.
+- *Option B (Makefile env vars):* `CARGO_TARGET_..._RUSTFLAGS` env vars are highest priority
+  and override all config files. This would work, but the user rejected it — bare `cargo`
+  invocations (without going through `make`) should continue to function.
+- *`CARGO_ENCODED_RUSTFLAGS` test:* Attempted to verify the env-var approach during
+  investigation. Initial test showed both `-T` flags still appearing even with the override;
+  this turned out to be stale build artifacts from before the config change. A clean build
+  (`cargo clean` first) confirmed env-var override works correctly.
+
+**Finding the right fix.** The key insight was that `cargo:rustc-link-arg` emitted from
+`kernel/build.rs` is a completely separate mechanism from the rustflags config system. It
+fires exactly once per build, is not subject to hierarchical config merging, and can use
+`CARGO_MANIFEST_DIR` for an absolute path to the linker script. Removing the linker flag
+from `.cargo/config.toml` while keeping only `-C force-frame-pointers=yes` (which is
+harmless when doubled) made the config files idempotent with respect to the parent walk.
+
 ## Root Cause
 
 Cargo searches for `.cargo/config.toml` by walking up the directory tree

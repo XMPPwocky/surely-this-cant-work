@@ -21,6 +21,40 @@ and process exited events.
 5. Observe: "Suspend requested (waiting for event...)" is printed, but
    "[event] Process suspended" does NOT appear until Enter is pressed.
 
+## Investigation
+
+The bug was reported with the symptom that `[event] Process suspended` did not
+appear until the user pressed Enter after running `suspend` in the debugger.
+
+The first step was reading the debugger client source (`user/dbg/src/main.rs`)
+alongside the debug protocol definitions (`lib/rvos-proto/src/debug.rs`) and
+the kernel debug service (`kernel/src/services/proc_debug.rs`). After reading
+the client, the problem was immediately apparent in the main loop structure:
+`poll_events()` used a non-blocking `try_recv`, followed unconditionally by a
+blocking `stdin.read_line()`. The polling happened only at the top of the loop,
+so any event arriving while blocked on stdin would be silently queued.
+
+To confirm the fix direction, the kernel's channel poll infrastructure was
+examined. A search for `sys_chan_poll_add` and `sys_block` confirmed that the
+OS already had an `epoll`-style mechanism: `sys_chan_poll_add` registers a
+channel of interest, then `sys_block` sleeps until any registered channel has
+data. The fbcon window client (`user/fbcon/src/main.rs`) was read as a reference
+implementation of this poll/block pattern, since it already multiplexes a
+window-server event channel and a keyboard input channel.
+
+The next question was how to replace `stdin.read_line()` with a manual read that
+could be part of the poll loop. This required reading the rvOS stdio
+implementation (`vendor/rust/library/std/src/sys/stdio/rvos.rs`) and the raw
+channel API (`lib/rvos/src/raw.rs`) to understand that stdin reads are just
+`FileRequest::Read` messages sent to the stdin channel handle. The
+`FileRequest`/`FileResponse` types from `rvos-proto` provided the message
+encoding needed to implement manual, non-blocking stdin reads.
+
+No dead ends were encountered: the cause was visible from the first code read,
+and the fix pattern was already proven in fbcon. The investigation phase was
+primarily code-reading to understand the syscall interface well enough to write
+the multiplexed `read_line_with_events()` function.
+
 ## Root Cause
 
 The debugger main loop in `user/dbg/src/main.rs` had this structure:

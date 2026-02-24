@@ -30,6 +30,26 @@ any `make run`, `make test`, etc. will work again.
 Also triggered by expect timeouts (e.g., if a test hangs and the 300s timeout
 fires, expect exits but QEMU persists).
 
+## Investigation
+
+The bug was reported as: "QEMU processes can persist after Ctrl-C or killing `make test`; they hold the lock and block subsequent runs."
+
+**Initial code review** of `qemu-lock.sh` immediately identified the proximate cause: the script used `exec "$@"` to replace itself with QEMU, leaving no parent process to perform cleanup when a signal arrived. The expect scripts' timeout paths all called `exit 1` without killing the spawned process. The expected fix was straightforward: run QEMU as a background child and add signal traps.
+
+**First trap attempt — EXIT trap only.** The initial fix added `trap 'kill $QEMU_PID' EXIT` and ran QEMU as a background child. Testing showed QEMU still survived SIGTERM. Root cause: bash only runs the EXIT trap on clean exits, not on uncaught signals. SIGTERM with no explicit trap causes immediate death of the shell, bypassing EXIT.
+
+**Second trap attempt — explicit INT/TERM/HUP traps.** Added traps for INT, TERM, and HUP that called `exit`, which in turn triggered the EXIT trap. Re-tested by killing the wrapper with SIGTERM — QEMU still persisted. The confusion stemmed from the test methodology: the kill command was hitting a subshell (spawned by `cd && script &`) rather than the script itself, making it appear the traps weren't working when they actually were.
+
+**Isolated direct test.** A direct test (invoking `qemu-lock.sh` without a subshell wrapper) confirmed the traps worked correctly. When expect spawned `qemu-lock.sh` directly (without `make` in the chain), killing expect closed the PTY, which sent SIGHUP to `qemu-lock.sh`'s process group, the HUP trap fired, and QEMU was cleaned up.
+
+**Make-in-the-chain failure.** When the real call chain was used (`expect → spawn make run-test → qemu-lock.sh → QEMU`), the fix failed: QEMU still orphaned after expect exit. Process group inspection revealed why: GNU Make places recipe processes in a separate process group (`setpgid`). SIGHUP from PTY close only reaches the session leader's process group (make + expect), not the recipe's process group containing `qemu-lock.sh` and QEMU. Make received SIGHUP and exited, but the recipe process group never received any signal.
+
+**Parent-death monitor attempt.** Tried adding a background polling loop in `qemu-lock.sh` that checked whether `$PPID` was still alive and killed QEMU if not. This was abandoned because `$PPID` in the recipe shell points to `sh` (the recipe interpreter), not to make, and `sh` stays alive as long as `qemu-lock.sh` is running — so the monitor could never detect that make had died.
+
+**Working approach: fix the expect scripts.** Since the signal break originated at the expect layer, the fix needed to live there too. The `exp_pid` Tcl variable gives the PID of the spawned process (make), and since make is the process group leader, `kill -- -[exp_pid]` kills the entire recipe tree (make + shell + `qemu-lock.sh` + QEMU) in one shot. A shared `expect-cleanup.tcl` helper was created that wraps `exit` and installs SIGINT/SIGTERM/SIGHUP traps. All five expect scripts were updated to source this helper after `spawn`.
+
+**Confounding factor during testing.** Several test iterations were confused by stale QEMU processes left by concurrent agents working in other worktrees. Once testing was isolated to track specific PIDs rather than using `pkill`, results became reliable.
+
 ## Root Cause
 
 **Mechanism:**

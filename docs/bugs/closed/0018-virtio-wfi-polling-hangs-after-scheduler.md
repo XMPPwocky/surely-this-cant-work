@@ -42,6 +42,68 @@ All VirtIO driver functions that use `wfi` polling:
    runs again, the VirtIO request state may be stale or already completed
    and consumed by an IRQ handler.
 
+## Investigation
+
+This bug was discovered while implementing VirtIO serial-number-based drive
+identification (to reliably map QEMU block devices to their intended mount
+points regardless of MMIO enumeration order).
+
+**Step 1: Initial implementation and first hang.** A `get_serial()` function
+was added to `virtio/blk.rs` using the same `wfi` polling loop as the existing
+`read_sectors()`/`write_sectors()` functions. `get_serial()` was called from
+`kernel/src/main.rs` after `task::init()` and `interrupts_enable()` — the
+natural place to look up device serials before spawning ext2 servers. When
+booted via the MCP server, the system hung immediately: the boot log showed
+blk-server spawns but the `rvos>` prompt never appeared. The 60-second
+`qemu_boot` timeout fired. The partial boot log confirmed the kernel reached
+the blk-server spawn but then went silent, with no panic or error message.
+
+**Step 2: Understanding the mechanism.** Inspection of the boot log revealed
+the system stalled right after `"Spawned [7] \"blk-server1\" (PID 7)"` —
+which is after `task::init()` and `interrupts_enable()` were called. The
+conclusion: a timer interrupt fired while the `wfi` was spinning, causing
+`preempt()` → `schedule()` to switch away from the kernel boot task. The
+polling loop was abandoned mid-flight on the scheduler's ready queue.
+
+**Step 3: Move serial read to `init_one()` (pre-scheduler).** The serial
+read was moved into `init_one()`, which runs during device probing before
+the scheduler starts. The `read_serial_into()` helper was added to operate
+on a `BlkDevice` reference, and a `serial()` accessor was added for later
+lookup. A second boot attempt was made. The system again timed out — the
+boot log showed progress through blk probing but stalled at
+`[blk] Found VirtIO blk at 0x10007000 (IRQ 7)` without printing the blk0
+summary line. The issue was that `init_one()` ran before the PLIC was
+configured and SIE was set for the VirtIO device IRQ, so the device
+completion interrupt never fired and `wfi` slept forever.
+
+**Step 4: Replace `wfi` with `spin_loop()`.** Since `init_one()` is called
+before interrupts are enabled, the VirtIO device interrupt cannot unblock
+`wfi`. The fix was to replace `unsafe { core::arch::asm!("wfi") }` with
+`core::hint::spin_loop()` in `read_serial_into()`. A third boot succeeded:
+the kernel printed `[blk] blk0: 32768 sectors (16 MiB), RW +flush
+serial=""` — progress, but the serial strings came back empty.
+
+**Step 5: QEMU serial= option placement.** The `serial=bin` option was
+initially placed on the `-drive` line (e.g. `-drive
+if=none,id=blk0,file=bin.img,format=raw,serial=bin`). The QEMU source
+(`hw/block/virtio-blk.c`) showed that the VirtIO blk serial is set via the
+`serial` property on the `-device` line, not the `-drive` line. The drive
+serial (`blk_get_serial()`) is a block backend property that does not
+propagate to the VirtIO device's GET_ID response. Moving the option to the
+`-device virtio-blk-device,...,serial=bin` line returned the expected
+serial strings.
+
+**Step 6: MCP server also had hardcoded drives.** The MCP server
+(`scripts/qemu-mcp/server.py`) constructs its own QEMU command independent
+of the Makefile's `QEMU_BLK` variable. The `serial=` tags had to be added
+there as well.
+
+**Summary of dead ends:** (1) Calling `get_serial()` post-scheduler with
+`wfi` — timer preemption prevents the polling loop from completing. (2)
+Moving to `init_one()` while still using `wfi` — VirtIO IRQ not configured
+yet, `wfi` sleeps forever. (3) Placing `serial=` on the `-drive` line —
+this sets the block backend serial, not the VirtIO device GET_ID response.
+
 ## Root Cause
 
 The low-level VirtIO drivers use `wfi` (Wait For Interrupt) as a synchronous

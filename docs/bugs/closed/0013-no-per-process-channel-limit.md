@@ -20,6 +20,39 @@ the fs server. This is a system-wide denial of service.
 2. After exhausting the per-process limit (32 handles) or the global pool,
    `sys_chan_create` returns `(usize::MAX, usize::MAX)`.
 
+## Investigation
+
+The bug surfaced during development of the persistent ext2 filesystem feature.
+After adding VirtIO block device support, `make test` was run to verify the new
+block device tests. The test suite printed multiple "done" lines from hello-std
+child processes but never exited. The user killed the hung process and asked why
+it had not terminated.
+
+Examining the serial console output revealed `[ipc] channel_create_pair: all 64
+slots exhausted` messages appearing repeatedly during the "Regression -- Cap Ref
+Counting" section. Tracing the test execution showed:
+
+1. The `run_test()` framework runs each test twice (warmup + real run).
+2. `ns_override_cap_delivery` and `two_children_shared_override` each spawn 2+
+   hello-std child processes per run, totalling 8+ spawned processes across the
+   two tests.
+3. Those processes exit asynchronously and had not yet released their channel
+   endpoints by the time `cap_delivery_via_spawn` ran.
+4. With all 64 slots consumed, `sys_chan_create()` returned
+   `(usize::MAX, usize::MAX)`. The test then called
+   `sys_chan_recv_blocking(usize::MAX, ...)` on the invalid handle, which blocked
+   forever.
+
+Code inspection confirmed the root cause immediately: `MAX_CHANNELS = 64` in
+`kernel/src/ipc/mod.rs:12`, and `channel_create_pair()` (lines 316-333) scans
+for a free slot with no per-process accounting whatsoever. The `sys_chan_create`
+syscall in `kernel/src/arch/syscall/chan.rs:8-31` likewise has no quota check.
+
+This was filed as Bug 0012 (the ktest-specific hang symptom). The user then
+noted that the ability for any single process to exhaust all 64 global slots
+was itself a deeper design bug, prompting Bug 0013 to be filed immediately as
+the underlying resource-exhaustion issue.
+
 ## Root Cause
 
 The IPC channel table was a fixed-size global array of 64 slots (`MAX_CHANNELS`)

@@ -28,6 +28,60 @@ Alternative reproduction (new debugger instance):
 7. Attach to any process: `attach <pid2>`
 8. Observe: the attach command hangs forever.
 
+## Investigation
+
+The bug was reported from session `822f5320` (2026-02-16) immediately after the
+user started exercising the newly implemented debugger (design 0006): attaching
+to a process, detaching, and attempting to re-attach caused the second `attach`
+to hang indefinitely, even after quitting and restarting the `dbg` process.
+
+An Explore subagent was launched to read the full debugger implementation:
+`kernel/src/services/proc_debug.rs`, `user/dbg/src/main.rs`, and
+`docs/designs/0006-process-debugger.md`. The initial hypothesis was that some
+kernel-side state persisted after detach (e.g., a dangling `debug_attached` flag
+on the `Process` struct, or a stale `event_ep` reference). The subagent read the
+detach path in `proc_debug.rs` and the associated process state fields, but found
+these were cleared correctly on detach.
+
+The next hypothesis was that the debug service itself was stuck. The subagent
+examined `proc_debug_service`, which uses `ipc::accept_client` to wait for new
+connections. The code structure showed a pattern where `handle_debug_session` is
+called after `accept_client` returns and the service never returns to `accept_client`
+if the session handler does not return. This prompted investigation into what would
+cause `handle_debug_session` to block forever.
+
+Reading `handle_debug_session` revealed that it calls
+`channel_recv_blocking(session_a)` in a loop. For it to return `None` (end the
+session and allow the service to call `accept_client` again), the B-side of
+`session` must be fully closed (ref_count_b must reach 0). The subagent then
+read `channel_close` in `kernel/src/ipc/mod.rs` (lines 487-524) and found the
+critical invariant: deactivation only occurs when the ref count reaches 0; a
+positive ref count causes `channel_close` to return early without deactivating.
+
+Tracing back through the attach path in `proc_debug_service`: the service calls
+`channel_create_pair` (giving `session_b` an initial ref_count_b = 1), then calls
+`channel_inc_ref(session_b)` before placing it in the attach response caps[]
+(bringing ref_count_b to 2), then sends the message. The agent confirmed this was
+correct per the kernel's cap-transfer convention — the inc_ref creates a reference
+for the receiver. However, the service then continued into `handle_debug_session`
+without ever calling `channel_close(session_b)`, so the service's own original
+reference (ref_count_b = 2 minus the one the receiver holds) was never released.
+
+When the debugger detached and closed its handle to `session_b`, ref_count_b
+dropped from 2 to 1 — not to 0. The channel remained active, so
+`channel_recv_blocking(session_a)` never returned `None`, and the single-threaded
+debug service was permanently stuck in the session loop, unable to accept new
+connections.
+
+The same analysis applied to `event_b`: it also had an unreleased reference from
+the service, though the hang was directly caused by `session_b`.
+
+No dead ends or alternative hypotheses were pursued; the code path from symptom
+to root cause was direct once the `channel_close` deactivation invariant was
+understood. The error path in `proc_debug_service` (around line 162-168) was
+noted to correctly close both endpoints on failure, making the bug a missing
+close only on the success path.
+
 ## Root Cause
 
 **Mechanism:** The debug service (`proc_debug_service`) creates two channel

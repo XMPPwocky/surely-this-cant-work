@@ -22,6 +22,53 @@ parent to child processes).
 3. hello-std runs and prints output
 4. Shell never prints another prompt; keyboard input is ignored
 
+## Investigation
+
+The user reported the bug with a key clue: "this started happening after the recent change to
+inherit namespace overrides." The first step was to identify the offending commit.
+
+**Step 1: Identify the regression commit.** `git log --oneline -10` confirmed that commit
+`a33a409` ("Propagate namespace overrides from parent to child processes"), merged minutes
+before the bug was reported, was the immediate suspect. `git diff a33a409^..a33a409` was read
+to understand what changed. The commit added `merge_overrides` to copy parent namespace
+overrides into child boot registrations during `handle_spawn_request`.
+
+**Step 2: Read hello-std source to understand its behavior.** A subagent read
+`user/hello/src/main.rs` to confirm that hello-std uses `println!`/`print!` (stdout) and
+calls filesystem services, meaning it connects to the override channels inherited from the GUI
+shell.
+
+**Step 3: Investigate the cap transfer mechanism.** Two parallel subagents searched the
+kernel IPC subsystem:
+- One looked for `encode_cap_channel`/`decode_cap_channel` and how caps are transferred
+  during message delivery. This revealed `KernelTransport::send` in
+  `kernel/src/ipc/transport.rs`, which calls `ipc::encode_cap_channel(cap)` and then
+  `ipc::channel_send_blocking` — without calling `channel_inc_ref`.
+- Another searched for process exit and handle cleanup logic, discovering
+  `terminate_current_process` in `kernel/src/task/scheduler.rs`, which iterates all handles
+  and calls `channel_close(ep)` for each `HandleObject::Channel`.
+
+**Step 4: Find the ref counting invariant.** The IPC code in `kernel/src/ipc/mod.rs` showed
+that `Channel::new()` initializes `ref_count_a = 1, ref_count_b = 1`, and that
+`channel_close` decrements the ref count and deactivates the channel when it reaches zero.
+The function `channel_inc_ref` exists to increment the count when sharing an endpoint.
+
+**Step 5: Trace the user-space syscall path for comparison.** `translate_cap_for_send` in
+`kernel/src/arch/trap.rs` was identified as the correct pattern: it calls `channel_inc_ref`
+for every cap placed in a message's `caps[]` array. The kernel init server's direct calls to
+`channel_send_blocking` skip this step entirely.
+
+**Root cause identified (line ~105 of the session, ~8 minutes after bug report):** The agent
+concluded that when init sends a namespace override cap to the shell (and then to hello-std)
+without incrementing the ref count, all three entities share the same endpoint at ref count 1.
+When hello-std exits and closes its handles, `channel_close` decrements the count to 0 and
+deactivates the channel, killing the shell's stdin/stdout. The serial console was unaffected
+because serial console processes do not receive namespace overrides for stdin/stdout.
+
+No dead ends or false hypotheses were recorded — the initial clue ("started after the NS
+override commit") pointed directly to the affected code path, and the investigation proceeded
+linearly through code reading.
+
 ## Root Cause
 
 **Mechanism:** The init server (a kernel task) sends IPC messages with
