@@ -6,7 +6,9 @@ console, taking screenshots, injecting input, and capturing network traffic.
 """
 
 import asyncio
+import atexit
 import base64
+import glob
 import os
 import re
 import signal
@@ -40,6 +42,51 @@ def _resolve_paths(root: Path) -> tuple[Path, Path, Path]:
 # Temp paths include PID to avoid collisions between concurrent instances.
 SERIAL_PIPE_BASE = f"/tmp/rvos-mcp-serial-{os.getpid()}"
 QMP_SOCK = f"/tmp/rvos-mcp-qmp-{os.getpid()}.sock"
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check whether a process is still running."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _cleanup_stale_resources() -> None:
+    """Remove pipes and sockets left by dead MCP server processes.
+
+    Globs /tmp/rvos-mcp-serial-*.{in,out} and /tmp/rvos-mcp-qmp-*.sock,
+    extracts the PID from the filename, and removes the file if that PID
+    is no longer alive.  Skips files owned by the current process.
+    """
+    patterns = [
+        "/tmp/rvos-mcp-serial-*.in",
+        "/tmp/rvos-mcp-serial-*.out",
+        "/tmp/rvos-mcp-qmp-*.sock",
+    ]
+    my_pid = os.getpid()
+    for pat in patterns:
+        for path in glob.glob(pat):
+            # Extract PID from filename: e.g. /tmp/rvos-mcp-serial-12345.in
+            basename = os.path.basename(path)
+            try:
+                # serial pipes: "rvos-mcp-serial-<pid>.in"
+                # qmp sockets:  "rvos-mcp-qmp-<pid>.sock"
+                parts = basename.rsplit("-", 1)  # ["rvos-mcp-serial", "12345.in"]
+                pid_str = parts[1].split(".")[0]  # "12345"
+                pid = int(pid_str)
+            except (IndexError, ValueError):
+                continue
+            if pid == my_pid:
+                continue
+            if not _pid_alive(pid):
+                try:
+                    os.unlink(path)
+                    sys.stderr.write(f"Removed stale resource: {path}\n")
+                except OSError:
+                    pass
+
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -157,7 +204,10 @@ class QEMUInstance:
                 f"Kernel binary not found at {self._kernel_bin}. Run 'make build' first."
             )
 
-        # Clean up any stale resources
+        # Remove stale pipes/sockets from dead server instances
+        _cleanup_stale_resources()
+
+        # Clean up any stale resources from our own PID (e.g. previous boot)
         self._cleanup_fifos()
         self._cleanup_socket()
 
@@ -806,19 +856,67 @@ async def qemu_status() -> str:
 # Cleanup on server exit
 # ---------------------------------------------------------------------------
 
-async def _cleanup_on_exit() -> None:
-    """Ensure QEMU is shut down when the MCP server exits."""
-    if qemu.running:
-        sys.stderr.write("MCP server exiting — shutting down QEMU...\n")
-        await qemu.shutdown()
+def _sync_cleanup() -> None:
+    """Synchronous cleanup of pipes, socket, and QEMU process.
+
+    Suitable for atexit and signal handlers where the async event loop may
+    not be available.
+    """
+    # Kill QEMU if still running
+    if qemu.proc is not None and qemu.proc.returncode is None:
+        sys.stderr.write("MCP server exiting — killing QEMU...\n")
+        try:
+            qemu.proc.terminate()
+        except ProcessLookupError:
+            pass
+
+    # Close serial FDs
+    for fd in (qemu.serial_reader_fd, qemu.serial_writer_fd):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    qemu.serial_reader_fd = None
+    qemu.serial_writer_fd = None
+
+    # Stop pcap
+    if qemu.pcap_proc is not None:
+        try:
+            qemu.pcap_proc.terminate()
+        except ProcessLookupError:
+            pass
+        qemu.pcap_proc = None
+
+    # Remove pipes and socket
+    qemu._cleanup_fifos()
+    qemu._cleanup_socket()
+
+    # Destroy dynamic TAP device
+    if qemu._tap_name is not None:
+        try:
+            subprocess.run(
+                ["sudo", "ip", "tuntap", "del", "dev", qemu._tap_name,
+                 "mode", "tap"],
+                check=False, capture_output=True,
+            )
+        except Exception:
+            pass
+        qemu._tap_name = None
 
 
-def _signal_handler(sig: int, frame: Any) -> None:
-    """Handle SIGTERM/SIGINT by scheduling cleanup."""
-    loop = asyncio.get_event_loop()
-    loop.create_task(_cleanup_on_exit())
-    # Let the event loop finish the cleanup before exiting
-    loop.call_later(2.0, sys.exit, 0)
+# Register synchronous cleanup for normal interpreter exit
+atexit.register(_sync_cleanup)
+
+
+def _signal_handler(sig: int, _frame: Any) -> None:
+    """Handle SIGTERM/SIGINT with synchronous cleanup, then exit."""
+    _sync_cleanup()
+    sys.exit(128 + sig)
+
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
 
 
 # ---------------------------------------------------------------------------

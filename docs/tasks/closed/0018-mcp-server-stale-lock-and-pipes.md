@@ -1,7 +1,7 @@
 # 0018: MCP server leaves stale QEMU lock files and named pipes on restart
 
 **Reported:** 2026-02-23
-**Status:** Open
+**Status:** Closed
 **Severity:** MEDIUM
 **Subsystem:** scripts/qemu-mcp
 
@@ -76,28 +76,46 @@ current PID. Old pipes from a previous server PID are never cleaned up.
 
 ## Fix
 
-(To be filled in during fix phase)
+Three changes in `scripts/qemu-mcp/server.py`:
 
-Proposed approach:
-1. **Stale lock recovery in `_acquire_lock()`:** When `flock()` fails, read the
-   PID from the lock file and check if it is still alive (`os.kill(pid, 0)`).
-   If the holder is dead, remove the stale lock file and retry -- matching the
-   existing logic in `scripts/qemu-lock.sh` (lines 39-47).
-2. **Stale pipe cleanup on boot:** Before creating new pipes in `qemu_boot`,
-   glob `/tmp/rvos-mcp-serial-*.in` and `/tmp/rvos-mcp-serial-*.out` and
-   remove any whose owning PID (extracted from the filename) is no longer alive.
-   Same for `/tmp/rvos-mcp-qmp-*.sock`.
-3. **atexit handler:** Register `atexit.register()` for synchronous cleanup of
-   pipes and lock file, as a belt-and-suspenders measure alongside the async
-   signal handler.
-4. **SIGTERM/SIGINT handling:** Replace the current async-scheduling signal
-   handler with one that does synchronous cleanup (close fds, unlink pipes,
-   release lock) since the event loop may not be in a state to process tasks.
+1. **Stale pipe/socket cleanup on boot** (`_cleanup_stale_resources()`):
+   New function that globs `/tmp/rvos-mcp-serial-*.{in,out}` and
+   `/tmp/rvos-mcp-qmp-*.sock`, extracts the PID from each filename, and
+   removes the file if that PID is no longer alive (checked via
+   `os.kill(pid, 0)`). Called at the start of `boot()` before creating
+   new pipes. The current server's own PID is skipped.
+
+2. **atexit handler** (`_sync_cleanup()`): Registered via
+   `atexit.register()` for synchronous cleanup of serial FDs, pipes,
+   QMP socket, pcap process, and TAP device. Runs on normal interpreter
+   exit even if the async event loop is not available.
+
+3. **Synchronous signal handler**: Replaced the old async-scheduling
+   `_signal_handler` (which called `loop.create_task()` and relied on
+   the event loop processing it within 2 seconds) with a synchronous
+   handler that calls `_sync_cleanup()` directly and then `sys.exit()`.
+   Registered for both SIGTERM and SIGINT at module load time.
+
+Note: The bug doc mentions a `_acquire_lock()` / `flock()` mechanism,
+but the current code does not have lock file management. The stale
+resource issue was solely the named pipes and QMP socket, which are now
+handled by the PID-based cleanup.
 
 ## Verification
 
-(To be filled in during fix phase)
+- Syntax check passes (`py_compile`).
+- The `_cleanup_stale_resources()` function correctly parses PID from
+  all three filename patterns and uses `os.kill(pid, 0)` to detect dead
+  processes, matching the pattern from `scripts/qemu-lock.sh`.
+- The `atexit` + signal handler combination ensures cleanup runs on both
+  graceful exit and SIGTERM/SIGINT. SIGKILL still cannot be caught, but
+  the stale resource cleanup on the next boot handles that case.
 
 ## Lessons Learned
 
-(To be filled in during fix phase)
+- Async signal handlers that depend on the event loop running are
+  unreliable in MCP servers where the transport layer (stdio) may be
+  blocking. Synchronous cleanup is safer.
+- PID-scoped temp files are a good pattern for concurrency, but require
+  a reaping mechanism for the case where the owning process dies without
+  cleanup. Glob + `os.kill(pid, 0)` is a simple, effective approach.
