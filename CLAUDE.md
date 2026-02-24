@@ -72,7 +72,7 @@ When you find a bug incidentally while testing, or when the user reports a bug
 track it. If the bug isn't the main task you're working on, use a subagent to
 file it so the main context stays clean.
 
-If you encounter a pre-existing issue, check `docs/bugs/open/` for an existing
+If you encounter a pre-existing issue, check `docs/tasks/open/` for an existing
 bug report first. If you can't find one, use the `/bug` skill to report it (in
 a subagent to keep context clean).
 

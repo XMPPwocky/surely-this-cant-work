@@ -1,7 +1,7 @@
 # Bug Tracker
 
 Track, reproduce, root-cause, fix, and close bugs in rvOS. Produce a written
-bug report at `docs/bugs/open/NNNN-slug.md`, then work through the bug lifecycle
+bug report at `docs/tasks/open/NNNN-slug.md`, then work through the bug lifecycle
 to resolution.
 
 The argument to this skill is a description of the bug (symptoms, how to trigger
@@ -10,14 +10,14 @@ the bug.
 
 ## Phase 1: Intake & Document
 
-1. **Assign a bug number.** Look at existing files in `docs/bugs/open/` and
-   `docs/bugs/closed/` to find the highest NNNN. Increment by 1. If none exist,
+1. **Assign a bug number.** Look at existing files in `docs/tasks/open/` and
+   `docs/tasks/closed/` to find the highest NNNN. Increment by 1. If none exist,
    start at 0001.
 
 2. **Choose a slug.** A short kebab-case name for the bug (e.g.,
    `channel-leak-on-cap-transfer`, `idle-in-ready-queue`).
 
-3. **Create `docs/bugs/open/NNNN-slug.md`** with this template:
+3. **Create `docs/tasks/open/NNNN-slug.md`** with this template:
 
 ```markdown
 # NNNN: Title
@@ -193,7 +193,7 @@ Update the "Root Cause" section with:
 
 2. **Move the bug doc** from open to closed:
    ```
-   git mv docs/bugs/open/NNNN-slug.md docs/bugs/closed/NNNN-slug.md
+   git mv docs/tasks/open/NNNN-slug.md docs/tasks/closed/NNNN-slug.md
    ```
 
 3. **Update the bug doc status** to `**Status:** Closed (YYYY-MM-DD)` and
