@@ -56,7 +56,7 @@ The boot sequence has six phases, all orchestrated by `kmain()` in
 
 1. **Scheduler** — the round-robin scheduler is initialized with capacity for
    64 processes. PID 0 is the idle task (the `kmain` loop itself).
-2. **IPC channels** — the channel manager is initialized with 32 channel slots.
+2. **IPC channels** — the channel manager is initialized with 1024 channel slots.
 3. **TTY** — serial and (optionally) framebuffer ring buffers for keyboard
    input.
 

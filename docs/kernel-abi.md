@@ -513,7 +513,7 @@ Internally, endpoints are identified by global IDs:
 
 ### Channel Limits
 
-- `MAX_CHANNELS` = 64 -- maximum number of simultaneous channels.
+- `MAX_CHANNELS` = 1024 -- maximum number of simultaneous channels.
 - `MAX_QUEUE_DEPTH` = 64 -- maximum number of messages queued per endpoint.
   When a send would exceed this limit, `SYS_CHAN_SEND` returns error code 5
   (`QUEUE_FULL`) and the message is not enqueued.
@@ -753,7 +753,7 @@ After obtaining a `"sysinfo"` channel:
 |---------------------|-------|-------------------------------------|
 | `MAX_HANDLES`       | 32    | Handle table slots per process      |
 | `MAX_PROCS`         | 64    | Maximum number of processes         |
-| `MAX_CHANNELS`      | 64    | Maximum simultaneous channels       |
+| `MAX_CHANNELS`      | 1024  | Maximum simultaneous channels       |
 | `MAX_QUEUE_DEPTH`   | 64    | Maximum messages per endpoint queue  |
 | `MAX_MSG_SIZE`      | 1024  | Maximum message payload (bytes)     |
 | `MAX_CAPS`          | 4     | Capability slots per message        |
