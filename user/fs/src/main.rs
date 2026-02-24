@@ -54,10 +54,6 @@ struct Inode {
     children: [Option<DirEntry>; MAX_CHILDREN],
     child_count: usize,
     active: bool,
-    // Read-only static file backing (for files embedded via include_bytes!)
-    read_only: bool,
-    static_data: *const u8,
-    static_data_len: usize,
 }
 
 impl Inode {
@@ -69,9 +65,6 @@ impl Inode {
             children: [const { None }; MAX_CHILDREN],
             child_count: 0,
             active: false,
-            read_only: false,
-            static_data: core::ptr::null(),
-            static_data_len: 0,
         }
     }
 
@@ -331,23 +324,6 @@ impl Filesystem {
         }
 
         Some((current, filename))
-    }
-
-    /// Add a read-only file backed by static data (e.g. include_bytes!).
-    /// Creates intermediate directories as needed (mkdir -p behavior).
-    fn add_static_file(&mut self, path: &[u8], data: &'static [u8]) {
-        let (parent_inode, filename) = self.ensure_parent_dirs(path)
-            .expect("add_static_file: invalid path");
-        let new_inode = self.alloc_inode().expect("add_static_file: no free inodes");
-        self.inodes[new_inode].init_file();
-        self.inodes[new_inode].read_only = true;
-        self.inodes[new_inode].static_data = data.as_ptr();
-        self.inodes[new_inode].static_data_len = data.len();
-        self.inodes[new_inode].data_len = data.len();
-        assert!(
-            self.inodes[parent_inode].add_child(filename, new_inode),
-            "add_static_file: failed to add child"
-        );
     }
 
     fn register_open_file(&mut self, endpoint_handle: usize, inode: usize, append: bool) -> bool {
@@ -697,12 +673,7 @@ fn handle_read(ch: &Channel<FileResponseMsg, FileRequestMsg>, inode_idx: usize, 
     let available = inode.data_len - offset;
     let to_send = if len < available { len } else { available };
 
-    // Read from static data or mutable data buffer
-    let data_slice: &[u8] = if inode.read_only {
-        unsafe { core::slice::from_raw_parts(inode.static_data.add(offset), to_send) }
-    } else {
-        &inode.data[offset..offset + to_send]
-    };
+    let data_slice: &[u8] = &inode.data[offset..offset + to_send];
 
     let mut sent = 0;
     while sent < to_send {
@@ -749,11 +720,6 @@ fn handle_write(ch: &Channel<FileResponseMsg, FileRequestMsg>, inode_idx: usize,
     };
 
     let inode = &mut fs.inodes[inode_idx];
-
-    if inode.read_only {
-        send_file_error(ch, FsError::Io {});
-        return;
-    }
 
     let end = offset + data.len();
     let written;
@@ -879,70 +845,6 @@ fn do_readdir(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
     send_dir_sentinel(raw_handle);
 }
 
-static HELLO_STD_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/hello"
-);
-
-static WINDOW_SERVER_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/window-server"
-);
-
-static WINCLIENT_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/winclient"
-);
-
-static IPC_TORTURE_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/ipc-torture"
-);
-
-static FBCON_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/fbcon"
-);
-
-static SHELL_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/shell"
-);
-
-static BENCH_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/bench"
-);
-
-static TRIANGLE_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/triangle"
-);
-
-static GUI_BENCH_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/gui-bench"
-);
-
-static KTEST_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/ktest"
-);
-
-static KTEST_HELPER_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/ktest-helper"
-);
-
-static DBG_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/dbg"
-);
-
-static NET_STACK_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/net-stack"
-);
-
-static TCP_ECHO_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/tcp-echo"
-);
-
-static UDP_ECHO_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/udp-echo"
-);
-
-static NC_ELF: &[u8] = include_bytes!(
-    "../../target/riscv64gc-unknown-rvos/release/nc"
-);
-
 // --- Multiplexed client state ---
 
 const MAX_CLIENTS: usize = 8;
@@ -964,24 +866,6 @@ fn main() {
     unsafe {
         *FS.0.get() = Some(Filesystem::new());
     }
-
-    // Register read-only static files
-    fs().add_static_file(b"/bin/hello-std", HELLO_STD_ELF);
-    fs().add_static_file(b"/bin/window-server", WINDOW_SERVER_ELF);
-    fs().add_static_file(b"/bin/winclient", WINCLIENT_ELF);
-    fs().add_static_file(b"/bin/ipc-torture", IPC_TORTURE_ELF);
-    fs().add_static_file(b"/bin/fbcon", FBCON_ELF);
-    fs().add_static_file(b"/bin/shell", SHELL_ELF);
-    fs().add_static_file(b"/bin/bench", BENCH_ELF);
-    fs().add_static_file(b"/bin/triangle", TRIANGLE_ELF);
-    fs().add_static_file(b"/bin/gui-bench", GUI_BENCH_ELF);
-    fs().add_static_file(b"/bin/ktest", KTEST_ELF);
-    fs().add_static_file(b"/bin/ktest-helper", KTEST_HELPER_ELF);
-    fs().add_static_file(b"/bin/dbg", DBG_ELF);
-    fs().add_static_file(b"/bin/net-stack", NET_STACK_ELF);
-    fs().add_static_file(b"/bin/tcp-echo", TCP_ECHO_ELF);
-    fs().add_static_file(b"/bin/udp-echo", UDP_ECHO_ELF);
-    fs().add_static_file(b"/bin/nc", NC_ELF);
 
     // The fs server has:
     // Handle 0: boot channel (for requesting stdio from init)
@@ -1218,10 +1102,6 @@ fn do_open(client: &mut ClientState, flags: OpenFlags, path_bytes: &[u8]) {
                 send_error(client.ctl.as_ref().unwrap(), FsError::NotAFile {});
                 return;
             }
-            if truncate && fs.inodes[idx].read_only {
-                send_error(client.ctl.as_ref().unwrap(), FsError::Io {});
-                return;
-            }
             if truncate {
                 fs.inodes[idx].data_len = 0;
             }
@@ -1345,11 +1225,6 @@ fn do_delete(ch: &Channel<FsResponse, FsRequestMsg>, path_bytes: &[u8]) {
 
     if fs.inodes[target_inode].kind == InodeKind::Dir && fs.inodes[target_inode].child_count > 0 {
         send_error(ch, FsError::NotEmpty {});
-        return;
-    }
-
-    if fs.inodes[target_inode].read_only {
-        send_error(ch, FsError::Io {});
         return;
     }
 

@@ -39,15 +39,11 @@ QEMU_BLK_TEST = $(QEMU_BLK) \
 EXT2_BINS = hello winclient ipc-torture fbcon triangle gui-bench dbg \
             net-stack udp-echo window-server bench tcp-echo nc ktest ktest-helper shell
 
-.PHONY: build build-user build-fs build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images mcp-setup mcp-server
+.PHONY: build build-user build-std-lib run run-quick run-gui run-vnc run-gpu-screenshot debug clean bench gui-bench run-test test test-quick bench-save bench-check clippy clippy-kernel clippy-user disk-images mcp-setup mcp-server
 
-# Build all user crates except fs (which embeds the others via include_bytes!)
+# Build all user-space crates
 build-user:
-	$(USER_CARGO) build --release $(USER_MANIFEST) $(USER_TARGET) --workspace --exclude fs
-
-# fs embeds user binaries via include_bytes!, so build the rest first
-build-fs: build-user
-	$(USER_CARGO) build --release $(USER_MANIFEST) $(USER_TARGET) -p fs
+	$(USER_CARGO) build --release $(USER_MANIFEST) $(USER_TARGET) --workspace
 
 # Rebuild the rvOS std library + clippy via x.py.
 # Run after modifying vendor/rust/library/ or lib/rvos-wire/ or lib/rvos-proto/.
@@ -99,7 +95,7 @@ test.img:
 # Build all disk images
 disk-images: bin.img persist.img
 
-build: build-fs disk-images
+build: build-user disk-images
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml \
 		--target riscv64gc-unknown-none-elf $(BUILD_STD)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)
