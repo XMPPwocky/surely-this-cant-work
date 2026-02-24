@@ -1,5 +1,6 @@
 //! IPC Message type matching the kernel's layout.
 
+use alloc::boxed::Box;
 use crate::raw::NO_CAP;
 use rvos_wire::{Reader, Writer};
 
@@ -90,5 +91,17 @@ impl Message {
     /// Create a Reader over the payload.
     pub fn reader(&self) -> Reader<'_> {
         Reader::new(&self.data[..self.len])
+    }
+
+    /// Heap-allocate a zeroed Message without placing it on the stack first.
+    pub fn boxed() -> Box<Message> {
+        unsafe {
+            let layout = alloc::alloc::Layout::new::<Message>();
+            let ptr = alloc::alloc::alloc_zeroed(layout) as *mut Message;
+            // Set caps to NO_CAP (which is usize::MAX, not zero)
+            let msg = &mut *ptr;
+            msg.caps = [NO_CAP; MAX_CAPS];
+            Box::from_raw(ptr)
+        }
     }
 }

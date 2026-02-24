@@ -29,7 +29,7 @@ impl Transport for UserTransport {
     }
 
     fn send(&mut self, data: &[u8], caps: &[usize]) -> Result<(), RpcError> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         let copy_len = data.len().min(msg.data.len());
         msg.data[..copy_len].copy_from_slice(&data[..copy_len]);
         msg.len = copy_len;
@@ -46,7 +46,7 @@ impl Transport for UserTransport {
     }
 
     fn recv(&mut self, buf: &mut [u8], caps: &mut [usize]) -> Result<(usize, usize), RpcError> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         let ret = raw::sys_chan_recv_blocking(self.handle, &mut msg);
         match ret {
             0 => {

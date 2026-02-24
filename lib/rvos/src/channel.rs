@@ -1,5 +1,6 @@
 //! RAII channel handles — both raw (untyped) and typed.
 
+use alloc::boxed::Box;
 use core::marker::PhantomData;
 
 use crate::error::{RecvError, SysError, SysResult};
@@ -119,7 +120,7 @@ impl Drop for RawChannel {
 /// Use `channel_pair::<A, B>()` to create a matched pair.
 pub struct Channel<S, R> {
     inner: RawChannel,
-    recv_buf: Message,
+    recv_buf: Box<Message>,
     _phantom: PhantomData<(S, R)>,
 }
 
@@ -128,7 +129,7 @@ impl<S, R> Channel<S, R> {
     pub fn from_raw_handle(handle: usize) -> Self {
         Channel {
             inner: RawChannel::from_raw_handle(handle),
-            recv_buf: Message::new(),
+            recv_buf: Message::boxed(),
             _phantom: PhantomData,
         }
     }
@@ -187,7 +188,7 @@ impl<S: rvos_wire::MessageType, R> Channel<S, R> {
     /// Any [`ChannelCap`](rvos_wire::ChannelCap) fields in `val` are
     /// automatically transferred via the message's capability sideband.
     pub fn send(&self, val: &S::Msg<'_>) -> SysResult<()> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         let (data_len, cap_count) =
             rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
                 .map_err(|_| SysError::BadAddress)?;
@@ -201,7 +202,7 @@ impl<S: rvos_wire::MessageType, R> Channel<S, R> {
     /// Any [`ChannelCap`](rvos_wire::ChannelCap) fields in `val` are
     /// automatically transferred via the message's capability sideband.
     pub fn try_send(&self, val: &S::Msg<'_>) -> SysResult<()> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         let (data_len, cap_count) =
             rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
                 .map_err(|_| SysError::BadAddress)?;
@@ -219,7 +220,7 @@ impl<S: rvos_wire::MessageType, R> Channel<S, R> {
     /// the message type instead.
     #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn send_with_cap(&self, val: &S::Msg<'_>, cap: usize) -> SysResult<()> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         let (data_len, cap_count) =
             rvos_wire::to_bytes_with_caps(val, &mut msg.data, &mut msg.caps)
                 .map_err(|_| SysError::BadAddress)?;
@@ -342,7 +343,7 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     /// the message type instead.
     #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn recv_with_cap_blocking(&self) -> SysResult<(R, usize)> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         self.inner.recv_blocking(&mut msg)?;
         let val = rvos_wire::from_bytes_with_caps::<R>(
             &msg.data[..msg.len], &msg.caps[..msg.cap_count])
@@ -357,7 +358,7 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     /// the message type instead.
     #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn recv_with_caps_blocking(&self) -> SysResult<(R, [usize; crate::message::MAX_CAPS], usize)> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         self.inner.recv_blocking(&mut msg)?;
         let val = rvos_wire::from_bytes_with_caps::<R>(
             &msg.data[..msg.len], &msg.caps[..msg.cap_count])
@@ -371,7 +372,7 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
     /// the message type instead.
     #[deprecated(note = "embed ChannelCap fields in the message type instead")]
     pub fn try_recv_with_cap(&self) -> Option<(R, usize)> {
-        let mut msg = Message::new();
+        let mut msg = Message::boxed();
         if self.inner.try_recv(&mut msg) != 0 { return None; }
         let val = rvos_wire::from_bytes_with_caps::<R>(
             &msg.data[..msg.len], &msg.caps[..msg.cap_count]).ok()?;
@@ -391,7 +392,7 @@ impl<S, R: rvos_wire::DeserializeOwned> Channel<S, R> {
 pub fn channel_pair<A, B>() -> SysResult<(Channel<A, B>, Channel<B, A>)> {
     let (a, b) = RawChannel::create_pair()?;
     Ok((
-        Channel { inner: a, recv_buf: Message::new(), _phantom: PhantomData },
-        Channel { inner: b, recv_buf: Message::new(), _phantom: PhantomData },
+        Channel { inner: a, recv_buf: Message::boxed(), _phantom: PhantomData },
+        Channel { inner: b, recv_buf: Message::boxed(), _phantom: PhantomData },
     ))
 }

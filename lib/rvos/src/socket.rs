@@ -118,7 +118,7 @@ impl UdpSocket {
         self.ch.send(&SocketRequest::RecvFrom {})
             .map_err(|_| SocketError::NoResources {})?;
         // Response is a SocketData message (not SocketResponse)
-        let mut msg = crate::Message::new();
+        let mut msg = crate::Message::boxed();
         let ret = crate::raw::sys_chan_recv_blocking(self.data_handle, &mut msg);
         if ret != 0 {
             return Err(SocketError::NoResources {});
@@ -238,7 +238,7 @@ impl TcpStream {
         self.ch.send(&SocketRequest::Recv { max_len })
             .map_err(|_| SocketError::NoResources {})?;
         // Response is a SocketData::Data message
-        let mut msg = crate::Message::new();
+        let mut msg = crate::Message::boxed();
         let ret = crate::raw::sys_chan_recv_blocking(self.data_handle, &mut msg);
         if ret != 0 {
             return Err(SocketError::NoResources {});

@@ -5,6 +5,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod raw;
 pub mod error;
 pub mod message;

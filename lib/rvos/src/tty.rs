@@ -11,7 +11,7 @@ pub fn ioctl(handle: usize, cmd: u32, arg: u32) -> SysResult<i32> {
     if handle == 0 {
         return Err(SysError::BadAddress);
     }
-    let mut msg = Message::new();
+    let mut msg = Message::boxed();
     msg.len = rvos_wire::to_bytes(
         &FileRequest::Ioctl { cmd, arg },
         &mut msg.data,
@@ -20,7 +20,7 @@ pub fn ioctl(handle: usize, cmd: u32, arg: u32) -> SysResult<i32> {
     SysError::from_code(send_ret)?;
 
     // Receive response
-    let mut resp = Message::new();
+    let mut resp = Message::boxed();
     let recv_ret = raw::sys_chan_recv_blocking(handle, &mut resp);
     SysError::from_code(recv_ret)?;
 
