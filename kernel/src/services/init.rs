@@ -77,19 +77,28 @@ impl NamedService {
 static NAMED_SERVICES: [NamedService; MAX_NAMED_SERVICES] = [const { NamedService::empty() }; MAX_NAMED_SERVICES];
 static NAMED_SERVICE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Register a named service's control endpoint (called from kmain before spawning init).
+/// Register a named service's control endpoint (called from kmain before spawning init,
+/// or at runtime when launching service processes from the filesystem).
 /// The name is matched against incoming boot-channel requests from user processes.
 ///
-/// SAFETY: Must only be called during single-threaded boot (before init_server runs).
-/// This writes to the name fields without a lock, relying on the fact that the init
-/// server has not started yet.
-pub fn register_service(name: &str, control_ep: usize) {
+/// Returns `None` if all service slots are full. Logs a warning on failure.
+///
+/// SAFETY: During boot, this writes to the name fields without a lock, relying on
+/// single-threaded execution before init_server starts. At runtime (fs launches),
+/// the atomic count acts as the synchronization point.
+pub fn register_service(name: &str, control_ep: usize) -> Option<()> {
     let idx = NAMED_SERVICE_COUNT.fetch_add(1, Ordering::Relaxed);
-    assert!(idx < MAX_NAMED_SERVICES, "Too many named services");
+    if idx >= MAX_NAMED_SERVICES {
+        // Roll back the counter — we didn't actually use a slot.
+        NAMED_SERVICE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        crate::println!("[init] WARNING: named service table full, cannot register \"{}\"", name);
+        return None;
+    }
     let svc = &NAMED_SERVICES[idx];
     let bytes = name.as_bytes();
     let len = bytes.len().min(SERVICE_NAME_LEN);
-    // SAFETY: called during single-threaded boot before init_server starts.
+    // SAFETY: called during single-threaded boot before init_server starts,
+    // or at runtime with unique idx from atomic fetch_add.
     // The name field is only written here and read later by init_server.
     unsafe {
         let name_ptr = svc.name.get() as *mut u8;
@@ -97,12 +106,14 @@ pub fn register_service(name: &str, control_ep: usize) {
     }
     svc.name_len.store(len, Ordering::Relaxed);
     svc.control_ep.store(control_ep, Ordering::Relaxed);
+    Some(())
 }
 
 // Legacy compatibility wrappers — kmain calls these; they now delegate to register_service.
-pub fn set_sysinfo_control_ep(ep: usize) { register_service("sysinfo", ep); }
-pub fn set_math_control_ep(ep: usize) { register_service("math", ep); }
-pub fn set_fs_control_ep(ep: usize) { register_service("fs", ep); }
+// These are called during boot where failure is fatal (core services), so unwrap is acceptable.
+pub fn set_sysinfo_control_ep(ep: usize) { register_service("sysinfo", ep).expect("boot: sysinfo service slot"); }
+pub fn set_math_control_ep(ep: usize) { register_service("math", ep).expect("boot: math service slot"); }
+pub fn set_fs_control_ep(ep: usize) { register_service("fs", ep).expect("boot: fs service slot"); }
 
 struct InitConfig {
     boot_regs: [Option<BootRegistration>; MAX_BOOT_REGS],
@@ -1301,7 +1312,13 @@ fn finish_fs_launch(
                 return;
             }
         };
-        register_service(svc_name, init_svc_ep.into_raw());
+        if register_service(svc_name, init_svc_ep.raw()).is_none() {
+            // Service table full — both OwnedEndpoints drop automatically.
+            ctx.state = FsLaunchState::Done;
+            return;
+        }
+        // Registration succeeded — transfer ownership of the raw endpoint.
+        let _ = init_svc_ep.into_raw();
         crate::task::spawn_user_elf_with_handles(&ctx.data, ctx.name(), boot_a, svc_ctl_ep)
     } else if let Some(console_type) = ctx.provides_console {
         // This program provides a console: give it a control channel as handle 1

@@ -167,17 +167,17 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
         // GPU server kernel task
         let (init_gpu_ep, gpu_ctl_ep) = ipc::channel_create_pair().expect("boot: gpu channel");
         services::gpu_server::set_control_ep(gpu_ctl_ep.into_raw());
-        services::init::register_service("gpu", init_gpu_ep.into_raw());
+        services::init::register_service("gpu", init_gpu_ep.into_raw()).expect("boot: gpu service slot");
 
         // Keyboard server kernel task
         let (init_kbd_ep, kbd_ctl_ep) = ipc::channel_create_pair().expect("boot: kbd channel");
         services::kbd_server::set_control_ep(kbd_ctl_ep.into_raw());
-        services::init::register_service("kbd", init_kbd_ep.into_raw());
+        services::init::register_service("kbd", init_kbd_ep.into_raw()).expect("boot: kbd service slot");
 
         // Mouse server kernel task
         let (init_mouse_ep, mouse_ctl_ep) = ipc::channel_create_pair().expect("boot: mouse channel");
         services::mouse_server::set_control_ep(mouse_ctl_ep.into_raw());
-        services::init::register_service("mouse", init_mouse_ep.into_raw());
+        services::init::register_service("mouse", init_mouse_ep.into_raw()).expect("boot: mouse service slot");
 
         // No fb-con control channel — window server takes over the display
         None
@@ -198,13 +198,13 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
     // Process debug service control channel
     let (init_debug_ep, debug_ctl_ep) = ipc::channel_create_pair().expect("boot: debug channel");
     services::proc_debug::set_control_ep(debug_ctl_ep.into_raw());
-    services::init::register_service("process-debug", init_debug_ep.into_raw());
+    services::init::register_service("process-debug", init_debug_ep.into_raw()).expect("boot: process-debug service slot");
 
     // Net server kernel task (only if VirtIO net device is present)
     if net_present {
         let (init_net_ep, net_ctl_ep) = ipc::channel_create_pair().expect("boot: net channel");
         services::net_server::set_control_ep(net_ctl_ep.into_raw());
-        services::init::register_service("net-raw", init_net_ep.into_raw());
+        services::init::register_service("net-raw", init_net_ep.into_raw()).expect("boot: net-raw service slot");
     }
 
     // Block device servers (one per detected block device)
@@ -220,13 +220,13 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
             3 => "blk3",
             _ => "blk?",
         };
-        services::init::register_service(name, init_blk_ep.into_raw());
+        services::init::register_service(name, init_blk_ep.into_raw()).expect("boot: blk service slot");
     }
 
     // Timer service kernel task
     let (init_timer_ep, timer_ctl_ep) = ipc::channel_create_pair().expect("boot: timer channel");
     services::timer::set_control_ep(timer_ctl_ep.into_raw());
-    services::init::register_service("timer", init_timer_ep.into_raw());
+    services::init::register_service("timer", init_timer_ep.into_raw()).expect("boot: timer service slot");
 
     // Filesystem service: control channel goes to a user-space fs server
     let (init_fs_ep, fs_ctl_ep) = ipc::channel_create_pair().expect("boot: fs channel");
@@ -298,7 +298,7 @@ pub extern "C" fn kmain(hart_id: usize, dtb_ptr: usize) -> ! {
 
         // Service control channel
         let (init_ext2_ep, ext2_ctl_ep) = ipc::channel_create_pair().expect("boot: ext2 channel");
-        services::init::register_service(svc_name, init_ext2_ep.into_raw());
+        services::init::register_service(svc_name, init_ext2_ep.into_raw()).expect("boot: ext2 service slot");
 
         // Boot channel (for ConnectService to blk services etc.)
         let (ext2_boot_a, ext2_boot_b) = ipc::channel_create_pair().expect("boot: ext2-boot channel");
