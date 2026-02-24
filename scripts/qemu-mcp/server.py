@@ -506,15 +506,32 @@ class QEMUInstance:
         ) as f:
             self.pcap_file = f.name
 
-        cmd = ["tcpdump", "-i", interface, "-w", self.pcap_file, "-U"]
+        cmd = ["sudo", "tcpdump", "-i", interface, "-w", self.pcap_file, "-U"]
         if filter_expr:
             cmd.extend(filter_expr.split())
 
         self.pcap_proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+
+        # Check for early exit (e.g. permission denied, bad interface)
+        try:
+            self.pcap_proc.wait(timeout=0.5)
+            # Process exited immediately — read stderr for error details
+            stderr = ""
+            if self.pcap_proc.stderr:
+                stderr = self.pcap_proc.stderr.read().decode(errors="replace").strip()
+            rc = self.pcap_proc.returncode
+            self.pcap_proc = None
+            raise RuntimeError(
+                f"tcpdump exited immediately (rc={rc}): {stderr or 'no error output'}"
+            )
+        except subprocess.TimeoutExpired:
+            # Still running after 0.5s — good, tcpdump is capturing
+            pass
+
         return f"PCAP capture started on {interface} -> {self.pcap_file}"
 
     async def pcap_stop(self) -> dict[str, str]:
@@ -522,21 +539,38 @@ class QEMUInstance:
         if self.pcap_proc is None:
             raise RuntimeError("No PCAP capture running.")
 
+        # sudo tcpdump needs SIGTERM sent to sudo; sudo forwards it
         self.pcap_proc.terminate()
         try:
             self.pcap_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.pcap_proc.kill()
+            self.pcap_proc.wait(timeout=2)
+
+        rc = self.pcap_proc.returncode
+        stderr = ""
+        if self.pcap_proc.stderr:
+            try:
+                stderr = self.pcap_proc.stderr.read().decode(errors="replace").strip()
+            except Exception:
+                pass
         self.pcap_proc = None
 
         pcap_path = self.pcap_file or ""
         self.pcap_file = None
 
         size = os.path.getsize(pcap_path) if os.path.exists(pcap_path) else 0
-        return {
+        result: dict[str, str] = {
             "path": pcap_path,
             "size_bytes": str(size),
         }
+        if size == 0 and rc not in (None, 0, -15):
+            # rc=-15 is SIGTERM (normal for tcpdump stop)
+            result["warning"] = (
+                f"tcpdump exited with rc={rc}, pcap file is empty. "
+                f"stderr: {stderr or '(not captured)'}"
+            )
+        return result
 
     async def shutdown(self) -> str:
         """Gracefully shut down QEMU."""

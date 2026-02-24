@@ -1,7 +1,7 @@
 # 0020: MCP server pcap capture always reports 0 bytes — tcpdump launched without sudo
 
 **Reported:** 2026-02-24
-**Status:** Open
+**Status:** Closed
 **Severity:** MEDIUM
 **Subsystem:** scripts/qemu-mcp
 
@@ -117,8 +117,20 @@ Two changes needed:
 
 ## Verification
 
-(To be filled in during fix phase)
+- Syntax check passes (`py_compile`).
+- The `sudo` prefix matches the pattern used for TAP device creation in
+  the same file (lines 214-226).
+- Early exit detection: after `Popen`, `wait(timeout=0.5)` catches
+  immediate failures (permission denied, bad interface) and raises
+  `RuntimeError` with the stderr output instead of silently succeeding.
+- `pcap_stop()` reads stderr and returncode after termination, and
+  includes a warning in the result dict if the pcap file is empty and
+  tcpdump exited with an unexpected error code (not 0 or -15/SIGTERM).
 
 ## Lessons Learned
 
-(To be filled in during fix phase)
+- Any subprocess that requires elevated privileges should use `sudo`,
+  matching the existing pattern in the same file.
+- Never send stderr to DEVNULL for a subprocess that might fail silently.
+  Capture stderr via `subprocess.PIPE` and check for early exit to
+  surface errors to the caller.
