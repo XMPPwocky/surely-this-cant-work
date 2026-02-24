@@ -28,10 +28,66 @@ const RX_SLOTS: usize = 8;
 const TX_SLOTS: usize = 4;
 const SHM_PAGE_COUNT: usize = 5;
 
-const OUR_IP: [u8; 4] = [10, 0, 2, 15];
-const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
-const SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
 const BROADCAST_MAC: [u8; 6] = [0xff; 6];
+const BROADCAST_IP: [u8; 4] = [255, 255, 255, 255];
+const ZERO_IP: [u8; 4] = [0, 0, 0, 0];
+
+/// Fallback static configuration (used when DHCP times out).
+const FALLBACK_IP: [u8; 4] = [10, 0, 2, 15];
+const FALLBACK_GATEWAY: [u8; 4] = [10, 0, 2, 2];
+const FALLBACK_MASK: [u8; 4] = [255, 255, 255, 0];
+
+/// Runtime network configuration, populated by DHCP or fallback.
+struct NetConfig {
+    our_ip: [u8; 4],
+    gateway: [u8; 4],
+    subnet_mask: [u8; 4],
+}
+
+impl NetConfig {
+    fn new_unconfigured() -> Self {
+        NetConfig {
+            our_ip: ZERO_IP,
+            gateway: ZERO_IP,
+            subnet_mask: ZERO_IP,
+        }
+    }
+
+    fn apply_fallback(&mut self) {
+        self.our_ip = FALLBACK_IP;
+        self.gateway = FALLBACK_GATEWAY;
+        self.subnet_mask = FALLBACK_MASK;
+    }
+
+    /// Resolve next-hop IP for a destination. Broadcast destinations
+    /// are returned as-is (caller must use BROADCAST_MAC).
+    fn resolve_next_hop(&self, dst_ip: &[u8; 4]) -> [u8; 4] {
+        if *dst_ip == BROADCAST_IP {
+            return BROADCAST_IP;
+        }
+        // Subnet-directed broadcast (e.g. 10.0.2.255 for /24)
+        let is_subnet_bcast = dst_ip.iter().zip(&self.subnet_mask).all(|(&d, &m)| d & !m == !m);
+        if is_subnet_bcast {
+            return *dst_ip;
+        }
+        // Off-subnet → gateway
+        let off_subnet = dst_ip.iter().zip(&self.our_ip).zip(&self.subnet_mask)
+            .any(|((&d, &o), &m)| (d & m) != (o & m));
+        if off_subnet {
+            return self.gateway;
+        }
+        *dst_ip
+    }
+
+    /// Check if an IP is a broadcast address.
+    fn is_broadcast(&self, ip: &[u8; 4]) -> bool {
+        if *ip == BROADCAST_IP {
+            return true;
+        }
+        // Subnet-directed broadcast
+        ip.iter().zip(&self.subnet_mask).all(|(&b, &m)| b & !m == !m)
+    }
+}
 
 const ETH_HDR_SIZE: usize = 14;
 const ETHERTYPE_ARP: u16 = 0x0806;
@@ -759,19 +815,6 @@ fn tcp_alloc_conn(conns: &TcpConns) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
-// Routing
-// ---------------------------------------------------------------------------
-
-fn resolve_next_hop(dst_ip: &[u8; 4]) -> [u8; 4] {
-    for i in 0..4 {
-        if (dst_ip[i] & SUBNET_MASK[i]) != (OUR_IP[i] & SUBNET_MASK[i]) {
-            return GATEWAY_IP;
-        }
-    }
-    *dst_ip
-}
-
-// ---------------------------------------------------------------------------
 // Socket table
 // ---------------------------------------------------------------------------
 
@@ -903,6 +946,7 @@ fn send_ip_packet(
     shm_base: usize,
     raw_handle: usize,
     our_mac: &[u8; 6],
+    config: &NetConfig,
     arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING],
     ip_packet: &[u8],
@@ -911,7 +955,16 @@ fn send_ip_packet(
     frame_buf: &mut [u8; 1534],
     msg: &mut Message,
 ) {
-    let next_hop = resolve_next_hop(dst_ip);
+    let next_hop = config.resolve_next_hop(dst_ip);
+
+    // Broadcast destinations use broadcast MAC directly (no ARP)
+    if config.is_broadcast(&next_hop) {
+        let frame_len = build_eth(&BROADCAST_MAC, our_mac, ETHERTYPE_IPV4, ip_packet, frame_buf);
+        if frame_len > 0 {
+            tx_frame(shm_base, raw_handle, &frame_buf[..frame_len], msg);
+        }
+        return;
+    }
 
     if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
         // Have MAC -- send immediately
@@ -938,7 +991,7 @@ fn send_ip_packet(
         }
 
         let mut arp_buf = [0u8; 64];
-        let arp_len = send_arp_request(our_mac, &OUR_IP, &next_hop, &mut arp_buf);
+        let arp_len = send_arp_request(our_mac, &config.our_ip, &next_hop, &mut arp_buf);
         if arp_len > 0 {
             tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], msg);
         }
@@ -954,6 +1007,7 @@ fn drain_pending(
     shm_base: usize,
     raw_handle: usize,
     our_mac: &[u8; 6],
+    config: &NetConfig,
     arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
@@ -971,7 +1025,7 @@ fn drain_pending(
             p.active = false;
             continue;
         }
-        let next_hop = resolve_next_hop(&p.dst_ip);
+        let next_hop = config.resolve_next_hop(&p.dst_ip);
         if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
             let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, &p.data, frame_buf);
             if frame_len > 0 {
@@ -992,6 +1046,7 @@ fn process_frame(
     shm_base: usize,
     raw_handle: usize,
     our_mac: &[u8; 6],
+    config: &NetConfig,
     arp_table: &mut ArpTable,
     sockets: &mut [Socket; MAX_SOCKETS],
     tcp_conns: &mut TcpConns,
@@ -1008,19 +1063,19 @@ fn process_frame(
     match eth.ethertype {
         ETHERTYPE_ARP => {
             let mut reply_buf = [0u8; 64];
-            if let Some(reply_len) = handle_arp(arp_table, our_mac, &OUR_IP, payload, &mut reply_buf, now) {
+            if let Some(reply_len) = handle_arp(arp_table, our_mac, &config.our_ip, payload, &mut reply_buf, now) {
                 tx_frame(shm_base, raw_handle, &reply_buf[..reply_len], &mut tx.msg);
             }
             // After learning new MACs, try to drain pending queue
-            drain_pending(shm_base, raw_handle, our_mac, arp_table, pending, now, &mut tx.frame_buf, &mut tx.msg);
+            drain_pending(shm_base, raw_handle, our_mac, config, arp_table, pending, now, &mut tx.frame_buf, &mut tx.msg);
         }
         ETHERTYPE_IPV4 => {
             let (ip, ip_payload) = match parse_ipv4(payload) {
                 Some(i) => i,
                 None => return,
             };
-            // Only accept packets addressed to us
-            if ip.dst != OUR_IP {
+            // Accept packets addressed to us, or broadcast
+            if ip.dst != config.our_ip && !config.is_broadcast(&ip.dst) && ip.dst != ZERO_IP {
                 return;
             }
             // Learn sender MAC for future replies
@@ -1078,7 +1133,7 @@ fn process_frame(
                     &ip.src, &ip.dst,
                     &tcp, tcp_data,
                     sockets, tcp_conns, pending_accept,
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
             }
@@ -1098,18 +1153,18 @@ fn tcp_send_segment(
     seq: u32, ack: u32, flags: u8, window: u16,
     payload: &[u8],
     shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
+    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     tx: &mut TxScratch,
 ) {
     let tcp_len = build_tcp(
-        &OUR_IP, dst_addr, src_port, dst_port,
+        &config.our_ip, dst_addr, src_port, dst_port,
         seq, ack, flags, window, payload, &mut tx.tcp_buf,
     );
     if tcp_len == 0 { return; }
-    let ip_len = build_ipv4(&OUR_IP, dst_addr, PROTO_TCP, &tx.tcp_buf[..tcp_len], &mut tx.ip_buf);
+    let ip_len = build_ipv4(&config.our_ip, dst_addr, PROTO_TCP, &tx.tcp_buf[..tcp_len], &mut tx.ip_buf);
     if ip_len == 0 { return; }
-    send_ip_packet(shm_base, raw_handle, our_mac, arp_table, pending, &tx.ip_buf[..ip_len], dst_addr, now, &mut tx.frame_buf, &mut tx.msg);
+    send_ip_packet(shm_base, raw_handle, our_mac, config, arp_table, pending, &tx.ip_buf[..ip_len], dst_addr, now, &mut tx.frame_buf, &mut tx.msg);
 }
 
 /// Send a RST in response to an unexpected segment.
@@ -1117,7 +1172,7 @@ fn tcp_send_segment(
 fn tcp_send_rst(
     src_ip: &[u8; 4], tcp: &TcpHdr,
     shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
+    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     tx: &mut TxScratch,
 ) {
@@ -1129,7 +1184,7 @@ fn tcp_send_rst(
     tcp_send_segment(
         tcp.dst_port, src_ip, tcp.src_port,
         seq, ack, flags, 0, &[],
-        shm_base, raw_handle, our_mac, arp_table, pending, now,
+        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
         tx,
     );
 }
@@ -1184,7 +1239,7 @@ fn tcp_try_send_data(
     conn_idx: usize,
     tcp_conns: &mut TcpConns,
     shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
+    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     tx: &mut TxScratch,
 ) {
@@ -1207,7 +1262,7 @@ fn tcp_try_send_data(
         conn.local_port, &conn.remote_addr, conn.remote_port,
         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
         payload,
-        shm_base, raw_handle, our_mac, arp_table, pending, now,
+        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
         tx,
     );
     conn.snd_nxt = conn.snd_nxt.wrapping_add(send_len as u32);
@@ -1228,7 +1283,7 @@ fn tcp_input(
     tcp_conns: &mut TcpConns,
     pending_accept: &mut Option<PendingAcceptInfo>,
     shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
+    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     tx: &mut TxScratch,
 ) {
@@ -1236,7 +1291,7 @@ fn tcp_input(
     if let Some(ci) = tcp_find_conn(tcp_conns, tcp.dst_port, src_ip, tcp.src_port) {
         tcp_input_conn(
             ci, src_ip, tcp, data,
-            sockets, tcp_conns, pending_accept, shm_base, raw_handle, our_mac, arp_table, pending, now,
+            sockets, tcp_conns, pending_accept, shm_base, raw_handle, our_mac, config, arp_table, pending, now,
             tx,
         );
         return;
@@ -1249,17 +1304,17 @@ fn tcp_input(
     if let Some(li) = listener_idx {
         // Only SYN should arrive for a listening socket
         if tcp.flags & TCP_SYN == 0 || tcp.flags & TCP_ACK != 0 {
-            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
             return;
         }
         // Check accept backlog
         if sockets[li].accept_count >= TCP_ACCEPT_BACKLOG {
-            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
             return;
         }
         // Allocate a connection
         let Some(ci) = tcp_alloc_conn(tcp_conns) else {
-            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
             return;
         };
         let conn = &mut tcp_conns[ci];
@@ -1281,7 +1336,7 @@ fn tcp_input(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, arp_table, pending, now,
+            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
             tx,
         );
         return;
@@ -1289,7 +1344,7 @@ fn tcp_input(
 
     // 3. No match — send RST
     if tcp.flags & TCP_RST == 0 {
-        tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+        tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
     }
 }
 
@@ -1303,7 +1358,7 @@ fn tcp_input_conn(
     tcp_conns: &mut TcpConns,
     pending_accept: &mut Option<PendingAcceptInfo>,
     shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
+    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     tx: &mut TxScratch,
 ) {
@@ -1334,7 +1389,7 @@ fn tcp_input_conn(
             // We sent SYN (client connect), expecting SYN-ACK
             if tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK != 0 {
                 if tcp.ack != conn.snd_nxt {
-                    tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+                    tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
                     return;
                 }
                 conn.snd_una = tcp.ack;
@@ -1347,7 +1402,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
                 // Notify waiting Connect call
@@ -1389,7 +1444,7 @@ fn tcp_input_conn(
                     tcp_send_segment(
                         conn.local_port, &conn.remote_addr, conn.remote_port,
                         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                        shm_base, raw_handle, our_mac, arp_table, pending, now,
+                        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                         tx,
                     );
                 }
@@ -1417,7 +1472,7 @@ fn tcp_input_conn(
             }
         }
         TcpState::Established => {
-            tcp_input_established(ci, tcp, data, sockets, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+            tcp_input_established(ci, tcp, data, sockets, tcp_conns, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
         }
         TcpState::FinWait1 => {
             let conn = &mut tcp_conns[ci];
@@ -1433,7 +1488,7 @@ fn tcp_input_conn(
                     tcp_send_segment(
                         conn.local_port, &conn.remote_addr, conn.remote_port,
                         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                        shm_base, raw_handle, our_mac, arp_table, pending, now,
+                        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                         tx,
                     );
                 } else {
@@ -1446,7 +1501,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
             }
@@ -1461,7 +1516,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
             }
@@ -1496,7 +1551,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
             }
@@ -1513,7 +1568,7 @@ fn tcp_input_established(
     sockets: &mut [Socket; MAX_SOCKETS],
     tcp_conns: &mut TcpConns,
     shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
+    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     tx: &mut TxScratch,
 ) {
@@ -1538,7 +1593,7 @@ fn tcp_input_established(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, arp_table, pending, now,
+            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
             tx,
         );
         // Try to deliver data to waiting client
@@ -1551,7 +1606,7 @@ fn tcp_input_established(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, arp_table, pending, now,
+            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
             tx,
         );
     }
@@ -1565,7 +1620,7 @@ fn tcp_input_established(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, arp_table, pending, now,
+            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
             tx,
         );
         // If client is waiting on Recv, deliver EOF
@@ -1577,7 +1632,7 @@ fn tcp_input_established(
 
     // Try to send more data if window opened up
     if tcp_conns[ci].send_len > 0 {
-        tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+        tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
     }
 }
 
@@ -1684,7 +1739,7 @@ struct PendingAcceptInfo {
 fn tcp_check_retransmits(
     tcp_conns: &mut TcpConns,
     shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
+    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING], now: u64,
     sockets: &mut [Socket; MAX_SOCKETS],
     tx: &mut TxScratch,
@@ -1723,7 +1778,7 @@ fn tcp_check_retransmits(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
             }
@@ -1732,7 +1787,7 @@ fn tcp_check_retransmits(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
             }
@@ -1745,7 +1800,7 @@ fn tcp_check_retransmits(
                         conn.local_port, &conn.remote_addr, conn.remote_port,
                         conn.snd_una, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
                         &conn.send_buf[..send_len],
-                        shm_base, raw_handle, our_mac, arp_table, pending, now,
+                        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                         tx,
                     );
                 }
@@ -1756,7 +1811,7 @@ fn tcp_check_retransmits(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt.wrapping_sub(1), conn.rcv_nxt,
                     TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
             }
@@ -1838,6 +1893,7 @@ fn handle_client_message(
     shm_base: usize,
     raw_handle: usize,
     our_mac: &[u8; 6],
+    config: &NetConfig,
     arp_table: &ArpTable,
     pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
@@ -1879,7 +1935,7 @@ fn handle_client_message(
 
             // Build UDP payload
             let mut udp_buf = [0u8; 1480];
-            let udp_len = build_udp(&OUR_IP, &dst_ip, src_port, dst_port, data, &mut udp_buf);
+            let udp_len = build_udp(&config.our_ip, &dst_ip, src_port, dst_port, data, &mut udp_buf);
             if udp_len == 0 {
                 tx.msg = Message::new();
                 tx.msg.len = rvos_wire::to_bytes(
@@ -1893,7 +1949,7 @@ fn handle_client_message(
             }
 
             // Build IPv4 packet
-            let ip_len = build_ipv4(&OUR_IP, &dst_ip, PROTO_UDP, &udp_buf[..udp_len], &mut tx.ip_buf);
+            let ip_len = build_ipv4(&config.our_ip, &dst_ip, PROTO_UDP, &udp_buf[..udp_len], &mut tx.ip_buf);
             if ip_len == 0 {
                 tx.msg = Message::new();
                 tx.msg.len = rvos_wire::to_bytes(
@@ -1907,7 +1963,7 @@ fn handle_client_message(
             }
 
             send_ip_packet(
-                shm_base, raw_handle, our_mac, arp_table, pending,
+                shm_base, raw_handle, our_mac, config, arp_table, pending,
                 &tx.ip_buf[..ip_len], &dst_ip, now,
                 &mut tx.frame_buf, &mut tx.msg,
             );
@@ -1930,8 +1986,8 @@ fn handle_client_message(
             tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Addr {
                     addr: SocketAddr::Inet4 {
-                        a: OUR_IP[0], b: OUR_IP[1],
-                        c: OUR_IP[2], d: OUR_IP[3],
+                        a: config.our_ip[0], b: config.our_ip[1],
+                        c: config.our_ip[2], d: config.our_ip[3],
                         port,
                     },
                 },
@@ -2013,7 +2069,7 @@ fn handle_client_message(
             tcp_send_segment(
                 src_port, &dst_ip, port,
                 conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
-                shm_base, raw_handle, our_mac, arp_table, pending, now,
+                shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                 tx,
             );
             // Response is deferred until SYN-ACK arrives
@@ -2039,7 +2095,7 @@ fn handle_client_message(
                 .copy_from_slice(&data[..copy_len]);
             conn.send_len += copy_len;
             // Try to send immediately
-            tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, arp_table, pending, now, tx);
+            tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
             // Respond with bytes accepted
             tx.msg = Message::new();
             tx.msg.len = rvos_wire::to_bytes(
@@ -2080,7 +2136,7 @@ fn handle_client_message(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
+                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
                     tx,
                 );
                 conn.snd_nxt = conn.snd_nxt.wrapping_add(1);
@@ -2183,6 +2239,390 @@ fn handle_socket_request(
 }
 
 // ---------------------------------------------------------------------------
+// DHCP Client
+// ---------------------------------------------------------------------------
+
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
+
+// DHCP message types
+const DHCP_DISCOVER: u8 = 1;
+const DHCP_OFFER: u8 = 2;
+const DHCP_REQUEST: u8 = 3;
+const DHCP_ACK: u8 = 5;
+
+// DHCP options
+const OPT_SUBNET_MASK: u8 = 1;
+const OPT_ROUTER: u8 = 3;
+const OPT_DNS: u8 = 6;
+const OPT_REQUESTED_IP: u8 = 50;
+const OPT_MESSAGE_TYPE: u8 = 53;
+const OPT_SERVER_ID: u8 = 54;
+const OPT_PARAM_REQUEST: u8 = 55;
+const OPT_END: u8 = 255;
+
+/// Parsed DHCP response.
+struct DhcpOffer {
+    your_ip: [u8; 4],
+    server_ip: [u8; 4],
+    subnet_mask: [u8; 4],
+    gateway: [u8; 4],
+    msg_type: u8,
+}
+
+/// Build a DHCP message (DISCOVER or REQUEST) as a raw Ethernet frame.
+/// Returns the frame length written to `frame_buf`.
+fn build_dhcp_frame(
+    our_mac: &[u8; 6],
+    xid: u32,
+    msg_type: u8,
+    requested_ip: Option<[u8; 4]>,
+    server_ip: Option<[u8; 4]>,
+    frame_buf: &mut [u8],
+) -> usize {
+    // Build DHCP payload
+    let mut dhcp = [0u8; 576];
+    dhcp[0] = 1; // op: BOOTREQUEST
+    dhcp[1] = 1; // htype: Ethernet
+    dhcp[2] = 6; // hlen: MAC length
+    // dhcp[3] = 0; // hops
+    dhcp[4..8].copy_from_slice(&xid.to_be_bytes());
+    // secs = 0, flags = 0x8000 (broadcast)
+    dhcp[10] = 0x80;
+    // ciaddr, yiaddr, siaddr, giaddr = 0
+    // chaddr: our MAC padded to 16 bytes
+    dhcp[28..34].copy_from_slice(our_mac);
+    // sname (64 bytes) and file (128 bytes) are zero
+
+    // Magic cookie at offset 236
+    dhcp[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+
+    // Options start at offset 240
+    let mut opt_pos = 240;
+
+    // Option 53: DHCP Message Type
+    dhcp[opt_pos] = OPT_MESSAGE_TYPE;
+    dhcp[opt_pos + 1] = 1;
+    dhcp[opt_pos + 2] = msg_type;
+    opt_pos += 3;
+
+    // Option 50: Requested IP (for REQUEST)
+    if let Some(ip) = requested_ip {
+        dhcp[opt_pos] = OPT_REQUESTED_IP;
+        dhcp[opt_pos + 1] = 4;
+        dhcp[opt_pos + 2..opt_pos + 6].copy_from_slice(&ip);
+        opt_pos += 6;
+    }
+
+    // Option 54: Server Identifier (for REQUEST)
+    if let Some(ip) = server_ip {
+        dhcp[opt_pos] = OPT_SERVER_ID;
+        dhcp[opt_pos + 1] = 4;
+        dhcp[opt_pos + 2..opt_pos + 6].copy_from_slice(&ip);
+        opt_pos += 6;
+    }
+
+    // Option 55: Parameter Request List
+    dhcp[opt_pos] = OPT_PARAM_REQUEST;
+    dhcp[opt_pos + 1] = 3;
+    dhcp[opt_pos + 2] = OPT_SUBNET_MASK;
+    dhcp[opt_pos + 3] = OPT_ROUTER;
+    dhcp[opt_pos + 4] = OPT_DNS;
+    opt_pos += 5;
+
+    // End
+    dhcp[opt_pos] = OPT_END;
+    opt_pos += 1;
+
+    let dhcp_len = opt_pos;
+
+    // Build UDP header
+    let mut udp = [0u8; 8];
+    udp[0..2].copy_from_slice(&DHCP_CLIENT_PORT.to_be_bytes());
+    udp[2..4].copy_from_slice(&DHCP_SERVER_PORT.to_be_bytes());
+    let udp_total = 8 + dhcp_len;
+    udp[4..6].copy_from_slice(&(udp_total as u16).to_be_bytes());
+    // UDP checksum = 0 (optional for IPv4)
+
+    // Build IPv4 header
+    let mut ip = [0u8; 20];
+    ip[0] = 0x45; // version 4, IHL 5
+    let ip_total = 20 + udp_total;
+    ip[2..4].copy_from_slice(&(ip_total as u16).to_be_bytes());
+    ip[6] = 0x40; // Don't Fragment
+    ip[8] = 64;   // TTL
+    ip[9] = PROTO_UDP;
+    // src = 0.0.0.0, dst = 255.255.255.255
+    ip[16..20].copy_from_slice(&BROADCAST_IP);
+    // Checksum
+    let cksum = ipv4_checksum(&ip);
+    ip[10..12].copy_from_slice(&cksum.to_be_bytes());
+
+    // Build Ethernet frame
+    let frame_len = ETH_HDR_SIZE + ip_total;
+    if frame_buf.len() < frame_len {
+        return 0;
+    }
+    frame_buf[0..6].copy_from_slice(&BROADCAST_MAC);
+    frame_buf[6..12].copy_from_slice(our_mac);
+    frame_buf[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    frame_buf[14..34].copy_from_slice(&ip);
+    frame_buf[34..42].copy_from_slice(&udp);
+    frame_buf[42..42 + dhcp_len].copy_from_slice(&dhcp[..dhcp_len]);
+
+    frame_len
+}
+
+/// Parse a received frame as a DHCP response. Returns None if not a DHCP reply
+/// matching our xid/MAC.
+fn parse_dhcp_response(frame: &[u8], our_mac: &[u8; 6], xid: u32) -> Option<DhcpOffer> {
+    let (eth, payload) = parse_eth(frame)?;
+    if eth.ethertype != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let (_ip, ip_payload) = parse_ipv4(payload)?;
+    let (udp, udp_data) = parse_udp(ip_payload)?;
+    if udp.dst_port != DHCP_CLIENT_PORT {
+        return None;
+    }
+    // DHCP minimum: 236 bytes fixed + 4 bytes magic cookie
+    if udp_data.len() < 240 {
+        return None;
+    }
+    // op must be BOOTREPLY (2)
+    if udp_data[0] != 2 {
+        return None;
+    }
+    // Check xid
+    let resp_xid = u32::from_be_bytes([udp_data[4], udp_data[5], udp_data[6], udp_data[7]]);
+    if resp_xid != xid {
+        return None;
+    }
+    // Check chaddr matches our MAC
+    if udp_data[28..34] != *our_mac {
+        return None;
+    }
+    // Check magic cookie
+    if udp_data[236..240] != DHCP_MAGIC_COOKIE {
+        return None;
+    }
+
+    let your_ip = [udp_data[16], udp_data[17], udp_data[18], udp_data[19]];
+    let server_ip = [udp_data[20], udp_data[21], udp_data[22], udp_data[23]];
+
+    // Parse options
+    let mut msg_type = 0u8;
+    let mut subnet_mask = [255, 255, 255, 0]; // default
+    let mut gateway = [0u8; 4];
+    let mut i = 240;
+    while i < udp_data.len() {
+        let opt = udp_data[i];
+        if opt == OPT_END {
+            break;
+        }
+        if opt == 0 {
+            // Padding
+            i += 1;
+            continue;
+        }
+        if i + 1 >= udp_data.len() {
+            break;
+        }
+        let len = udp_data[i + 1] as usize;
+        if i + 2 + len > udp_data.len() {
+            break;
+        }
+        let data = &udp_data[i + 2..i + 2 + len];
+        match opt {
+            OPT_MESSAGE_TYPE if len >= 1 => msg_type = data[0],
+            OPT_SUBNET_MASK if len >= 4 => subnet_mask.copy_from_slice(&data[..4]),
+            OPT_ROUTER if len >= 4 => gateway.copy_from_slice(&data[..4]),
+            OPT_SERVER_ID if len >= 4 => {
+                // Use server identifier from option (more reliable than siaddr)
+                let _ = server_ip; // siaddr is fallback
+            }
+            _ => {}
+        }
+        i += 2 + len;
+    }
+
+    Some(DhcpOffer {
+        your_ip,
+        server_ip,
+        subnet_mask,
+        gateway,
+        msg_type,
+    })
+}
+
+/// Run the DHCP client: DISCOVER → OFFER → REQUEST → ACK.
+/// Returns true if an address was acquired, false if we should use fallback.
+fn dhcp_acquire(
+    shm_base: usize,
+    raw_handle: usize,
+    our_mac: &[u8; 6],
+    config: &mut NetConfig,
+    tx: &mut TxScratch,
+    rx: &mut RxScratch,
+) -> bool {
+    // Generate a transaction ID from our MAC
+    let xid = u32::from_be_bytes([our_mac[2], our_mac[3], our_mac[4], our_mac[5]]);
+
+    println!("[net] DHCP: sending DISCOVER...");
+
+    // --- Phase 1: DISCOVER → OFFER ---
+    let offer = match dhcp_transact(
+        shm_base, raw_handle, our_mac, xid,
+        DHCP_DISCOVER, None, None,
+        DHCP_OFFER, tx, rx,
+    ) {
+        Some(o) => o,
+        None => {
+            println!("[net] DHCP: no OFFER received, using static config");
+            return false;
+        }
+    };
+
+    println!(
+        "[net] DHCP: got OFFER {}.{}.{}.{}",
+        offer.your_ip[0], offer.your_ip[1], offer.your_ip[2], offer.your_ip[3],
+    );
+
+    // --- Phase 2: REQUEST → ACK ---
+    let ack = match dhcp_transact(
+        shm_base, raw_handle, our_mac, xid,
+        DHCP_REQUEST, Some(offer.your_ip), Some(offer.server_ip),
+        DHCP_ACK, tx, rx,
+    ) {
+        Some(a) => a,
+        None => {
+            println!("[net] DHCP: no ACK received, using static config");
+            return false;
+        }
+    };
+
+    // Apply configuration
+    config.our_ip = ack.your_ip;
+    config.subnet_mask = ack.subnet_mask;
+    if ack.gateway != ZERO_IP {
+        config.gateway = ack.gateway;
+    } else {
+        config.gateway = offer.server_ip;
+    }
+
+    println!(
+        "[net] DHCP: acquired {}.{}.{}.{}/{}.{}.{}.{} gw {}.{}.{}.{}",
+        config.our_ip[0], config.our_ip[1], config.our_ip[2], config.our_ip[3],
+        config.subnet_mask[0], config.subnet_mask[1], config.subnet_mask[2], config.subnet_mask[3],
+        config.gateway[0], config.gateway[1], config.gateway[2], config.gateway[3],
+    );
+
+    true
+}
+
+/// Send a DHCP message and wait for a response of the expected type.
+/// Retries with exponential backoff. Returns None on timeout.
+#[allow(clippy::too_many_arguments)]
+fn dhcp_transact(
+    shm_base: usize,
+    raw_handle: usize,
+    our_mac: &[u8; 6],
+    xid: u32,
+    send_type: u8,
+    requested_ip: Option<[u8; 4]>,
+    server_ip: Option<[u8; 4]>,
+    expect_type: u8,
+    tx: &mut TxScratch,
+    rx: &mut RxScratch,
+) -> Option<DhcpOffer> {
+    let mut timeout_ticks = 2 * TICK_HZ; // 2 seconds initial
+    const MAX_RETRIES: usize = 4;
+
+    for attempt in 0..MAX_RETRIES {
+        // Send DHCP message
+        let frame_len = build_dhcp_frame(
+            our_mac, xid, send_type, requested_ip, server_ip,
+            &mut tx.frame_buf,
+        );
+        if frame_len > 0 {
+            tx_frame(shm_base, raw_handle, &tx.frame_buf[..frame_len], &mut tx.msg);
+        }
+
+        // Wait for response
+        let deadline = now_ticks() + timeout_ticks;
+        loop {
+            let now = now_ticks();
+            if now >= deadline {
+                break;
+            }
+
+            // Poll RX ring
+            let rx_head = shm_read_u32(shm_base, CTRL_RX_HEAD);
+            let rx_tail = shm_read_u32(shm_base, CTRL_RX_TAIL);
+            if rx_head == rx_tail {
+                // No packets — yield and retry
+                std::thread::yield_now();
+                continue;
+            }
+
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
+            let slot_idx = (rx_tail % RX_SLOTS as u32) as usize;
+            let slot_offset = RX_RING_OFFSET + slot_idx * RX_SLOT_SIZE;
+            let frame_len = shm_read_u16(shm_base, slot_offset) as usize;
+            let copy_len = frame_len.min(rx.rx_buf.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (shm_base + slot_offset + 2) as *const u8,
+                    rx.rx_buf.as_mut_ptr(),
+                    copy_len,
+                );
+            }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            shm_write_u32(shm_base, CTRL_RX_TAIL, rx_tail.wrapping_add(1));
+
+            // Tell kernel we consumed the frame
+            rx.doorbell = Message::new();
+            rx.doorbell.len = rvos_wire::to_bytes(
+                &NetRawRequest::RxConsumed {},
+                &mut rx.doorbell.data,
+            ).expect("serialize");
+            let _ = raw::sys_chan_send(raw_handle, &rx.doorbell);
+
+            // Try to parse as DHCP response
+            if let Some(offer) = parse_dhcp_response(&rx.rx_buf[..copy_len], our_mac, xid) {
+                if offer.msg_type == expect_type {
+                    return Some(offer);
+                }
+            }
+            // Not a DHCP response — discard and keep polling
+        }
+
+        if attempt + 1 < MAX_RETRIES {
+            println!("[net] DHCP: retry {} (timeout {}s)...", attempt + 1, timeout_ticks / TICK_HZ);
+        }
+        timeout_ticks = (timeout_ticks * 2).min(8 * TICK_HZ);
+    }
+
+    None
+}
+
+/// Compute IPv4 header checksum.
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < header.len() {
+        let word = u16::from_be_bytes([header[i], header[i + 1]]);
+        sum += word as u32;
+        i += 2;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2275,12 +2715,18 @@ fn main() {
     let mut pending = core::array::from_fn(|_| PendingPacket::new());
     let mut pending_clients = [const { PendingClient::new() }; MAX_PENDING_CLIENTS];
 
+    // Run DHCP to acquire network configuration; fall back to static IPs
+    let mut config = NetConfig::new_unconfigured();
+    if !dhcp_acquire(shm_base, raw_handle, &our_mac, &mut config, &mut tx, &mut rx) {
+        config.apply_fallback();
+    }
+
     // Pre-populate ARP entry for gateway (QEMU user-net responds to ARP)
     // We'll learn it dynamically from the first ARP reply, but send a
     // gratuitous ARP request to speed things up.
     {
         let mut arp_buf = [0u8; 64];
-        let arp_len = send_arp_request(&our_mac, &OUR_IP, &GATEWAY_IP, &mut arp_buf);
+        let arp_len = send_arp_request(&our_mac, &config.our_ip, &config.gateway, &mut arp_buf);
         if arp_len > 0 {
             tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], &mut tx.msg);
         }
@@ -2324,6 +2770,7 @@ fn main() {
                 shm_base,
                 raw_handle,
                 &our_mac,
+                &config,
                 &mut arp_table,
                 &mut sockets,
                 &mut tcp_conns,
@@ -2428,6 +2875,7 @@ fn main() {
                     shm_base,
                     raw_handle,
                     &our_mac,
+                    &config,
                     &arp_table,
                     &mut pending,
                     now,
@@ -2440,13 +2888,13 @@ fn main() {
         for p in pending.iter_mut() {
             if p.active {
                 handled = true; // Keep looping while we have pending work
-                let next_hop = resolve_next_hop(&p.dst_ip);
+                let next_hop = config.resolve_next_hop(&p.dst_ip);
                 if arp_table.lookup(&next_hop, now).is_none()
                     && now.wrapping_sub(p.last_arp) >= ARP_RETRY_INTERVAL
                 {
                     p.last_arp = now;
                     let mut arp_buf = [0u8; 64];
-                    let arp_len = send_arp_request(&our_mac, &OUR_IP, &next_hop, &mut arp_buf);
+                    let arp_len = send_arp_request(&our_mac, &config.our_ip, &next_hop, &mut arp_buf);
                     if arp_len > 0 {
                         tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], &mut tx.msg);
                     }
@@ -2454,7 +2902,7 @@ fn main() {
             }
         }
         // Try to drain any newly resolved entries (also expires timed-out packets)
-        drain_pending(shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now, &mut tx.frame_buf, &mut tx.msg);
+        drain_pending(shm_base, raw_handle, &our_mac, &config, &arp_table, &mut pending, now, &mut tx.frame_buf, &mut tx.msg);
 
         // f. Process pending accept assignments
         if let Some(info) = pending_accept.take() {
@@ -2463,7 +2911,7 @@ fn main() {
         }
 
         // g. TCP retransmit timers
-        tcp_check_retransmits(&mut tcp_conns, shm_base, raw_handle, &our_mac, &arp_table, &mut pending, now, &mut sockets, &mut tx);
+        tcp_check_retransmits(&mut tcp_conns, shm_base, raw_handle, &our_mac, &config, &arp_table, &mut pending, now, &mut sockets, &mut tx);
 
         // h. TCP TimeWait cleanup
         tcp_check_timewait(&mut tcp_conns, now);
