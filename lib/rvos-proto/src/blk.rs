@@ -23,9 +23,9 @@ define_message! {
 
 define_message! {
     /// Responses from blk_server to client.
-    pub owned enum BlkResponse {
+    pub owned enum BlkResponse<'a> => BlkResponseMsg {
         /// Device info. SHM handle sent as cap in message sideband (cap index 0).
-        DeviceInfo(0) { capacity_sectors: u64, sector_size: u32, read_only: u8 },
+        DeviceInfo(0) { capacity_sectors: u64, sector_size: u32, read_only: u8, serial: &'a [u8] },
         /// Operation completed successfully.
         Ok(1) {},
         /// Operation failed with error code.
