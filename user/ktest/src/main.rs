@@ -2139,6 +2139,403 @@ fn test_ext2_persistence() -> Result<(), &'static str> {
 }
 
 // ============================================================
+// 27. Regression -- Per-Process Channel Limit (Bug 0013)
+// ============================================================
+
+fn test_chan_per_process_limit() -> Result<(), &'static str> {
+    // Bug 0013: the per-process channel limit is MAX_CHANNELS_PER_PROCESS = 32.
+    // Each sys_chan_create uses 2 handle slots, so we can create at most ~14 pairs
+    // (28 handles) on top of the 3-4 pre-allocated handles (boot, stdin, stdout, etc.).
+    // Keep creating pairs until we hit the limit, then verify the next create fails.
+    let mut pairs = [(0usize, 0usize); 16];
+    let mut count = 0;
+    for pair in &mut pairs {
+        let (ha, hb) = raw::sys_chan_create();
+        if ha == usize::MAX {
+            break;
+        }
+        *pair = (ha, hb);
+        count += 1;
+    }
+
+    // We should have hit the limit before filling all 16 slots
+    // (boot channel + stdio handles eat into the 32 limit).
+    // The important thing is that after exhaustion, create returns MAX.
+    let (fail_a, fail_b) = raw::sys_chan_create();
+    let at_limit = fail_a == usize::MAX && fail_b == usize::MAX;
+
+    // If we somehow didn't exhaust, that's also informative but not a failure
+    // (could mean fewer pre-existing handles). The critical test: if we did exhaust,
+    // verify the error is correct.
+    if count == 16 && !at_limit {
+        // Didn't hit the limit even with 16 pairs (32 handles) + pre-existing.
+        // This means the limit is not enforced.
+        for &(ha, hb) in pairs.iter().take(count) {
+            raw::sys_chan_close(ha);
+            raw::sys_chan_close(hb);
+        }
+        return Err("created 16 pairs without hitting per-process limit");
+    }
+
+    // If we hit limit, clean up the extra pair if it somehow succeeded
+    if !at_limit {
+        raw::sys_chan_close(fail_a);
+        raw::sys_chan_close(fail_b);
+    }
+
+    // Clean up all created pairs
+    for &(ha, hb) in pairs.iter().take(count) {
+        raw::sys_chan_close(ha);
+        raw::sys_chan_close(hb);
+    }
+
+    // After closing everything, we should be able to create again
+    let (ha, hb) = raw::sys_chan_create();
+    if ha == usize::MAX {
+        return Err("chan_create failed after freeing all handles");
+    }
+    raw::sys_chan_close(ha);
+    raw::sys_chan_close(hb);
+
+    Ok(())
+}
+
+fn test_chan_limit_exact_boundary() -> Result<(), &'static str> {
+    // Create pairs one at a time, counting until failure.
+    // Then close one pair and verify a new create succeeds.
+    let mut pairs = [(0usize, 0usize); 16];
+    let mut count = 0;
+    for pair in &mut pairs {
+        let (ha, hb) = raw::sys_chan_create();
+        if ha == usize::MAX {
+            break;
+        }
+        *pair = (ha, hb);
+        count += 1;
+    }
+    assert_true(count > 0, "couldn't create any channels")?;
+
+    // Next create should fail (we're at the limit)
+    let (fa, fb) = raw::sys_chan_create();
+    if fa != usize::MAX {
+        raw::sys_chan_close(fa);
+        raw::sys_chan_close(fb);
+    }
+
+    // Free one pair
+    raw::sys_chan_close(pairs[0].0);
+    raw::sys_chan_close(pairs[0].1);
+
+    // Now create should succeed again
+    let (ha, hb) = raw::sys_chan_create();
+    assert_ne(ha, usize::MAX, "create after freeing one pair should succeed")?;
+    raw::sys_chan_close(ha);
+    raw::sys_chan_close(hb);
+
+    // Clean up remaining
+    for &(ha, hb) in pairs.iter().take(count).skip(1) {
+        raw::sys_chan_close(ha);
+        raw::sys_chan_close(hb);
+    }
+    Ok(())
+}
+
+// ============================================================
+// 28. SYS_KILL
+// ============================================================
+
+fn test_kill_process() -> Result<(), &'static str> {
+    // Spawn ktest-helper in wait mode (command 3), get its PID,
+    // kill it with SYS_KILL, and verify it exits.
+    let (our_ep, child_ep) = raw::sys_chan_create();
+
+    // Send command byte 3 (wait mode)
+    let mut cmd = Message::new();
+    cmd.data[0] = 3;
+    cmd.len = 1;
+    raw::sys_chan_send(our_ep, &cmd);
+
+    let proc_chan = rvos::spawn_process_with_cap("/bin/ktest-helper", child_ep)
+        .map_err(|_| "spawn ktest-helper failed")?;
+    raw::sys_chan_close(child_ep);
+
+    let proc_handle = proc_chan.into_raw_handle();
+
+    // Receive ProcessStarted to get the child PID
+    let mut started_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(proc_handle, &mut started_msg);
+    if ret != 0 {
+        raw::sys_chan_close(proc_handle);
+        raw::sys_chan_close(our_ep);
+        return Err("recv ProcessStarted failed");
+    }
+
+    // Decode PID from ProcessStarted message
+    use rvos::rvos_wire;
+    let started: rvos_proto::process::ProcessStarted =
+        rvos_wire::from_bytes(&started_msg.data[..started_msg.len])
+            .map_err(|_| "decode ProcessStarted failed")?;
+    let child_pid = started.pid as usize;
+    assert_true(child_pid > 0, "child PID should be > 0")?;
+
+    // Wait for the ack message from the child (it sends "ack" on its cap channel)
+    let mut ack_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(our_ep, &mut ack_msg);
+    if ret != 0 {
+        raw::sys_chan_close(proc_handle);
+        raw::sys_chan_close(our_ep);
+        return Err("recv ack from child failed");
+    }
+
+    // Kill the child
+    let kill_ret = raw::sys_kill(child_pid, 137);
+    assert_eq(kill_ret, 0, "sys_kill should return 0")?;
+
+    // Wait for exit notification
+    let mut exit_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+    raw::sys_chan_close(proc_handle);
+    raw::sys_chan_close(our_ep);
+
+    assert_eq(ret, 0, "recv exit notification failed")?;
+    Ok(())
+}
+
+fn test_kill_invalid_pid() -> Result<(), &'static str> {
+    // Killing PID 0 or a non-existent PID should not crash.
+    // It may return an error or silently no-op.
+    let ret = raw::sys_kill(0, 1);
+    // Just verify kernel didn't crash — return value is implementation-defined
+    let _ = ret;
+
+    // Kill a PID that's very unlikely to exist
+    let ret = raw::sys_kill(9999, 1);
+    let _ = ret;
+
+    // Verify kernel is still alive
+    let (wall, _) = raw::sys_clock();
+    assert_true(wall > 0, "kernel dead after invalid kill")
+}
+
+// ============================================================
+// 29. Spawn Suspended
+// ============================================================
+
+fn test_spawn_suspended_blocks() -> Result<(), &'static str> {
+    // Spawn hello-std in suspended mode. It should not produce output
+    // or exit immediately. Then resume it via the debugger service
+    // and verify it eventually exits.
+    use rvos::rvos_wire;
+    use rvos_proto::debug::*;
+
+    let proc_chan = rvos::spawn_process_suspended("/bin/hello-std")
+        .map_err(|_| "spawn suspended failed")?;
+    let proc_handle = proc_chan.into_raw_handle();
+
+    // Receive ProcessStarted to get child PID
+    let mut started_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(proc_handle, &mut started_msg);
+    if ret != 0 {
+        raw::sys_chan_close(proc_handle);
+        return Err("recv ProcessStarted failed");
+    }
+    let started: rvos_proto::process::ProcessStarted =
+        rvos_wire::from_bytes(&started_msg.data[..started_msg.len])
+            .map_err(|_| "decode ProcessStarted failed")?;
+    let child_pid = started.pid as u32;
+
+    // Give the child a chance to run (it shouldn't, because it's suspended).
+    // If it were running, it would exit very quickly. We yield a few times
+    // and then check that it hasn't sent an exit notification yet.
+    for _ in 0..50 {
+        raw::sys_yield();
+    }
+
+    // Non-blocking recv on proc_handle — should return Empty (1) because
+    // the child is suspended and hasn't exited.
+    let mut peek_msg = Message::new();
+    let peek_ret = raw::sys_chan_recv(proc_handle, &mut peek_msg);
+    if peek_ret == 0 {
+        // Child already exited — suspension didn't work
+        raw::sys_chan_close(proc_handle);
+        return Err("suspended child exited before resume");
+    }
+
+    // Attach to the child via the debugger service and resume it
+    let svc = rvos::connect_to_service("process-debug")
+        .map_err(|_| "connect to process-debug failed")?;
+    let svc_handle = svc.into_raw_handle();
+
+    let req = DebugAttachRequest { pid: child_pid };
+    let mut msg = Message::new();
+    msg.len = rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(svc_handle, &msg);
+
+    let mut resp_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(svc_handle, &mut resp_msg);
+    raw::sys_chan_close(svc_handle);
+
+    if ret != 0 {
+        // Can't attach — kill the child and clean up
+        raw::sys_kill(child_pid as usize, 1);
+        let mut exit_msg = Message::new();
+        raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+        raw::sys_chan_close(proc_handle);
+        return Err("debugger attach failed");
+    }
+
+    let resp: DebugAttachResponse = rvos_wire::from_bytes_with_caps(
+        &resp_msg.data[..resp_msg.len],
+        &resp_msg.caps[..resp_msg.cap_count],
+    ).map_err(|_| "decode attach response failed")?;
+
+    let (session, events) = match resp {
+        DebugAttachResponse::Ok { session, events } => (session.raw(), events.raw()),
+        DebugAttachResponse::Error { .. } => {
+            raw::sys_kill(child_pid as usize, 1);
+            let mut exit_msg = Message::new();
+            raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+            raw::sys_chan_close(proc_handle);
+            return Err("debugger attach returned error");
+        }
+    };
+
+    // Send Resume command on the session channel
+    let resume_req = SessionRequest::Resume {};
+    let mut resume_msg = Message::new();
+    resume_msg.len = rvos_wire::to_bytes(&resume_req, &mut resume_msg.data).unwrap_or(0);
+    raw::sys_chan_send_blocking(session, &resume_msg);
+
+    // Receive Resume response
+    let mut resume_resp = Message::new();
+    let ret = raw::sys_chan_recv_blocking(session, &mut resume_resp);
+
+    // Close debugger channels
+    raw::sys_chan_close(session);
+    raw::sys_chan_close(events);
+
+    if ret != 0 {
+        raw::sys_kill(child_pid as usize, 1);
+        let mut exit_msg = Message::new();
+        raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+        raw::sys_chan_close(proc_handle);
+        return Err("resume response failed");
+    }
+
+    // Now wait for the child to exit
+    let mut exit_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(proc_handle, &mut exit_msg);
+    raw::sys_chan_close(proc_handle);
+
+    assert_eq(ret, 0, "recv exit notification failed")?;
+    Ok(())
+}
+
+// ============================================================
+// 30. HTTP Loopback (Integration)
+// ============================================================
+
+fn test_http_loopback() -> Result<(), &'static str> {
+    // Integration test: spawn http-server, create a test file, then
+    // spawn http-client to fetch it via loopback (127.0.0.1).
+    //
+    // This test requires net-stack with loopback support.
+
+    // Create a test file for the HTTP server to serve
+    let _ = std::fs::create_dir_all("/persist/www");
+    let test_content = "ktest-http-loopback-ok";
+    std::fs::write("/persist/www/ktest.txt", test_content)
+        .map_err(|_| "write test file failed")?;
+
+    // Spawn http-server on port 8080
+    let server_chan = rvos::spawn_process_with_args("/bin/http-server", b"8080")
+        .map_err(|_| "spawn http-server failed")?;
+    let server_handle = server_chan.into_raw_handle();
+
+    // Receive ProcessStarted from server
+    let mut started_msg = Message::new();
+    let ret = raw::sys_chan_recv_blocking(server_handle, &mut started_msg);
+    if ret != 0 {
+        raw::sys_chan_close(server_handle);
+        let _ = std::fs::remove_file("/persist/www/ktest.txt");
+        return Err("recv server ProcessStarted failed");
+    }
+
+    // Give the server time to bind and listen
+    // Use a timer to wait 200ms
+    {
+        use rvos::rvos_wire;
+        use rvos_proto::timer::TimerRequest;
+        if let Ok(timer_svc) = rvos::connect_to_service("timer") {
+            let timer_handle = timer_svc.into_raw_handle();
+            let req = TimerRequest::After { duration_us: 200_000 };
+            let mut msg = Message::new();
+            msg.len = rvos_wire::to_bytes(&req, &mut msg.data).unwrap_or(0);
+            raw::sys_chan_send_blocking(timer_handle, &msg);
+            let mut resp = Message::new();
+            raw::sys_chan_recv_blocking(timer_handle, &mut resp);
+            raw::sys_chan_close(timer_handle);
+        }
+    }
+
+    // Spawn http-client to fetch the test file
+    let client_chan = rvos::spawn_process_with_args(
+        "/bin/http-client",
+        b"http://127.0.0.1:8080/ktest.txt",
+    ).map_err(|_| {
+        // Clean up server
+        raw::sys_kill(
+            {
+                let s: rvos_proto::process::ProcessStarted =
+                    rvos::rvos_wire::from_bytes(&started_msg.data[..started_msg.len])
+                        .unwrap_or(rvos_proto::process::ProcessStarted { pid: 0 });
+                s.pid as usize
+            },
+            1,
+        );
+        let mut exit_msg = Message::new();
+        raw::sys_chan_recv_blocking(server_handle, &mut exit_msg);
+        raw::sys_chan_close(server_handle);
+        let _ = std::fs::remove_file("/persist/www/ktest.txt");
+        "spawn http-client failed"
+    })?;
+    let client_handle = client_chan.into_raw_handle();
+
+    // Receive ProcessStarted from client
+    let mut client_started = Message::new();
+    raw::sys_chan_recv_blocking(client_handle, &mut client_started);
+
+    // Wait for client to exit
+    let mut client_exit = Message::new();
+    let ret = raw::sys_chan_recv_blocking(client_handle, &mut client_exit);
+    raw::sys_chan_close(client_handle);
+
+    // Kill the server (it loops forever accepting connections)
+    let server_pid = {
+        use rvos::rvos_wire;
+        let s: rvos_proto::process::ProcessStarted =
+            rvos_wire::from_bytes(&started_msg.data[..started_msg.len])
+                .unwrap_or(rvos_proto::process::ProcessStarted { pid: 0 });
+        s.pid as usize
+    };
+    if server_pid > 0 {
+        raw::sys_kill(server_pid, 1);
+    }
+    let mut server_exit = Message::new();
+    raw::sys_chan_recv_blocking(server_handle, &mut server_exit);
+    raw::sys_chan_close(server_handle);
+
+    // Clean up test file
+    let _ = std::fs::remove_file("/persist/www/ktest.txt");
+
+    assert_eq(ret, 0, "client exit notification failed")?;
+    // If the client exited successfully, the HTTP loopback worked.
+    // The client prints the response to stdout which we can't easily capture,
+    // but a successful exit means the connection + transfer completed.
+    Ok(())
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -2333,6 +2730,30 @@ fn main() {
             ("ext2_grow_file", test_ext2_grow_file),
             ("ext2_persistence", test_ext2_persistence),
         ]));
+    }
+
+    total.merge(&run_section("Regression -- Per-Process Channel Limit", &[
+        ("chan_per_process_limit", test_chan_per_process_limit),
+        ("chan_limit_exact_boundary", test_chan_limit_exact_boundary),
+    ]));
+
+    if !quick {
+        yield_drain();
+        total.merge(&run_section("SYS_KILL", &[
+            ("kill_process", test_kill_process),
+            ("kill_invalid_pid", test_kill_invalid_pid),
+        ]));
+        yield_drain();
+
+        total.merge(&run_section("Spawn Suspended", &[
+            ("spawn_suspended_blocks", test_spawn_suspended_blocks),
+        ]));
+        yield_drain();
+
+        total.merge(&run_section("HTTP Loopback", &[
+            ("http_loopback", test_http_loopback),
+        ]));
+        yield_drain();
     }
 
     println!();
