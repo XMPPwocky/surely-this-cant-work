@@ -73,7 +73,7 @@ if path.len() > path_buf.len() {
 
 ---
 
-### MEDIUM: Process spawn panics on PID exhaustion
+### ~~MEDIUM: Process spawn panics on PID exhaustion~~ ALREADY FIXED
 
 **Location**: `kernel/src/task/process.rs:15` (MAX_PROCS = 64)
 
@@ -81,7 +81,7 @@ if path.len() > path_buf.len() {
 
 **Impact**: Unrecoverable kernel panic on resource exhaustion.
 
-**Fix**: Return `Option<usize>` from `find_free_slot()`. Propagate error to caller.
+**Fix**: ~~Return `Option<usize>` from `find_free_slot()`. Propagate error to caller.~~ Already fixed: `find_free_slot()` returns `Option<usize>`, all `spawn_*` functions propagate via `?`, and the init server's dynamic spawn path (line ~1343) handles `None` gracefully. Boot-time callers in `kmain` use `.expect()` which is correct — failure to spawn essential services (init, serial-con, etc.) is genuinely fatal.
 
 ---
 
@@ -165,7 +165,7 @@ CLAUDE.md states "No static mut. Pass state through function parameters." This s
 | Channels (global) | **1024** | Returns None | Yes | **Yes** (64→1024 in Bug 0012 fix) | Per-process limit (32) prevents monopolization |
 | Channels/process | 32 | Returns Error | Yes | **New** (Bug 0013 fix) | Adequate |
 | Handles/process | 32 | Returns None | Yes | No | Consider increase to 64 |
-| Processes | 64 | **Panics** | **No** | No | Return Option |
+| Processes | 64 | Returns None | Yes | No (already Option) | Adequate |
 | SHM regions | 32 | **Panics** | **No** | No | Return Option |
 | Page frames | ~32K | Returns None | Yes | No | Adequate |
 | mmap regions/proc | 256 | Returns false | Yes (bool) | No | Change to Result |
@@ -186,7 +186,7 @@ CLAUDE.md states "No static mut. Pass state through function parameters." This s
 
 **Key changes from review 6**: Channel pool expanded 16x (64→1024). Per-process channel limit added (32). TCP connection exhaustion now sends RST instead of silent drop. ext2 file management redesigned with flat slot array (Bug 0021).
 
-**Still problematic**: Process spawn panics. SHM creation panics. Console clients silently dropped.
+**Still problematic**: SHM creation panics. Console clients silently dropped.
 
 ---
 
@@ -415,7 +415,7 @@ All unsafe blocks in reviewed code are necessary and minimal:
 
 | Error Path | Tested? | Risk |
 |------------|---------|------|
-| Process table full (>64 procs) | **No** | HIGH (panics) |
+| Process table full (>64 procs) | **No** | MEDIUM (returns None, handled gracefully) |
 | SHM creation exhaustion (>32 regions) | **No** | HIGH (panics) |
 | Global channel pool exhaustion | **No** | MEDIUM |
 | ext2 disk full | **No** | HIGH |
@@ -464,9 +464,9 @@ The addition of Investigation sections to all 17 closed bug docs (fafba7c) creat
 
 ### Immediate (fix this week)
 
-1. **Return error from ext2-server for paths > 64 bytes** — silent truncation is a data corruption risk (MEDIUM correctness)
+1. ~~**Return error from ext2-server for paths > 64 bytes** — silent truncation is a data corruption risk (MEDIUM correctness)~~ **DONE** (6bdfb9c)
 2. ~~**Update `docs/kernel-abi.md` MAX_CHANNELS** — says 64, actual is 1024 (CRITICAL doc drift)~~ **DONE** (1122aa6)
-3. **Replace process spawn panic with error return** — user-triggerable kernel crash (MEDIUM robustness)
+3. ~~**Replace process spawn panic with error return**~~ **ALREADY FIXED** — `find_free_slot()` returns `Option`, init server handles gracefully
 4. **Replace SHM creation panic with error return** — user-triggerable kernel crash (MEDIUM robustness)
 
 ### Soon (next sprint)
