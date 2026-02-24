@@ -44,6 +44,7 @@ fn handle_client(mut stream: TcpStream) {
     // Read the request (up to 2KB should be enough for the request line + headers)
     let mut req_buf = [0u8; 2048];
     let mut total = 0;
+    let mut headers_complete = false;
     // Read until we see \r\n\r\n or fill the buffer
     loop {
         if total >= req_buf.len() {
@@ -55,14 +56,25 @@ fn handle_client(mut stream: TcpStream) {
                 total += n;
                 // Check for end of headers
                 if req_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    headers_complete = true;
                     break;
                 }
             }
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("http-server: read error: {:?}", e);
+                let _ = stream.shutdown(Shutdown::Both);
+                return;
+            }
         }
     }
 
     if total == 0 {
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
+
+    if !headers_complete {
+        send_response(&mut stream, 400, "Bad Request", b"Incomplete headers\n");
         let _ = stream.shutdown(Shutdown::Both);
         return;
     }
