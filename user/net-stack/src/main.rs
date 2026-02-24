@@ -121,6 +121,10 @@ const MAX_SOCKETS: usize = 16;
 const MAX_PENDING: usize = 4;
 const MAX_PENDING_CLIENTS: usize = 4;
 
+const MAX_INTERFACES: usize = 4;
+const IFACE_LOOPBACK: usize = 0;
+const IFACE_ETH0: usize = 1;
+
 /// Heap-allocated scratch buffers for packet TX, avoiding large stack frames.
 struct TxScratch {
     frame_buf: [u8; 1534],
@@ -760,6 +764,8 @@ struct TcpConn {
     active: bool,
     // TimeWait deadline
     time_wait_deadline: u64,
+    // Interface index for routing
+    iface_idx: usize,
 }
 
 impl TcpConn {
@@ -784,6 +790,7 @@ impl TcpConn {
             listener_sock_idx: usize::MAX,
             active: false,
             time_wait_deadline: 0,
+            iface_idx: 0,
         }
     }
 
@@ -911,6 +918,41 @@ impl PendingPacket {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-interface support
+// ---------------------------------------------------------------------------
+
+struct Interface {
+    active: bool,
+    name: &'static str,
+    mac: [u8; 6],
+    config: NetConfig,
+    arp_table: ArpTable,
+    shm_base: Option<usize>,
+    raw_handle: Option<usize>,
+    loopback_rx: Vec<Vec<u8>>,
+    pending: [PendingPacket; MAX_PENDING],
+}
+
+/// Select the outgoing interface for a destination IP.
+fn route(interfaces: &[Interface; MAX_INTERFACES], dst_ip: &[u8; 4]) -> usize {
+    // 1. Loopback: 127.x.x.x
+    if dst_ip[0] == 127 {
+        return IFACE_LOOPBACK;
+    }
+    // 2. Own-IP destinations route through the owning interface (not loopback).
+    // send_ip_packet detects self-delivery and pushes to the interface's loopback_rx.
+    // This preserves the correct source IP on the packet.
+
+    // 3. Default: first active non-loopback interface
+    for (i, iface) in interfaces.iter().enumerate() {
+        if iface.active && i != IFACE_LOOPBACK {
+            return i;
+        }
+    }
+    IFACE_LOOPBACK // fallback
+}
+
+// ---------------------------------------------------------------------------
 // TX via SHM ring buffer
 // ---------------------------------------------------------------------------
 
@@ -946,39 +988,44 @@ fn tx_frame(shm_base: usize, raw_handle: usize, frame: &[u8], msg: &mut Message)
 
 #[allow(clippy::too_many_arguments)]
 fn send_ip_packet(
-    shm_base: usize,
-    raw_handle: usize,
-    our_mac: &[u8; 6],
-    config: &NetConfig,
-    arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING],
+    iface: &mut Interface,
     ip_packet: &[u8],
     dst_ip: &[u8; 4],
     now: u64,
     frame_buf: &mut [u8; 1534],
     msg: &mut Message,
 ) {
-    let next_hop = config.resolve_next_hop(dst_ip);
+    // Loopback or self-delivery: push raw IP packet directly to loopback RX queue.
+    // This handles both the virtual loopback interface (127.x) and own-IP delivery
+    // (e.g., connecting to 10.0.2.30 on a host with IP 10.0.2.30).
+    if iface.shm_base.is_none() || *dst_ip == iface.config.our_ip {
+        iface.loopback_rx.push(ip_packet.to_vec());
+        return;
+    }
+    let shm_base = iface.shm_base.unwrap();
+    let raw_handle = iface.raw_handle.unwrap();
+
+    let next_hop = iface.config.resolve_next_hop(dst_ip);
 
     // Broadcast destinations use broadcast MAC directly (no ARP)
-    if config.is_broadcast(&next_hop) {
-        let frame_len = build_eth(&BROADCAST_MAC, our_mac, ETHERTYPE_IPV4, ip_packet, frame_buf);
+    if iface.config.is_broadcast(&next_hop) {
+        let frame_len = build_eth(&BROADCAST_MAC, &iface.mac, ETHERTYPE_IPV4, ip_packet, frame_buf);
         if frame_len > 0 {
             tx_frame(shm_base, raw_handle, &frame_buf[..frame_len], msg);
         }
         return;
     }
 
-    if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
+    if let Some(dst_mac) = iface.arp_table.lookup(&next_hop, now) {
         // Have MAC -- send immediately
-        let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, ip_packet, frame_buf);
+        let frame_len = build_eth(&dst_mac, &iface.mac, ETHERTYPE_IPV4, ip_packet, frame_buf);
         if frame_len > 0 {
             tx_frame(shm_base, raw_handle, &frame_buf[..frame_len], msg);
         }
     } else {
         // Queue packet and send ARP request
         let mut queued = false;
-        for p in pending.iter_mut() {
+        for p in iface.pending.iter_mut() {
             if !p.active {
                 p.data = ip_packet.to_vec();
                 p.dst_ip = *dst_ip;
@@ -994,7 +1041,7 @@ fn send_ip_packet(
         }
 
         let mut arp_buf = [0u8; 64];
-        let arp_len = send_arp_request(our_mac, &config.our_ip, &next_hop, &mut arp_buf);
+        let arp_len = send_arp_request(&iface.mac, &iface.config.our_ip, &next_hop, &mut arp_buf);
         if arp_len > 0 {
             tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], msg);
         }
@@ -1005,19 +1052,18 @@ fn send_ip_packet(
 // Drain pending ARP queue: try to send queued packets whose MAC is now known
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn drain_pending(
-    shm_base: usize,
-    raw_handle: usize,
-    our_mac: &[u8; 6],
-    config: &NetConfig,
-    arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING],
+    iface: &mut Interface,
     now: u64,
     frame_buf: &mut [u8; 1534],
     msg: &mut Message,
 ) {
-    for p in pending.iter_mut() {
+    // Only hardware interfaces have pending ARP
+    let (shm_base, raw_handle) = match (iface.shm_base, iface.raw_handle) {
+        (Some(s), Some(r)) => (s, r),
+        _ => return,
+    };
+    for p in iface.pending.iter_mut() {
         if !p.active {
             continue;
         }
@@ -1028,9 +1074,9 @@ fn drain_pending(
             p.active = false;
             continue;
         }
-        let next_hop = config.resolve_next_hop(&p.dst_ip);
-        if let Some(dst_mac) = arp_table.lookup(&next_hop, now) {
-            let frame_len = build_eth(&dst_mac, our_mac, ETHERTYPE_IPV4, &p.data, frame_buf);
+        let next_hop = iface.config.resolve_next_hop(&p.dst_ip);
+        if let Some(dst_mac) = iface.arp_table.lookup(&next_hop, now) {
+            let frame_len = build_eth(&dst_mac, &iface.mac, ETHERTYPE_IPV4, &p.data, frame_buf);
             if frame_len > 0 {
                 tx_frame(shm_base, raw_handle, &frame_buf[..frame_len], msg);
             }
@@ -1040,21 +1086,17 @@ fn drain_pending(
 }
 
 // ---------------------------------------------------------------------------
-// Process a received Ethernet frame
+// Process a received Ethernet frame (hardware NIC path)
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn process_frame(
     frame: &[u8],
-    shm_base: usize,
-    raw_handle: usize,
-    our_mac: &[u8; 6],
-    config: &NetConfig,
-    arp_table: &mut ArpTable,
+    interfaces: &mut [Interface; MAX_INTERFACES],
+    rx_iface_idx: usize,
     sockets: &mut [Socket; MAX_SOCKETS],
     tcp_conns: &mut TcpConns,
     pending_accept: &mut Option<PendingAcceptInfo>,
-    pending: &mut [PendingPacket; MAX_PENDING],
     now: u64,
     tx: &mut TxScratch,
 ) {
@@ -1065,83 +1107,102 @@ fn process_frame(
 
     match eth.ethertype {
         ETHERTYPE_ARP => {
+            let iface = &mut interfaces[rx_iface_idx];
             let mut reply_buf = [0u8; 64];
-            if let Some(reply_len) = handle_arp(arp_table, our_mac, &config.our_ip, payload, &mut reply_buf, now) {
-                tx_frame(shm_base, raw_handle, &reply_buf[..reply_len], &mut tx.msg);
+            if let Some(reply_len) = handle_arp(&mut iface.arp_table, &iface.mac, &iface.config.our_ip, payload, &mut reply_buf, now) {
+                if let (Some(sb), Some(rh)) = (iface.shm_base, iface.raw_handle) {
+                    tx_frame(sb, rh, &reply_buf[..reply_len], &mut tx.msg);
+                }
             }
             // After learning new MACs, try to drain pending queue
-            drain_pending(shm_base, raw_handle, our_mac, config, arp_table, pending, now, &mut tx.frame_buf, &mut tx.msg);
+            drain_pending(iface, now, &mut tx.frame_buf, &mut tx.msg);
         }
         ETHERTYPE_IPV4 => {
             let (ip, ip_payload) = match parse_ipv4(payload) {
                 Some(i) => i,
                 None => return,
             };
-            // Accept packets addressed to us, or broadcast
-            if ip.dst != config.our_ip && !config.is_broadcast(&ip.dst) && ip.dst != ZERO_IP {
-                return;
-            }
-            // Learn sender MAC for future replies
-            arp_table.insert(ip.src, eth.src, now);
-
-            if ip.proto == PROTO_UDP {
-                let (udp, udp_data) = match parse_udp(ip_payload) {
-                    Some(u) => u,
-                    None => return,
-                };
-                if !udp_checksum_ok(&ip.src, &ip.dst, ip_payload) {
-                    println!("net-stack: dropped UDP packet from {}.{}.{}.{}:{} (bad checksum)",
-                        ip.src[0], ip.src[1], ip.src[2], ip.src[3], udp.src_port);
-                    return;
-                }
-                // Find socket bound to this destination port
-                for sock in sockets.iter_mut() {
-                    if sock.active && sock.port == udp.dst_port {
-                        if sock.recv_pending {
-                            // Send SocketData::Datagram to client
-                            tx.msg = Message::new();
-                            let truncated_len = udp_data.len().min(900);
-                            let addr = SocketAddr::Inet4 {
-                                a: ip.src[0], b: ip.src[1],
-                                c: ip.src[2], d: ip.src[3],
-                                port: udp.src_port,
-                            };
-                            tx.msg.len = rvos_wire::to_bytes(
-                                &SocketData::Datagram {
-                                    addr,
-                                    data: &udp_data[..truncated_len],
-                                },
-                                &mut tx.msg.data,
-                            ).expect("serialize");
-                            let ret = raw::sys_chan_send(sock.handle, &tx.msg);
-                            sock.recv_pending = false;
-                            if ret == raw::CHAN_CLOSED {
-                                // Client channel closed — clean up socket
-                                sock.deactivate(tcp_conns);
-                            }
-                        }
-                        // Only deliver to the first matching socket
-                        break;
-                    }
-                }
-            } else if ip.proto == PROTO_TCP {
-                if !tcp_checksum_ok(&ip.src, &ip.dst, ip_payload) {
-                    return;
-                }
-                let (tcp, tcp_data) = match parse_tcp(ip_payload) {
-                    Some(t) => t,
-                    None => return,
-                };
-                tcp_input(
-                    &ip.src, &ip.dst,
-                    &tcp, tcp_data,
-                    sockets, tcp_conns, pending_accept,
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
-                    tx,
-                );
-            }
+            // Learn sender MAC on receiving interface
+            interfaces[rx_iface_idx].arp_table.insert(ip.src, eth.src, now);
+            process_ip_packet(&ip, ip_payload, interfaces, sockets, tcp_conns, pending_accept, rx_iface_idx, now, tx);
         }
         _ => {} // Ignore other ethertypes
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Process an IP packet (shared by hardware NIC and loopback paths)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn process_ip_packet(
+    ip: &IpHdr, ip_payload: &[u8],
+    interfaces: &mut [Interface; MAX_INTERFACES],
+    sockets: &mut [Socket; MAX_SOCKETS],
+    tcp_conns: &mut TcpConns,
+    pending_accept: &mut Option<PendingAcceptInfo>,
+    rx_iface_idx: usize,
+    now: u64,
+    tx: &mut TxScratch,
+) {
+    // Accept packets addressed to any of our interfaces, or broadcast
+    let accepted = interfaces.iter().any(|iface| {
+        iface.active && (ip.dst == iface.config.our_ip || iface.config.is_broadcast(&ip.dst))
+    }) || ip.dst == ZERO_IP;
+    if !accepted { return; }
+
+    if ip.proto == PROTO_UDP {
+        let (udp, udp_data) = match parse_udp(ip_payload) {
+            Some(u) => u,
+            None => return,
+        };
+        if !udp_checksum_ok(&ip.src, &ip.dst, ip_payload) {
+            println!("net-stack: dropped UDP packet from {}.{}.{}.{}:{} (bad checksum)",
+                ip.src[0], ip.src[1], ip.src[2], ip.src[3], udp.src_port);
+            return;
+        }
+        // Find socket bound to this destination port
+        for sock in sockets.iter_mut() {
+            if sock.active && sock.port == udp.dst_port {
+                if sock.recv_pending {
+                    tx.msg = Message::new();
+                    let truncated_len = udp_data.len().min(900);
+                    let addr = SocketAddr::Inet4 {
+                        a: ip.src[0], b: ip.src[1],
+                        c: ip.src[2], d: ip.src[3],
+                        port: udp.src_port,
+                    };
+                    tx.msg.len = rvos_wire::to_bytes(
+                        &SocketData::Datagram {
+                            addr,
+                            data: &udp_data[..truncated_len],
+                        },
+                        &mut tx.msg.data,
+                    ).expect("serialize");
+                    let ret = raw::sys_chan_send(sock.handle, &tx.msg);
+                    sock.recv_pending = false;
+                    if ret == raw::CHAN_CLOSED {
+                        sock.deactivate(tcp_conns);
+                    }
+                }
+                break;
+            }
+        }
+    } else if ip.proto == PROTO_TCP {
+        if !tcp_checksum_ok(&ip.src, &ip.dst, ip_payload) {
+            return;
+        }
+        let (tcp, tcp_data) = match parse_tcp(ip_payload) {
+            Some(t) => t,
+            None => return,
+        };
+        tcp_input(
+            &ip.src, &ip.dst,
+            &tcp, tcp_data,
+            sockets, tcp_conns, pending_accept,
+            interfaces, rx_iface_idx, now,
+            tx,
+        );
     }
 }
 
@@ -1155,28 +1216,23 @@ fn tcp_send_segment(
     src_port: u16, dst_addr: &[u8; 4], dst_port: u16,
     seq: u32, ack: u32, flags: u8, window: u16,
     payload: &[u8],
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    iface: &mut Interface, now: u64,
     tx: &mut TxScratch,
 ) {
     let tcp_len = build_tcp(
-        &config.our_ip, dst_addr, src_port, dst_port,
+        &iface.config.our_ip, dst_addr, src_port, dst_port,
         seq, ack, flags, window, payload, &mut tx.tcp_buf,
     );
     if tcp_len == 0 { return; }
-    let ip_len = build_ipv4(&config.our_ip, dst_addr, PROTO_TCP, &tx.tcp_buf[..tcp_len], &mut tx.ip_buf);
+    let ip_len = build_ipv4(&iface.config.our_ip, dst_addr, PROTO_TCP, &tx.tcp_buf[..tcp_len], &mut tx.ip_buf);
     if ip_len == 0 { return; }
-    send_ip_packet(shm_base, raw_handle, our_mac, config, arp_table, pending, &tx.ip_buf[..ip_len], dst_addr, now, &mut tx.frame_buf, &mut tx.msg);
+    send_ip_packet(iface, &tx.ip_buf[..ip_len], dst_addr, now, &mut tx.frame_buf, &mut tx.msg);
 }
 
 /// Send a RST in response to an unexpected segment.
-#[allow(clippy::too_many_arguments)]
 fn tcp_send_rst(
     src_ip: &[u8; 4], tcp: &TcpHdr,
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    iface: &mut Interface, now: u64,
     tx: &mut TxScratch,
 ) {
     let (seq, ack, flags) = if tcp.flags & TCP_ACK != 0 {
@@ -1187,7 +1243,7 @@ fn tcp_send_rst(
     tcp_send_segment(
         tcp.dst_port, src_ip, tcp.src_port,
         seq, ack, flags, 0, &[],
-        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+        iface, now,
         tx,
     );
 }
@@ -1237,13 +1293,10 @@ fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns, msg: &mut M
 }
 
 /// Try to send data from the send buffer.
-#[allow(clippy::too_many_arguments)]
 fn tcp_try_send_data(
     conn_idx: usize,
     tcp_conns: &mut TcpConns,
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    iface: &mut Interface, now: u64,
     tx: &mut TxScratch,
 ) {
     let conn = &mut tcp_conns[conn_idx];
@@ -1265,7 +1318,7 @@ fn tcp_try_send_data(
         conn.local_port, &conn.remote_addr, conn.remote_port,
         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
         payload,
-        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+        iface, now,
         tx,
     );
     conn.snd_nxt = conn.snd_nxt.wrapping_add(send_len as u32);
@@ -1285,16 +1338,17 @@ fn tcp_input(
     sockets: &mut [Socket; MAX_SOCKETS],
     tcp_conns: &mut TcpConns,
     pending_accept: &mut Option<PendingAcceptInfo>,
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    interfaces: &mut [Interface; MAX_INTERFACES],
+    rx_iface_idx: usize, now: u64,
     tx: &mut TxScratch,
 ) {
     // 1. Try to find an existing connection
     if let Some(ci) = tcp_find_conn(tcp_conns, tcp.dst_port, src_ip, tcp.src_port) {
+        let iface_idx = tcp_conns[ci].iface_idx;
         tcp_input_conn(
             ci, src_ip, tcp, data,
-            sockets, tcp_conns, pending_accept, shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+            sockets, tcp_conns, pending_accept,
+            &mut interfaces[iface_idx], now,
             tx,
         );
         return;
@@ -1307,17 +1361,17 @@ fn tcp_input(
     if let Some(li) = listener_idx {
         // Only SYN should arrive for a listening socket
         if tcp.flags & TCP_SYN == 0 || tcp.flags & TCP_ACK != 0 {
-            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+            tcp_send_rst(src_ip, tcp, &mut interfaces[rx_iface_idx], now, tx);
             return;
         }
         // Check accept backlog
         if sockets[li].accept_count >= TCP_ACCEPT_BACKLOG {
-            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+            tcp_send_rst(src_ip, tcp, &mut interfaces[rx_iface_idx], now, tx);
             return;
         }
         // Allocate a connection
         let Some(ci) = tcp_alloc_conn(tcp_conns) else {
-            tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+            tcp_send_rst(src_ip, tcp, &mut interfaces[rx_iface_idx], now, tx);
             return;
         };
         let conn = &mut tcp_conns[ci];
@@ -1332,6 +1386,7 @@ fn tcp_input(
         conn.snd_wnd = tcp.window;
         conn.socket_idx = usize::MAX; // not yet associated with a socket
         conn.listener_sock_idx = li;
+        conn.iface_idx = rx_iface_idx;
         conn.rto_ticks = TCP_INITIAL_RTO;
         conn.retx_count = 0;
         conn.retx_deadline = now + conn.rto_ticks;
@@ -1339,7 +1394,7 @@ fn tcp_input(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+            &mut interfaces[rx_iface_idx], now,
             tx,
         );
         return;
@@ -1347,7 +1402,7 @@ fn tcp_input(
 
     // 3. No match — send RST
     if tcp.flags & TCP_RST == 0 {
-        tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+        tcp_send_rst(src_ip, tcp, &mut interfaces[rx_iface_idx], now, tx);
     }
 }
 
@@ -1360,9 +1415,7 @@ fn tcp_input_conn(
     sockets: &mut [Socket; MAX_SOCKETS],
     tcp_conns: &mut TcpConns,
     pending_accept: &mut Option<PendingAcceptInfo>,
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    iface: &mut Interface, now: u64,
     tx: &mut TxScratch,
 ) {
     // Handle RST
@@ -1392,7 +1445,7 @@ fn tcp_input_conn(
             // We sent SYN (client connect), expecting SYN-ACK
             if tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK != 0 {
                 if tcp.ack != conn.snd_nxt {
-                    tcp_send_rst(src_ip, tcp, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+                    tcp_send_rst(src_ip, tcp, iface, now, tx);
                     return;
                 }
                 conn.snd_una = tcp.ack;
@@ -1405,7 +1458,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+                    iface, now,
                     tx,
                 );
                 // Notify waiting Connect call
@@ -1447,7 +1500,7 @@ fn tcp_input_conn(
                     tcp_send_segment(
                         conn.local_port, &conn.remote_addr, conn.remote_port,
                         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+                        iface, now,
                         tx,
                     );
                 }
@@ -1462,8 +1515,7 @@ fn tcp_input_conn(
                     // If Accept is pending, deliver now
                     if sockets[li].accept_pending {
                         tcp_deliver_accept(
-                            &mut sockets[li], tcp_conns, pending_accept, 0,
-                            shm_base, raw_handle, our_mac, arp_table, pending, now,
+                            &mut sockets[li], tcp_conns, pending_accept,
                             tx,
                         );
                         // Process pending accept assignment
@@ -1475,7 +1527,7 @@ fn tcp_input_conn(
             }
         }
         TcpState::Established => {
-            tcp_input_established(ci, tcp, data, sockets, tcp_conns, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+            tcp_input_established(ci, tcp, data, sockets, tcp_conns, iface, now, tx);
         }
         TcpState::FinWait1 => {
             let conn = &mut tcp_conns[ci];
@@ -1491,7 +1543,7 @@ fn tcp_input_conn(
                     tcp_send_segment(
                         conn.local_port, &conn.remote_addr, conn.remote_port,
                         conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+                        iface, now,
                         tx,
                     );
                 } else {
@@ -1504,7 +1556,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+                    iface, now,
                     tx,
                 );
             }
@@ -1519,7 +1571,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+                    iface, now,
                     tx,
                 );
             }
@@ -1554,7 +1606,7 @@ fn tcp_input_conn(
                 tcp_send_segment(
                     conn.local_port, &conn.remote_addr, conn.remote_port,
                     conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+                    iface, now,
                     tx,
                 );
             }
@@ -1570,9 +1622,7 @@ fn tcp_input_established(
     tcp: &TcpHdr, data: &[u8],
     sockets: &mut [Socket; MAX_SOCKETS],
     tcp_conns: &mut TcpConns,
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    iface: &mut Interface, now: u64,
     tx: &mut TxScratch,
 ) {
     // Process ACK
@@ -1596,7 +1646,7 @@ fn tcp_input_established(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+            iface, now,
             tx,
         );
         // Try to deliver data to waiting client
@@ -1609,7 +1659,7 @@ fn tcp_input_established(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+            iface, now,
             tx,
         );
     }
@@ -1623,7 +1673,7 @@ fn tcp_input_established(
         tcp_send_segment(
             conn.local_port, &conn.remote_addr, conn.remote_port,
             conn.snd_nxt, conn.rcv_nxt, TCP_ACK, TCP_WINDOW, &[],
-            shm_base, raw_handle, our_mac, config, arp_table, pending, now,
+            iface, now,
             tx,
         );
         // If client is waiting on Recv, deliver EOF
@@ -1635,7 +1685,7 @@ fn tcp_input_established(
 
     // Try to send more data if window opened up
     if tcp_conns[ci].send_len > 0 {
-        tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+        tcp_try_send_data(ci, tcp_conns, iface, now, tx);
     }
 }
 
@@ -1666,15 +1716,10 @@ fn tcp_process_ack(ci: usize, tcp_conns: &mut TcpConns, ack_num: u32) {
 }
 
 /// Deliver a connection from the accept queue to a waiting Accept call.
-#[allow(clippy::too_many_arguments)]
 fn tcp_deliver_accept(
     sock: &mut Socket,
     tcp_conns: &mut TcpConns,
     pending_accept: &mut Option<PendingAcceptInfo>,
-    _sockets_base: usize,
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], _now: u64,
     tx: &mut TxScratch,
 ) {
     if !sock.accept_pending || sock.accept_count == 0 {
@@ -1724,7 +1769,6 @@ fn tcp_deliver_accept(
     // We can't assign the socket here because sock is already a mutable
     // reference to one element of the sockets array. Store the info for
     // the caller to assign after this function returns.
-    let _ = (shm_base, raw_handle, our_mac, arp_table, pending, tx);
     conn.socket_idx = sock_a; // abuse: store handle temporarily
     *pending_accept = Some(PendingAcceptInfo {
         handle: sock_a,
@@ -1741,9 +1785,7 @@ struct PendingAcceptInfo {
 #[allow(clippy::too_many_arguments)]
 fn tcp_check_retransmits(
     tcp_conns: &mut TcpConns,
-    shm_base: usize, raw_handle: usize,
-    our_mac: &[u8; 6], config: &NetConfig, arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING], now: u64,
+    interfaces: &mut [Interface; MAX_INTERFACES], now: u64,
     sockets: &mut [Socket; MAX_SOCKETS],
     tx: &mut TxScratch,
 ) {
@@ -1775,47 +1817,52 @@ fn tcp_check_retransmits(
         conn.rto_ticks = conn.rto_ticks.saturating_mul(2).min(60 * TICK_HZ);
         conn.retx_deadline = now + conn.rto_ticks;
 
+        // Copy fields needed for tcp_send_segment (avoid borrow conflict)
+        let local_port = conn.local_port;
+        let remote_addr = conn.remote_addr;
+        let remote_port = conn.remote_port;
+        let snd_una = conn.snd_una;
+        let snd_nxt = conn.snd_nxt;
+        let rcv_nxt = conn.rcv_nxt;
+        let iface_idx = conn.iface_idx;
+
         match conn.state {
             TcpState::SynSent => {
                 // Retransmit SYN
                 tcp_send_segment(
-                    conn.local_port, &conn.remote_addr, conn.remote_port,
-                    conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
-                    tx,
+                    local_port, &remote_addr, remote_port,
+                    snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
+                    &mut interfaces[iface_idx], now, tx,
                 );
             }
             TcpState::SynReceived => {
                 // Retransmit SYN-ACK
                 tcp_send_segment(
-                    conn.local_port, &conn.remote_addr, conn.remote_port,
-                    conn.snd_una, conn.rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
-                    tx,
+                    local_port, &remote_addr, remote_port,
+                    snd_una, rcv_nxt, TCP_SYN | TCP_ACK, TCP_WINDOW, &[],
+                    &mut interfaces[iface_idx], now, tx,
                 );
             }
             TcpState::Established | TcpState::CloseWait => {
                 // Retransmit unacked data
-                let unacked_len = conn.snd_nxt.wrapping_sub(conn.snd_una) as usize;
+                let unacked_len = snd_nxt.wrapping_sub(snd_una) as usize;
                 if unacked_len > 0 && unacked_len <= conn.send_len {
                     let send_len = unacked_len.min(TCP_MSS as usize);
                     tcp_send_segment(
-                        conn.local_port, &conn.remote_addr, conn.remote_port,
-                        conn.snd_una, conn.rcv_nxt, TCP_ACK, TCP_WINDOW,
+                        local_port, &remote_addr, remote_port,
+                        snd_una, rcv_nxt, TCP_ACK, TCP_WINDOW,
                         &conn.send_buf[..send_len],
-                        shm_base, raw_handle, our_mac, config, arp_table, pending, now,
-                        tx,
+                        &mut interfaces[iface_idx], now, tx,
                     );
                 }
             }
             TcpState::FinWait1 | TcpState::LastAck => {
                 // Retransmit FIN
                 tcp_send_segment(
-                    conn.local_port, &conn.remote_addr, conn.remote_port,
-                    conn.snd_nxt.wrapping_sub(1), conn.rcv_nxt,
+                    local_port, &remote_addr, remote_port,
+                    snd_nxt.wrapping_sub(1), rcv_nxt,
                     TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
-                    tx,
+                    &mut interfaces[iface_idx], now, tx,
                 );
             }
             _ => {
@@ -1898,12 +1945,7 @@ fn handle_client_message(
     tcp_conns: &mut TcpConns,
     pending_accept: &mut Option<PendingAcceptInfo>,
     msg: &Message,
-    shm_base: usize,
-    raw_handle: usize,
-    our_mac: &[u8; 6],
-    config: &NetConfig,
-    arp_table: &ArpTable,
-    pending: &mut [PendingPacket; MAX_PENDING],
+    interfaces: &mut [Interface; MAX_INTERFACES],
     now: u64,
     tx: &mut TxScratch,
 ) {
@@ -1963,9 +2005,13 @@ fn handle_client_message(
             }
             let src_port = sockets[sock_idx].port;
 
+            // Route the packet to the correct interface
+            let iface_idx = route(interfaces, &dst_ip);
+            let src_ip = interfaces[iface_idx].config.our_ip;
+
             // Build UDP payload
             let mut udp_buf = [0u8; 1480];
-            let udp_len = build_udp(&config.our_ip, &dst_ip, src_port, dst_port, data, &mut udp_buf);
+            let udp_len = build_udp(&src_ip, &dst_ip, src_port, dst_port, data, &mut udp_buf);
             if udp_len == 0 {
                 tx.msg = Message::new();
                 tx.msg.len = rvos_wire::to_bytes(
@@ -1979,7 +2025,7 @@ fn handle_client_message(
             }
 
             // Build IPv4 packet
-            let ip_len = build_ipv4(&config.our_ip, &dst_ip, PROTO_UDP, &udp_buf[..udp_len], &mut tx.ip_buf);
+            let ip_len = build_ipv4(&src_ip, &dst_ip, PROTO_UDP, &udp_buf[..udp_len], &mut tx.ip_buf);
             if ip_len == 0 {
                 tx.msg = Message::new();
                 tx.msg.len = rvos_wire::to_bytes(
@@ -1993,7 +2039,7 @@ fn handle_client_message(
             }
 
             send_ip_packet(
-                shm_base, raw_handle, our_mac, config, arp_table, pending,
+                &mut interfaces[iface_idx],
                 &tx.ip_buf[..ip_len], &dst_ip, now,
                 &mut tx.frame_buf, &mut tx.msg,
             );
@@ -2012,12 +2058,13 @@ fn handle_client_message(
         }
         SocketRequest::GetSockName {} => {
             let port = sockets[sock_idx].port;
+            let our_ip = interfaces[IFACE_ETH0].config.our_ip;
             tx.msg = Message::new();
             tx.msg.len = rvos_wire::to_bytes(
                 &SocketResponse::Addr {
                     addr: SocketAddr::Inet4 {
-                        a: config.our_ip[0], b: config.our_ip[1],
-                        c: config.our_ip[2], d: config.our_ip[3],
+                        a: our_ip[0], b: our_ip[1],
+                        c: our_ip[2], d: our_ip[3],
                         port,
                     },
                 },
@@ -2047,9 +2094,7 @@ fn handle_client_message(
             if sockets[sock_idx].accept_count > 0 {
                 // Connection already waiting — deliver immediately
                 tcp_deliver_accept(
-                    &mut sockets[sock_idx], tcp_conns, pending_accept, 0,
-                    shm_base, raw_handle, our_mac, arp_table, pending, now,
-                    tx,
+                    &mut sockets[sock_idx], tcp_conns, pending_accept, tx,
                 );
                 // Process pending accept assignment
                 if let Some(info) = pending_accept.take() {
@@ -2094,13 +2139,15 @@ fn handle_client_message(
             conn.rto_ticks = TCP_INITIAL_RTO;
             conn.retx_count = 0;
             conn.retx_deadline = now + conn.rto_ticks;
+            conn.iface_idx = route(interfaces, &dst_ip);
             sockets[sock_idx].tcp_conn_idx = ci;
             // Send SYN
+            let snd_una = conn.snd_una;
+            let iface_idx = conn.iface_idx;
             tcp_send_segment(
                 src_port, &dst_ip, port,
-                conn.snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
-                shm_base, raw_handle, our_mac, config, arp_table, pending, now,
-                tx,
+                snd_una, 0, TCP_SYN, TCP_WINDOW, &[],
+                &mut interfaces[iface_idx], now, tx,
             );
             // Response is deferred until SYN-ACK arrives
         }
@@ -2125,7 +2172,8 @@ fn handle_client_message(
                 .copy_from_slice(&data[..copy_len]);
             conn.send_len += copy_len;
             // Try to send immediately
-            tcp_try_send_data(ci, tcp_conns, shm_base, raw_handle, our_mac, config, arp_table, pending, now, tx);
+            let iface_idx = tcp_conns[ci].iface_idx;
+            tcp_try_send_data(ci, tcp_conns, &mut interfaces[iface_idx], now, tx);
             // Respond with bytes accepted
             tx.msg = Message::new();
             tx.msg.len = rvos_wire::to_bytes(
@@ -2163,11 +2211,16 @@ fn handle_client_message(
                     TcpState::LastAck
                 };
                 conn.state = new_state;
+                let local_port = conn.local_port;
+                let remote_addr = conn.remote_addr;
+                let remote_port = conn.remote_port;
+                let snd_nxt = conn.snd_nxt;
+                let rcv_nxt = conn.rcv_nxt;
+                let iface_idx = conn.iface_idx;
                 tcp_send_segment(
-                    conn.local_port, &conn.remote_addr, conn.remote_port,
-                    conn.snd_nxt, conn.rcv_nxt, TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
-                    shm_base, raw_handle, our_mac, config, arp_table, pending, now,
-                    tx,
+                    local_port, &remote_addr, remote_port,
+                    snd_nxt, rcv_nxt, TCP_FIN | TCP_ACK, TCP_WINDOW, &[],
+                    &mut interfaces[iface_idx], now, tx,
                 );
                 conn.snd_nxt = conn.snd_nxt.wrapping_add(1);
                 conn.retx_deadline = now + conn.rto_ticks;
@@ -2205,7 +2258,7 @@ fn handle_socket_request(
     client_handle: usize,
     sockets: &mut [Socket; MAX_SOCKETS],
     msg: &Message,
-    config: &NetConfig,
+    interfaces: &[Interface; MAX_INTERFACES],
     tx: &mut TxScratch,
 ) {
     let req = match rvos_wire::from_bytes::<SocketsRequest>(&msg.data[..msg.len]) {
@@ -2218,6 +2271,7 @@ fn handle_socket_request(
 
     // Handle GetConfig — reply with current network configuration and close
     if matches!(req, SocketsRequest::GetConfig {}) {
+        let config = &interfaces[IFACE_ETH0].config;
         tx.msg = Message::new();
         let (len, cap_count) = rvos_wire::to_bytes_with_caps(
             &SocketsResponse::Config {
@@ -2765,7 +2819,6 @@ fn main() {
     println!("[net-stack] SHM mapped at {:#x}", shm_base);
 
     // 5. Initialize state
-    let mut arp_table = ArpTable::new();
     let mut sockets = [const { Socket::new() }; MAX_SOCKETS];
     let mut tcp_conns: Box<TcpConns> = {
         let layout = alloc::alloc::Layout::new::<TcpConns>();
@@ -2780,7 +2833,6 @@ fn main() {
         b
     };
     let mut pending_accept: Option<PendingAcceptInfo> = None;
-    let mut pending = core::array::from_fn(|_| PendingPacket::new());
     let mut pending_clients = [const { PendingClient::new() }; MAX_PENDING_CLIENTS];
 
     // Run DHCP to acquire network configuration; fall back to static IPs
@@ -2789,12 +2841,40 @@ fn main() {
         config.apply_fallback();
     }
 
+    // Initialize interfaces array
+    let mut interfaces: [Interface; MAX_INTERFACES] = core::array::from_fn(|_| Interface {
+        active: false,
+        name: "",
+        mac: [0; 6],
+        config: NetConfig::new_unconfigured(),
+        arp_table: ArpTable::new(),
+        shm_base: None,
+        raw_handle: None,
+        loopback_rx: Vec::new(),
+        pending: core::array::from_fn(|_| PendingPacket::new()),
+    });
+
+    // Interface 0: loopback (127.0.0.1/8)
+    interfaces[IFACE_LOOPBACK].active = true;
+    interfaces[IFACE_LOOPBACK].name = "lo";
+    interfaces[IFACE_LOOPBACK].config.our_ip = [127, 0, 0, 1];
+    interfaces[IFACE_LOOPBACK].config.subnet_mask = [255, 0, 0, 0];
+
+    // Interface 1: eth0 (hardware NIC from DHCP)
+    interfaces[IFACE_ETH0].active = true;
+    interfaces[IFACE_ETH0].name = "eth0";
+    interfaces[IFACE_ETH0].mac = our_mac;
+    interfaces[IFACE_ETH0].config = config;
+    interfaces[IFACE_ETH0].shm_base = Some(shm_base);
+    interfaces[IFACE_ETH0].raw_handle = Some(raw_handle);
+
     // Pre-populate ARP entry for gateway (QEMU user-net responds to ARP)
     // We'll learn it dynamically from the first ARP reply, but send a
     // gratuitous ARP request to speed things up.
     {
+        let eth0 = &interfaces[IFACE_ETH0];
         let mut arp_buf = [0u8; 64];
-        let arp_len = send_arp_request(&our_mac, &config.our_ip, &config.gateway, &mut arp_buf);
+        let arp_len = send_arp_request(&eth0.mac, &eth0.config.our_ip, &eth0.config.gateway, &mut arp_buf);
         if arp_len > 0 {
             tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], &mut tx.msg);
         }
@@ -2807,8 +2887,12 @@ fn main() {
         let mut handled = false;
         let now = now_ticks();
 
-        // Expire stale ARP entries
-        arp_table.expire(now);
+        // Expire stale ARP entries on all interfaces
+        for iface in interfaces.iter_mut() {
+            if iface.active {
+                iface.arp_table.expire(now);
+            }
+        }
 
         // a. Drain SHM RX ring
         loop {
@@ -2835,18 +2919,43 @@ fn main() {
 
             process_frame(
                 &rx.rx_buf[..copy_len],
-                shm_base,
-                raw_handle,
-                &our_mac,
-                &config,
-                &mut arp_table,
+                &mut interfaces,
+                IFACE_ETH0,
                 &mut sockets,
                 &mut tcp_conns,
                 &mut pending_accept,
-                &mut pending,
                 now,
                 &mut tx,
             );
+        }
+
+        // a2. Drain loopback RX queues on all interfaces.
+        // Both the loopback interface (127.x) and hardware interfaces (own-IP
+        // self-delivery) can have queued packets.
+        for drain_iface in 0..MAX_INTERFACES {
+            loop {
+                let queue = core::mem::take(&mut interfaces[drain_iface].loopback_rx);
+                if queue.is_empty() {
+                    break;
+                }
+                handled = true;
+                for pkt in &queue {
+                    let (ip, ip_payload) = match parse_ipv4(pkt) {
+                        Some(parsed) => parsed,
+                        None => continue,
+                    };
+                    process_ip_packet(
+                        &ip, ip_payload,
+                        &mut interfaces,
+                        &mut sockets,
+                        &mut tcp_conns,
+                        &mut pending_accept,
+                        drain_iface,
+                        now,
+                        &mut tx,
+                    );
+                }
+            }
         }
 
         // b. Poll raw channel for RxReady/TxConsumed doorbells
@@ -2912,7 +3021,7 @@ fn main() {
             handled = true;
             let h = pc.handle;
             pc.active = false;
-            handle_socket_request(h, &mut sockets, &rx.client_msg, &config, &mut tx);
+            handle_socket_request(h, &mut sockets, &rx.client_msg, &interfaces, &mut tx);
         }
 
         // d. Poll all active socket channels for SocketRequest messages
@@ -2940,37 +3049,35 @@ fn main() {
                     &mut tcp_conns,
                     &mut pending_accept,
                     &rx.client_msg,
-                    shm_base,
-                    raw_handle,
-                    &our_mac,
-                    &config,
-                    &arp_table,
-                    &mut pending,
+                    &mut interfaces,
                     now,
                     &mut tx,
                 );
             }
         }
 
-        // e. Check pending ARP queue (retry with backoff, expire timed-out entries)
-        for p in pending.iter_mut() {
-            if p.active {
-                handled = true; // Keep looping while we have pending work
-                let next_hop = config.resolve_next_hop(&p.dst_ip);
-                if arp_table.lookup(&next_hop, now).is_none()
-                    && now.wrapping_sub(p.last_arp) >= ARP_RETRY_INTERVAL
-                {
-                    p.last_arp = now;
-                    let mut arp_buf = [0u8; 64];
-                    let arp_len = send_arp_request(&our_mac, &config.our_ip, &next_hop, &mut arp_buf);
-                    if arp_len > 0 {
-                        tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], &mut tx.msg);
+        // e. Check pending ARP queue on eth0 (retry with backoff, expire timed-out entries)
+        {
+            let eth0 = &mut interfaces[IFACE_ETH0];
+            for p in eth0.pending.iter_mut() {
+                if p.active {
+                    handled = true; // Keep looping while we have pending work
+                    let next_hop = eth0.config.resolve_next_hop(&p.dst_ip);
+                    if eth0.arp_table.lookup(&next_hop, now).is_none()
+                        && now.wrapping_sub(p.last_arp) >= ARP_RETRY_INTERVAL
+                    {
+                        p.last_arp = now;
+                        let mut arp_buf = [0u8; 64];
+                        let arp_len = send_arp_request(&eth0.mac, &eth0.config.our_ip, &next_hop, &mut arp_buf);
+                        if arp_len > 0 {
+                            tx_frame(shm_base, raw_handle, &arp_buf[..arp_len], &mut tx.msg);
+                        }
                     }
                 }
             }
         }
         // Try to drain any newly resolved entries (also expires timed-out packets)
-        drain_pending(shm_base, raw_handle, &our_mac, &config, &arp_table, &mut pending, now, &mut tx.frame_buf, &mut tx.msg);
+        drain_pending(&mut interfaces[IFACE_ETH0], now, &mut tx.frame_buf, &mut tx.msg);
 
         // f. Process pending accept assignments
         if let Some(info) = pending_accept.take() {
@@ -2979,7 +3086,7 @@ fn main() {
         }
 
         // g. TCP retransmit timers
-        tcp_check_retransmits(&mut tcp_conns, shm_base, raw_handle, &our_mac, &config, &arp_table, &mut pending, now, &mut sockets, &mut tx);
+        tcp_check_retransmits(&mut tcp_conns, &mut interfaces, now, &mut sockets, &mut tx);
 
         // h. TCP TimeWait cleanup
         tcp_check_timewait(&mut tcp_conns, now);
