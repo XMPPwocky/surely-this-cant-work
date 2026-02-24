@@ -69,6 +69,8 @@ define_message! {
     pub enum SocketsRequest {
         /// Create a new socket of the given type.
         Socket(0) { sock_type: SocketType },
+        /// Get current network configuration (IP, gateway, mask, DNS).
+        GetConfig(1) {},
     }
 }
 
@@ -79,6 +81,13 @@ define_message! {
         Created(0) { socket: RawChannelCap },
         /// Error creating socket.
         Error(1) { code: SocketError },
+        /// Network configuration.
+        Config(2) {
+            ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8,
+            gw_a: u8, gw_b: u8, gw_c: u8, gw_d: u8,
+            mask_a: u8, mask_b: u8, mask_c: u8, mask_d: u8,
+            dns_a: u8, dns_b: u8, dns_c: u8, dns_d: u8,
+        },
     }
 }
 
@@ -92,6 +101,9 @@ define_protocol! {
 
         /// Create a new socket.
         rpc socket as Socket(sock_type: SocketType) -> SocketsResponse;
+
+        /// Get current network configuration.
+        rpc get_config as GetConfig() -> SocketsResponse;
     }
 }
 

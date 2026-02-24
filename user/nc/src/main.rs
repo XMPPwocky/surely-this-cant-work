@@ -65,6 +65,10 @@ fn create_socket(sock_type: SocketType) -> usize {
             eprintln!("nc: socket: {:?}", code);
             process::exit(1);
         }
+        _ => {
+            eprintln!("nc: unexpected net response");
+            process::exit(1);
+        }
     }
 }
 

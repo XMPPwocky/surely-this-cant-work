@@ -9,6 +9,42 @@ use rvos_proto::socket::*;
 /// Re-export socket types for convenience.
 pub use rvos_proto::socket::{SocketAddr, SocketError, ShutdownHow};
 
+/// Network configuration returned by `get_net_config()`.
+pub struct NetConfigInfo {
+    pub ip: [u8; 4],
+    pub gateway: [u8; 4],
+    pub mask: [u8; 4],
+    pub dns: [u8; 4],
+}
+
+/// Query the net-stack for the current network configuration.
+pub fn get_net_config() -> Result<NetConfigInfo, SocketError> {
+    let svc = crate::service::connect_to_service("net")
+        .map_err(|_| SocketError::NoResources {})?;
+    let mut ch: Channel<SocketsRequest, SocketsResponse> =
+        Channel::from_raw_handle(svc.into_raw_handle());
+
+    ch.send(&SocketsRequest::GetConfig {})
+        .map_err(|_| SocketError::NoResources {})?;
+    let resp = ch.recv_blocking()
+        .map_err(|_| SocketError::NoResources {})?;
+
+    match resp {
+        SocketsResponse::Config {
+            ip_a, ip_b, ip_c, ip_d,
+            gw_a, gw_b, gw_c, gw_d,
+            mask_a, mask_b, mask_c, mask_d,
+            dns_a, dns_b, dns_c, dns_d,
+        } => Ok(NetConfigInfo {
+            ip: [ip_a, ip_b, ip_c, ip_d],
+            gateway: [gw_a, gw_b, gw_c, gw_d],
+            mask: [mask_a, mask_b, mask_c, mask_d],
+            dns: [dns_a, dns_b, dns_c, dns_d],
+        }),
+        _ => Err(SocketError::NoResources {}),
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 /// Connect to the "net" service and request a socket of the given type.
@@ -27,6 +63,7 @@ fn create_socket(sock_type: SocketType) -> Result<usize, SocketError> {
     match resp {
         SocketsResponse::Created { socket } => Ok(socket.raw()),
         SocketsResponse::Error { code } => Err(code),
+        _ => Err(SocketError::NoResources {}),
     }
     // ch drops here, closing the control channel
 }

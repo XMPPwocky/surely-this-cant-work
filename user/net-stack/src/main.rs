@@ -42,6 +42,7 @@ struct NetConfig {
     our_ip: [u8; 4],
     gateway: [u8; 4],
     subnet_mask: [u8; 4],
+    dns_server: [u8; 4],
 }
 
 impl NetConfig {
@@ -50,6 +51,7 @@ impl NetConfig {
             our_ip: ZERO_IP,
             gateway: ZERO_IP,
             subnet_mask: ZERO_IP,
+            dns_server: ZERO_IP,
         }
     }
 
@@ -57,6 +59,7 @@ impl NetConfig {
         self.our_ip = FALLBACK_IP;
         self.gateway = FALLBACK_GATEWAY;
         self.subnet_mask = FALLBACK_MASK;
+        self.dns_server = FALLBACK_GATEWAY; // gateway is also the DNS server
     }
 
     /// Resolve next-hop IP for a destination. Broadcast destinations
@@ -2170,11 +2173,12 @@ fn handle_client_message(
 }
 
 /// Handle a SocketsRequest from a pending client: create per-socket channel,
-/// send back Created response with the cap.
+/// send back Created response with the cap, or return config info.
 fn handle_socket_request(
     client_handle: usize,
     sockets: &mut [Socket; MAX_SOCKETS],
     msg: &Message,
+    config: &NetConfig,
     tx: &mut TxScratch,
 ) {
     let req = match rvos_wire::from_bytes::<SocketsRequest>(&msg.data[..msg.len]) {
@@ -2185,7 +2189,34 @@ fn handle_socket_request(
         }
     };
 
-    let SocketsRequest::Socket { sock_type } = req;
+    // Handle GetConfig — reply with current network configuration and close
+    if matches!(req, SocketsRequest::GetConfig {}) {
+        tx.msg = Message::new();
+        let (len, cap_count) = rvos_wire::to_bytes_with_caps(
+            &SocketsResponse::Config {
+                ip_a: config.our_ip[0], ip_b: config.our_ip[1],
+                ip_c: config.our_ip[2], ip_d: config.our_ip[3],
+                gw_a: config.gateway[0], gw_b: config.gateway[1],
+                gw_c: config.gateway[2], gw_d: config.gateway[3],
+                mask_a: config.subnet_mask[0], mask_b: config.subnet_mask[1],
+                mask_c: config.subnet_mask[2], mask_d: config.subnet_mask[3],
+                dns_a: config.dns_server[0], dns_b: config.dns_server[1],
+                dns_c: config.dns_server[2], dns_d: config.dns_server[3],
+            },
+            &mut tx.msg.data,
+            &mut tx.msg.caps,
+        ).unwrap_or((0, 0));
+        tx.msg.len = len;
+        tx.msg.cap_count = cap_count;
+        let _ = raw::sys_chan_send(client_handle, &tx.msg);
+        raw::sys_chan_close(client_handle);
+        return;
+    }
+
+    let SocketsRequest::Socket { sock_type } = req else {
+        raw::sys_chan_close(client_handle);
+        return;
+    };
     let is_stream = matches!(sock_type, SocketType::Stream {});
 
     // Find a free socket slot
@@ -2268,6 +2299,7 @@ struct DhcpOffer {
     server_ip: [u8; 4],
     subnet_mask: [u8; 4],
     gateway: [u8; 4],
+    dns_server: [u8; 4],
     msg_type: u8,
 }
 
@@ -2415,6 +2447,7 @@ fn parse_dhcp_response(frame: &[u8], our_mac: &[u8; 6], xid: u32) -> Option<Dhcp
     let mut msg_type = 0u8;
     let mut subnet_mask = [255, 255, 255, 0]; // default
     let mut gateway = [0u8; 4];
+    let mut dns_server = [0u8; 4];
     let mut i = 240;
     while i < udp_data.len() {
         let opt = udp_data[i];
@@ -2438,6 +2471,7 @@ fn parse_dhcp_response(frame: &[u8], our_mac: &[u8; 6], xid: u32) -> Option<Dhcp
             OPT_MESSAGE_TYPE if len >= 1 => msg_type = data[0],
             OPT_SUBNET_MASK if len >= 4 => subnet_mask.copy_from_slice(&data[..4]),
             OPT_ROUTER if len >= 4 => gateway.copy_from_slice(&data[..4]),
+            OPT_DNS if len >= 4 => dns_server.copy_from_slice(&data[..4]),
             OPT_SERVER_ID if len >= 4 => {
                 // Use server identifier from option (more reliable than siaddr)
                 let _ = server_ip; // siaddr is fallback
@@ -2452,6 +2486,7 @@ fn parse_dhcp_response(frame: &[u8], our_mac: &[u8; 6], xid: u32) -> Option<Dhcp
         server_ip,
         subnet_mask,
         gateway,
+        dns_server,
         msg_type,
     })
 }
@@ -2510,12 +2545,18 @@ fn dhcp_acquire(
     } else {
         config.gateway = offer.server_ip;
     }
+    if ack.dns_server != ZERO_IP {
+        config.dns_server = ack.dns_server;
+    } else {
+        config.dns_server = config.gateway; // fallback: gateway is often the DNS server
+    }
 
     println!(
-        "[net] DHCP: acquired {}.{}.{}.{}/{}.{}.{}.{} gw {}.{}.{}.{}",
+        "[net] DHCP: acquired {}.{}.{}.{}/{}.{}.{}.{} gw {}.{}.{}.{} dns {}.{}.{}.{}",
         config.our_ip[0], config.our_ip[1], config.our_ip[2], config.our_ip[3],
         config.subnet_mask[0], config.subnet_mask[1], config.subnet_mask[2], config.subnet_mask[3],
         config.gateway[0], config.gateway[1], config.gateway[2], config.gateway[3],
+        config.dns_server[0], config.dns_server[1], config.dns_server[2], config.dns_server[3],
     );
 
     true
@@ -2844,7 +2885,7 @@ fn main() {
             handled = true;
             let h = pc.handle;
             pc.active = false;
-            handle_socket_request(h, &mut sockets, &rx.client_msg, &mut tx);
+            handle_socket_request(h, &mut sockets, &rx.client_msg, &config, &mut tx);
         }
 
         // d. Poll all active socket channels for SocketRequest messages
