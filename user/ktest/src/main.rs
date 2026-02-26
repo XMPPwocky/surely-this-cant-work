@@ -2688,6 +2688,48 @@ fn test_socket_exhaustion_tcp() -> Result<(), &'static str> {
 }
 
 // ============================================================
+// 34. TCP State Machine
+// ============================================================
+
+fn test_tcp_connect_refused() -> Result<(), &'static str> {
+    // Connect to a port with no listener on the loopback interface.
+    // The net-stack should send RST in response to the SYN, and
+    // the connect should fail with an error (not hang forever).
+    match std::net::TcpStream::connect("127.0.0.1:9999") {
+        Err(e) => {
+            // RST during SYN_SENT → ConnectionReset or ConnectionRefused
+            let k = e.kind();
+            assert_true(
+                k == std::io::ErrorKind::ConnectionReset
+                    || k == std::io::ErrorKind::ConnectionRefused,
+                "expected ConnectionReset or ConnectionRefused",
+            )
+        }
+        Ok(_) => Err("connect should have failed"),
+    }
+}
+
+fn test_tcp_listener_reuse() -> Result<(), &'static str> {
+    // Verify that after dropping a TcpListener, the port can be reused.
+    let addr = "0.0.0.0:11000";
+    {
+        let _l = std::net::TcpListener::bind(addr).map_err(|_| "first bind failed")?;
+        // listener dropped here
+    }
+    for _ in 0..5 {
+        raw::sys_yield();
+    }
+    {
+        let _l = std::net::TcpListener::bind(addr).map_err(|_| "second bind (reuse) failed")?;
+    }
+    for _ in 0..5 {
+        raw::sys_yield();
+    }
+    Ok(())
+}
+
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -2911,6 +2953,12 @@ fn main() {
         total.merge(&run_section("Socket Exhaustion", &[
             ("socket_exhaustion_udp", test_socket_exhaustion_udp),
             ("socket_exhaustion_tcp", test_socket_exhaustion_tcp),
+        ]));
+        yield_drain();
+
+        total.merge(&run_section("TCP State Machine", &[
+            ("tcp_connect_refused", test_tcp_connect_refused),
+            ("tcp_listener_reuse", test_tcp_listener_reuse),
         ]));
         yield_drain();
     }
