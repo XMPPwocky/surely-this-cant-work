@@ -2593,6 +2593,101 @@ fn test_http_loopback() -> Result<(), &'static str> {
 }
 
 // ============================================================
+// 33. Socket Exhaustion
+// ============================================================
+
+fn test_socket_exhaustion_udp() -> Result<(), &'static str> {
+    // Create UDP sockets until the net-stack runs out of slots.
+    // MAX_SOCKETS is 16, so we should get close to that.
+    let mut sockets = Vec::new();
+    let mut hit_limit = false;
+
+    for _ in 0..32 {
+        match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => sockets.push(s),
+            Err(_) => {
+                hit_limit = true;
+                break;
+            }
+        }
+    }
+
+    let created = sockets.len();
+
+    if !hit_limit {
+        return Err("never hit socket limit");
+    }
+    // Should have created a reasonable number (at least 8 of 16 slots)
+    if created < 8 {
+        return Err("too few sockets before limit");
+    }
+
+    // After dropping one socket, we should be able to create another.
+    // Yield a few times to let the net-stack process the channel close.
+    sockets.pop();
+    for _ in 0..5 {
+        raw::sys_yield();
+    }
+
+    match std::net::UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => sockets.push(s),
+        Err(_) => return Err("could not create socket after freeing one"),
+    }
+
+    // Clean up: drop all sockets
+    drop(sockets);
+    for _ in 0..5 {
+        raw::sys_yield();
+    }
+
+    Ok(())
+}
+
+fn test_socket_exhaustion_tcp() -> Result<(), &'static str> {
+    // Same test but with TCP listeners (stream sockets).
+    let mut listeners = Vec::new();
+    let mut hit_limit = false;
+
+    for port in 10000..10032u16 {
+        let addr = format!("0.0.0.0:{}", port);
+        match std::net::TcpListener::bind(addr.as_str()) {
+            Ok(l) => listeners.push(l),
+            Err(_) => {
+                hit_limit = true;
+                break;
+            }
+        }
+    }
+
+    let created = listeners.len();
+
+    if !hit_limit {
+        return Err("never hit socket limit");
+    }
+    if created < 8 {
+        return Err("too few sockets before limit");
+    }
+
+    // After dropping one, should be able to create another
+    listeners.pop();
+    for _ in 0..5 {
+        raw::sys_yield();
+    }
+
+    match std::net::TcpListener::bind("0.0.0.0:10099") {
+        Ok(l) => listeners.push(l),
+        Err(_) => return Err("could not create socket after freeing one"),
+    }
+
+    drop(listeners);
+    for _ in 0..5 {
+        raw::sys_yield();
+    }
+
+    Ok(())
+}
+
+// ============================================================
 // Main
 // ============================================================
 
@@ -2810,6 +2905,12 @@ fn main() {
 
         total.merge(&run_section("HTTP Loopback", &[
             ("http_loopback", test_http_loopback),
+        ]));
+        yield_drain();
+
+        total.merge(&run_section("Socket Exhaustion", &[
+            ("socket_exhaustion_udp", test_socket_exhaustion_udp),
+            ("socket_exhaustion_tcp", test_socket_exhaustion_tcp),
         ]));
         yield_drain();
     }

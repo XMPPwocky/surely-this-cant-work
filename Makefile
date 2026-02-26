@@ -19,6 +19,9 @@ QEMU_LOCK = scripts/qemu-lock.sh
 # VirtIO net device via TAP (requires: sudo scripts/net-setup.sh)
 QEMU_NET = -device virtio-net-device,netdev=net0 -netdev tap,id=net0,ifname=rvos-tap0,script=no,downscript=no
 
+# VirtIO net device via QEMU user-mode networking (no TAP/root required)
+QEMU_NET_USER = -device virtio-net-device,netdev=net0 -netdev user,id=net0
+
 # VirtIO block devices: bin.img (RO), persist.img (RW)
 # Each drive has a serial= tag so the kernel can identify it regardless of
 # MMIO probe order (QEMU virt assigns slots non-deterministically).
@@ -191,6 +194,7 @@ run-test: build test.img
 	$(QEMU_LOCK) qemu-system-riscv64 -machine virt -nographic -serial mon:stdio \
 		-bios default -m 128M \
 		-device virtio-keyboard-device \
+		$(QEMU_NET_USER) \
 		$(QEMU_BLK_TEST) \
 		-kernel $(KERNEL_BIN)
 
