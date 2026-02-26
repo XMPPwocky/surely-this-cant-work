@@ -167,31 +167,31 @@ fn blk_server(server_idx: usize) {
                 }
             }
 
-            // Drain control_ep: reject new connections while serving a client.
-            // Accept the endpoint so the caller gets a ChannelClosed error
-            // when the OwnedEndpoint is immediately dropped.
-            loop {
-                let (msg, send_wake) = ipc::channel_recv(control_ep);
-                if send_wake != 0 {
-                    crate::task::wake_process(send_wake);
-                }
-                match msg {
-                    Some(mut msg) => {
-                        did_work = true;
-                        if msg.cap_count > 0 {
-                            // Take the cap — OwnedEndpoint drops immediately,
-                            // closing the channel so the client gets an error.
-                            msg.caps[0].take();
-                        }
-                    }
-                    None => break,
-                }
-            }
-
             if !did_work {
                 if !ipc::channel_is_active(client_ep) {
                     crate::println!("[blk{}] client disconnected", device_idx);
                     break 'client;
+                }
+
+                // Drain control_ep: reject new connections while serving a client.
+                // Only drain when the current client is still active — if the
+                // client just disconnected, leave queued connections for
+                // accept_client on the next outer loop iteration.
+                loop {
+                    let (msg, send_wake) = ipc::channel_recv(control_ep);
+                    if send_wake != 0 {
+                        crate::task::wake_process(send_wake);
+                    }
+                    match msg {
+                        Some(mut msg) => {
+                            if msg.cap_count > 0 {
+                                // Take the cap — OwnedEndpoint drops immediately,
+                                // closing the channel so the client gets an error.
+                                msg.caps[0].take();
+                            }
+                        }
+                        None => break,
+                    }
                 }
                 // Wake on either client message or new connection attempt
                 ipc::channel_set_blocked(client_ep, my_pid);
