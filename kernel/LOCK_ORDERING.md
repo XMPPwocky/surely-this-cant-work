@@ -1,13 +1,26 @@
 # Kernel Lock Ordering
 
 This document defines the lock acquisition hierarchy for the rvOS kernel.
-All code that acquires multiple locks must follow this ordering to prevent
-deadlocks.
+Higher-level locks release before calling into lower-level code
+(**collect-release-act** pattern). Level 0 leaf locks can be acquired
+while holding any other lock.
 
-## Lock Hierarchy (acquire from top to bottom, never invert)
+## Lock Hierarchy
 
 ```
-Level 0 — Leaf locks (independent, never acquire other locks while held)
+Level 3 (outermost) — Init server
+  INIT_CONFIG     services/init.rs:121    Boot registrations, service directory
+
+Level 2 — Scheduler
+  SCHEDULER       task/scheduler.rs:76    Process table, ready queue, current PID
+
+Level 1 — IPC locks
+  CHANNELS        ipc/mod.rs:185          Channel pairs, message queues, blocked PIDs
+  SHM_REGIONS     ipc/mod.rs:564          Shared memory regions + ref counts
+
+Level 0 (leaf) — Independent locks, never acquire other locks while held
+  FRAME_ALLOCATOR mm/frame.rs:107         Physical frame bitmap
+  HEAP            mm/heap.rs:310          Buddy allocator (LockedHeap)
   UART            drivers/uart.rs:88      UART 16550 hardware
   SERIAL_INPUT    drivers/tty.rs:47       Serial console input ring buffer
   SERIAL_WAKE_PID drivers/tty.rs:50       PID blocked on serial input
@@ -16,18 +29,7 @@ Level 0 — Leaf locks (independent, never acquire other locks while held)
   RAW_MOUSE_EVENTS drivers/tty.rs:193     Raw mouse event ring buffer
   RAW_MOUSE_WAKE_PID drivers/tty.rs:196   PID blocked on mouse input
   TRACE_RING      trace.rs:41             Kernel trace buffer
-  FRAME_ALLOCATOR mm/frame.rs:107         Physical frame bitmap
-  HEAP            mm/heap.rs:310          Buddy allocator (LockedHeap)
-
-Level 1 — IPC locks (may call into Level 0; may call wake_process after release)
-  SHM_REGIONS     ipc/mod.rs:564          Shared memory regions + ref counts
-  CHANNELS        ipc/mod.rs:185          Channel pairs, message queues, blocked PIDs
-
-Level 2 — Scheduler (may be called by Level 1 wakeups after lock release)
-  SCHEDULER       task/scheduler.rs:76    Process table, ready queue, current PID
-
-Level 3 — Init server
-  INIT_CONFIG     services/init.rs:121    Boot registrations, service directory
+  PLATFORM        platform/mod.rs         FDT platform configuration (read-only)
 ```
 
 ## Critical Ordering Rules
@@ -98,7 +100,8 @@ is dropped. The SHM lock is released before calling `frame_dealloc()`.
 When adding a new lock:
 
 1. Determine its level in the hierarchy based on what it may call.
-2. If it never calls into other locked subsystems, it's Level 0.
-3. If it may trigger process wakeups, it's Level 1 or higher.
-4. Document the lock in this file.
-5. Never acquire a higher-level lock while holding a lower-level one.
+2. If it never calls into other locked subsystems, it's Level 0 (leaf).
+3. If it may trigger process wakeups or IPC after release, it's Level 1+.
+4. Document the lock in this file and in `kernel/CLAUDE.md`.
+5. Never hold a higher-level lock while acquiring a lower-level one
+   (use collect-release-act instead).

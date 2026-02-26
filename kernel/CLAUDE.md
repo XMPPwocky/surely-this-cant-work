@@ -72,16 +72,21 @@ success-value / error-code collisions.
 ## Lock Ordering
 
 The kernel uses `SpinLock` (interrupt-disabling) for all shared state.
-Locks must be acquired in the order below to prevent deadlock. A lock at
-level N may only acquire locks at level N+1 or higher — never lower.
+See `kernel/LOCK_ORDERING.md` for the full reference with code patterns.
+
+Locks use a **collect-release-act** discipline: higher-level locks are
+never held while acquiring lower-level locks. Instead, data is collected
+under the lock, the lock is released, and then lower-level operations
+(wake_process, channel_close, frame_dealloc) are called.
 
 ```
-Level 0 (outermost):  SCHEDULER         task/scheduler.rs
+Level 3 (outermost):  INIT_CONFIG        services/init.rs
+Level 2:              SCHEDULER          task/scheduler.rs
 Level 1:              CHANNELS           ipc/mod.rs
                       SHM_REGIONS        ipc/mod.rs
-Level 2:              FRAME_ALLOCATOR    mm/frame.rs
+Level 0 (leaf):       FRAME_ALLOCATOR    mm/frame.rs
                       HEAP               mm/heap.rs (via GlobalAlloc)
-Level 3 (innermost):  UART               drivers/uart.rs
+                      UART               drivers/uart.rs
                       TRACE_RING         trace.rs
                       SERIAL_INPUT       drivers/tty.rs
                       SERIAL_WAKE_PID    drivers/tty.rs
@@ -90,28 +95,27 @@ Level 3 (innermost):  UART               drivers/uart.rs
                       RAW_MOUSE_EVENTS   drivers/tty.rs
                       RAW_MOUSE_WAKE_PID drivers/tty.rs
                       PLATFORM           platform/mod.rs
-                      INIT_CONFIG        services/init.rs
 ```
 
-**Key nesting patterns:**
+**Causal chains (release lock, then call):**
 
-- `CHANNELS → SCHEDULER`: `channel_close()` and `channel_send_blocking()`
-  call `wake_process()` which acquires SCHEDULER.
-- `TTY ring buffers → SCHEDULER`: IRQ handlers push events then call
-  `wake_process()`.
-- `schedule()` uses `suppress_irq_restore()` to keep interrupts disabled
-  between lock release and context switch (see root CLAUDE.md invariant).
+- INIT_CONFIG → release → `channel_close()` (acquires CHANNELS)
+- SCHEDULER → release → `channel_close()`, `frame_dealloc()`
+- CHANNELS → release → `wake_process()` (acquires SCHEDULER)
+- SHM_REGIONS → release → `frame_dealloc()`
 
 **Rules:**
 
 1. Never hold a lock across a blocking call (`block_process`, `schedule`).
    Release the lock first, then block.
-2. Never acquire SCHEDULER while holding CHANNELS or any lower lock.
-   Instead, collect the PID to wake, release the lock, then call
-   `wake_process()`.
+2. Never acquire SCHEDULER while holding CHANNELS or vice versa.
+   Use collect-release-act: collect the PID to wake, release the lock,
+   then call `wake_process()`.
 3. `channel_close()` uses deferred-drop: messages removed under CHANNELS
    lock are dropped after the lock is released to avoid nested CHANNELS
    acquisition from destructors.
+4. `schedule()` uses `suppress_irq_restore()` to keep interrupts disabled
+   between lock release and context switch (see root CLAUDE.md invariant).
 
 ## Kernel-internal Panic Policy
 
