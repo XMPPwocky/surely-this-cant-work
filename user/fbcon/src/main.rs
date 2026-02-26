@@ -1,13 +1,7 @@
 extern crate rvos_rt;
 
 use rvos::raw;
-use rvos::UserTransport;
-use rvos::rvos_wire::Never;
-use rvos_proto::window::{
-    CreateWindowRequest, CreateWindowResponse,
-    WindowReply, WindowEvent, WindowClient,
-};
-use rvos::Channel;
+use rvos_proto::window::WindowEvent;
 use termserv::{TermOutput, TermServer};
 
 // --- Font data (shared from rvos-gfx) ---
@@ -367,62 +361,25 @@ fn main() {
         (0, 0) // fullscreen
     };
 
-    // 1. Connect to "window" service via boot channel
-    let win_ctl = rvos::connect_to_service("window")
-        .expect("failed to connect to window service")
-        .into_raw_handle();
+    let mut win = rvos::Window::create(req_width, req_height)
+        .expect("[fbcon] window creation failed");
 
-    // 2. Send CreateWindow request and receive per-window channels
-    let mut ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
-    ch.send(&CreateWindowRequest { width: req_width, height: req_height }).expect("CreateWindow send failed");
-    let create_resp = ch.recv_blocking().expect("CreateWindow recv failed");
-    let req_chan = create_resp.req_channel.raw();
-    let event_chan = create_resp.event_channel.raw();
-
-    // 3. Use WindowClient for typed RPC
-    let mut window_client = WindowClient::new(UserTransport::new(req_chan));
-
-    // 4. GetInfo to query dimensions
-    let (width, height, stride) = match window_client.get_info(1) {
-        Ok(WindowReply::InfoReply { width, height, stride, .. }) => (width, height, stride),
-        _ => (1024, 768, 1024),
-    };
-
-    // 5. GetFramebuffer -> receive SHM handle
-    let shm_handle = match window_client.get_framebuffer(2) {
-        Ok(WindowReply::FbReply { fb, .. }) => fb.0,
-        _ => panic!("[fbcon] GetFramebuffer failed"),
-    };
-
-    // 6. Map the SHM (double-buffered: 2 * stride * height * 4)
-    let fb_size = (stride as usize) * (height as usize) * 4 * 2;
-    let fb_base = match raw::mmap(shm_handle, fb_size) {
-        Ok(ptr) => ptr as *mut u32,
-        Err(_) => panic!("[fbcon] mmap failed"),
-    };
-    let pixels_per_buffer = (stride as usize) * (height as usize);
-
-    println!("[fbcon] window ready ({}x{}, stride={}, fb={:#x})", width, height, stride, fb_base as usize);
-
-    // Start drawing in back buffer (buffer 1)
-    let mut current_back: u8 = 1;
-    let back_offset = pixels_per_buffer;
-    let back_fb = unsafe { fb_base.add(back_offset) };
+    println!("[fbcon] window ready ({}x{}, stride={}, fb={:#x})",
+             win.width(), win.height(), win.stride(), win.fb_base() as usize);
 
     // Initialize FbConsole on the back buffer
-    let mut console = FbConsole::new(back_fb, width, height, stride);
+    let mut console = FbConsole::new(win.back_buffer(), win.width(), win.height(), win.stride());
     let mut term = TermServer::new();
     let mut shift_pressed = false;
     let mut ctrl_pressed = false;
-    let mut swap_seq: u32 = 10;
 
     // Print startup banner
     console.write_str(b"rvOS GUI Console\r\n");
     console.write_str(b"================\r\n\r\n");
 
     // Do initial present
-    do_swap(&mut window_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
-    update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
+    win.present();
+    update_console_fb(&mut console, &win);
     console.dirty = false;
 
     // Spawn /bin/shell with stdin/stdout connected to us
@@ -450,15 +407,12 @@ fn main() {
     // Register shell as a terminal client
     term.add_client(stdin_our, stdout_our);
 
-    // Typed event channel
-    let mut events = Channel::<Never, WindowEvent>::from_raw_handle(event_chan);
-
     // Main event loop
     loop {
         let mut handled = false;
 
         // Check for keyboard events on event channel
-        while let Some(event) = events.try_next_message() {
+        while let Some(event) = win.event_channel().try_next_message() {
             handled = true;
             match event {
                 WindowEvent::KeyDown { code } => {
@@ -468,7 +422,6 @@ fn main() {
                     } else if code == 29 || code == 97 {
                         ctrl_pressed = true;
                     } else if let Some(seq) = escape_seq_for_keycode(code) {
-                        // Special key: send escape sequence in raw mode
                         if term.is_raw_mode() {
                             term.feed_raw(seq);
                         }
@@ -498,7 +451,6 @@ fn main() {
                     }
                 }
                 WindowEvent::CloseRequested {} => {
-                    let _ = window_client.close_window();
                     return;
                 }
                 _ => {}
@@ -515,16 +467,15 @@ fn main() {
         // If console is dirty, present the frame
         if console.dirty {
             console.toggle_cursor();
-            do_swap(&mut window_client, &mut swap_seq, fb_base, pixels_per_buffer, &mut current_back);
-            update_console_fb(&mut console, fb_base, pixels_per_buffer, current_back);
+            win.present();
+            update_console_fb(&mut console, &win);
             console.toggle_cursor();
             console.dirty = false;
             handled = true;
         }
 
         if !handled {
-            raw::sys_chan_poll_add(req_chan);
-            events.poll_add();
+            win.poll_add();
             term.poll_add_all();
             raw::sys_block();
         }
@@ -545,30 +496,7 @@ fn escape_seq_for_keycode(code: usize) -> Option<&'static [u8]> {
     }
 }
 
-/// Swap buffers, wait for swap reply, then copy front->new-back.
-fn do_swap(
-    window_client: &mut WindowClient<UserTransport>,
-    seq: &mut u32,
-    fb_base: *mut u32,
-    pixels_per_buffer: usize,
-    current_back: &mut u8,
-) {
-    let _ = window_client.swap_buffers(*seq);
-    *seq = seq.wrapping_add(1);
-    *current_back = 1 - *current_back;
-    let front_offset = if *current_back == 0 { pixels_per_buffer } else { 0 };
-    let back_offset = if *current_back == 0 { 0 } else { pixels_per_buffer };
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            fb_base.add(front_offset),
-            fb_base.add(back_offset),
-            pixels_per_buffer,
-        );
-    }
-}
-
 /// Update FbConsole's fb pointer to point at the current back buffer.
-fn update_console_fb(console: &mut FbConsole, fb_base: *mut u32, pixels_per_buffer: usize, current_back: u8) {
-    let offset = if current_back == 0 { 0 } else { pixels_per_buffer };
-    console.fb = unsafe { fb_base.add(offset) };
+fn update_console_fb(console: &mut FbConsole, win: &rvos::Window) {
+    console.fb = win.back_buffer();
 }

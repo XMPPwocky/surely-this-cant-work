@@ -1,13 +1,5 @@
 extern crate rvos_rt;
 
-use rvos::raw::{self};
-use rvos::UserTransport;
-use rvos::Channel;
-use rvos_proto::window::{
-    CreateWindowRequest, CreateWindowResponse,
-    WindowReply, WindowClient,
-};
-
 // --- Timing helpers ---
 
 #[inline(always)]
@@ -68,59 +60,6 @@ fn print_result(name: &str, iters: u32, total_us: u64, per_us: u64, fill_us: u64
     println!();
 }
 
-// --- Window helpers ---
-
-struct WinContext {
-    client: WindowClient<UserTransport>,
-    event_chan: usize,
-    width: u32,
-    height: u32,
-    fb_base: *mut u32,
-    pixels_per_buffer: usize,
-}
-
-fn connect_window(width: u32, height: u32) -> WinContext {
-    let win_ctl = rvos::connect_to_service("window")
-        .expect("failed to connect to window service")
-        .into_raw_handle();
-
-    // CreateWindow handshake (returns embedded channel caps)
-    let mut win_ctl_ch = Channel::<CreateWindowRequest, CreateWindowResponse>::from_raw_handle(win_ctl);
-    win_ctl_ch.send(&CreateWindowRequest { width, height }).expect("CreateWindow send");
-    let create_resp = win_ctl_ch.recv_blocking()
-        .expect("CreateWindow recv");
-    let req_chan = create_resp.req_channel.raw();
-    let event_chan = create_resp.event_channel.raw();
-
-    // Typed WindowClient for subsequent RPCs
-    let mut client = WindowClient::new(UserTransport::new(req_chan));
-
-    let info = client.get_info(1).expect("GetInfo failed");
-    let (w, h, stride) = match info {
-        WindowReply::InfoReply { width, height, stride, .. } => (width, height, stride),
-        _ => (width, height, width),
-    };
-
-    let shm_handle = match client.get_framebuffer(2) {
-        Ok(WindowReply::FbReply { fb, .. }) => fb.0,
-        _ => panic!("gui-bench: GetFramebuffer failed"),
-    };
-
-    let fb_size = (stride as usize) * (h as usize) * 4 * 2;
-    let fb_base = match raw::mmap(shm_handle, fb_size) {
-        Ok(ptr) => ptr as *mut u32,
-        Err(_) => panic!("gui-bench: mmap failed"),
-    };
-    let pixels_per_buffer = (stride as usize) * (h as usize);
-
-    WinContext { client, event_chan, width: w, height: h, fb_base, pixels_per_buffer }
-}
-
-fn close_window(ctx: &mut WinContext) {
-    let _ = ctx.client.close_window();
-    raw::sys_chan_close(ctx.event_chan);
-}
-
 fn fill_solid(fb: *mut u32, offset: usize, count: usize, color: u32) {
     unsafe {
         for i in 0..count {
@@ -133,15 +72,13 @@ fn fill_solid(fb: *mut u32, offset: usize, count: usize, color: u32) {
 
 fn bench_small_fill_swap() {
     let iters = 60u32;
-    let mut ctx = connect_window(400, 300);
-    let mut back = 1u8;
+    let mut win = rvos::Window::create(400, 300).expect("gui-bench: window creation failed");
 
     // Warmup: 5 frames
-    for i in 0..5u32 {
-        let off = if back == 0 { 0 } else { ctx.pixels_per_buffer };
-        fill_solid(ctx.fb_base, off, ctx.pixels_per_buffer, 0xFF222222);
-        let _ = ctx.client.swap_buffers(i);
-        back = 1 - back;
+    for _ in 0..5u32 {
+        fill_solid(win.fb_base(), if win.current_back() == 0 { 0 } else { win.pixels_per_buffer() },
+                   win.pixels_per_buffer(), 0xFF222222);
+        win.present_no_copy();
     }
 
     println!("[gui-bench] small window (400x300) solid fill + swap x{}", iters);
@@ -151,18 +88,17 @@ fn bench_small_fill_swap() {
     let mut fill_ticks: u64 = 0;
 
     for i in 0..iters {
-        let off = if back == 0 { 0 } else { ctx.pixels_per_buffer };
+        let off = if win.current_back() == 0 { 0 } else { win.pixels_per_buffer() };
         let color = 0xFF000000 | (i * 4);
 
         let t0 = rdtime();
-        fill_solid(ctx.fb_base, off, ctx.pixels_per_buffer, color);
+        fill_solid(win.fb_base(), off, win.pixels_per_buffer(), color);
         let t1 = rdtime();
-        let _ = ctx.client.swap_buffers(100 + i);
+        win.present_no_copy();
         let t2 = rdtime();
 
         fill_ticks += t1 - t0;
         swap_ticks += t2 - t1;
-        back = 1 - back;
     }
 
     let total = rdtime() - start;
@@ -172,41 +108,37 @@ fn bench_small_fill_swap() {
     let swap_us = ticks_to_us(swap_ticks) / iters as u64;
 
     print_result("small fill+swap", iters, total_us, per_us, fill_us, swap_us);
-    close_window(&mut ctx);
 }
 
 fn bench_fullscreen_fill_swap() {
     let iters = 30u32;
-    let mut ctx = connect_window(0, 0); // fullscreen
-    let mut back = 1u8;
+    let mut win = rvos::Window::create(0, 0).expect("gui-bench: window creation failed");
 
     // Warmup
-    for i in 0..3u32 {
-        let off = if back == 0 { 0 } else { ctx.pixels_per_buffer };
-        fill_solid(ctx.fb_base, off, ctx.pixels_per_buffer, 0xFF222222);
-        let _ = ctx.client.swap_buffers(i);
-        back = 1 - back;
+    for _ in 0..3u32 {
+        fill_solid(win.fb_base(), if win.current_back() == 0 { 0 } else { win.pixels_per_buffer() },
+                   win.pixels_per_buffer(), 0xFF222222);
+        win.present_no_copy();
     }
 
-    println!("[gui-bench] fullscreen ({}x{}) solid fill + swap x{}", ctx.width, ctx.height, iters);
+    println!("[gui-bench] fullscreen ({}x{}) solid fill + swap x{}", win.width(), win.height(), iters);
 
     let start = rdtime();
     let mut swap_ticks: u64 = 0;
     let mut fill_ticks: u64 = 0;
 
     for i in 0..iters {
-        let off = if back == 0 { 0 } else { ctx.pixels_per_buffer };
+        let off = if win.current_back() == 0 { 0 } else { win.pixels_per_buffer() };
         let color = 0xFF000000 | ((i * 8) & 0xFF);
 
         let t0 = rdtime();
-        fill_solid(ctx.fb_base, off, ctx.pixels_per_buffer, color);
+        fill_solid(win.fb_base(), off, win.pixels_per_buffer(), color);
         let t1 = rdtime();
-        let _ = ctx.client.swap_buffers(200 + i);
+        win.present_no_copy();
         let t2 = rdtime();
 
         fill_ticks += t1 - t0;
         swap_ticks += t2 - t1;
-        back = 1 - back;
     }
 
     let total = rdtime() - start;
@@ -216,25 +148,22 @@ fn bench_fullscreen_fill_swap() {
     let swap_us = ticks_to_us(swap_ticks) / iters as u64;
 
     print_result("fullscreen fill+swap", iters, total_us, per_us, fill_us, swap_us);
-    close_window(&mut ctx);
 }
 
 fn bench_swap_only() {
     let iters = 60u32;
-    let mut ctx = connect_window(400, 300);
+    let mut win = rvos::Window::create(400, 300).expect("gui-bench: window creation failed");
 
     // Fill both buffers once with same color
-    fill_solid(ctx.fb_base, 0, ctx.pixels_per_buffer, 0xFF444444);
-    fill_solid(ctx.fb_base, ctx.pixels_per_buffer, ctx.pixels_per_buffer, 0xFF444444);
-    let _ = ctx.client.swap_buffers(0);
-    let mut back = 0u8;
+    fill_solid(win.fb_base(), 0, win.pixels_per_buffer(), 0xFF444444);
+    fill_solid(win.fb_base(), win.pixels_per_buffer(), win.pixels_per_buffer(), 0xFF444444);
+    win.present_no_copy();
 
     println!("[gui-bench] small window (400x300) swap-only (no fill) x{}", iters);
 
     let start = rdtime();
-    for i in 0..iters {
-        let _ = ctx.client.swap_buffers(300 + i);
-        back = 1 - back;
+    for _ in 0..iters {
+        win.present_no_copy();
     }
 
     let total = rdtime() - start;
@@ -242,7 +171,6 @@ fn bench_swap_only() {
     let per_us = total_us / iters as u64;
 
     print_result("swap-only (no fill)", iters, total_us, per_us, 0, per_us);
-    close_window(&mut ctx);
 }
 
 fn main() {

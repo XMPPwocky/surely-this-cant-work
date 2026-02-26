@@ -15,6 +15,7 @@ pub mod channel;
 pub mod service;
 pub mod reactor;
 pub mod transport;
+pub mod window;
 pub mod tty;
 pub mod fs;
 pub mod socket;
@@ -27,6 +28,7 @@ pub use service::{connect_to_service, spawn_process, spawn_process_with_args, sp
 pub use raw::NO_CAP;
 pub use reactor::Reactor;
 pub use transport::UserTransport;
+pub use window::Window;
 
 pub use rvos_wire;
 pub use rvos_proto;
