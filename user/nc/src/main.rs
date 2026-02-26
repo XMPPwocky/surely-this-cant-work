@@ -181,6 +181,9 @@ fn relay_tcp(sock_h: usize, stdin_h: usize) {
     let mut stdin_pending = false;
     let mut recv_pending = false;
     let mut stdin_eof = false;
+    let mut reactor = rvos::Reactor::new();
+    reactor.add(sock_h);
+    reactor.add(stdin_h);
 
     loop {
         // Post new requests as needed.
@@ -200,11 +203,10 @@ fn relay_tcp(sock_h: usize, stdin_h: usize) {
         }
 
         // Poll and sleep until data arrives on either channel.
-        if !stdin_eof {
-            raw::sys_chan_poll_add(stdin_h);
+        if stdin_eof {
+            reactor.remove(stdin_h);
         }
-        raw::sys_chan_poll_add(sock_h);
-        raw::sys_block();
+        reactor.poll_and_block();
 
         // ── stdin → socket ──────────────────────────────────────
         if stdin_pending {
@@ -280,6 +282,9 @@ fn relay_udp(sock_h: usize, stdin_h: usize, peer: SocketAddr) {
     let mut stdin_pending = false;
     let mut recv_pending = false;
     let mut stdin_eof = false;
+    let mut reactor = rvos::Reactor::new();
+    reactor.add(sock_h);
+    reactor.add(stdin_h);
 
     loop {
         if !stdin_pending && !stdin_eof {
@@ -294,11 +299,10 @@ fn relay_udp(sock_h: usize, stdin_h: usize, peer: SocketAddr) {
             recv_pending = true;
         }
 
-        if !stdin_eof {
-            raw::sys_chan_poll_add(stdin_h);
+        if stdin_eof {
+            reactor.remove(stdin_h);
         }
-        raw::sys_chan_poll_add(sock_h);
-        raw::sys_block();
+        reactor.poll_and_block();
 
         // ── stdin → socket ──────────────────────────────────────
         if stdin_pending {

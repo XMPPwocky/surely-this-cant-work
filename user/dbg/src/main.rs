@@ -495,7 +495,7 @@ fn print_help() {
 }
 
 /// Read a line from stdin while also polling for debug events.
-/// Uses sys_chan_poll_add + sys_block to multiplex stdin and event channels,
+/// Uses a Reactor to multiplex stdin and event channels,
 /// so events are printed immediately instead of waiting for user input.
 fn read_line_with_events(stdin_h: usize, dbg: &mut Debugger) -> Option<String> {
     // Send a FileRequest::Read to stdin
@@ -509,12 +509,13 @@ fn read_line_with_events(stdin_h: usize, dbg: &mut Debugger) -> Option<String> {
     }
 
     // Poll both stdin and event channel until stdin has data
+    let mut reactor = rvos::Reactor::new();
+    reactor.add(stdin_h);
+    if let Some(eh) = dbg.event_handle {
+        reactor.add(eh);
+    }
     loop {
-        raw::sys_chan_poll_add(stdin_h);
-        if let Some(eh) = dbg.event_handle {
-            raw::sys_chan_poll_add(eh);
-        }
-        raw::sys_block();
+        reactor.poll_and_block();
 
         // Drain debug events first
         dbg.poll_events();
