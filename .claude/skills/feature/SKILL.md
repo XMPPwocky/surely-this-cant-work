@@ -1,8 +1,9 @@
 # Feature
 
 Design, scope, implement, and document a new feature for rvOS. Produce a
-design doc at `docs/designs/NNNN-slug.md` that serves as both the
-implementation plan and permanent reference documentation.
+design doc at `docs/tasks/open/NNNN-FEATURE-slug.md` that serves as both the
+implementation plan and permanent reference documentation. When complete,
+move it to `docs/tasks/closed/`.
 
 The argument to this skill is a description of the feature (what it should
 do, why it's needed, any constraints). If no argument is provided, ask the
@@ -10,13 +11,19 @@ user to describe the feature.
 
 ## Phase 1: Intake
 
-1. **Assign a feature number.** Look at existing files in `docs/designs/`
-   to find the highest NNNN. Increment by 1. If none exist, start at 0001.
+1. **Assign a task number.** Look at existing files in `docs/tasks/open/`
+   and `docs/tasks/closed/` to find the highest NNNN. Increment by 1.
+   If none exist, start at 0001.
 
 2. **Choose a slug.** A short kebab-case name (e.g., `virtio-net`,
-   `process-groups`, `block-device-fs`).
+   `process-groups`, `block-device-fs`). The filename format is
+   `NNNN-FEATURE-slug.md`.
 
-3. **Create `docs/designs/NNNN-slug.md`** with the template below. Fill in
+3. **Record the current commit hash.** Run `git rev-parse --short HEAD` and
+   include it in the design doc. This pins the exact codebase version the
+   feature was designed against.
+
+4. **Create `docs/tasks/open/NNNN-FEATURE-slug.md`** with the template below. Fill in
    what you know; mark unknowns with `TBD` — Phase 2 will resolve them.
 
 ```markdown
@@ -24,7 +31,9 @@ user to describe the feature.
 
 **Date:** YYYY-MM-DD
 **Status:** Design
+**Type:** Feature
 **Subsystem:** (e.g., kernel/ipc, kernel/mm, user/fs, lib/rvos, std-port)
+**Commit:** (short hash from `git rev-parse --short HEAD` at time of creation)
 
 ## Motivation
 
@@ -73,6 +82,9 @@ when they're exhausted? (Must not be silent failure.)
 
 (Updated during Phase 4)
 ```
+
+5. **Update the doc as you go.** Every phase should update the relevant
+   section of the design doc in-place.
 
 ## Phase 2: Design & Blast Radius
 
@@ -201,7 +213,7 @@ criteria.
 5. **Update the design doc** — mark all acceptance criteria boxes,
    fill in the Verification section with results.
 
-## Phase 5: Commit & Document
+## Phase 5: Commit & Close
 
 1. **Commit the implementation.** Follow the project's commit style:
    ```
@@ -211,21 +223,28 @@ criteria.
    [Key design decisions]
    [What changed in existing code]
 
-   Design: NNNN
+   Feature: NNNN
    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
    ```
 
-2. **Update the design doc status** to `**Status:** Complete (YYYY-MM-DD)`.
+2. **Move the design doc** from open to closed:
+   ```
+   git mv docs/tasks/open/NNNN-FEATURE-slug.md docs/tasks/closed/NNNN-FEATURE-slug.md
+   ```
 
-3. **Update MEMORY.md** if the feature is significant:
-   - Add to "Current Status" section
+3. **Update the design doc status** to `**Status:** Complete (YYYY-MM-DD)`.
+
+4. **Commit the doc move** (can be part of the same commit or a separate one).
+
+5. **Update MEMORY.md** if the feature is significant:
+   - Add to "Features" section
    - Add any key learnings
    - Update resource limits if changed
 
-4. **Update CLAUDE.md** if the feature introduces new conventions that
+6. **Update CLAUDE.md** if the feature introduces new conventions that
    agents should follow.
 
-5. **Check for documentation drift.** Does README.md need updating?
+7. **Check for documentation drift.** Does README.md need updating?
    Does `docs/architecture.md` need a new section? Are all protocol
    docs current?
 

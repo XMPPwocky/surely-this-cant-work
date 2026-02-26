@@ -1,8 +1,8 @@
 # Bug Tracker
 
 Track, reproduce, root-cause, fix, and close bugs in rvOS. Produce a written
-bug report at `docs/tasks/open/NNNN-slug.md`, then work through the bug lifecycle
-to resolution.
+bug report at `docs/tasks/open/NNNN-BUG-slug.md`, then work through the bug
+lifecycle to resolution.
 
 The argument to this skill is a description of the bug (symptoms, how to trigger
 it, any initial theories). If no argument is provided, ask the user to describe
@@ -15,13 +15,14 @@ the bug.
    start at 0001.
 
 2. **Choose a slug.** A short kebab-case name for the bug (e.g.,
-   `channel-leak-on-cap-transfer`, `idle-in-ready-queue`).
+   `channel-leak-on-cap-transfer`, `idle-in-ready-queue`). The filename
+   format is `NNNN-BUG-slug.md`.
 
 3. **Record the current commit hash.** Run `git rev-parse --short HEAD` and
    include it in the bug report. This pins the exact codebase version the bug
    was reported against, making reproduction and bisection easier.
 
-4. **Create `docs/tasks/open/NNNN-slug.md`** with this template:
+4. **Create `docs/tasks/open/NNNN-BUG-slug.md`** with this template:
 
 ```markdown
 # NNNN: Title
@@ -198,7 +199,7 @@ Update the "Root Cause" section with:
 
 2. **Move the bug doc** from open to closed:
    ```
-   git mv docs/tasks/open/NNNN-slug.md docs/tasks/closed/NNNN-slug.md
+   git mv docs/tasks/open/NNNN-BUG-slug.md docs/tasks/closed/NNNN-BUG-slug.md
    ```
 
 3. **Update the bug doc status** to `**Status:** Closed (YYYY-MM-DD)` and
