@@ -1699,12 +1699,11 @@ fn blk_connect(name: &str) -> Result<(usize, usize, usize, u64, bool), &'static 
 }
 
 /// Find the blk service name whose VirtIO serial matches `target_serial`.
-/// Tries devices in reverse order (highest index first) because lower-indexed
-/// devices may already have ext2-server clients connected, and connecting
-/// to a busy blk_server would block until that client disconnects.
+/// Busy blk_servers (with an active client) reject new connections immediately,
+/// so probe order doesn't matter.
 fn blk_find_by_serial(target_serial: &[u8]) -> Result<&'static str, &'static str> {
     use rvos_proto::blk::{BlkRequest, BlkResponse};
-    const NAMES: &[&str] = &["blk3", "blk2", "blk1", "blk0"];
+    const NAMES: &[&str] = &["blk0", "blk1", "blk2", "blk3"];
 
     for &name in NAMES {
         let svc = match rvos::connect_to_service(name) {
