@@ -121,6 +121,9 @@ const MAX_SOCKETS: usize = 16;
 const MAX_PENDING: usize = 4;
 const MAX_PENDING_CLIENTS: usize = 4;
 
+const EPHEMERAL_PORT_MIN: u16 = 49152;
+const EPHEMERAL_PORT_MAX: u16 = 65535;
+
 const MAX_INTERFACES: usize = 4;
 const IFACE_LOOPBACK: usize = 0;
 const IFACE_ETH0: usize = 1;
@@ -1901,11 +1904,11 @@ fn send_sock_error(handle: usize, code: SocketError, msg: &mut Message) -> bool 
     raw::sys_chan_send(handle, msg) != raw::CHAN_CLOSED
 }
 
-/// Allocate an ephemeral port (49152..65535) that isn't in use.
+/// Allocate an ephemeral port (EPHEMERAL_PORT_MIN..=EPHEMERAL_PORT_MAX) that isn't in use.
 fn alloc_ephemeral_port(sockets: &[Socket; MAX_SOCKETS], next_ephemeral: &mut u16) -> u16 {
     for _ in 0..1000 {
         let p = *next_ephemeral;
-        *next_ephemeral = if p >= 65534 { 49152 } else { p + 1 };
+        *next_ephemeral = if p >= EPHEMERAL_PORT_MAX - 1 { EPHEMERAL_PORT_MIN } else { p + 1 };
         if !sockets.iter().any(|s| s.active && s.port == p) {
             return p;
         }
@@ -1929,9 +1932,9 @@ fn assign_accepted_socket(sockets: &mut [Socket; MAX_SOCKETS], tcp_conns: &mut T
     sockets[idx].port = tcp_conns[conn_idx].local_port;
 }
 
-/// Allocate an ephemeral port (49152–65535) not currently in use.
+/// Allocate an ephemeral port (EPHEMERAL_PORT_MIN..=EPHEMERAL_PORT_MAX) not currently in use.
 fn allocate_ephemeral_port(sockets: &[Socket; MAX_SOCKETS]) -> Option<u16> {
-    (49152u16..=65535).find(|&port| !sockets.iter().any(|s| s.active && s.port == port))
+    (EPHEMERAL_PORT_MIN..=EPHEMERAL_PORT_MAX).find(|&port| !sockets.iter().any(|s| s.active && s.port == port))
 }
 
 #[allow(clippy::too_many_arguments)] // inherent complexity of passing service state
@@ -2823,7 +2826,7 @@ fn main() {
 
     // 5. Initialize state
     let mut sockets = [const { Socket::new() }; MAX_SOCKETS];
-    let mut next_ephemeral: u16 = 49152;
+    let mut next_ephemeral: u16 = EPHEMERAL_PORT_MIN;
     let mut tcp_conns: Box<TcpConns> = {
         let layout = alloc::alloc::Layout::new::<TcpConns>();
         let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut TcpConns };
