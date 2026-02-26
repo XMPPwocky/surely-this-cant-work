@@ -176,8 +176,13 @@ pub fn timer_service() {
                 // Sleep until earliest deadline (precise wakeup)
                 crate::task::block_with_deadline(my_pid, earliest);
             } else {
-                // No pending timers — block on channels only
-                crate::task::block_process(my_pid);
+                // No pending timers — block with watchdog interval or indefinitely
+                let interval = crate::watchdog::pet_interval();
+                if interval > 0 {
+                    crate::task::block_with_deadline(my_pid, now + interval);
+                } else {
+                    crate::task::block_process(my_pid);
+                }
             }
             crate::task::schedule();
         }

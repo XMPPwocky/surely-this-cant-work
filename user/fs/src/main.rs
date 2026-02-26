@@ -877,7 +877,7 @@ fn main() {
 
     // Multiplexed event loop: poll control channel + all active client channels
     loop {
-        raw::sys_heartbeat();
+        let interval = raw::sys_heartbeat();
         let mut handled = false;
 
         // Accept new clients from control channel (raw — receives caps in sideband)
@@ -1066,7 +1066,12 @@ fn main() {
                     file_ch.poll_add();
                 }
             }
-            raw::sys_block();
+            if interval > 0 {
+                let now = raw::sys_clock().0;
+                raw::sys_block_deadline(now + interval);
+            } else {
+                raw::sys_block();
+            }
         }
     }
 }

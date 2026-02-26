@@ -13,6 +13,7 @@ pub const SYS_SHM_DUP_RO: usize = 206;
 pub const SYS_CHAN_SEND_BLOCKING: usize = 207;
 pub const SYS_CHAN_POLL_ADD: usize = 208;
 pub const SYS_BLOCK: usize = 209;
+pub const SYS_BLOCK_DEADLINE: usize = 210;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
@@ -197,6 +198,13 @@ pub fn sys_block() {
     syscall0(SYS_BLOCK);
 }
 
+/// Block the calling process until woken by a channel event or the given
+/// deadline (in rdtime ticks) is reached — whichever comes first.
+/// Typically used after one or more `sys_chan_poll_add()` calls.
+pub fn sys_block_deadline(deadline: u64) {
+    syscall1(SYS_BLOCK_DEADLINE, deadline as usize);
+}
+
 /// Kernel memory statistics returned by `sys_meminfo()`.
 #[repr(C)]
 pub struct MemInfo {
@@ -220,7 +228,10 @@ pub fn sys_kill(pid: usize, exit_code: i32) -> usize {
 
 /// Pet the system watchdog. Updates the calling process's heartbeat timestamp.
 /// Critical processes should call this in their main loop.
-pub fn sys_heartbeat() {
-    syscall0(SYS_HEARTBEAT);
+/// Returns the recommended maximum blocking duration in rdtime ticks (half the
+/// watchdog timeout). Returns 0 if the watchdog is disabled — callers should
+/// interpret 0 as "block forever."
+pub fn sys_heartbeat() -> u64 {
+    syscall0(SYS_HEARTBEAT).0 as u64
 }
 

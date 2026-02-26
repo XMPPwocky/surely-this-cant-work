@@ -20,13 +20,30 @@ pub fn sysinfo_service() {
 
     loop {
         crate::watchdog::heartbeat(crate::watchdog::SLOT_SYSINFO);
-        let accepted = ipc::accept_client(control_ep, my_pid);
+        let interval = crate::watchdog::pet_interval();
+        let deadline = if interval > 0 {
+            crate::task::process::rdtime() + interval
+        } else {
+            u64::MAX
+        };
+
+        let accepted = match ipc::accept_client_timeout(control_ep, my_pid, deadline) {
+            Ok(a) => a,
+            Err(ipc::RecvTimeoutError::TimedOut) => continue,
+            Err(ipc::RecvTimeoutError::ChannelClosed) => continue,
+        };
         let client = accepted.endpoint;
 
         // Wait for one request from this client
-        let msg = match ipc::channel_recv_blocking(client.raw(), my_pid) {
-            Some(msg) => msg,
-            None => continue, // client disconnected
+        let deadline = if interval > 0 {
+            crate::task::process::rdtime() + interval
+        } else {
+            u64::MAX
+        };
+        let msg = match ipc::channel_recv_blocking_timeout(client.raw(), my_pid, deadline) {
+            Ok(msg) => msg,
+            Err(ipc::RecvTimeoutError::TimedOut) => continue,
+            Err(ipc::RecvTimeoutError::ChannelClosed) => continue,
         };
 
         // Deserialize command

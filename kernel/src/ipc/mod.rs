@@ -511,6 +511,44 @@ pub fn channel_recv_blocking(endpoint: usize, pid: usize) -> Option<Message> {
     }
 }
 
+/// Errors returned by blocking-with-timeout receive operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvTimeoutError {
+    /// The deadline expired before a message arrived.
+    TimedOut,
+    /// The channel was closed/deactivated.
+    ChannelClosed,
+}
+
+/// Blocking receive with a deadline. Returns `Err(TimedOut)` when
+/// `rdtime() >= deadline` without a message, `Err(ChannelClosed)` when the
+/// channel is deactivated. Callers should heartbeat and retry on `TimedOut`.
+pub fn channel_recv_blocking_timeout(
+    endpoint: usize,
+    pid: usize,
+    deadline: u64,
+) -> Result<Message, RecvTimeoutError> {
+    loop {
+        let (msg, send_wake) = channel_recv(endpoint);
+        if send_wake != 0 {
+            crate::task::wake_process(send_wake);
+        }
+        if let Some(msg) = msg {
+            return Ok(msg);
+        }
+        if !channel_is_active(endpoint) {
+            return Err(RecvTimeoutError::ChannelClosed);
+        }
+        if crate::task::process::rdtime() >= deadline {
+            return Err(RecvTimeoutError::TimedOut);
+        }
+        channel_set_blocked(endpoint, pid);
+        crate::task::set_block_reason(pid, crate::task::BlockReason::IpcRecv(endpoint));
+        crate::task::block_with_deadline(pid, deadline);
+        crate::task::schedule();
+    }
+}
+
 /// Result of accepting a client connection from a service control channel.
 #[allow(dead_code)]
 pub struct AcceptedClient {
@@ -552,6 +590,39 @@ pub fn accept_client(control_ep: usize, pid: usize) -> AcceptedClient {
                 crate::task::block_process(pid);
                 crate::task::schedule();
             }
+        }
+    }
+}
+
+/// Wait for a client endpoint from a service's control channel, with a deadline.
+/// Like `accept_client` but returns `Err(TimedOut)` or `Err(ChannelClosed)`
+/// instead of blocking forever.
+pub fn accept_client_timeout(
+    control_ep: usize,
+    pid: usize,
+    deadline: u64,
+) -> Result<AcceptedClient, RecvTimeoutError> {
+    loop {
+        match channel_recv_blocking_timeout(control_ep, pid, deadline) {
+            Ok(mut msg) => {
+                if msg.cap_count > 0 {
+                    if let Cap::Channel(ep) = msg.caps[0].take() {
+                        let client_pid = if msg.len >= 5 {
+                            u32::from_le_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]])
+                        } else {
+                            0
+                        };
+                        let channel_role = if msg.len >= 5 {
+                            msg.data[4]
+                        } else {
+                            0
+                        };
+                        return Ok(AcceptedClient { endpoint: ep, client_pid, channel_role });
+                    }
+                }
+                // Message without channel cap — ignore and keep waiting
+            }
+            Err(e) => return Err(e),
         }
     }
 }

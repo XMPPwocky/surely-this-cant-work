@@ -434,7 +434,13 @@ pub fn serial_console_server() {
                     ipc::channel_set_blocked(client.stdout_ep, my_pid);
                 }
             }
-            crate::task::block_process(my_pid);
+            let interval = crate::watchdog::pet_interval();
+            if interval > 0 {
+                let deadline = crate::task::process::rdtime() + interval;
+                crate::task::block_with_deadline(my_pid, deadline);
+            } else {
+                crate::task::block_process(my_pid);
+            }
             crate::task::schedule();
         }
     }

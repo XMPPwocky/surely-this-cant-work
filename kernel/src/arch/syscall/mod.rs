@@ -26,6 +26,7 @@ pub const SYS_SHM_CREATE: usize = 205;
 pub const SYS_SHM_DUP_RO: usize = 206;
 pub const SYS_CHAN_POLL_ADD: usize = 208;
 pub const SYS_BLOCK: usize = 209;
+pub const SYS_BLOCK_DEADLINE: usize = 210;
 pub const SYS_MUNMAP: usize = 215;
 pub const SYS_MMAP: usize = 222;
 pub const SYS_TRACE: usize = 230;
@@ -168,6 +169,14 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
             crate::task::schedule();
             tf.regs[10] = 0;
         }
+        SYS_BLOCK_DEADLINE => {
+            let pid = crate::task::current_pid();
+            let deadline = a0 as u64;
+            crate::task::set_block_reason(pid, crate::task::BlockReason::Poll);
+            crate::task::block_with_deadline(pid, deadline);
+            crate::task::schedule();
+            tf.regs[10] = 0;
+        }
         SYS_SHM_CREATE => {
             tf.regs[10] = value_result_to_a0(mem::sys_shm_create(a0));
         }
@@ -201,7 +210,8 @@ pub fn handle_syscall(tf: &mut TrapFrame) {
         SYS_HEARTBEAT => {
             let time = crate::task::process::rdtime();
             crate::task::update_current_heartbeat(time);
-            tf.regs[10] = 0;
+            // Return the pet interval so user-space knows max blocking duration
+            tf.regs[10] = crate::watchdog::pet_interval() as usize;
         }
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);
@@ -315,6 +325,7 @@ fn syscall_name(num: usize) -> &'static [u8] {
         SYS_CHAN_SEND_BLOCKING => b"sendb",
         SYS_CHAN_POLL_ADD => b"polladd",
         SYS_BLOCK => b"block",
+        SYS_BLOCK_DEADLINE => b"blkdl",
         SYS_SHM_CREATE => b"shmc",
         SYS_SHM_DUP_RO => b"shmro",
         SYS_MMAP => b"mmap",

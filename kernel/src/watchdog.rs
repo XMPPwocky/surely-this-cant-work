@@ -100,6 +100,14 @@ pub fn pet_all() {
     }
 }
 
+/// Return the recommended interval (in ticks) between heartbeats.
+/// Services use this as their maximum blocking duration: block with a deadline
+/// of `rdtime() + pet_interval()`, wake on expiry, heartbeat, re-block.
+/// Returns 0 when the watchdog is disabled — callers treat 0 as "block forever."
+pub fn pet_interval() -> u64 {
+    TIMEOUT_TICKS.load(Ordering::Relaxed) / 2
+}
+
 /// Check all heartbeat slots. Called from `timer_tick()`.
 /// If any slot has timed out, fires the watchdog (prints diagnostics + shutdown).
 pub fn check(now: u64) {
