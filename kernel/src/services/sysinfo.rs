@@ -1,4 +1,4 @@
-use crate::ipc::{self, Message, MAX_MSG_SIZE};
+use crate::ipc::{self, Message, Cap, OwnedEndpoint, MAX_MSG_SIZE};
 use crate::mm::heap;
 use alloc::string::String;
 use core::fmt::Write;
@@ -32,74 +32,94 @@ pub fn sysinfo_service() {
             Err(ipc::RecvTimeoutError::TimedOut) => continue,
             Err(ipc::RecvTimeoutError::ChannelClosed) => continue,
         };
-        let client = accepted.endpoint;
 
-        // Wait for one request from this client
-        let deadline = if interval > 0 {
-            crate::task::process::rdtime() + interval
-        } else {
-            u64::MAX
-        };
-        let msg = match ipc::channel_recv_blocking_timeout(client.raw(), my_pid, deadline) {
-            Ok(msg) => msg,
-            Err(ipc::RecvTimeoutError::TimedOut) => continue,
-            Err(ipc::RecvTimeoutError::ChannelClosed) => continue,
-        };
+        serve_client(accepted.endpoint, my_pid);
 
-        // Deserialize command
-        let cmd = match rvos_wire::from_bytes::<SysinfoCommand>(&msg.data[..msg.len]) {
-            Ok(cmd) => cmd,
-            Err(_) => {
-                send_chunked(client.raw(), my_pid, b"Unknown command\n");
-                continue;
+        // Drain any connections that queued while we were serving.
+        // Sysinfo is one-shot per client (fast), so serve them inline.
+        loop {
+            let (msg, send_wake) = ipc::channel_recv(control_ep);
+            if send_wake != 0 {
+                crate::task::wake_process(send_wake);
             }
-        };
-
-        match cmd {
-            SysinfoCommand::Ps {} => {
-                let list = crate::task::process_list();
-                send_chunked(client.raw(), my_pid, list.as_bytes());
-            }
-            SysinfoCommand::Memstat {} => {
-                let text = format_memstat();
-                send_chunked(client.raw(), my_pid, text.as_bytes());
-            }
-            SysinfoCommand::Trace {} => {
-                let text = crate::trace::trace_read();
-                send_chunked(client.raw(), my_pid, text.as_bytes());
-            }
-            SysinfoCommand::TraceClear {} => {
-                crate::trace::trace_clear();
-                send_chunked(client.raw(), my_pid, b"ok\n");
-            }
-            SysinfoCommand::Kstat {} => {
-                let text = crate::kstat::format_counters();
-                send_chunked(client.raw(), my_pid, text.as_bytes());
-            }
-            SysinfoCommand::Channels {} => {
-                let text = crate::ipc::format_channel_stats();
-                send_chunked(client.raw(), my_pid, text.as_bytes());
-            }
-            SysinfoCommand::SchedLatency {} => {
-                // 10 MHz clock → 10 ticks per microsecond
-                let text = crate::kstat::SCHED_LATENCY.format(
-                    "Scheduler run-queue latency", "us", 10,
-                );
-                send_chunked(client.raw(), my_pid, text.as_bytes());
-            }
-            SysinfoCommand::IpcLatency {} => {
-                let text = crate::kstat::IPC_LATENCY.format(
-                    "IPC delivery latency", "us", 10,
-                );
-                send_chunked(client.raw(), my_pid, text.as_bytes());
-            }
-            SysinfoCommand::Watchdog {} => {
-                let text = crate::watchdog::status();
-                send_chunked(client.raw(), my_pid, text.as_bytes());
+            match msg {
+                Some(mut msg) => {
+                    if msg.cap_count > 0 {
+                        if let Cap::Channel(ep) = msg.caps[0].take() {
+                            serve_client(ep, my_pid);
+                        }
+                    }
+                }
+                None => break,
             }
         }
-        // OwnedEndpoint closes on drop at end of loop iteration
     }
+}
+
+/// Serve a single sysinfo client: recv one request, send response, close.
+fn serve_client(client: OwnedEndpoint, my_pid: usize) {
+    let interval = crate::watchdog::pet_interval();
+    let deadline = if interval > 0 {
+        crate::task::process::rdtime() + interval
+    } else {
+        u64::MAX
+    };
+    let msg = match ipc::channel_recv_blocking_timeout(client.raw(), my_pid, deadline) {
+        Ok(msg) => msg,
+        Err(_) => return,
+    };
+
+    let cmd = match rvos_wire::from_bytes::<SysinfoCommand>(&msg.data[..msg.len]) {
+        Ok(cmd) => cmd,
+        Err(_) => {
+            send_chunked(client.raw(), my_pid, b"Unknown command\n");
+            return;
+        }
+    };
+
+    match cmd {
+        SysinfoCommand::Ps {} => {
+            let list = crate::task::process_list();
+            send_chunked(client.raw(), my_pid, list.as_bytes());
+        }
+        SysinfoCommand::Memstat {} => {
+            let text = format_memstat();
+            send_chunked(client.raw(), my_pid, text.as_bytes());
+        }
+        SysinfoCommand::Trace {} => {
+            let text = crate::trace::trace_read();
+            send_chunked(client.raw(), my_pid, text.as_bytes());
+        }
+        SysinfoCommand::TraceClear {} => {
+            crate::trace::trace_clear();
+            send_chunked(client.raw(), my_pid, b"ok\n");
+        }
+        SysinfoCommand::Kstat {} => {
+            let text = crate::kstat::format_counters();
+            send_chunked(client.raw(), my_pid, text.as_bytes());
+        }
+        SysinfoCommand::Channels {} => {
+            let text = crate::ipc::format_channel_stats();
+            send_chunked(client.raw(), my_pid, text.as_bytes());
+        }
+        SysinfoCommand::SchedLatency {} => {
+            let text = crate::kstat::SCHED_LATENCY.format(
+                "Scheduler run-queue latency", "us", 10,
+            );
+            send_chunked(client.raw(), my_pid, text.as_bytes());
+        }
+        SysinfoCommand::IpcLatency {} => {
+            let text = crate::kstat::IPC_LATENCY.format(
+                "IPC delivery latency", "us", 10,
+            );
+            send_chunked(client.raw(), my_pid, text.as_bytes());
+        }
+        SysinfoCommand::Watchdog {} => {
+            let text = crate::watchdog::status();
+            send_chunked(client.raw(), my_pid, text.as_bytes());
+        }
+    }
+    // OwnedEndpoint closes on drop
 }
 
 /// Send a byte slice in MAX_MSG_SIZE-sized chunks, with yield-on-full backpressure,
