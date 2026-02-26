@@ -319,8 +319,9 @@ pub fn transmit(frame: &[u8]) -> bool {
     net.transmitq.push_avail(desc_idx);
     net.transmitq.notify(net.base, 1);
 
-    // Poll for completion via WFI
-    loop {
+    // Poll for completion via WFI with timeout
+    const MAX_TX_ATTEMPTS: u32 = 10_000;
+    for _ in 0..MAX_TX_ATTEMPTS {
         if let Some((head, _len)) = net.transmitq.pop_used() {
             net.transmitq.free_chain(head);
             return true;
@@ -329,6 +330,11 @@ pub fn transmit(frame: &[u8]) -> bool {
             core::arch::asm!("wfi");
         }
     }
+
+    // Timed out — free the descriptor and report failure
+    crate::println!("[net] transmit timed out after {} WFI cycles", MAX_TX_ATTEMPTS);
+    net.transmitq.free_chain(desc_idx);
+    false
 }
 
 /// Handle a network device IRQ. Called from the trap handler.
