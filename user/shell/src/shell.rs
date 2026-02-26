@@ -133,21 +133,16 @@ fn send_sysinfo_cmd(cmd: &SysinfoCommand) {
         return;
     }
 
+    let ch = rvos::RawChannel::from_raw_handle(sysinfo_handle);
     let mut msg = Message::new();
     msg.len = rvos_wire::to_bytes(cmd, &mut msg.data).unwrap_or(0);
-    raw::sys_chan_send_blocking(sysinfo_handle, &msg);
+    ch.send(&msg).ok();
 
-    loop {
-        let mut resp = Message::new();
-        raw::sys_chan_recv_blocking(sysinfo_handle, &mut resp);
-        if resp.len == 0 {
-            break;
-        }
-        io::stdout().write_all(&resp.data[..resp.len]).ok();
-    }
+    ch.recv_stream_raw(|m| {
+        io::stdout().write_all(&m.data[..m.len]).ok();
+    });
     io::stdout().flush().ok();
-
-    raw::sys_chan_close(sysinfo_handle);
+    // ch drops here, closing the handle
 }
 
 fn cmd_trace(args: &str) {

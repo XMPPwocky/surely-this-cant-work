@@ -1,6 +1,7 @@
 //! RAII channel handles — both raw (untyped) and typed.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::error::{RecvError, SysError, SysResult};
@@ -86,6 +87,33 @@ impl RawChannel {
     /// Register this channel for poll-based wakeup.
     pub fn poll_add(&self) {
         raw::sys_chan_poll_add(self.handle);
+    }
+
+    /// Receive a stream of messages, calling `f` for each non-sentinel message.
+    ///
+    /// Blocks until a zero-length sentinel message arrives or the channel closes.
+    /// Used for streaming responses (e.g. sysinfo commands that send data in chunks).
+    pub fn recv_stream_raw(&self, mut f: impl FnMut(&Message)) {
+        let mut msg = Message::new();
+        loop {
+            let ret = raw::sys_chan_recv_blocking(self.handle, &mut msg);
+            if ret != 0 || msg.len == 0 {
+                break;
+            }
+            f(&msg);
+        }
+    }
+
+    /// Receive a stream of messages and collect all data bytes into a Vec.
+    ///
+    /// Blocks until a zero-length sentinel arrives. Returns the concatenated
+    /// data from all chunks.
+    pub fn recv_stream_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.recv_stream_raw(|msg| {
+            out.extend_from_slice(&msg.data[..msg.len]);
+        });
+        out
     }
 }
 
