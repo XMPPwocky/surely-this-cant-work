@@ -1,4 +1,4 @@
-# 0054: MCP server: screenshot save-to-file option
+# 0054: MCP server: remove PPM screenshot option or add save-to-file
 
 **Reported:** 2026-02-26
 **Status:** Open
@@ -7,33 +7,43 @@
 
 ## Description
 
-The `qemu_screenshot` MCP tool always returns image data inline as base64.
-For PNG this is fine (~4KB), but PPM format produces ~4MB which exceeds
-the MCP tool result size limit, causing a "result exceeds maximum allowed
-tokens" error and saving to a temp file that requires manual extraction.
+The `qemu_screenshot` MCP tool returns image data inline as base64, which
+is the standard MCP approach (`{"type": "image", "data": "<base64>",
+"mimeType": "image/png"}`). For PNG this works fine (~4KB). However, PPM
+format produces ~4MB of base64 which exceeds the Claude Code tool result
+size limit.
 
-Even for PNG, returning base64 inline is wasteful when the caller just
-wants a file on disk (e.g., to show the user via `Read`).
+## Analysis
 
-## Proposed Solution
+Per the MCP spec (2025-11-25), tool results support these content types:
+- `text` — plain text
+- `image` — base64-encoded image with mimeType (what we use for PNG)
+- `audio` — base64-encoded audio
+- `resource_link` — URI the client can fetch separately
 
-Add an optional `save_path: str` parameter to `qemu_screenshot`:
+The current PNG path is correct and works well. The PPM option is the
+problem — raw uncompressed bitmaps are too large for inline base64.
 
-- **If `save_path` is provided:** Save the screenshot to that path and
-  return `{"path": "/tmp/foo.png", "size": 4036}` instead of base64 data.
-  The caller can then use `Read` to view the image.
-- **If `save_path` is omitted:** Current behavior (return base64 inline).
+## Proposed Solutions (pick one)
 
-This keeps backwards compatibility while enabling the file-based workflow.
+### Option A: Just remove PPM support (simplest)
+PNG is always smaller and is the default. There's no reason to offer PPM
+through the MCP tool. The QMP `screendump` command can still be used
+directly via `qemu_monitor` if raw PPM is needed.
+
+### Option B: Add optional `save_path` parameter
+- If `save_path` is provided: save screenshot to that path, return the
+  path as text instead of base64 data. Caller uses `Read` to view it.
+- If omitted: current behavior (return base64 PNG inline).
+
+This is more flexible but adds complexity. The `qemu_monitor` +
+`screendump` workaround already covers the save-to-file case (which is
+how we got the working screenshot in the session where this was filed).
+
+### Recommendation
+Option A. Keep it simple.
 
 ## Files
 
-- `scripts/qemu-mcp/server.py` — modify `screenshot()` and
-  `qemu_screenshot` tool to accept optional `save_path`
-
-## Notes
-
-The underlying QMP `screendump` command already saves to a file — the
-current code saves to a temp file, reads it back, deletes it, and
-base64-encodes it. With `save_path`, we can skip the read-back and just
-leave the file in place.
+- `scripts/qemu-mcp/server.py` — `screenshot()` method and
+  `qemu_screenshot` tool registration
