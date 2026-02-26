@@ -405,8 +405,8 @@ class QEMUInstance:
         self.output_buffer = ""
         return result
 
-    async def screenshot(self, fmt: str = "png") -> tuple[str, bytes]:
-        """Take a screenshot via QMP screendump.
+    async def screenshot(self) -> tuple[str, bytes]:
+        """Take a screenshot via QMP screendump (PNG).
 
         Returns (mime_type, image_data).
         """
@@ -417,21 +417,19 @@ class QEMUInstance:
         if self.qmp is None:
             raise RuntimeError("QMP not connected.")
 
-        suffix = ".png" if fmt == "png" else ".ppm"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
             tmp_path = f.name
 
         try:
             await self.qmp.execute("screendump", {
                 "filename": tmp_path,
-                "format": fmt,
+                "format": "png",
             })
             # Small delay for file to be written
             await asyncio.sleep(0.3)
             with open(tmp_path, "rb") as f:
                 data = f.read()
-            mime = "image/png" if fmt == "png" else "image/x-portable-pixmap"
-            return mime, data
+            return "image/png", data
         finally:
             try:
                 os.unlink(tmp_path)
@@ -449,6 +447,49 @@ class QEMUInstance:
             "keys": key_list,
             "hold-time": hold_time,
         })
+
+    # Character-to-QKeyCode mapping for type_text().
+    _CHAR_TO_KEYS: dict[str, list[str]] = {
+        **{c: [c] for c in "abcdefghijklmnopqrstuvwxyz0123456789"},
+        **{c: ["shift", c.lower()] for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
+        " ": ["spc"], "\t": ["tab"], "\n": ["ret"],
+        "-": ["minus"], "=": ["equal"], "[": ["bracket_left"],
+        "]": ["bracket_right"], "\\": ["backslash"], ";": ["semicolon"],
+        "'": ["apostrophe"], "`": ["grave_accent"], ",": ["comma"],
+        ".": ["dot"], "/": ["slash"],
+        "!": ["shift", "1"], "@": ["shift", "2"], "#": ["shift", "3"],
+        "$": ["shift", "4"], "%": ["shift", "5"], "^": ["shift", "6"],
+        "&": ["shift", "7"], "*": ["shift", "8"], "(": ["shift", "9"],
+        ")": ["shift", "0"], "_": ["shift", "minus"], "+": ["shift", "equal"],
+        "{": ["shift", "bracket_left"], "}": ["shift", "bracket_right"],
+        "|": ["shift", "backslash"], ":": ["shift", "semicolon"],
+        '"': ["shift", "apostrophe"], "~": ["shift", "grave_accent"],
+        "<": ["shift", "comma"], ">": ["shift", "dot"],
+        "?": ["shift", "slash"],
+    }
+
+    async def type_text(self, text: str, delay_ms: int = 50) -> int:
+        """Type a string of text by sending individual key events.
+
+        Returns the number of characters typed.
+        """
+        if self.qmp is None:
+            raise RuntimeError("QMP not connected.")
+
+        count = 0
+        for ch in text:
+            keys = self._CHAR_TO_KEYS.get(ch)
+            if keys is None:
+                continue  # Skip unmapped characters
+            key_list = [{"type": "qcode", "data": k} for k in keys]
+            await self.qmp.execute("send-key", {
+                "keys": key_list,
+                "hold-time": 50,
+            })
+            count += 1
+            if delay_ms > 0:
+                await asyncio.sleep(delay_ms / 1000.0)
+        return count
 
     async def send_mouse(
         self,
@@ -759,17 +800,14 @@ async def qemu_read(
 
 
 @mcp.tool()
-async def qemu_screenshot(format: str = "png") -> list[dict[str, Any]]:
-    """Take a screenshot of the VNC display.
+async def qemu_screenshot() -> list[dict[str, Any]]:
+    """Take a screenshot of the VNC display (PNG).
 
     Requires: QEMU booted with gpu=true.
 
-    Args:
-        format: Image format — "png" or "ppm" (default png)
-
     Returns: Screenshot image data.
     """
-    mime, data = await qemu.screenshot(fmt=format)
+    mime, data = await qemu.screenshot()
     return [
         {
             "type": "image",
@@ -794,6 +832,27 @@ async def qemu_send_key(
     """
     await qemu.send_key(keys, hold_time=hold_time)
     return f"Sent key: {keys}"
+
+
+@mcp.tool()
+async def qemu_type_text(
+    text: str,
+    delay_ms: int = 50,
+) -> str:
+    """Type a string of text into the GUI keyboard.
+
+    Converts each character to the appropriate QKeyCode(s) and sends
+    them as individual key events. Use this instead of calling
+    qemu_send_key once per character.
+
+    Args:
+        text: The text to type (ASCII printable, newlines, tabs)
+        delay_ms: Delay between keystrokes in ms (default 50)
+
+    Returns: Confirmation with character count.
+    """
+    count = await qemu.type_text(text, delay_ms=delay_ms)
+    return f"Typed {count} characters"
 
 
 @mcp.tool()
