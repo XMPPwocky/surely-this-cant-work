@@ -518,7 +518,7 @@ fn try_complete(line: &str) -> Completion {
 // --- History Ring ---
 
 const HISTORY_MAX: usize = 64;
-const HISTORY_ENTRY_MAX: usize = 256;
+const HISTORY_ENTRY_MAX: usize = 1024;
 
 struct HistoryRing {
     entries: Box<[[u8; HISTORY_ENTRY_MAX]; HISTORY_MAX]>,
@@ -594,7 +594,7 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 // --- Line Editor ---
 
-const LINE_MAX: usize = 256;
+const LINE_MAX: usize = 1024;
 const SEARCH_MAX: usize = 64;
 const PROMPT: &str = "rvos> ";
 
