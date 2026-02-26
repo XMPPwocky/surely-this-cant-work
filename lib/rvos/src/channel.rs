@@ -61,6 +61,7 @@ impl RawChannel {
     }
 
     /// Non-blocking receive. Returns 0 on success, nonzero on empty/error.
+    #[must_use]
     pub fn try_recv(&self, msg: &mut Message) -> usize {
         raw::sys_chan_recv(self.handle, msg)
     }
