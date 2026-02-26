@@ -2137,6 +2137,64 @@ fn test_ext2_persistence() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn test_ext2_disk_full() -> Result<(), &'static str> {
+    let path = "/persist/diskfull";
+    // Clean up from any previous run
+    let _ = std::fs::remove_file(path);
+
+    // Write data in a loop until the disk is full
+    let chunk = vec![0x55u8; 4096];
+    let mut f = std::fs::File::create(path).map_err(|_| "create failed")?;
+    let mut total = 0usize;
+    let mut got_full = false;
+    loop {
+        match std::io::Write::write(&mut f, &chunk) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::StorageFull {
+                    got_full = true;
+                } else {
+                    drop(f);
+                    let _ = std::fs::remove_file(path);
+                    return Err("expected StorageFull, got other error");
+                }
+                break;
+            }
+        }
+        // Safety limit: persist.img is 16 MB
+        if total > 20 * 1024 * 1024 {
+            drop(f);
+            let _ = std::fs::remove_file(path);
+            return Err("wrote >20 MB without error");
+        }
+    }
+    drop(f);
+
+    if !got_full {
+        let _ = std::fs::remove_file(path);
+        return Err("never got disk full error");
+    }
+
+    // We should have written a substantial amount before hitting the limit
+    if total < 1024 {
+        let _ = std::fs::remove_file(path);
+        return Err("disk full too early");
+    }
+
+    // Clean up the large file
+    std::fs::remove_file(path).map_err(|_| "cleanup remove failed")?;
+
+    // Verify disk is usable after cleanup
+    let check = "/persist/diskfull_ok";
+    std::fs::write(check, b"ok").map_err(|_| "post-cleanup write failed")?;
+    let data = std::fs::read(check).map_err(|_| "post-cleanup read failed")?;
+    assert_true(&data == b"ok", "post-cleanup data mismatch")?;
+    std::fs::remove_file(check).map_err(|_| "post-cleanup cleanup failed")?;
+
+    Ok(())
+}
+
 // ============================================================
 // 27. Regression -- Per-Process Channel Limit (Bug 0013)
 // ============================================================
@@ -2728,6 +2786,7 @@ fn main() {
             ("ext2_mkdir", test_ext2_mkdir),
             ("ext2_grow_file", test_ext2_grow_file),
             ("ext2_persistence", test_ext2_persistence),
+            ("ext2_disk_full", test_ext2_disk_full),
         ]));
     }
 

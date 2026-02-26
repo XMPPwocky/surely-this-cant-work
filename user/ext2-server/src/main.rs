@@ -104,6 +104,19 @@ impl Ext2State {
     }
 }
 
+// --- Error mapping ---
+
+/// Map ext2 internal error strings to FsError codes.
+/// Allocation failures ("no space", "no inodes") map to NoSpace;
+/// everything else maps to Io.
+fn map_ext2_error(e: &str) -> FsError {
+    if e == "no space" || e == "no inodes" {
+        FsError::NoSpace {}
+    } else {
+        FsError::Io {}
+    }
+}
+
 // --- Response helpers ---
 
 fn send_error(ch: &Channel<FsResponse, FsRequestMsg>, code: FsError) {
@@ -244,8 +257,8 @@ fn do_open(
                         ext2.cache.sync(&ext2.blk).ok();
                         ino
                     }
-                    Err(_) => {
-                        send_error(ctl_ch, FsError::Io {});
+                    Err(e) => {
+                        send_error(ctl_ch, map_ext2_error(e));
                         return;
                     }
                 }
@@ -469,8 +482,8 @@ fn do_mkdir(ext2: &mut Ext2State, ch: &Channel<FsResponse, FsRequestMsg>, path: 
                 size: 0,
             });
         }
-        Err(_) => {
-            send_error(ch, FsError::Io {});
+        Err(e) => {
+            send_error(ch, map_ext2_error(e));
         }
     }
 }
@@ -570,8 +583,8 @@ fn handle_file_write(ext2: &mut Ext2State, ch: &Channel<FileResponseMsg, FileReq
 
     let written = match ext2::write_data(&ext2.sb, &mut inode, write_offset, data, &mut ext2.cache, &ext2.blk) {
         Ok(n) => n,
-        Err(_) => {
-            send_file_error(ch, FsError::Io {});
+        Err(e) => {
+            send_file_error(ch, map_ext2_error(e));
             return;
         }
     };
