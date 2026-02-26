@@ -760,10 +760,10 @@ struct TcpConn {
     rto_ticks: u64,
     retx_count: u8,
     retx_deadline: u64, // 0 = no pending retransmit
-    // Owning socket index
-    socket_idx: usize,
+    // Owning socket index (None = not yet associated with a socket)
+    socket_idx: Option<usize>,
     // For listening: index of the listener socket that spawned this conn
-    listener_sock_idx: usize,
+    listener_sock_idx: Option<usize>,
     active: bool,
     // TimeWait deadline
     time_wait_deadline: u64,
@@ -789,8 +789,8 @@ impl TcpConn {
             rto_ticks: 0,
             retx_count: 0,
             retx_deadline: 0,
-            socket_idx: usize::MAX,
-            listener_sock_idx: usize::MAX,
+            socket_idx: None,
+            listener_sock_idx: None,
             active: false,
             time_wait_deadline: 0,
             iface_idx: 0,
@@ -838,9 +838,9 @@ struct Socket {
     active: bool,
     is_stream: bool,
     // TCP-specific
-    tcp_conn_idx: usize,        // index into tcp_conns (usize::MAX = none)
+    tcp_conn_idx: Option<usize>,
     tcp_listening: bool,
-    accept_queue: [usize; TCP_ACCEPT_BACKLOG], // conn indices waiting to be accepted
+    accept_queue: [Option<usize>; TCP_ACCEPT_BACKLOG], // conn indices waiting to be accepted
     accept_count: usize,
     accept_pending: bool,       // client has called Accept, waiting for connection
     recv_max_len: u32,          // for TCP Recv: max bytes to return
@@ -854,9 +854,9 @@ impl Socket {
             recv_pending: false,
             active: false,
             is_stream: false,
-            tcp_conn_idx: usize::MAX,
+            tcp_conn_idx: None,
             tcp_listening: false,
-            accept_queue: [usize::MAX; TCP_ACCEPT_BACKLOG],
+            accept_queue: [None; TCP_ACCEPT_BACKLOG],
             accept_count: 0,
             accept_pending: false,
             recv_max_len: 0,
@@ -868,13 +868,12 @@ impl Socket {
         if self.active {
             raw::sys_chan_close(self.handle);
             // Clean up associated TCP connection
-            if self.tcp_conn_idx != usize::MAX {
-                tcp_conns[self.tcp_conn_idx].reset();
+            if let Some(ci) = self.tcp_conn_idx {
+                tcp_conns[ci].reset();
             }
             // Clean up accept queue connections
             for i in 0..self.accept_count {
-                let ci = self.accept_queue[i];
-                if ci != usize::MAX {
+                if let Some(ci) = self.accept_queue[i] {
                     tcp_conns[ci].reset();
                 }
             }
@@ -1253,10 +1252,11 @@ fn tcp_send_rst(
 
 /// Deliver buffered data to a client waiting on Recv.
 fn tcp_try_deliver_recv(sock: &mut Socket, tcp_conns: &mut TcpConns, msg: &mut Message) {
-    if !sock.recv_pending || sock.tcp_conn_idx == usize::MAX {
+    let Some(ci) = sock.tcp_conn_idx else { return };
+    if !sock.recv_pending {
         return;
     }
-    let conn = &mut tcp_conns[sock.tcp_conn_idx];
+    let conn = &mut tcp_conns[ci];
     if conn.recv_len == 0 {
         // If connection is in CloseWait/LastAck (remote sent FIN) and buffer is empty,
         // deliver zero-length read to signal EOF
@@ -1387,8 +1387,8 @@ fn tcp_input(
         conn.snd_una = tcp_initial_seq();
         conn.snd_nxt = conn.snd_una.wrapping_add(1); // SYN consumes one seq
         conn.snd_wnd = tcp.window;
-        conn.socket_idx = usize::MAX; // not yet associated with a socket
-        conn.listener_sock_idx = li;
+        conn.socket_idx = None; // not yet associated with a socket
+        conn.listener_sock_idx = Some(li);
         conn.iface_idx = rx_iface_idx;
         conn.rto_ticks = TCP_INITIAL_RTO;
         conn.retx_count = 0;
@@ -1426,15 +1426,17 @@ fn tcp_input_conn(
         let conn = &mut tcp_conns[ci];
         let si = conn.socket_idx;
         conn.reset();
-        if si != usize::MAX && si < MAX_SOCKETS && sockets[si].active {
-            // Notify client of reset; deactivate if channel already closed
-            tx.msg = Message::new();
-            tx.msg.len = rvos_wire::to_bytes(
-                &SocketResponse::Error { code: SocketError::ConnReset {} },
-                &mut tx.msg.data,
-            ).expect("serialize");
-            if raw::sys_chan_send(sockets[si].handle, &tx.msg) == raw::CHAN_CLOSED {
-                sockets[si].deactivate(tcp_conns);
+        if let Some(si) = si {
+            if sockets[si].active {
+                // Notify client of reset; deactivate if channel already closed
+                tx.msg = Message::new();
+                tx.msg.len = rvos_wire::to_bytes(
+                    &SocketResponse::Error { code: SocketError::ConnReset {} },
+                    &mut tx.msg.data,
+                ).expect("serialize");
+                if raw::sys_chan_send(sockets[si].handle, &tx.msg) == raw::CHAN_CLOSED {
+                    sockets[si].deactivate(tcp_conns);
+                }
             }
         }
         return;
@@ -1465,8 +1467,8 @@ fn tcp_input_conn(
                     tx,
                 );
                 // Notify waiting Connect call
-                if conn.socket_idx != usize::MAX && conn.socket_idx < MAX_SOCKETS {
-                    let sock = &mut sockets[conn.socket_idx];
+                if let Some(si) = conn.socket_idx {
+                    let sock = &mut sockets[si];
                     tx.msg = Message::new();
                     tx.msg.len = rvos_wire::to_bytes(
                         &SocketResponse::Ok {},
@@ -1508,22 +1510,21 @@ fn tcp_input_conn(
                     );
                 }
                 // Add to listener's accept queue
-                let li = conn.listener_sock_idx;
-                if li != usize::MAX && li < MAX_SOCKETS && sockets[li].active
-                    && sockets[li].accept_count < TCP_ACCEPT_BACKLOG
-                {
-                    let cnt = sockets[li].accept_count;
-                    sockets[li].accept_queue[cnt] = ci;
-                    sockets[li].accept_count += 1;
-                    // If Accept is pending, deliver now
-                    if sockets[li].accept_pending {
-                        tcp_deliver_accept(
-                            &mut sockets[li], tcp_conns, pending_accept,
-                            tx,
-                        );
-                        // Process pending accept assignment
-                        if let Some(info) = pending_accept.take() {
-                            assign_accepted_socket(sockets, tcp_conns, info.handle, info.conn_idx);
+                if let Some(li) = conn.listener_sock_idx {
+                    if sockets[li].active && sockets[li].accept_count < TCP_ACCEPT_BACKLOG {
+                        let cnt = sockets[li].accept_count;
+                        sockets[li].accept_queue[cnt] = Some(ci);
+                        sockets[li].accept_count += 1;
+                        // If Accept is pending, deliver now
+                        if sockets[li].accept_pending {
+                            tcp_deliver_accept(
+                                &mut sockets[li], tcp_conns, pending_accept,
+                                tx,
+                            );
+                            // Process pending accept assignment
+                            if let Some(info) = pending_accept.take() {
+                                assign_accepted_socket(sockets, tcp_conns, info.handle, info.conn_idx);
+                            }
                         }
                     }
                 }
@@ -1589,11 +1590,8 @@ fn tcp_input_conn(
         TcpState::LastAck => {
             let conn = &mut tcp_conns[ci];
             if tcp.flags & TCP_ACK != 0 && tcp.ack == conn.snd_nxt {
-                let si = conn.socket_idx;
                 conn.reset();
-                if si != usize::MAX && si < MAX_SOCKETS {
-                    // Don't deactivate — let client close the channel
-                }
+                // Don't deactivate socket — let client close the channel
             }
         }
         TcpState::CloseWait => {
@@ -1653,8 +1651,7 @@ fn tcp_input_established(
             tx,
         );
         // Try to deliver data to waiting client
-        let si = conn.socket_idx;
-        if si != usize::MAX && si < MAX_SOCKETS {
+        if let Some(si) = conn.socket_idx {
             tcp_try_deliver_recv(&mut sockets[si], tcp_conns, &mut tx.msg);
         }
     } else if !data.is_empty() {
@@ -1680,8 +1677,7 @@ fn tcp_input_established(
             tx,
         );
         // If client is waiting on Recv, deliver EOF
-        let si = conn.socket_idx;
-        if si != usize::MAX && si < MAX_SOCKETS {
+        if let Some(si) = conn.socket_idx {
             tcp_try_deliver_recv(&mut sockets[si], tcp_conns, &mut tx.msg);
         }
     }
@@ -1729,12 +1725,12 @@ fn tcp_deliver_accept(
         return;
     }
     // Pop the first connection from the accept queue
-    let ci = sock.accept_queue[0];
+    let ci = sock.accept_queue[0].expect("accept_queue entry should be Some");
     for j in 1..sock.accept_count {
         sock.accept_queue[j - 1] = sock.accept_queue[j];
     }
     sock.accept_count -= 1;
-    sock.accept_queue[sock.accept_count] = usize::MAX;
+    sock.accept_queue[sock.accept_count] = None;
 
     let conn = &mut tcp_conns[ci];
     let peer_addr = SocketAddr::Inet4 {
@@ -1772,7 +1768,7 @@ fn tcp_deliver_accept(
     // We can't assign the socket here because sock is already a mutable
     // reference to one element of the sockets array. Store the info for
     // the caller to assign after this function returns.
-    conn.socket_idx = sock_a; // abuse: store handle temporarily
+    // socket_idx will be set by assign_accepted_socket after this returns
     *pending_accept = Some(PendingAcceptInfo {
         handle: sock_a,
         conn_idx: ci,
@@ -1801,17 +1797,19 @@ fn tcp_check_retransmits(
             // Too many retransmits — abort connection
             let si = conn.socket_idx;
             conn.reset();
-            if si != usize::MAX && si < MAX_SOCKETS && sockets[si].active {
-                tx.msg = Message::new();
-                tx.msg.len = rvos_wire::to_bytes(
-                    &SocketResponse::Error { code: SocketError::TimedOut {} },
-                    &mut tx.msg.data,
-                ).expect("serialize");
-                if raw::sys_chan_send(sockets[si].handle, &tx.msg) == raw::CHAN_CLOSED {
-                    // Can't call deactivate() here (tcp_conns borrowed by iter).
-                    // Close handle; main loop will clean up the socket on next poll.
-                    raw::sys_chan_close(sockets[si].handle);
-                    sockets[si].active = false;
+            if let Some(si) = si {
+                if sockets[si].active {
+                    tx.msg = Message::new();
+                    tx.msg.len = rvos_wire::to_bytes(
+                        &SocketResponse::Error { code: SocketError::TimedOut {} },
+                        &mut tx.msg.data,
+                    ).expect("serialize");
+                    if raw::sys_chan_send(sockets[si].handle, &tx.msg) == raw::CHAN_CLOSED {
+                        // Can't call deactivate() here (tcp_conns borrowed by iter).
+                        // Close handle; main loop will clean up the socket on next poll.
+                        raw::sys_chan_close(sockets[si].handle);
+                        sockets[si].active = false;
+                    }
                 }
             }
             continue;
@@ -1927,8 +1925,8 @@ fn assign_accepted_socket(sockets: &mut [Socket; MAX_SOCKETS], tcp_conns: &mut T
     sockets[idx].active = true;
     sockets[idx].handle = handle;
     sockets[idx].is_stream = true;
-    sockets[idx].tcp_conn_idx = conn_idx;
-    tcp_conns[conn_idx].socket_idx = idx;
+    sockets[idx].tcp_conn_idx = Some(conn_idx);
+    tcp_conns[conn_idx].socket_idx = Some(idx);
     sockets[idx].port = tcp_conns[conn_idx].local_port;
 }
 
@@ -2135,12 +2133,12 @@ fn handle_client_message(
             conn.snd_una = tcp_initial_seq();
             conn.snd_nxt = conn.snd_una.wrapping_add(1);
             conn.snd_wnd = TCP_WINDOW;
-            conn.socket_idx = sock_idx;
+            conn.socket_idx = Some(sock_idx);
             conn.rto_ticks = TCP_INITIAL_RTO;
             conn.retx_count = 0;
             conn.retx_deadline = now + conn.rto_ticks;
             conn.iface_idx = route(interfaces, &dst_ip);
-            sockets[sock_idx].tcp_conn_idx = ci;
+            sockets[sock_idx].tcp_conn_idx = Some(ci);
             // Send SYN
             let snd_una = conn.snd_una;
             let iface_idx = conn.iface_idx;
@@ -2152,11 +2150,10 @@ fn handle_client_message(
             // Response is deferred until SYN-ACK arrives
         }
         SocketRequest::Send { data } => {
-            let ci = sockets[sock_idx].tcp_conn_idx;
-            if ci == usize::MAX {
+            let Some(ci) = sockets[sock_idx].tcp_conn_idx else {
                 send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
-            }
+            };
             let conn = &mut tcp_conns[ci];
             if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
                 send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
@@ -2185,22 +2182,20 @@ fn handle_client_message(
             }
         }
         SocketRequest::Recv { max_len } => {
-            let ci = sockets[sock_idx].tcp_conn_idx;
-            if ci == usize::MAX {
+            let Some(_ci) = sockets[sock_idx].tcp_conn_idx else {
                 send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
-            }
+            };
             sockets[sock_idx].recv_max_len = max_len;
             sockets[sock_idx].recv_pending = true;
             // Try to deliver immediately if data is available
             tcp_try_deliver_recv(&mut sockets[sock_idx], tcp_conns, &mut tx.msg);
         }
         SocketRequest::Shutdown { how } => {
-            let ci = sockets[sock_idx].tcp_conn_idx;
-            if ci == usize::MAX {
+            let Some(ci) = sockets[sock_idx].tcp_conn_idx else {
                 send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
-            }
+            };
             let conn = &mut tcp_conns[ci];
             let send_fin = matches!(how, ShutdownHow::Write {} | ShutdownHow::Both {});
             if send_fin && (conn.state == TcpState::Established || conn.state == TcpState::CloseWait) {
@@ -2228,11 +2223,10 @@ fn handle_client_message(
             send_sock_ok(handle, &mut tx.msg);
         }
         SocketRequest::GetPeerName {} => {
-            let ci = sockets[sock_idx].tcp_conn_idx;
-            if ci == usize::MAX {
+            let Some(ci) = sockets[sock_idx].tcp_conn_idx else {
                 send_sock_error(handle, SocketError::NotConnected {}, &mut tx.msg);
                 return;
-            }
+            };
             let conn = &tcp_conns[ci];
             tx.msg = Message::new();
             tx.msg.len = rvos_wire::to_bytes(
@@ -2832,10 +2826,9 @@ fn main() {
         let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) as *mut TcpConns };
         assert!(!ptr.is_null(), "failed to allocate TcpConns");
         let mut b = unsafe { Box::from_raw(ptr) };
-        // Fix up non-zero default fields
+        // alloc_zeroed gives us zero bytes; reinit with proper defaults
         for conn in b.iter_mut() {
-            conn.socket_idx = usize::MAX;
-            conn.listener_sock_idx = usize::MAX;
+            *conn = TcpConn::new();
         }
         b
     };
