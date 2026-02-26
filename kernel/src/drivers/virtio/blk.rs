@@ -299,7 +299,7 @@ pub fn read_sectors(idx: usize, sector: u64, count: u32, dst: *mut u8) -> bool {
     write_outhdr(dev.outhdr_buf, VIRTIO_BLK_T_IN, sector);
 
     // Clear status
-    unsafe { (dev.status_buf as *mut u8).write_volatile(0xFF); }
+    clear_status(dev);
 
     // Build 3-descriptor chain: outhdr → data(device-writable) → status(device-writable)
     let d0 = dev.requestq.alloc_desc().expect("blk: no desc for outhdr");
@@ -322,7 +322,7 @@ pub fn read_sectors(idx: usize, sector: u64, count: u32, dst: *mut u8) -> bool {
         unsafe { core::arch::asm!("wfi"); }
     }
 
-    let status = unsafe { (dev.status_buf as *const u8).read_volatile() };
+    let status = read_status(dev);
     if status != VIRTIO_BLK_S_OK {
         return false;
     }
@@ -368,7 +368,7 @@ pub fn write_sectors(idx: usize, sector: u64, count: u32, src: *const u8) -> boo
     write_outhdr(dev.outhdr_buf, VIRTIO_BLK_T_OUT, sector);
 
     // Clear status
-    unsafe { (dev.status_buf as *mut u8).write_volatile(0xFF); }
+    clear_status(dev);
 
     // Build 3-descriptor chain: outhdr → data(device-readable) → status(device-writable)
     let d0 = dev.requestq.alloc_desc().expect("blk: no desc for outhdr");
@@ -391,7 +391,7 @@ pub fn write_sectors(idx: usize, sector: u64, count: u32, src: *const u8) -> boo
         unsafe { core::arch::asm!("wfi"); }
     }
 
-    let status = unsafe { (dev.status_buf as *const u8).read_volatile() };
+    let status = read_status(dev);
     status == VIRTIO_BLK_S_OK
 }
 
@@ -414,7 +414,7 @@ pub fn flush(idx: usize) -> bool {
     write_outhdr(dev.outhdr_buf, VIRTIO_BLK_T_FLUSH, 0);
 
     // Clear status
-    unsafe { (dev.status_buf as *mut u8).write_volatile(0xFF); }
+    clear_status(dev);
 
     // Build 2-descriptor chain: outhdr → status (no data)
     let d0 = dev.requestq.alloc_desc().expect("blk: no desc for flush outhdr");
@@ -435,7 +435,7 @@ pub fn flush(idx: usize) -> bool {
         unsafe { core::arch::asm!("wfi"); }
     }
 
-    let status = unsafe { (dev.status_buf as *const u8).read_volatile() };
+    let status = read_status(dev);
     status == VIRTIO_BLK_S_OK
 }
 
@@ -445,7 +445,7 @@ pub fn flush(idx: usize) -> bool {
 fn read_serial_into(dev: &mut BlkDevice) {
     write_outhdr(dev.outhdr_buf, VIRTIO_BLK_T_GET_ID, 0);
 
-    unsafe { (dev.status_buf as *mut u8).write_volatile(0xFF); }
+    clear_status(dev);
     unsafe {
         core::ptr::write_bytes(dev.data_buf as *mut u8, 0, VIRTIO_BLK_ID_BYTES);
     }
@@ -470,7 +470,7 @@ fn read_serial_into(dev: &mut BlkDevice) {
         core::hint::spin_loop();
     }
 
-    let status = unsafe { (dev.status_buf as *const u8).read_volatile() };
+    let status = read_status(dev);
     if status != VIRTIO_BLK_S_OK {
         return;
     }
@@ -527,6 +527,16 @@ pub fn handle_irq(irq: u32) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Clear the status byte (set to 0xFF) before submitting a request.
+fn clear_status(dev: &BlkDevice) {
+    unsafe { (dev.status_buf as *mut u8).write_volatile(0xFF) }
+}
+
+/// Read the status byte after a request completes.
+fn read_status(dev: &BlkDevice) -> u8 {
+    unsafe { (dev.status_buf as *const u8).read_volatile() }
+}
 
 /// Write the outhdr structure to the DMA buffer.
 fn write_outhdr(buf: usize, req_type: u32, sector: u64) {

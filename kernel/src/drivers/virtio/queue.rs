@@ -121,32 +121,31 @@ impl Virtqueue {
         let avail = avail_phys as *mut VirtqAvail;
         let used = used_phys as *mut VirtqUsed;
 
-        // Init free list: chain all descriptors
+        // Init free list: chain all descriptors (volatile — DMA memory)
         for i in 0..QUEUE_SIZE as u16 {
             unsafe {
-                let d = &mut *desc.add(i as usize);
-                d.addr = 0;
-                d.len = 0;
-                d.flags = 0;
-                d.next = if i + 1 < QUEUE_SIZE as u16 { i + 1 } else { 0xFFFF };
+                let d = desc.add(i as usize);
+                let next = if i + 1 < QUEUE_SIZE as u16 { i + 1 } else { 0xFFFF };
+                core::ptr::addr_of_mut!((*d).addr).write_volatile(0);
+                core::ptr::addr_of_mut!((*d).len).write_volatile(0);
+                core::ptr::addr_of_mut!((*d).flags).write_volatile(0);
+                core::ptr::addr_of_mut!((*d).next).write_volatile(next);
             }
         }
 
-        // Zero avail ring
+        // Zero avail ring (volatile — DMA memory)
         unsafe {
-            let a = &mut *avail;
-            a.flags = 0;
-            a.idx = 0;
-            for slot in a.ring.iter_mut() {
-                *slot = 0;
+            core::ptr::addr_of_mut!((*avail).flags).write_volatile(0);
+            core::ptr::addr_of_mut!((*avail).idx).write_volatile(0);
+            for i in 0..QUEUE_SIZE {
+                core::ptr::addr_of_mut!((*avail).ring[i]).write_volatile(0);
             }
         }
 
-        // Zero used ring
+        // Zero used ring (volatile — DMA memory)
         unsafe {
-            let u = &mut *used;
-            u.flags = 0;
-            u.idx = 0;
+            core::ptr::addr_of_mut!((*used).flags).write_volatile(0);
+            core::ptr::addr_of_mut!((*used).idx).write_volatile(0);
         }
 
         Virtqueue {
