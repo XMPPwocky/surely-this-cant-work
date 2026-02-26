@@ -106,6 +106,12 @@ pub fn write_satp(val: usize) {
 
 #[allow(dead_code)]
 #[inline(always)]
+pub fn read_sscratch() -> usize {
+    read_csr!("sscratch")
+}
+
+#[allow(dead_code)]
+#[inline(always)]
 pub fn write_sscratch(val: usize) {
     write_csr!("sscratch", val);
 }

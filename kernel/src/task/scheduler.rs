@@ -109,6 +109,10 @@ pub fn init() {
     unsafe {
         core::arch::asm!("csrw sscratch, {}", in(reg) trap_ctx_ptr);
     }
+    debug_assert_eq!(
+        crate::arch::csr::read_sscratch(), trap_ctx_ptr,
+        "sscratch invariant violated after scheduler init"
+    );
     crate::println!("Scheduler initialized (max {} processes, sscratch={:#x})", MAX_PROCS, trap_ctx_ptr);
 }
 
@@ -519,6 +523,13 @@ pub fn schedule() {
         // interrupts. (Interrupts are still disabled here, so this is safe.)
         core::arch::asm!("csrw sscratch, {}", in(reg) old_trap_ctx);
     }
+
+    // Verify sscratch invariant: after resume, sscratch must point to
+    // this task's TrapContext.
+    debug_assert_eq!(
+        crate::arch::csr::read_sscratch(), old_trap_ctx,
+        "sscratch invariant violated after schedule() resume"
+    );
 
     // After switch_context returns, we've been switched BACK to this task.
     // Only re-enable interrupts if they were on before (i.e., we were NOT
