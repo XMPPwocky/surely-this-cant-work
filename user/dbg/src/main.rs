@@ -47,20 +47,20 @@ fn parse_hex(s: &str) -> Option<u64> {
 }
 
 struct Debugger {
-    session_handle: Option<usize>,
+    session_client: Option<DebugSessionClient<rvos::UserTransport>>,
     event_handle: Option<usize>,
 }
 
 impl Debugger {
     fn new() -> Self {
         Debugger {
-            session_handle: None,
+            session_client: None,
             event_handle: None,
         }
     }
 
     fn is_attached(&self) -> bool {
-        self.session_handle.is_some()
+        self.session_client.is_some()
     }
 
     fn attach(&mut self, pid: u32) {
@@ -115,7 +115,8 @@ impl Debugger {
 
         match resp {
             DebugAttachResponse::Ok { session, events } => {
-                self.session_handle = Some(session.raw());
+                let transport = rvos::UserTransport::new(session.raw());
+                self.session_client = Some(DebugSessionClient::new(transport));
                 self.event_handle = Some(events.raw());
                 println!("Attached to PID {}", pid);
             }
@@ -135,8 +136,9 @@ impl Debugger {
     }
 
     fn detach(&mut self) {
-        if let Some(h) = self.session_handle.take() {
-            raw::syscall1(raw::SYS_CHAN_CLOSE, h);
+        if let Some(client) = self.session_client.take() {
+            let transport = client.into_inner();
+            raw::syscall1(raw::SYS_CHAN_CLOSE, transport.handle());
         }
         if let Some(h) = self.event_handle.take() {
             raw::syscall1(raw::SYS_CHAN_CLOSE, h);
@@ -144,82 +146,64 @@ impl Debugger {
         println!("Detached.");
     }
 
-    fn send_request(&self, req: &SessionRequest) -> Option<Vec<u8>> {
-        let session = match self.session_handle {
-            Some(h) => h,
-            None => {
-                println!("Not attached.");
-                return None;
-            }
+    fn cmd_suspend(&mut self) {
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
         };
-
-        let mut msg = rvos::Message::new();
-        msg.len = rvos_wire::to_bytes(req, &mut msg.data).unwrap_or(0);
-        let ret = raw::sys_chan_send_blocking(session, &msg);
-        if ret != 0 {
-            println!("Send failed (channel closed?)");
-            return None;
-        }
-
-        let mut resp = rvos::Message::new();
-        let ret = raw::sys_chan_recv_blocking(session, &mut resp);
-        if ret != 0 {
-            println!("Recv failed (channel closed?)");
-            return None;
-        }
-
-        Some(resp.data[..resp.len].to_vec())
-    }
-
-    fn cmd_suspend(&self) {
-        if let Some(data) = self.send_request(&SessionRequest::Suspend {}) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Ok {}) => println!("Suspend requested (waiting for event...)"),
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
-            }
+        match client.suspend() {
+            Ok(SessionResponse::Ok {}) => println!("Suspend requested (waiting for event...)"),
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_resume(&self) {
-        if let Some(data) = self.send_request(&SessionRequest::Resume {}) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Ok {}) => println!("Resumed."),
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
-            }
+    fn cmd_resume(&mut self) {
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.resume() {
+            Ok(SessionResponse::Ok {}) => println!("Resumed."),
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_regs(&self) {
-        if let Some(data) = self.send_request(&SessionRequest::ReadRegisters {}) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Registers { data: reg_data }) => {
-                    if reg_data.len() < 264 {
-                        println!("Incomplete register data");
-                        return;
-                    }
-                    let pc = u64::from_le_bytes(reg_data[0..8].try_into().unwrap());
-                    println!("  pc  = {:#018x}", pc);
-                    println!();
-                    for (i, name) in REG_NAMES.iter().enumerate().take(32) {
-                        let off = 8 + i * 8;
-                        let val = u64::from_le_bytes(
-                            reg_data[off..off + 8].try_into().unwrap(),
-                        );
-                        print!("  {:4} = {:#018x}", name, val);
-                        if i % 4 == 3 {
-                            println!();
-                        }
+    fn cmd_regs(&mut self) {
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.read_registers() {
+            Ok(SessionResponse::Registers { data: reg_data }) => {
+                if reg_data.len() < 264 {
+                    println!("Incomplete register data");
+                    return;
+                }
+                let pc = u64::from_le_bytes(reg_data[0..8].try_into().unwrap());
+                println!("  pc  = {:#018x}", pc);
+                println!();
+                for (i, name) in REG_NAMES.iter().enumerate().take(32) {
+                    let off = 8 + i * 8;
+                    let val = u64::from_le_bytes(
+                        reg_data[off..off + 8].try_into().unwrap(),
+                    );
+                    print!("  {:4} = {:#018x}", name, val);
+                    if i % 4 == 3 {
+                        println!();
                     }
                 }
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
             }
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_setreg(&self, name: &str, val_str: &str) {
+    fn cmd_setreg(&mut self, name: &str, val_str: &str) {
         let reg = match reg_index(name) {
             Some(r) => r,
             None => {
@@ -235,18 +219,21 @@ impl Debugger {
             }
         };
 
-        if let Some(data) = self.send_request(&SessionRequest::WriteRegister { reg, value }) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Ok {}) => {
-                    println!("Set {} = {:#x}", REG_NAMES[reg as usize], value);
-                }
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.write_register(reg, value) {
+            Ok(SessionResponse::Ok {}) => {
+                println!("Set {} = {:#x}", REG_NAMES[reg as usize], value);
             }
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_mem(&self, addr_str: &str, len_str: Option<&str>) {
+    fn cmd_mem(&mut self, addr_str: &str, len_str: Option<&str>) {
         let addr = match parse_hex(addr_str) {
             Some(a) => a,
             None => {
@@ -260,18 +247,21 @@ impl Debugger {
         };
         let len = len.min(512);
 
-        if let Some(data) = self.send_request(&SessionRequest::ReadMemory { addr, len }) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Memory { data: mem }) => {
-                    hex_dump(addr, mem);
-                }
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.read_memory(addr, len) {
+            Ok(SessionResponse::Memory { data: mem }) => {
+                hex_dump(addr, mem);
             }
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_write(&self, addr_str: &str, hex_str: &str) {
+    fn cmd_write(&mut self, addr_str: &str, hex_str: &str) {
         let addr = match parse_hex(addr_str) {
             Some(a) => a,
             None => {
@@ -287,20 +277,21 @@ impl Debugger {
             }
         };
 
-        if let Some(data) =
-            self.send_request(&SessionRequest::WriteMemory { addr, data: &bytes })
-        {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Ok {}) => {
-                    println!("Wrote {} bytes at {:#x}", bytes.len(), addr);
-                }
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.write_memory(addr, &bytes) {
+            Ok(SessionResponse::Ok {}) => {
+                println!("Wrote {} bytes at {:#x}", bytes.len(), addr);
             }
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_breakpoint(&self, addr_str: &str) {
+    fn cmd_breakpoint(&mut self, addr_str: &str) {
         let addr = match parse_hex(addr_str) {
             Some(a) => a,
             None => {
@@ -309,16 +300,19 @@ impl Debugger {
             }
         };
 
-        if let Some(data) = self.send_request(&SessionRequest::SetBreakpoint { addr }) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Ok {}) => println!("Breakpoint set at {:#x}", addr),
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
-            }
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.set_breakpoint(addr) {
+            Ok(SessionResponse::Ok {}) => println!("Breakpoint set at {:#x}", addr),
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_clear(&self, addr_str: &str) {
+    fn cmd_clear(&mut self, addr_str: &str) {
         let addr = match parse_hex(addr_str) {
             Some(a) => a,
             None => {
@@ -327,37 +321,43 @@ impl Debugger {
             }
         };
 
-        if let Some(data) = self.send_request(&SessionRequest::ClearBreakpoint { addr }) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Ok {}) => println!("Breakpoint cleared at {:#x}", addr),
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
-            }
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.clear_breakpoint(addr) {
+            Ok(SessionResponse::Ok {}) => println!("Breakpoint cleared at {:#x}", addr),
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
-    fn cmd_backtrace(&self) {
-        if let Some(data) = self.send_request(&SessionRequest::Backtrace {}) {
-            match rvos_wire::from_bytes::<SessionResponse>(&data) {
-                Ok(SessionResponse::Backtrace { frames }) => {
-                    if frames.is_empty() {
-                        println!("  (no frames)");
-                        return;
-                    }
-                    let count = frames.len() / 16;
-                    for i in 0..count {
-                        let off = i * 16;
-                        let ra =
-                            u64::from_le_bytes(frames[off..off + 8].try_into().unwrap());
-                        let fp = u64::from_le_bytes(
-                            frames[off + 8..off + 16].try_into().unwrap(),
-                        );
-                        println!("  #{}: ra={:#x} fp={:#x}", i, ra, fp);
-                    }
+    fn cmd_backtrace(&mut self) {
+        let client = match self.session_client.as_mut() {
+            Some(c) => c,
+            None => { println!("Not attached."); return; }
+        };
+        match client.backtrace() {
+            Ok(SessionResponse::Backtrace { frames }) => {
+                if frames.is_empty() {
+                    println!("  (no frames)");
+                    return;
                 }
-                Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
-                _ => println!("Unexpected response"),
+                let count = frames.len() / 16;
+                for i in 0..count {
+                    let off = i * 16;
+                    let ra =
+                        u64::from_le_bytes(frames[off..off + 8].try_into().unwrap());
+                    let fp = u64::from_le_bytes(
+                        frames[off + 8..off + 16].try_into().unwrap(),
+                    );
+                    println!("  #{}: ra={:#x} fp={:#x}", i, ra, fp);
+                }
             }
+            Ok(SessionResponse::Error { message }) => println!("Error: {}", message),
+            Ok(_) => println!("Unexpected response"),
+            Err(e) => println!("RPC error: {:?}", e),
         }
     }
 
