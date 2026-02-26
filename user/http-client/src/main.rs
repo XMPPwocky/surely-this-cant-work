@@ -22,28 +22,23 @@ fn main() {
         }
     };
 
-    // Resolve hostname to IP
-    eprintln!("[http-client] getting net config...");
-    let net_config = match rvos::socket::get_net_config() {
-        Ok(c) => {
-            eprintln!(
-                "[http-client] config: ip={}.{}.{}.{} dns={}.{}.{}.{}",
-                c.ip[0], c.ip[1], c.ip[2], c.ip[3],
-                c.dns[0], c.dns[1], c.dns[2], c.dns[3],
-            );
-            c
-        }
-        Err(e) => {
-            eprintln!("[http-client] get_net_config failed: {:?}", e);
-            process::exit(1);
-        }
-    };
-    eprintln!("[http-client] resolving '{}'...", host);
-    let ip = match rvos::dns::resolve(&host, net_config.dns) {
-        Ok(ip) => ip,
-        Err(e) => {
-            eprintln!("http-get: DNS resolve '{}': {:?}", host, e);
-            process::exit(1);
+    // Resolve hostname to IP (skip DNS for IP literals)
+    let ip = if let Some(addr) = parse_ipv4(&host) {
+        addr
+    } else {
+        let net_config = match rvos::socket::get_net_config() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("http-get: get_net_config: {:?}", e);
+                process::exit(1);
+            }
+        };
+        match rvos::dns::resolve(&host, net_config.dns) {
+            Ok(ip) => ip,
+            Err(e) => {
+                eprintln!("http-get: DNS resolve '{}': {:?}", host, e);
+                process::exit(1);
+            }
         }
     };
 
@@ -117,4 +112,14 @@ fn parse_url(url: &str) -> Option<(String, u16, String)> {
     }
 
     Some((host.into(), port, path.into()))
+}
+
+/// Try to parse a dotted-decimal IPv4 address (e.g. "10.0.2.62").
+fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut parts = s.splitn(4, '.');
+    let a: u8 = parts.next()?.parse().ok()?;
+    let b: u8 = parts.next()?.parse().ok()?;
+    let c: u8 = parts.next()?.parse().ok()?;
+    let d: u8 = parts.next()?.parse().ok()?;
+    Some([a, b, c, d])
 }
