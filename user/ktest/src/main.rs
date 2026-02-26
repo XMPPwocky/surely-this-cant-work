@@ -2709,6 +2709,24 @@ fn test_tcp_connect_refused() -> Result<(), &'static str> {
     }
 }
 
+fn test_tcp_loopback_self_connect() -> Result<(), &'static str> {
+    // A single-threaded process creates a TcpListener and then connects
+    // to it on the loopback interface.  The net-stack must complete the
+    // 3-way handshake (SYN → SYN-ACK → ACK) entirely within its own
+    // event loop before the connect() call returns.
+    println!("  [self-connect] binding...");
+    let listener = std::net::TcpListener::bind("127.0.0.1:11001")
+        .map_err(|_| "bind failed")?;
+    println!("  [self-connect] connecting...");
+    let _stream = std::net::TcpStream::connect("127.0.0.1:11001")
+        .map_err(|_| "connect failed")?;
+    println!("  [self-connect] connect returned, accepting...");
+    // Accept the connection (server side) -- should be immediately available
+    let (_accepted, _peer) = listener.accept().map_err(|_| "accept failed")?;
+    println!("  [self-connect] done!");
+    Ok(())
+}
+
 fn test_tcp_listener_reuse() -> Result<(), &'static str> {
     // Verify that after dropping a TcpListener, the port can be reused.
     let addr = "0.0.0.0:11000";
@@ -2958,6 +2976,7 @@ fn main() {
 
         total.merge(&run_section("TCP State Machine", &[
             ("tcp_connect_refused", test_tcp_connect_refused),
+            ("tcp_loopback_self_connect", test_tcp_loopback_self_connect),
             ("tcp_listener_reuse", test_tcp_listener_reuse),
         ]));
         yield_drain();

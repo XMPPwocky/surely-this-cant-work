@@ -611,7 +611,8 @@ pub fn tcp_input_conn(
                         &SocketResponse::Ok {},
                         &mut tx.msg.data,
                     ).expect("serialize");
-                    if raw::sys_chan_send(sock.handle, &tx.msg) == raw::CHAN_CLOSED {
+                    let ret = raw::sys_chan_send(sock.handle, &tx.msg);
+                    if ret == raw::CHAN_CLOSED {
                         sock.deactivate(tcp_conns);
                     }
                 }
@@ -1227,7 +1228,10 @@ pub fn handle_client_message(
                 return;
             }
             if sockets[sock_idx].accept_count > 0 {
-                // Connection already waiting -- deliver immediately
+                // Connection already waiting -- deliver immediately.
+                // Set accept_pending so tcp_deliver_accept knows there's a
+                // waiting caller (it checks the flag before proceeding).
+                sockets[sock_idx].accept_pending = true;
                 tcp_deliver_accept(
                     &mut sockets[sock_idx], tcp_conns, pending_accept, tx,
                 );
