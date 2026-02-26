@@ -1,4 +1,5 @@
     .section .text
+    .option arch, +f, +d
     .globl _trap_entry
     .globl _restore_from_trap
     .align 2
@@ -7,14 +8,16 @@
 #
 # sscratch ALWAYS holds a pointer to the current task's TrapContext:
 #
-#   Offset 0..255:  TrapFrame.regs[0..31]  (32 × 8 = 256 bytes)
-#   Offset 256:     TrapFrame.sstatus       (8 bytes)
-#   Offset 264:     TrapFrame.sepc          (8 bytes)
-#   Offset 272:     kernel_stack_top        (8 bytes)
-#   Offset 280:     user_satp              (8 bytes)
+#   Offset 0..255:    TrapFrame.regs[0..31]    (32 × 8 = 256 bytes)
+#   Offset 256..511:  TrapFrame.fpregs[0..31]  (32 × 8 = 256 bytes, f0-f31)
+#   Offset 512:       TrapFrame.fcsr           (8 bytes)
+#   Offset 520:       TrapFrame.sstatus        (8 bytes)
+#   Offset 528:       TrapFrame.sepc           (8 bytes)
+#   Offset 536:       kernel_stack_top         (8 bytes)
+#   Offset 544:       user_satp               (8 bytes)
 #
-# On trap entry, all registers are saved to the current task's TrapContext
-# (not on a stack). The handler stack is chosen based on SPP:
+# On trap entry, all registers (GPR + FPR) are saved to the current task's
+# TrapContext (not on a stack). The handler stack is chosen based on SPP:
 #   SPP=1 (S-mode): task's own kernel stack (reloaded from saved sp)
 #   SPP=0 (U-mode): per-task kernel stack (from TrapContext.kernel_stack_top)
 #
@@ -67,11 +70,49 @@ _trap_entry:
     sd      x30,240(t0)
     sd      x31,248(t0)
 
+    # Save FP registers (f0-f31) at offset 256..511
+    fsd     f0,  256(t0)
+    fsd     f1,  264(t0)
+    fsd     f2,  272(t0)
+    fsd     f3,  280(t0)
+    fsd     f4,  288(t0)
+    fsd     f5,  296(t0)
+    fsd     f6,  304(t0)
+    fsd     f7,  312(t0)
+    fsd     f8,  320(t0)
+    fsd     f9,  328(t0)
+    fsd     f10, 336(t0)
+    fsd     f11, 344(t0)
+    fsd     f12, 352(t0)
+    fsd     f13, 360(t0)
+    fsd     f14, 368(t0)
+    fsd     f15, 376(t0)
+    fsd     f16, 384(t0)
+    fsd     f17, 392(t0)
+    fsd     f18, 400(t0)
+    fsd     f19, 408(t0)
+    fsd     f20, 416(t0)
+    fsd     f21, 424(t0)
+    fsd     f22, 432(t0)
+    fsd     f23, 440(t0)
+    fsd     f24, 448(t0)
+    fsd     f25, 456(t0)
+    fsd     f26, 464(t0)
+    fsd     f27, 472(t0)
+    fsd     f28, 480(t0)
+    fsd     f29, 488(t0)
+    fsd     f30, 496(t0)
+    fsd     f31, 504(t0)
+
+    # Save fcsr at offset 512
+    frcsr   t1
+    sd      t1,  512(t0)
+
     # Save sstatus and sepc
     csrr    t1, sstatus
-    sd      t1, 256(t0)            # TrapFrame.sstatus
+    sd      t1, 520(t0)            # TrapFrame.sstatus
     csrr    t1, sepc
-    sd      t1, 264(t0)            # TrapFrame.sepc
+    sd      t1, 528(t0)            # TrapFrame.sepc
 
     # Restore sscratch = TrapContext pointer (was clobbered during save)
     csrw    sscratch, t0
@@ -79,7 +120,7 @@ _trap_entry:
     # Choose handler stack based on SPP (bit 8 of saved sstatus).
     #   SPP=1 (S-mode trap): task's own kernel stack (resume from saved sp)
     #   SPP=0 (U-mode trap): per-task kernel stack from TrapContext
-    ld      t1, 256(t0)            # reload sstatus
+    ld      t1, 520(t0)            # reload sstatus
     li      t2, (1 << 8)           # SPP mask
     and     t1, t1, t2
     beqz    t1, _user_handler_stack
@@ -99,7 +140,7 @@ _user_handler_stack:
     sfence.vma
 
     # Handler stack = per-task kernel stack (for blocking syscalls)
-    ld      sp, 272(t0)            # TrapContext.kernel_stack_top
+    ld      sp, 536(t0)            # TrapContext.kernel_stack_top
 
 _call_trap_handler:
     # Call trap_handler(&mut TrapFrame) -> *mut TrapFrame
@@ -131,7 +172,7 @@ _restore_from_trap:
     #   - user_entry_trampoline (first run of a user task)
 
     # Load sstatus for SPP check and for writing to CSR
-    ld      t1, 256(t0)            # TrapFrame.sstatus
+    ld      t1, 520(t0)            # TrapFrame.sstatus
 
     # If returning to U-mode (SPP=0), switch to user page table.
     # Kernel memory is identity-mapped in the user page table (without U
@@ -140,7 +181,7 @@ _restore_from_trap:
     and     t2, t1, t2
     bnez    t2, _skip_user_satp
 
-    ld      t2, 280(t0)           # TrapContext.user_satp
+    ld      t2, 544(t0)           # TrapContext.user_satp
     beqz    t2, _skip_user_satp
     csrw    satp, t2
     sfence.vma
@@ -148,8 +189,46 @@ _restore_from_trap:
 _skip_user_satp:
     # Write sstatus and sepc to CSRs
     csrw    sstatus, t1            # t1 still holds sstatus
-    ld      t1, 264(t0)           # TrapFrame.sepc
+    ld      t1, 528(t0)           # TrapFrame.sepc
     csrw    sepc, t1
+
+    # Restore fcsr from offset 512
+    ld      t1, 512(t0)
+    fscsr   t1
+
+    # Restore FP registers (f0-f31) from offset 256..511
+    fld     f0,  256(t0)
+    fld     f1,  264(t0)
+    fld     f2,  272(t0)
+    fld     f3,  280(t0)
+    fld     f4,  288(t0)
+    fld     f5,  296(t0)
+    fld     f6,  304(t0)
+    fld     f7,  312(t0)
+    fld     f8,  320(t0)
+    fld     f9,  328(t0)
+    fld     f10, 336(t0)
+    fld     f11, 344(t0)
+    fld     f12, 352(t0)
+    fld     f13, 360(t0)
+    fld     f14, 368(t0)
+    fld     f15, 376(t0)
+    fld     f16, 384(t0)
+    fld     f17, 392(t0)
+    fld     f18, 400(t0)
+    fld     f19, 408(t0)
+    fld     f20, 416(t0)
+    fld     f21, 424(t0)
+    fld     f22, 432(t0)
+    fld     f23, 440(t0)
+    fld     f24, 448(t0)
+    fld     f25, 456(t0)
+    fld     f26, 464(t0)
+    fld     f27, 472(t0)
+    fld     f28, 480(t0)
+    fld     f29, 488(t0)
+    fld     f30, 496(t0)
+    fld     f31, 504(t0)
 
     # Restore all GPRs (t0 restored last since it's our base pointer)
     ld      x1,   8(t0)

@@ -61,6 +61,10 @@ pub const SSTATUS_SIE: usize = 1 << 1;
 pub const SSTATUS_SPIE: usize = 1 << 5;
 #[allow(dead_code)]
 pub const SSTATUS_SPP: usize = 1 << 8;
+/// sstatus.FS = Initial (01): FPU enabled, state is initial.
+/// Bits [14:13] of sstatus. 01 = Initial, 10 = Clean, 11 = Dirty.
+#[allow(dead_code)]
+pub const SSTATUS_FS_INITIAL: usize = 1 << 13;
 #[allow(dead_code)]
 pub const SSTATUS_SUM: usize = 1 << 18;
 

@@ -16,15 +16,19 @@ static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TrapFrame {
-    pub regs: [usize; 32],
-    pub sstatus: usize,
-    pub sepc: usize,
+    pub regs: [usize; 32],    // offset 0..255   (32 × 8)
+    pub fpregs: [u64; 32],    // offset 256..511  (32 × 8) — f0-f31
+    pub fcsr: usize,          // offset 512       (only low 32 bits used)
+    pub sstatus: usize,       // offset 520
+    pub sepc: usize,          // offset 528
 }
 
 impl TrapFrame {
     pub const fn zero() -> Self {
         TrapFrame {
             regs: [0; 32],
+            fpregs: [0; 32],
+            fcsr: 0,
             sstatus: 0,
             sepc: 0,
         }
