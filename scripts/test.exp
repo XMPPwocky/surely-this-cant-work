@@ -2,7 +2,8 @@
 # Run the rvOS kernel test suite via serial console.
 # Usage: expect scripts/test.exp
 
-set timeout 300
+# Full suite took ~26s as of 02ff7e9.  120s gives ~5x headroom.
+set timeout 120
 log_user 1
 
 cd [file dirname [file dirname [file normalize [info script]]]]

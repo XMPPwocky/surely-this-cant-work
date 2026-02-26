@@ -4,6 +4,7 @@
 **Status:** Open
 **Severity:** MEDIUM
 **Subsystem:** user/net-stack
+**Commit:** 02ff7e9
 
 ## Description
 

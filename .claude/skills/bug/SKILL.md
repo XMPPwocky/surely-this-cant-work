@@ -17,7 +17,11 @@ the bug.
 2. **Choose a slug.** A short kebab-case name for the bug (e.g.,
    `channel-leak-on-cap-transfer`, `idle-in-ready-queue`).
 
-3. **Create `docs/tasks/open/NNNN-slug.md`** with this template:
+3. **Record the current commit hash.** Run `git rev-parse --short HEAD` and
+   include it in the bug report. This pins the exact codebase version the bug
+   was reported against, making reproduction and bisection easier.
+
+4. **Create `docs/tasks/open/NNNN-slug.md`** with this template:
 
 ```markdown
 # NNNN: Title
@@ -26,6 +30,7 @@ the bug.
 **Status:** Open
 **Severity:** HIGH | MEDIUM | LOW
 **Subsystem:** (e.g., ipc, scheduler, mm, init, fs, window-manager, std-port, shell)
+**Commit:** (short hash from `git rev-parse --short HEAD` at time of report)
 
 ## Symptoms
 
@@ -60,7 +65,7 @@ what you tried, what you observed, what led to dead ends, what worked.)
 (Filled in during Phase 6)
 ```
 
-4. **Update the doc as you go.** Every phase should update the relevant section
+5. **Update the doc as you go.** Every phase should update the relevant section
    of the bug doc in-place. Document your **investigation process**, not just
    your eventual conclusions — what you tried, what you observed, what led to
    dead ends, and what finally worked. This is valuable for future debugging:
