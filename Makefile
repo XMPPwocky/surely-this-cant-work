@@ -96,7 +96,14 @@ test.img:
 # Build all disk images
 disk-images: bin.img persist.img
 
+SYMTAB_BIN = kernel/ksymtab.bin
+
 build: build-user disk-images
+	@# Ensure a placeholder exists for the first pass
+	@test -f $(SYMTAB_BIN) || python3 -c "import struct; open('$(SYMTAB_BIN)','wb').write(struct.pack('<I',0))"
+	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml \
+		--target riscv64gc-unknown-none-elf $(BUILD_STD)
+	python3 scripts/gen_symtab.py --kernel $(KERNEL_ELF) -o $(SYMTAB_BIN)
 	. $$HOME/.cargo/env && cargo build --release --manifest-path kernel/Cargo.toml \
 		--target riscv64gc-unknown-none-elf $(BUILD_STD)
 	$(OBJCOPY) --binary-architecture=riscv64 $(KERNEL_ELF) --strip-all -O binary $(KERNEL_BIN)

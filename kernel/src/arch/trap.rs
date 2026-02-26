@@ -200,7 +200,11 @@ pub fn print_backtrace(start_fp: usize) {
     while (kern_lo..kern_hi).contains(&fp) && fp.is_multiple_of(8) && depth < MAX_DEPTH {
         let ra = unsafe { *((fp - 8) as *const usize) };
         let prev_fp = unsafe { *((fp - 16) as *const usize) };
-        crate::println!("    #{}: ra={:#x} fp={:#x}", depth, ra, fp);
+        if let Some((name, offset)) = crate::symtab::resolve(ra) {
+            crate::println!("    #{}: ra={:#x} {}+{:#x}", depth, ra, name, offset);
+        } else {
+            crate::println!("    #{}: ra={:#x}", depth, ra);
+        }
         if prev_fp == 0 || prev_fp == fp {
             break;
         }

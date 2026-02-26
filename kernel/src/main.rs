@@ -16,6 +16,7 @@ mod mm;
 mod panic;
 mod platform;
 mod services;
+mod symtab;
 mod sync;
 mod task;
 mod trace;
